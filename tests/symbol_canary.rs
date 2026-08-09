@@ -93,7 +93,13 @@ const TOLERANCE: f64 = 0.20;
 /// the dynamic-header and huffman-code builders, and both monomorphizations
 /// of the T>1 pipelined entry (stdout — the benchmark path — and file).
 const SUBSTRINGS: &[&str] = &[
-    "parse::fast::run",
+    // #286 wired bucket2/COST-GATE through `run_resumable` and the old
+    // `parse::fast::run` symbol dissolved into the two monomorphized hot
+    // loops below (the watch went 0-match, exactly the rename event the
+    // canary exists to catch — caught 2026-08-08, adjusted here with the
+    // pins regenerated in the same commit).
+    "fast::fastloop_l1",
+    "fast::fastloop_l1_lean",
     "greedy::run_resumable",
     "lazy::run_resumable",
     "optimize_and_flush",
@@ -305,6 +311,20 @@ fn symbol_sizes(bin: &Path, mut syms: Vec<(u64, String)>) -> Vec<(String, u64)> 
 /// Resolve one watch substring to exactly one (symbol, size).
 fn resolve<'a>(sizes: &'a [(String, u64)], substr: &str) -> Result<(&'a str, u64), String> {
     let hits: Vec<&(String, u64)> = sizes.iter().filter(|(n, _)| n.contains(substr)).collect();
+    // Disambiguation for watches that are a strict prefix of a sibling symbol
+    // (e.g. `fastloop_l1` vs `fastloop_l1_lean`, where NO plain substring can
+    // name the shorter one uniquely): when the substring matches several
+    // symbols but exactly ONE symbol *ends with* it, that suffix match is the
+    // named function. A genuine outlined/duplicated copy still fails below,
+    // because a copy of the same function matches the suffix too (`.._0`,
+    // `..::hXX` variants do not end with the plain path).
+    if hits.len() > 1 {
+        let suffix_hits: Vec<&&(String, u64)> =
+            hits.iter().filter(|(n, _)| n.ends_with(substr)).collect();
+        if suffix_hits.len() == 1 {
+            return Ok((suffix_hits[0].0.as_str(), suffix_hits[0].1));
+        }
+    }
     match hits.len() {
         1 => Ok((hits[0].0.as_str(), hits[0].1)),
         0 => Err(format!(

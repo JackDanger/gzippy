@@ -103,7 +103,11 @@ fn chunks_per_thread() -> usize {
 const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
 #[inline]
-pub(crate) fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
+// `pub` (not `pub(crate)`) so the perf-shape pin suite (tests/perf_shape.rs)
+// can derive the chunk count of a T>1 run from the same pure function the
+// encoder uses — bit-splice (#257) deleted the per-chunk sync-flush stored
+// blocks the suite previously counted chunks by.
+pub fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
     // THREAD-AWARE. Chunk COUNT is what costs size: every chunk restarts the block
     // grid and pays its own dynamic-header mass plus a seam, so a 26 MB file cut into
     // 512 KiB chunks pays that ~50 times whether it is running on 4 threads or 32.

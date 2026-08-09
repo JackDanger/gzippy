@@ -35,14 +35,15 @@
 //!    ("text"), same seeded generator (`fixtures::generate_sized`), at 1 MiB
 //!    and 8 MiB, T1 and T4, levels {1,6}: `alloc_events` must be O(1) in
 //!    input size at T1 (MEASURED: zero growth from 1 MiB to 8 MiB); at T4
-//!    the MEASURED current behavior is ~3.3-3.7 counted allocation events
-//!    per chunk, dominated by the per-chunk padded `[dict|data|pad]` copy
-//!    buffer (see the constants below for the mechanism and the encoded
-//!    tightest-true bound — allocation is NOT O(1) at T4 today). `alloc_bytes`
-//!    legitimately scales linearly with input (the padded [data|pad] work
-//!    buffer and the output-capacity estimate are both O(n)), so bytes are
-//!    pinned as a bytes-per-input-byte ceiling instead — said here so nobody
-//!    mistakes the linear term for a leak.
+//!    the MEASURED current behavior (2026-08-08, post-#293) is ~2.7-3.6
+//!    counted allocation events per chunk, dominated by the per-chunk padded
+//!    `[dict|data|pad]` copy buffer (see the constants below for the
+//!    mechanism and the encoded tightest-true bound — allocation is NOT O(1)
+//!    at T4 today). `alloc_bytes` legitimately scales linearly with input
+//!    (the padded [data|pad] work buffer and the output-capacity estimate
+//!    are both O(n)) and carries a fixed per-worker pooled-table term, so
+//!    bytes are pinned as a fixed-allowance-plus-slope ceiling — said here
+//!    so nobody mistakes either term for a leak.
 //!
 //! ## Determinism gate
 //!
@@ -50,11 +51,13 @@
 //! identical in-process runs. Every cell is measured TWICE at T4 (and at T1)
 //! and any counter that disagrees must be listed in
 //! `T4_NONDETERMINISTIC_COUNTERS` with the reason — the gate fails loudly on
-//! an unlisted one, so nondeterminism is a finding, not a flake. As of pin
-//! generation, ALL exposed counters are deterministic at T4: the chunk grid
-//! is a pure function of (input_len, threads, level), each chunk's work is a
-//! pure function of (chunk bytes, dictionary bytes), and worker scheduling
-//! only changes WHICH thread does the work, never how much of it there is.
+//! an unlisted one, so nondeterminism is a finding, not a flake. The chunk
+//! grid is a pure function of (input_len, threads, level) and each chunk's
+//! parse/emit work is a pure function of (chunk bytes, dictionary bytes), so
+//! worker scheduling only changes WHICH thread does that work, never how
+//! much of it there is — but the alloc pair became the exception on
+//! 2026-08-08 (thread-local pooled tables charge on first use PER WORKER,
+//! and worker participation is a race; see T4_NONDETERMINISTIC_COUNTERS).
 //!
 //! ## Why in-process, and why the shared lock
 //!
@@ -80,7 +83,7 @@
 
 use gzippy::compress::deflate::anatomy_counters;
 use gzippy::compress::deflate::encode_gzip_bytes_to_vec;
-use gzippy::compress::pipelined::PipelinedGzEncoder;
+use gzippy::compress::pipelined::{pipelined_block_size, PipelinedGzEncoder};
 use gzippy::fixtures;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -101,10 +104,20 @@ const REGEN_CMD: &str =
 /// excluded from the pin surface — each entry must name why. The determinism
 /// gate fails loudly on any unlisted disagreement.
 ///
-/// EMPTY as of pin generation: every exposed counter was measured
-/// deterministic at T4 (two identical in-process runs, every fixture x level
-/// — see the module doc for why the work volume is schedule-independent).
-const T4_NONDETERMINISTIC_COUNTERS: &[&str] = &[];
+/// Was EMPTY at pin generation. The alloc pair joined 2026-08-08: the
+/// matchfinder's head/len3 tables are THREAD-LOCAL pooled buffers charged to
+/// `alloc_events`/`alloc_bytes` only on a worker thread's FIRST use
+/// (parse/fast.rs `acquire_head_table` — "charge only a GENUINE allocation,
+/// never a pooled reuse"), and chunk->worker assignment is an atomic-queue
+/// race, so HOW MANY workers ever claim a chunk (and therefore pay the
+/// per-thread table charge) varies run to run. Receipt: CI run 31173528082
+/// (macos arm64, text:1MiB:L1:T4) measured run A 15 events / 2,328,086 B vs
+/// run B 17 events / 2,721,302 B — a delta of exactly 2 events / 393,216 B =
+/// one more participating worker's head (256 KiB) + len3 (128 KiB) tables.
+/// The allocation-invariance family still bounds these counters (one-sided
+/// ceilings over the max of two runs — see `alloc_arm`); only exact-ratio
+/// pinning is impossible.
+const T4_NONDETERMINISTIC_COUNTERS: &[&str] = &["alloc_events", "alloc_bytes"];
 
 /// Serializes the two tests in this binary against the one process-wide
 /// counter static. Poisoning is ignored deliberately: a panic in one test
@@ -179,15 +192,9 @@ fn measure(data: &[u8], compress: impl Fn() -> Vec<u8>, what: &str) -> BTreeMap<
     snapshot
 }
 
-/// Measure one arm TWICE and demand exact determinism on every counter not
-/// explicitly excluded. Returns the (excluded-counters-removed) snapshot.
-fn measure_deterministic(
-    data: &[u8],
-    compress: impl Fn() -> Vec<u8>,
-    what: &str,
-) -> BTreeMap<String, u64> {
-    let a = measure(data, &compress, what);
-    let b = measure(data, &compress, what);
+/// Demand exact run-to-run agreement on every counter not explicitly excluded
+/// (the shared determinism gate for both invariant families).
+fn assert_deterministic(a: &BTreeMap<String, u64>, b: &BTreeMap<String, u64>, what: &str) {
     let mut disagreements: Vec<String> = a
         .iter()
         .filter(|(k, va)| b.get(*k) != Some(va))
@@ -212,6 +219,18 @@ fn measure_deterministic(
          T4_NONDETERMINISTIC_COUNTERS with a comment naming why.\n",
         disagreements.join("\n")
     );
+}
+
+/// Measure one arm TWICE and demand exact determinism on every counter not
+/// explicitly excluded. Returns the (excluded-counters-removed) snapshot.
+fn measure_deterministic(
+    data: &[u8],
+    compress: impl Fn() -> Vec<u8>,
+    what: &str,
+) -> BTreeMap<String, u64> {
+    let a = measure(data, &compress, what);
+    let b = measure(data, &compress, what);
+    assert_deterministic(&a, &b, what);
     let mut out = a;
     for ex in T4_NONDETERMINISTIC_COUNTERS {
         out.remove(*ex);
@@ -441,8 +460,13 @@ fn parallel_overhead_budget() {
             tightenable.push(format!("{}:L{} ({under} counter(s))", cell.0, cell.1));
         }
         if !over.is_empty() {
-            // Sorted by ratio increase, biggest mechanism first.
-            over.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+            // Sorted by ratio increase, biggest mechanism first. `total_cmp`,
+            // not `partial_cmp(..).unwrap()`: a counter whose pinned AND
+            // current t1 are both 0 yields inf - inf = NaN here, and the
+            // unwrap panicked BEFORE the failure table printed (measured
+            // 2026-08-08, this suite's first post-#293 run) — the reporting
+            // path must never be less robust than the failure it reports.
+            over.sort_by(|a, b| b.3.total_cmp(&a.3));
             let mut msg = format!(
                 "PARALLEL OVERHEAD GREW {}:L{}:T4/T1 — {} counter(s) over the pinned ceiling\n    \
                  {:<30} {:>16} {:>16} {:>10} {:>10}\n",
@@ -523,66 +547,111 @@ const LARGE: usize = 8 * MIB; // 8 MiB
 /// events and fails loudly.
 const T1_EVENT_GROWTH_SLACK: u64 = 2;
 
-/// T4 `alloc_events` per chunk, ceiling. MEASURED current behavior (text,
-/// 1 MiB -> 8 MiB, i.e. 4 -> 10 chunks): events grow 20 over 6 extra chunks
-/// at L1 (3.33/chunk) and 22 over 6 at L6 (3.67/chunk). The dominant term is
-/// the padded `[dict | data | pad]` copy buffer
-/// `encode_deflate_segment_to_sink` builds for EVERY chunk
-/// (deflate/mod.rs:173-175); the rest is per-chunk-worker scratch growth
-/// (e.g. the header scratch's first growth, reused within but not across
-/// chunk invocations). This is a REAL, measured violation of the charter's
-/// zero-per-chunk-allocation ideal (STEP 1 wording), encoded here as the
-/// tightest true bound so any FURTHER per-chunk allocation fails the test —
-/// and so that removing the per-chunk copy (a named candidate lever) turns
-/// this ceiling slack into a visible tightening opportunity.
-const T4_EVENTS_PER_CHUNK_CEILING: u64 = 4;
+/// T4 `alloc_events` per chunk, ceiling. MEASURED 2026-08-08 (post-#293 main,
+/// aarch64-apple-darwin; text, 1 MiB -> 8 MiB = 4 -> 10 chunks): events grow
+/// 51 over 6 extra chunks at L1 (8.5/chunk) and 38 over 6 at L6 (6.3/chunk).
+/// Per-site attribution (temporary `anatomy_count!` site tracer over the
+/// exact cells above): the growth is dominated by `huffman/header.rs:179` —
+/// each chunk's parser invocation creates a FRESH `HeaderScratch`
+/// (fast.rs/lazy.rs `HeaderScratch::new()`), and since the Huffman candidate
+/// wave (#287 RLE-shaped header, #288 exact package-merge beside the
+/// heuristic) every block costs SEVERAL candidate headers, so the fresh
+/// scratch takes ~5-7 capacity-growth charges per chunk where the pre-wave
+/// encoder took ~1 (ceiling was 4/chunk then). One more event per chunk is
+/// the padded `[dict | data | pad]` copy `encode_deflate_splice_chunk_to_sink`
+/// builds. This is a REAL, measured violation of the charter's
+/// zero-per-chunk-allocation ideal (STEP 1 wording), now ~2x worse than at
+/// pin time — a per-worker HeaderScratch pool (the same pattern
+/// fast.rs uses for its head tables) is the named reclaim candidate — and it
+/// is encoded here as the tightest true integer bound so any FURTHER
+/// per-chunk allocation class fails the test.
+const T4_EVENTS_PER_CHUNK_CEILING: u64 = 9;
 
-/// `alloc_bytes` per input byte, ceiling (x1000, integer arithmetic).
-/// `alloc_bytes` legitimately scales linearly with input at BOTH thread
-/// counts — the padded work buffer is input-sized and the output-capacity
-/// estimate is ~len/2 at L1+ (`estimate_output_cap`) — so O(1) bytes is not
-/// the invariant; bytes-per-input-byte is. MEASURED at pin time (text,
-/// L1/L6): T1 = 1.5004x-1.5006x (one input-sized padded copy + the ~len/2
-/// output cap), T4 = 1.036x-1.096x (per-chunk padded copies sum to ~input
-/// size + one 32 KiB dictionary prefix per chunk; no whole-file output-cap
-/// vec). Ceiling 2.0x: one MORE input-sized copy (worst arm 1.5 -> 2.5)
-/// or a doubled output-cap estimate (1.5 -> 2.0006) both fail it.
-const BYTES_PER_INPUT_BYTE_CEILING_X1000: u64 = 2000;
+/// Scheduling-variance allowance on the T4 event ceiling: up to `T4` worker
+/// threads each pay a one-time 2-event thread-local pooled-table charge
+/// (head + len3, parse/fast.rs `acquire_head_table`) on the first chunk they
+/// happen to claim, and HOW MANY workers claim a chunk is a race (see
+/// `T4_NONDETERMINISTIC_COUNTERS` — measured run-to-run delta is exactly
+/// 2 events per extra participating worker). This term does NOT scale with
+/// chunks, so it must not be folded into the per-chunk ceiling.
+const T4_WORKER_EVENTS_ALLOWANCE: u64 = 2 * T4 as u64;
+
+/// `alloc_bytes` ceiling: a FIXED allowance plus a per-input-byte slope
+/// (both integer arithmetic; slope x1000). `alloc_bytes` legitimately scales
+/// linearly with input at BOTH thread counts — the padded work buffer is
+/// input-sized and the output-capacity estimate is ~len/2 at L1+
+/// (`estimate_output_cap`) — and since bit-splice + bucket2 it also carries a
+/// real input-INDEPENDENT term, so the honest bound is fixed + slope, not a
+/// pure ratio. MEASURED 2026-08-08 (post-#293 main, aarch64-apple-darwin;
+/// text, L1/L6, max of two runs):
+///   T1: 1,573,510 @ 1 MiB and 12,583,558 @ 8 MiB — pure 1.5004x-1.5006x
+///       slope (one input-sized padded copy + the ~len/2 output cap), fixed
+///       term nil.
+///   T4: 2,724,290 @ 1 MiB and 10,274,472 @ 8 MiB — slope ~1.03x (per-chunk
+///       padded copies + 32 KiB dictionary prefix per chunk) plus a ~1.7 MiB
+///       fixed term: up to 4 participating workers x 384 KiB of thread-local
+///       pooled matchfinder tables (256 KiB head + 128 KiB len3 since
+///       bucket2, #283) plus per-worker fragment scratch.
+/// Fixed allowance 2 MiB covers full 4-worker participation with slack;
+/// slope ceiling stays 1.5x + margin at 1.7x so ONE more whole-input copy
+/// (worst arm 1.5 -> 2.5) fails at 8 MiB where the fixed term is noise.
+const ALLOC_BYTES_FIXED_ALLOWANCE: u64 = 2 * 1024 * 1024;
+const BYTES_PER_INPUT_BYTE_CEILING_X1000: u64 = 1700;
 
 /// One measured allocation arm.
 struct AllocArm {
     events: u64,
     bytes: u64,
-    /// Chunk count, derived from the counters themselves: every non-final
-    /// T>1 chunk closes with a sync-flush EMPTY STORED block, and on this
-    /// compressible fixture at these levels stored never wins a real block,
-    /// so `blocks_emitted_stored + 1 == chunks`. At T1 there are no seams and
-    /// stored never wins, so this reads 1 (a single "chunk").
+    /// Chunk count. Until bit-splice (#257) this was READ off the counters
+    /// (`blocks_emitted_stored + 1`: every non-final chunk closed with a
+    /// sync-flush empty stored block). Bit-splice deleted exactly those seam
+    /// blocks — workers emit raw fragments the writer thread splices — so
+    /// `blocks_emitted_stored` reads 0 at T4 now and the count is instead
+    /// derived from [`pipelined_block_size`], the same pure function of
+    /// (input_len, threads) the encoder's grid uses. At T1 there is no grid:
+    /// one "chunk".
     chunks: u64,
 }
 
 fn alloc_arm(data: &[u8], level: u32, threads: usize) -> AllocArm {
     let what = format!("alloc:{}B:L{level}:T{threads}", data.len());
-    let snap = measure_deterministic(
-        data,
-        || {
-            if threads == 1 {
-                compress_t1(data, level)
-            } else {
-                compress_t4(data, level)
-            }
-        },
-        &what,
-    );
+    let compress = || {
+        if threads == 1 {
+            compress_t1(data, level)
+        } else {
+            compress_t4(data, level)
+        }
+    };
+    // NOT `measure_deterministic`: that helper strips the alloc pair (it is
+    // T4-nondeterministic — worker-participation race, see
+    // T4_NONDETERMINISTIC_COUNTERS), and the alloc pair is exactly what this
+    // family bounds. Instead: same double-run determinism gate on every
+    // OTHER counter, and the alloc pair is graded as the WORSE (max) of the
+    // two runs — every bound in this family is a one-sided ceiling, so the
+    // max is the honest arm.
+    let a = measure(data, &compress, &what);
+    let b = measure(data, &compress, &what);
+    assert_deterministic(&a, &b, &what);
     let get = |k: &str| {
-        snap.get(k)
+        let va = a
+            .get(k)
             .copied()
-            .unwrap_or_else(|| panic!("missing counter {k}"))
+            .unwrap_or_else(|| panic!("missing counter {k}"));
+        let vb = b
+            .get(k)
+            .copied()
+            .unwrap_or_else(|| panic!("missing counter {k}"));
+        va.max(vb)
     };
     AllocArm {
         events: get("alloc_events"),
         bytes: get("alloc_bytes"),
-        chunks: get("blocks_emitted_stored") + 1,
+        chunks: if threads == 1 {
+            1
+        } else {
+            let block = pipelined_block_size(data.len(), threads, level);
+            data.len().div_ceil(block) as u64
+        },
     }
 }
 
@@ -636,8 +705,11 @@ fn allocation_invariance() {
                 }
             } else {
                 // T4: events/chunk is the measured contract (see
-                // T4_EVENTS_PER_CHUNK_CEILING for the mechanism).
-                let ceiling = a.events + T4_EVENTS_PER_CHUNK_CEILING * chunk_growth;
+                // T4_EVENTS_PER_CHUNK_CEILING for the mechanism), plus the
+                // input-independent worker-participation variance term.
+                let ceiling = a.events
+                    + T4_EVENTS_PER_CHUNK_CEILING * chunk_growth
+                    + T4_WORKER_EVENTS_ALLOWANCE;
                 if b.events > ceiling {
                     failures.push(format!(
                         "ALLOCATION GROWTH {coord}: per-chunk alloc_events over ceiling\n    \
@@ -660,20 +732,24 @@ fn allocation_invariance() {
                 }
             }
 
-            // ── alloc_bytes: linear in input by design; pin the slope. ──
+            // ── alloc_bytes: fixed allowance + linear slope by design. ──
             for (len, arm, size_name) in [(SMALL, &a, "small"), (LARGE, &b, "large")] {
-                let ceiling = (len as u64) * BYTES_PER_INPUT_BYTE_CEILING_X1000 / 1000;
+                let ceiling = ALLOC_BYTES_FIXED_ALLOWANCE
+                    + (len as u64) * BYTES_PER_INPUT_BYTE_CEILING_X1000 / 1000;
                 if arm.bytes > ceiling {
                     failures.push(format!(
-                        "ALLOCATION VOLUME {coord} ({size_name}): alloc_bytes per input byte over ceiling\n    \
-                         alloc_bytes {} for {} input bytes = {:.3} bytes/input byte \
-                         (ceiling {:.3})\n    \
-                         alloc_bytes scales linearly by DESIGN (padded work buffer + output\n    \
-                         cap estimate); this failure means the input is being copied at least\n    \
-                         one more whole time than at pin time.",
+                        "ALLOCATION VOLUME {coord} ({size_name}): alloc_bytes over ceiling\n    \
+                         alloc_bytes {} for {} input bytes (ceiling {} = {} fixed + \
+                         {:.3} bytes/input byte)\n    \
+                         alloc_bytes carries a fixed per-worker pooled-table term plus a\n    \
+                         linear term BY DESIGN (padded work buffer + output cap estimate);\n    \
+                         this failure means either a new fixed allocation joined the\n    \
+                         pipeline or the input is being copied at least one more whole\n    \
+                         time than at pin time.",
                         commas(arm.bytes),
                         commas(len as u64),
-                        arm.bytes as f64 / len as f64,
+                        commas(ceiling),
+                        commas(ALLOC_BYTES_FIXED_ALLOWANCE),
                         BYTES_PER_INPUT_BYTE_CEILING_X1000 as f64 / 1000.0,
                     ));
                 }
