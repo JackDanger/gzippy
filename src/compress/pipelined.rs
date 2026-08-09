@@ -257,16 +257,79 @@ impl PipelinedGzEncoder {
             return Ok(0);
         }
         if self.num_threads > 1
-            && (self.compression_level == 8 || self.compression_level == 9)
+            && self.compression_level == 9
             && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
         {
-            // L8/L9 T>1: the pipelined chunk grid pays a seam tax on tabular/text
-            // inputs (per-chunk `skip_bytes` dict seed + forced block restarts) that
-            // a continuous `ParseState` path avoids — but the parallel-knob whole-file
-            // path regresses a few already-passing binary cells. A third T1-knob
-            // continuous candidate ties libdeflate on the tabular cells where the seam
-            // tax equals the gap exactly (e.g. data.csv L9). Pick the smallest gzip
-            // of the three (monotone non-worse vs chunked main by construction).
+            // L9 T>1: the chunk workers run the NEAR-OPTIMAL parse
+            // (`params_parallel(9)` routes to the L11 T>1 knobs — see the
+            // measured receipt in `level.rs`). Two candidates, picked by size:
+            //
+            //   chunked  — near-optimal per ≤512 KiB chunk, parallel workers.
+            //              2-7% smaller than every rival AND than both #290
+            //              whole-file candidates on every measured fixture
+            //              class (text/tabular/binary/float/noise).
+            //   whole_t1 — one continuous Lazy2 `ParseState` at T1 knobs, the
+            //              #290 candidate that ties libdeflate byte-for-byte on
+            //              the seam-tax=gap cells (data.csv L9 class). Kept as
+            //              the monotone guard for content where the chunk grid
+            //              or the cost-model parse loses to a continuous Lazy2.
+            //
+            // The #289/#290 `whole_parallel` (parallel-knob continuous) candidate
+            // is GONE at L9: with `params_parallel(9)` now NearOptimal it would
+            // be a SERIAL whole-file near-optimal encode — strictly slower than
+            // the chunked pass running the same parse in parallel — and
+            // `parse_resumable` cannot run NearOptimal at all. Its former wins
+            // are covered: the chunked near-optimal output was smaller than the
+            // parallel-knob continuous output on every measured fixture.
+            //
+            // The two survivors run CONCURRENTLY (the #293 T1 pick-min
+            // precedent): pick-min wall is max(candidates), not sum. Measured
+            // on 8 MiB text at -p4 (M1): 1,030 ms (three sequential candidates,
+            // main) -> ~800 ms here, with the output 185 KB smaller.
+            let header = self.gzip_header_bytes();
+            let (chunked, whole_t1) = std::thread::scope(|scope| {
+                let guard = scope.spawn(|| {
+                    let mut v = Vec::new();
+                    v.extend_from_slice(&header);
+                    crate::compress::deflate::encode_deflate_stateful_to_writer(
+                        data, &mut v, 9, false,
+                    )
+                    .map(|_| v)
+                });
+                let mut chunked = Vec::new();
+                let r = self.compress_parallel_pipeline_pure(data, &mut chunked);
+                (
+                    r.map(|_| chunked),
+                    guard.join().expect("whole_t1 candidate"),
+                )
+            });
+            let chunked = chunked?;
+            let whole_t1 = whole_t1?;
+            // Tie goes to chunked, matching #290's `min_by_key` first-minimum
+            // semantics (chunked was the first element).
+            let best = if whole_t1.len() < chunked.len() {
+                whole_t1
+            } else {
+                chunked
+            };
+            writer.write_all(&best)?;
+            return Ok(data.len() as u64);
+        }
+        if self.num_threads > 1
+            && self.compression_level == 8
+            && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
+        {
+            // L8 T>1 (unchanged from #289/#290): the pipelined chunk grid pays a
+            // seam tax on tabular/text inputs (per-chunk `skip_bytes` dict seed +
+            // forced block restarts) that a continuous `ParseState` path avoids —
+            // but the parallel-knob whole-file path regresses a few
+            // already-passing binary cells. A third T1-knob continuous candidate
+            // ties libdeflate on the tabular cells where the seam tax equals the
+            // gap exactly. Pick the smallest gzip of the three (monotone
+            // non-worse vs chunked main by construction). L8 keeps Lazy2 knobs
+            // (`params_parallel` L8 arm) — it is the documented exclusion from
+            // depth scaling and was left out of the L9 near-optimal routing on
+            // the L4-max-clean-subset principle: extend only with a measurement.
             let level = self.compression_level;
             let header = self.gzip_header_bytes();
 

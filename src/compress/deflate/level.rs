@@ -213,9 +213,44 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 ///
 /// The rule applied is one step of parse strategy at UNCHANGED knobs, which the ladder sweep
 /// measured as strictly smaller at fixed depth. Levels with no stronger strategy available
-/// (L0/L1 chainless, L3 already Lazy, L8/L9 already Lazy2, L10-12 already NearOptimal) are
-/// returned unchanged, so T>1 output at those levels is untouched.
+/// (L0/L1 chainless, L3 already Lazy, L8 already Lazy2, L10-12 already NearOptimal) are
+/// returned unchanged, so T>1 output at those levels is untouched. L9 is the exception:
+/// it takes the FULL step up to the near-optimal parser (see the first branch below).
 pub fn params_parallel(level: u32) -> LevelParams {
+    // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
+    // routing decision (the map is free to change; CLAUDE.md "Every technique is
+    // in scope"), measured in the crown-at-lower-levels study (2026-08-09, M1
+    // laptop, synthetic fixtures, main@af5503f1):
+    //
+    //   size, 8 MiB fixtures, `-p4` (gzip container):
+    //     text     ours-L9-pickmin 2,445,673 -> near-opt-chunked 2,260,495
+    //              (gzip -9 2,425,685 / pigz -9 2,430,279 / libdeflate -9 2,445,776:
+    //               LOSS -> WIN vs all three)
+    //     binary   5,099,126 -> 5,093,556 (gzip 5,103,889: LOSS -> WIN)
+    //     tabular  1,879,115 -> 1,832,677 (already winning; +46 KB margin)
+    //     weights-like float32 stream: 7,774,144 -> 7,766,521 (libdeflate
+    //              7,774,214 — the near-incompressible Lazy trap documented
+    //              below does NOT recur under the cost-model parse)
+    //     noise    byte-identical (stored escape unaffected)
+    //   wall, same coordinate: the chunked pass alone is 377 ms vs the
+    //     pick-min path's 1,030 ms (the two serial whole-file candidates
+    //     dominated it; see `compress_buffer_pure`).
+    //
+    // The full crown (zopfli/ultra) engine was measured at the same coordinate
+    // and REJECTED for the 1-9 ladder: 21-38x L9 wall at numiterations=1
+    // (10.4 s on the same 8 MiB input, single-core — its master-block loop is
+    // serial), and its F1 output (2,262,758) is LARGER than the near-optimal
+    // chunked output above. Near-optimal captures 92-99% of crown-F15's size
+    // win at ~1/30 the cost. Its exact-cost block SPLITTER transplanted onto
+    // the shipped parse was also measured: -364/-268/+16 B — the crown's win
+    // is the parse, not the boundaries.
+    //
+    // L11's knobs (not L10's): L10 is non-monotone vs L9 on the binary class
+    // (+2,057 B at 1 MiB, would OPEN cells); L11/L12 are smaller than L9
+    // everywhere measured, and L12's extra passes buy ~nothing (<0.01%) here.
+    if level == 9 {
+        return params_parallel(11);
+    }
     let mut p = params_inner(level);
     // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
     // (Greedy->Lazy, Lazy->Lazy2) and was NO-SHIP on clause 3: it flipped
