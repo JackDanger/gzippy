@@ -37,10 +37,11 @@ use super::{bsr32, NUM_LITERALS};
 
 /// Margin (in eighth-bit units) a far len-3 match must clear BELOW the
 /// estimated cost of the three literals it replaces before the gate accepts
-/// it. `8` = one full bit: the entropy model prices symbols at fractional
-/// ideal cost while the real code pays integer bits and shares one litlen
-/// alphabet, so a sub-bit paper win is inside the model's own error.
-const FAR_LEN3_MARGIN_EIGHTH_BITS: u32 = 8;
+/// it. The entropy model prices symbols at fractional ideal cost while the
+/// real code pays integer bits and shares one litlen alphabet, so a paper
+/// win below the margin is inside the model's own error. Two bits, paired
+/// with greedy's +1 shadow probe (see `greedy.rs`).
+pub(super) const GREEDY_MARGIN_EIGHTH_BITS: u32 = 16;
 
 /// Deterministic fixed-point `log2(x)` in eighth-bit units (3 fractional
 /// bits), integer-only. No libm: size is arch-invariant and must stay so —
@@ -97,15 +98,21 @@ impl FarLen3Gate {
         any_open: false,
     };
 
-    /// Rebuild from the block's running frequencies.
+    /// Rebuild from the block's running frequencies. `margin_eighth_bits` is
+    /// the caller's accept margin (see the per-parser constants above).
     pub(super) fn recalc(
         litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
         offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+        margin_eighth_bits: u32,
     ) -> Self {
         // Length 3 is length-slot 0 => symbol DEFLATE_FIRST_LEN_SYM (257).
         let f_len3 = litlen_freqs[DEFLATE_FIRST_LEN_SYM];
         let total_off: u32 = offset_freqs.iter().sum();
-        if f_len3 == 0 || total_off == 0 {
+        // Absolute evidence floor: on near-incompressible content the block
+        // has only sparse (often chance) matches, and ideal costs computed
+        // from a small sample are noise. Below 1024 observed offsets the
+        // gate stays inert.
+        if f_len3 == 0 || total_off < 1024 {
             return Self::INERT;
         }
         let total_litlen: u64 = litlen_freqs.iter().map(|&f| f as u64).sum();
@@ -125,13 +132,18 @@ impl FarLen3Gate {
         let mut any_open = false;
         for (s, &extra) in OFFSET_EXTRA_BITS.iter().enumerate() {
             let fo = offset_freqs[s];
-            if fo == 0 {
+            // Evidence floor: a slot must hold at least 1/64 of the block's
+            // offsets before its running cost is trusted. A thin slot's ideal
+            // cost is dominated by sampling noise (a handful of chance far
+            // matches make it look cheap), and mixed content pays for that
+            // optimism block-wide.
+            if fo == 0 || (fo as u64) * 64 < total_off as u64 {
                 continue;
             }
             match_cost[s] = len3_sym_bits
                 + (log_off - log2_fp3(fo))
                 + ((extra as u32) << 3)
-                + FAR_LEN3_MARGIN_EIGHTH_BITS;
+                + margin_eighth_bits;
             any_open = true;
         }
         Self {
@@ -183,7 +195,7 @@ mod tests {
     fn no_evidence_means_no_accept() {
         let ll = [0u32; DEFLATE_NUM_LITLEN_SYMS];
         let of = [0u32; DEFLATE_NUM_OFFSET_SYMS];
-        let g = FarLen3Gate::recalc(&ll, &of);
+        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS);
         assert!(!g.any_open);
         assert!(!g.allows(32000, 0, 0, 0));
 
@@ -193,7 +205,7 @@ mod tests {
             *f = 100;
         }
         let of2 = [10u32; DEFLATE_NUM_OFFSET_SYMS];
-        assert!(!FarLen3Gate::recalc(&ll2, &of2).any_open);
+        assert!(!FarLen3Gate::recalc(&ll2, &of2, GREEDY_MARGIN_EIGHTH_BITS).any_open);
 
         // INERT refuses everything by construction.
         assert!(!FarLen3Gate::INERT.allows(1, 255, 255, 255));
@@ -218,7 +230,7 @@ mod tests {
         for f in of.iter_mut() {
             *f = 1000;
         }
-        let g = FarLen3Gate::recalc(&ll, &of);
+        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS);
         assert!(g.any_open);
         // Rare bytes (~11 bits each under this code) at a far slot
         // (slot 27: 12 extra bits): match wins.

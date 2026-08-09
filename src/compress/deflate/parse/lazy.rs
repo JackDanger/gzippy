@@ -14,8 +14,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, recalculate_min_match_len, BlockRole, FarLen3Gate, InputMode, ParseState, Sink,
-    StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, recalculate_min_match_len, BlockRole, InputMode, ParseState, Sink, StaticCodes,
+    STREAM_BLOCK_LOOKAHEAD,
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
@@ -189,16 +189,11 @@ pub(super) fn run_block(
     let mut nice_len = params.nice_match_length.min(max_len);
     let mut next_recalc_min_len = in_next + (in_end - in_next).min(10000);
     let mut min_len = calculate_min_match_len(&buf[in_next..in_end], depth);
-    // Far-len-3 cost gate (see `far_len3.rs`): starts inert (= the shipped
-    // fixed guard) and opens only where this block's running statistics
-    // prove a far len-3 beats the three literals it replaces.
-    let mut far_len3 = FarLen3Gate::INERT;
 
     loop {
         // Refresh the min match length periodically from real literal usage.
         if in_next >= next_recalc_min_len {
             min_len = recalculate_min_match_len(&sink.litlen_freqs, depth);
-            far_len3 = FarLen3Gate::recalc(&sink.litlen_freqs, &sink.offset_freqs);
             next_recalc_min_len += (in_end - next_recalc_min_len).min(in_next - block_begin);
         }
 
@@ -215,11 +210,7 @@ pub(super) fn run_block(
             next_hashes,
         );
 
-        if cur_len < min_len
-            || (cur_len == DEFLATE_MIN_MATCH_LEN
-                && cur_offset > 8192
-                && !far_len3.allows(cur_offset, buf[in_next], buf[in_next + 1], buf[in_next + 2]))
-        {
+        if cur_len < min_len || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192) {
             // No (usable) match — emit a literal.
             sink.push_literal(buf[in_next]);
             in_next += 1;
