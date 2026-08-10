@@ -443,7 +443,7 @@ pub(super) fn compress(
         // (L0) monomorphizes with the scan-step ramp; `::<false>` (L1)
         // monomorphizes with that code compiled away entirely, not merely
         // runtime-disabled.
-        Strategy::Fast0 => fast::run::<true>(
+        Strategy::Fast0 => fast::run::<true, false>(
             buf,
             data_start,
             in_end,
@@ -475,20 +475,44 @@ pub(super) fn compress(
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
             };
-            fast::run::<false>(
-                buf,
-                data_start,
-                in_end,
-                statics,
-                bw,
-                is_last,
-                fast::FAST_BLOCK_LENGTH,
-                true,
-                params.fast_hash_update_inserts,
-                bucket2,
-                cost_gate,
-                budget,
-            )
+            // INTERLEAVED is a const generic like ACCEL: the T>1 route
+            // (`params_parallel`, `fast_interleaved_bucket == true`)
+            // monomorphizes with vendor-exact 2-slot bucket maintenance; the
+            // T1 route monomorphizes with the pre-lever two-array code
+            // compiled exactly as before, not runtime-branched — the tie
+            // cage freezes T1 bytes and clause 5 prices T1 wall (see
+            // `level::apply_l1_fast_parallel_knobs`).
+            if params.fast_interleaved_bucket {
+                fast::run::<false, true>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    fast::FAST_BLOCK_LENGTH,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            } else {
+                fast::run::<false, false>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    fast::FAST_BLOCK_LENGTH,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            }
         }
         #[cfg(feature = "l1-tune")]
         Strategy::Fast => {
@@ -503,20 +527,38 @@ pub(super) fn compress(
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
             };
-            fast::run::<false>(
-                buf,
-                data_start,
-                in_end,
-                statics,
-                bw,
-                is_last,
-                t.block_length,
-                true,
-                params.fast_hash_update_inserts,
-                bucket2,
-                cost_gate,
-                budget,
-            )
+            // Same INTERLEAVED dispatch as the default arm above.
+            if params.fast_interleaved_bucket {
+                fast::run::<false, true>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    t.block_length,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            } else {
+                fast::run::<false, false>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    t.block_length,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            }
         }
         Strategy::Greedy => greedy::run(
             buf, data_start, in_end, params, statics, bw, is_last, budget,
@@ -684,20 +726,32 @@ pub(super) fn parse_resumable(
         // carries nothing the fast parser reads. Default builds only — see
         // `level_has_resumable_parser` for why `l1-tune` never routes here.
         #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => fast::run_resumable(
-            buf,
-            state,
-            from,
-            in_end,
-            params,
-            statics,
-            bw,
-            role,
-            input_mode,
-            fast::FAST_BLOCK_LENGTH,
-            true,
-            budget,
-        ),
+        Strategy::Fast => {
+            // The resumable fast path is T1-only (`level_uses_stateful_t4`
+            // excludes Fast, so the T>1 stateful writer never routes here)
+            // and stays on the pre-lever two-array bucket code — the
+            // vendor-exact interleaved maintenance is a `params_parallel`
+            // knob (see `level::apply_l1_fast_parallel_knobs`).
+            debug_assert!(
+                !params.fast_interleaved_bucket,
+                "interleaved bucket maintenance is T>1-only; the resumable (T1 streaming) \
+                 fast path must run the frozen T1 code"
+            );
+            fast::run_resumable(
+                buf,
+                state,
+                from,
+                in_end,
+                params,
+                statics,
+                bw,
+                role,
+                input_mode,
+                fast::FAST_BLOCK_LENGTH,
+                true,
+                budget,
+            )
+        }
         Strategy::Greedy => greedy::run_resumable(
             buf, state, from, in_end, params, statics, bw, role, input_mode, budget,
         ),

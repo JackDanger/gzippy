@@ -17,15 +17,15 @@
 # Regenerate after an intentional change (commit the diff in the same PR):
 #   UPDATE_LDX_CENSUS=1 cargo test --release --test ldx_census
 fixture	level	first_pos	total_divergent	we_literal_they_match	we_match_they_literal	both_match_different_len	both_match_different_dist	misaligned_starts	block_boundary	ours_bytes	ldx_bytes
-text	1	14	133314	24838	446	131	0	107860	39	360089	359332
+text	1	14	179931	23218	446	11957	3734	140537	39	364911	359332
 text	2	-	0	0	0	0	0	0	0	348841	348841
 text	6	3690	157176	4319	4708	14198	0	133943	8	304234	322092
 text	9	-	0	0	0	0	0	0	0	306737	306737
-tabular	1	20	120163	23444	1966	224	0	94509	20	285060	306208
+tabular	1	20	150018	24791	1879	5777	4941	112610	20	288253	306208
 tabular	2	-	0	0	0	0	0	0	0	281308	281308
 tabular	6	2917	16015	1322	534	2784	0	11367	8	246495	247827
 tabular	9	-	0	0	0	0	0	0	0	236183	236183
-binary	1	69	49172	3301	12628	304	0	32909	30	662559	673068
+binary	1	69	54125	1748	12608	2662	3337	33742	28	666361	673068
 binary	2	-	0	0	0	0	0	0	0	666094	666094
 binary	6	1022	9303	19	1192	2648	0	5444	0	649294	651535
 binary	9	-	0	0	0	0	0	0	0	637063	637063

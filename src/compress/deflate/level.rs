@@ -102,13 +102,26 @@ pub struct LevelParams {
     /// T>1-only: probe the second bucket slot on a primary miss (vendor
     /// `ht_matchfinder` probes both slots every lookup).
     pub fast_bucket2_probe_on_miss: bool,
-    /// Hash inserts per accepted match interior. L1 (both T1 and T>1, via
-    /// [`apply_l1_fast_parallel_knobs`]) ships `usize::MAX` — insert EVERY
+    /// Hash inserts per accepted match interior. L1 T>1
+    /// ([`apply_l1_fast_parallel_knobs`]) ships `usize::MAX` — insert EVERY
     /// skipped byte, exactly libdeflate's `ht_matchfinder_skip_bytes` — since
     /// the interleaved-bucket lever made full maintenance one cache line per
-    /// insert. Non-L1 levels keep the igzip-style small cap (only the fast
-    /// path reads this).
+    /// insert. L1 T1 keeps the shipped cap of 8 (the maintenance bill is
+    /// ~6-15% of L1 wall on match-dense files and T1's slack is thin — PR
+    /// #296's clause-5 adjudication). Non-L1 levels keep the igzip-style
+    /// small cap (only the fast path reads this).
     pub fast_hash_update_inserts: usize,
+    /// T>1-only: vendor-exact bucket MAINTENANCE for the L1 head table — the
+    /// INTERLEAVED 2-slot bucket layout (`parse/fast.rs`'s
+    /// [`L1_HEAD_ENTRIES`]) with a slot-shift on EVERY insert (probe,
+    /// interior, warmup, tail), i.e. `ht_matchfinder`'s protocol. Set only by
+    /// [`apply_l1_fast_parallel_knobs`] (T>1); T1 keeps the two-array
+    /// `head`/`head2` layout where only PROBE-position inserts shift and
+    /// interior/warmup/tail inserts overwrite slot 0 — byte-frozen by the
+    /// tie cage (see `scripts/campaign/tie-guard.sh`). Selected as a const
+    /// generic at `parse::compress`'s dispatch so the T1 monomorphization
+    /// compiles to the pre-lever code, not a runtime-branched hybrid.
+    pub fast_interleaved_bucket: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -126,22 +139,43 @@ pub struct LevelParams {
     pub near_optimal: NearOptimalParams,
 }
 
-/// L1 parse knobs shared by T1 (`params`) and T>1 (`params_parallel`).
-fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
+/// L1 parse knobs shared by T1 (`params`) and T>1 (`params_parallel`) —
+/// the values main shipped before the interleaved-bucket lever, byte-frozen
+/// on the T1 route by the tie cage.
+fn apply_l1_fast_shared_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
-    // Insert EVERY interior (match-skip) byte, shifting the 2-slot bucket on
-    // each write — vendor `ht_matchfinder_skip_bytes` semantics. The old cap
-    // of 8 plus shift-free interior overwrites left the bucket holding stale
-    // generations; measured on solvency (2026-08-09, L1, main@03200049) the
-    // pair of fixes flips access.log (-70,953 B vs libdeflate) and
-    // ecoli.fastq (-7,579 B) and collapses the diff_dist divergence class to
-    // exactly 0. See `parse/fast.rs`'s `L1_HEAD_ENTRIES` for the layout that
-    // makes this affordable.
-    p.fast_hash_update_inserts = usize::MAX;
+    p.fast_hash_update_inserts = 8;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
+}
+
+/// L1 knobs for the T>1 route ONLY: the shared set plus vendor-exact bucket
+/// maintenance (PR #296, re-scoped to T>1).
+///
+/// Insert EVERY interior (match-skip) byte, shifting the interleaved 2-slot
+/// bucket on each write — vendor `ht_matchfinder_skip_bytes` semantics. The
+/// old cap of 8 plus shift-free interior overwrites left the bucket holding
+/// stale generations; measured on solvency (2026-08-09, L1, main@03200049)
+/// the pair of fixes flips access.log (-70,953 B vs libdeflate) and
+/// ecoli.fastq (-7,579 B) and collapses the diff_dist divergence class to
+/// exactly 0. See `parse/fast.rs`'s `L1_HEAD_ENTRIES` for the layout that
+/// makes this affordable.
+///
+/// T>1-ONLY because the maintenance bill is REAL at T1: #296's solvency
+/// adjudication measured insert-every-interior-byte at ~6-15% of L1 T1 wall
+/// on match-dense files (data.json L1:T1 0.548 -> 0.638), a clause-5
+/// NO-SHIP against T1's thin slack, while the same bill at T4 is absorbed
+/// by 249-330% slack (and several T4 wall cells got FASTER). Pay where the
+/// slack lives — the #297 pattern. The two L1 T1 size cells this leaves
+/// open (libdeflate:{access.log,ecoli.fastq}:L1:T1) revive on a CHEAPER T1
+/// maintenance scheme (batched/prefetched interior inserts), not on
+/// re-widening this knob.
+fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
+    apply_l1_fast_shared_knobs(p);
+    p.fast_interleaved_bucket = true;
+    p.fast_hash_update_inserts = usize::MAX;
 }
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
@@ -172,7 +206,10 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     #[cfg(feature = "ladder-tune")]
     ladder_tune::apply(&mut p);
     if level == 1 {
-        apply_l1_fast_parallel_knobs(&mut p);
+        // T1 route: the SHARED knob set only — never the vendor-exact
+        // maintenance knobs, which are a T>1 spend (see
+        // [`apply_l1_fast_parallel_knobs`]'s doc comment).
+        apply_l1_fast_shared_knobs(&mut p);
     }
     p
 }
@@ -432,6 +469,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast0,
@@ -451,6 +489,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast,
@@ -465,6 +504,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -532,6 +572,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -558,6 +599,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -572,6 +614,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -586,6 +629,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -600,6 +644,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -614,6 +659,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -628,6 +674,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -644,6 +691,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -663,6 +711,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -682,6 +731,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,

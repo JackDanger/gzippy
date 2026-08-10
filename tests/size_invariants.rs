@@ -37,15 +37,6 @@ const LEVELS: std::ops::RangeInclusive<u32> = 0..=9;
 /// A pair listed here that STOPS sagging fails the test with instructions to
 /// delete it, so this list is honest and can only shrink.
 const KNOWN_SAGS: &[(&str, u32)] = &[
-    // The L1->L2 sag on `binary`, created by the L1 interleaved-bucket lever
-    // (2026-08-09): vendor-exact bucket maintenance (insert every interior
-    // byte + shift the 2-slot bucket on every write) made our L1 SMALLER
-    // than our L2 on this fixture (L1 662577 -> L2 666112, +3535 B) — the
-    // same "our own win at level N exposes level N+1" family as the L3->L4
-    // entries below (memory: project_arch_curve_cache_three_legs.md, "our
-    // own L3 win causes the sag"). The defect to fix is L2's parse, not L1's
-    // win.
-    ("binary", 1), // L1 662577 -> L2 666112 (+3535 B)
     // The L3->L4 sag, the synthetic twin of the real-corpus L4 defect:
     ("tabular", 3), // L3 255735 -> L4 271505 (+15770 B)
     ("binary", 3),  // L3 661353 -> L4 663583 (+2230 B)
