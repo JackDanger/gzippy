@@ -37,15 +37,54 @@ after the change blocks the ship, regardless of what else improved.
 **4. Progress.** At least one failing cell closes, **or** the total fail-gap
 (`sum of max(0, ratio - 1)` over failing cells) decreases by at least 1%.
 
-**5. Erosion budget on passing cells.** A passing cell may degrade only by the smaller of
-a quarter of its margin and 0.5%:
+**5. Margin-floor erosion rule on passing cells** *(redesigned 2026-08-10; implemented in
+[fulcrum#25](https://github.com/JackDanger/fulcrum/pull/25) under the owner's delegated
+redesign).*
+
+> ~~A passing cell may degrade only by the smaller of a quarter of its margin and 0.5%:
+> `new_ratio - old_ratio <= min(0.25 * (1.0 - old_ratio), 0.005)`~~
+>
+> **Struck 2026-08-10.** The flat budget convicted on single-layout lottery rolls and
+> priced margin at zero. It survives below only for thin-margin cells.
+
+The rule now has two parts, both applying to **wall** cells only — size cells are exact
+integers and unchanged: a size erosion or size flip convicts directly, no confirmation
+involved.
+
+*Convictions require cross-layout confirmation.* A beyond-budget wall erosion suspect —
+and a wall pass -> fail flip that survives clause 3's existing 3x-n re-measure — only
+convicts after the cross-layout confirm machinery (`fulcrum layout confirm`, auto-run by
+`fulcrum try`) says CONFIRMED-REAL. One confirm covers each suspect (corpus, level,
+threads) coordinate, capped at ~12 coordinates per run; the cap and any overflow are
+stated in the output, and overflow suspects stay UNDECIDED — never convicted by default.
+LAYOUT-ARTIFACT acquits, with the confirm numbers printed; confirm-UNDECIDED leaves the
+suspect UNDECIDED. A coordinate the floors file does not cover is UNDECIDED with
+`layout calibrate` named — a floor is never borrowed from another coordinate.
+
+*The budget is the margin floor.* A CONFIRMED-real erosion on a **winning** wall cell
+(pre-lever ratio <= 0.80) is acceptable iff the confirmed post-lever ratio still clears
+the floor:
 
 ```
-new_ratio - old_ratio  <=  min(0.25 * (1.0 - old_ratio), 0.005)
+post_ratio  <=  min(0.80, 1 - 3 * layout_floor(cell))
 ```
 
-This is what stops death by a thousand cuts — many individually "harmless" degradations
-that never flip a cell on their own until one finally does and nothing can be attributed.
+Thin-margin cells (pre-lever ratio > 0.80) keep the old flat 0.005 budget exactly as
+written above. **Clause 3 remains absolute**: a CONFIRMED-real pass -> fail flip blocks
+the ship regardless of margin.
+
+This still stops death by a thousand cuts — the floor is a hard line no accumulation of
+"harmless" degradations may cross — while pricing margin as capital: a cell won 4-5x may
+spend some of that win to close cells elsewhere, which is the point of a rival-anchored
+Pareto goal.
+
+*Receipts for the redesign.* The #295/#296/#310 adjudications were vetoed on erosion
+lists dominated by proven layout artifacts — cross-layout confirms went 2/2
+LAYOUT-ARTIFACT on the tested drivers, including cells whose code was byte-identical
+between arms — while the genuinely real erosions were 2-9% on cells we win by 4-5x. The
+campaign goal is rival-anchored Pareto dominance per label, not preservation of every
+interior number; margin is capital, and a rule that forbids spending it converts wins
+into cages.
 
 **6. Net improvement.** Total improvement on failing cells must exceed total harm on
 passing cells by at least 2x. This stops closing one easy cell by worsening many hard ones.
