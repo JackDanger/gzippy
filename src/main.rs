@@ -308,6 +308,70 @@ fn run() -> Result<i32, GzippyError> {
     // --test implies decompress mode
     let decompress = decompress || args.test;
 
+    // ── Flag honesty (issues #302–#305) ──────────────────────────────────────
+    // Rival flags we PARSE but whose documented semantics we do not deliver
+    // are rejected LOUDLY before any work starts, instead of exiting 0 with
+    // output that silently lacks the property the flag exists to provide
+    // (non-rsyncable "rsyncable" archives, gzip bytes under .zz/.zip names,
+    // strategy flags that change nothing). Compress mode only: on
+    // decompress/test/list these flags are inert for the rivals too, so a
+    // `-d` pipeline that happens to carry them keeps working. Exit 2
+    // (warning-class): nothing was attempted, nothing was written.
+    if !decompress && !args.list {
+        if args.rsyncable {
+            eprintln!(
+                "gzippy: -R/--rsyncable: rsyncable output is not yet implemented (see issue #302)"
+            );
+            return Ok(2);
+        }
+        match args.format {
+            format::CompressionFormat::Zlib => {
+                eprintln!(
+                    "gzippy: -z/--zlib: zlib container output is not yet implemented (see issue #303). \
+                     Note: gzippy follows pigz's -z (zlib container), not igzip's -z (plain compress)."
+                );
+                return Ok(2);
+            }
+            format::CompressionFormat::Zip => {
+                eprintln!("gzippy: -K/--zip: zip container output is not yet implemented (see issue #303)");
+                return Ok(2);
+            }
+            format::CompressionFormat::Gzip => {}
+        }
+        if args.alias.is_some() {
+            eprintln!("gzippy: -A/--alias is only meaningful with --zip, which is not yet implemented (see issue #303)");
+            return Ok(2);
+        }
+        if args.huffman {
+            eprintln!("gzippy: -H/--huffman (Huffman-only strategy) is not implemented; refusing to silently compress normally");
+            return Ok(2);
+        }
+        if args.rle {
+            eprintln!("gzippy: -U/--rle (run-length-encoding strategy) is not implemented; refusing to silently compress normally");
+            return Ok(2);
+        }
+        if args.independent {
+            eprintln!("gzippy: -i/--independent block independence is not implemented; refusing to silently ignore it");
+            return Ok(2);
+        }
+        if args.comment.is_some() && (args.stdout || args.files.is_empty()) {
+            eprintln!("gzippy: -C/--comment is not stored on the stdout path; write to a file, or drop -C");
+            return Ok(2);
+        }
+        // Not a rejection — a LOUD divergence notice. -0 keeps its gzip/pigz
+        // meaning (STORE, no compression). igzip's level scale is 0..=3 where
+        // -0 is its FASTEST REAL COMPRESSOR, so an igzip script pointed here
+        // would otherwise silently get output larger than its input (issue
+        // #305). pigz -0 users get exactly what pigz gives them, plus one
+        // stderr line (suppressed by -q).
+        if args.compression_level == 0 && !args.quiet {
+            eprintln!(
+                "gzippy: warning: -0 stores without compression (gzip/pigz semantics); \
+                 igzip's -0 is its fastest compression level (see issue #305)"
+            );
+        }
+    }
+
     let mut exit_code = 0;
 
     // Handle --list mode
@@ -644,15 +708,12 @@ fn print_help() {
     println!("  -m, --no-time       Don't save/restore modification time");
     println!("  -M, --time          Save/restore modification time (pigz)");
     println!("  -p, --processes N   Number of threads (default: all CPUs)");
-    println!("  -b, --blocksize N   Block size for parallel compression");
+    println!("  -b, --blocksize N   Block size in KiB for parallel compression (pigz");
+    println!("                      semantics; k/m/g suffixes accepted)");
     println!("  -r, --recursive     Recurse into directories");
-    println!("  -R, --rsyncable     Make output rsync-friendly");
     println!("  -S, --suffix .suf   Use suffix .suf instead of .gz");
     println!("  -Y, --synchronous   Synchronous output (fsync after write)");
-    println!("  -i, --independent   Force independent blocks (parallel decompress)");
-    println!("  -C, --comment TEXT  Add comment to gzip header");
-    println!("  -H, --huffman       Huffman-only compression");
-    println!("  -U, --rle           Run-length encoding compression");
+    println!("  -C, --comment TEXT  Add comment to gzip header (file output only)");
     println!("  -q, --quiet         Suppress output");
     println!("  -v, --verbose       Verbose output");
     println!("  -h, --help          Show this help");
@@ -660,9 +721,20 @@ fn print_help() {
     println!("  -L, --license       Show license");
     println!();
     println!("Compression levels (one pure-Rust DEFLATE engine, no C-FFI compressor):");
+    println!("  0                Store only, no compression (gzip/pigz semantics)");
     println!("  1-9              Fast/balanced (hash-chain + lazy parse; ratio tracks libdeflate)");
     println!("  10,12            Near-optimal parse (near-zopfli ratio, parallel)");
     println!("  11               True zopfli (single-member, slowest, best ratio)");
+    println!();
+    println!("igzip compatibility: gzippy follows the gzip/pigz flag contract where they");
+    println!("collide with igzip's. igzip's 0..3 level scale is NOT emulated: -0 stores");
+    println!("(igzip's -0 is its fastest compressor) and -2/-3 are weak-fast gzip levels");
+    println!("(igzip's default/best). -z takes pigz's meaning (zlib container, currently");
+    println!("rejected — issue #303), not igzip's 'compress' no-op. See issue #305.");
+    println!();
+    println!("Not yet implemented (rejected loudly rather than silently misbehaving):");
+    println!("  -R/--rsyncable (#302), -z/--zlib and -K/--zip containers (#303),");
+    println!("  -H/--huffman, -U/--rle, -i/--independent, -A/--alias");
     println!();
     println!("Examples:");
     println!("  gzippy file.txt          Compress file.txt -> file.txt.gz");

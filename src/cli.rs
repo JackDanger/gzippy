@@ -580,12 +580,18 @@ fn parse_block_size(value: &str) -> GzippyResult<usize> {
     } else if value.ends_with('g') {
         (&value[..value.len() - 1], 1024 * 1024 * 1024)
     } else {
-        (value.as_str(), 1)
+        // pigz(1): "-b, --blocksize mmm — Set compression block size to mmmK".
+        // A BARE number is KIBIBYTES — pigz's documented unit (issue #304).
+        // This used to be bytes, which silently gave a pigz script's `-b 4096`
+        // (4 MiB there) a 1024x smaller block grid. The explicit k/m/g
+        // suffixes above are a gzippy extension.
+        (value.as_str(), 1024)
     };
 
     let num: usize = num_str
         .parse()
         .map_err(|_| GzippyError::InvalidBlockSize(format!("Invalid block size: {}", value)))?;
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| GzippyError::InvalidBlockSize(format!("Block size too large: {}", value)))
 }

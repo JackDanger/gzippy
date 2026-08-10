@@ -199,14 +199,27 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         detect_content_type(&mut sample_file).unwrap_or(ContentType::Binary)
     };
 
-    let effective_level =
-        if args.independent && args.compression_level >= 7 && args.compression_level <= 9 {
-            6
-        } else {
-            args.compression_level
-        };
-    let opt_config =
-        OptimizationConfig::new(args.processes, file_size, effective_level, content_type);
+    // (-i/--independent used to cap levels 7-9 to an L6 OptimizationConfig
+    // here; -i is now rejected up front in run() — flag honesty, it never
+    // delivered pigz's independence property — so the cap was dead code.)
+    let opt_config = OptimizationConfig::new(
+        args.processes,
+        file_size,
+        args.compression_level,
+        content_type,
+    );
+
+    // Flag honesty, -C/--comment: run() already rejects -C on the stdout
+    // path. BOTH single-thread file routes below (`use_t1_mmap` and the
+    // T1 branch inside `compress_with_pipeline_sized`) write a fixed gzip
+    // header with no FCOMMENT field, so a comment would be silently
+    // DROPPED — refuse instead. The multi-thread file path stores it.
+    if args.comment.is_some() && opt_config.thread_count == 1 {
+        return Err(GzippyError::invalid_argument(
+            "-C/--comment is not stored by the single-threaded encoder; use -p 2 or more, or drop -C"
+                .to_string(),
+        ));
+    }
 
     if args.verbosity >= 2 {
         eprintln!(
