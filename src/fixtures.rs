@@ -17,6 +17,19 @@ pub const NAMES: &[&str] = &["text", "tabular", "binary", "noise"];
 /// seconds.
 pub const LEN: usize = 1 << 20;
 
+/// Small-file sizes: 4 KiB / 16 KiB / 64 KiB / 256 KiB prefixes of the same
+/// generators (see [`generate_sized`] — a shorter output is a byte-exact
+/// prefix of a longer one). The board never grades sub-1-MiB inputs, but
+/// 4-100 KB files are the high-frequency real-world case;
+/// tests/smallfile_pins.rs pins our output size per (fixture, size, level)
+/// on this grid.
+pub const SMALL_SIZES: &[usize] = &[4 << 10, 16 << 10, 64 << 10, 256 << 10];
+
+/// The content classes graded at small sizes: one match-rich text class and
+/// one binary class. `tabular`/`noise` add little discrimination below 1 MiB
+/// (tabular is a denser text; noise is stored blocks at every size).
+pub const SMALL_NAMES: &[&str] = &["text", "binary"];
+
 struct XorShift(u64);
 impl XorShift {
     fn next(&mut self) -> u64 {
@@ -140,6 +153,26 @@ pub fn generate_sized(name: &str, len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The small-file grid (tests/smallfile_pins.rs) grades SHORTER RUNS of
+    /// the same generators, which is only honest if a shorter output really
+    /// is a byte-exact prefix of the standard fixture — vary the length,
+    /// never the content class. Guard that here for every declared cell.
+    #[test]
+    fn small_sizes_are_prefixes_of_the_standard_fixtures() {
+        for &name in SMALL_NAMES {
+            let full = generate(name);
+            for &size in SMALL_SIZES {
+                assert!(size < LEN, "{name}: small size {size} is not small");
+                assert_eq!(
+                    generate_sized(name, size),
+                    full[..size],
+                    "{name}@{size} is not a prefix of the {LEN}-byte fixture — \
+                     the generator appends non-deterministically?"
+                );
+            }
+        }
+    }
 
     /// The pinned-fingerprint files are only meaningful if these bytes never
     /// change. Guard the generators with content hashes: a change to any
