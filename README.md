@@ -92,8 +92,16 @@ let n = gzippy::compress_to_writer(reader, writer, 6)?;
 
 Built on ideas and code from [pigz](https://zlib.net/pigz/) (Mark Adler),
 [libdeflate](https://github.com/ebiggers/libdeflate) (Eric Biggers),
+[Zopfli](https://github.com/google/zopfli) (Google),
 [zlib-ng](https://github.com/zlib-ng/zlib-ng),
-[rapidgzip](https://github.com/mxmlnkn/rapidgzip), and
-[ISA-L](https://github.com/intel/isa-l).
+[rapidgzip](https://github.com/mxmlnkn/rapidgzip) (Maximilian Knespel),
+[ISA-L](https://github.com/intel/isa-l) (Intel), and
+[ECT](https://github.com/fhanau/Efficient-Compression-Tool) (Felix Hanau).
+Portions of this codebase are ports of those projects; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the per-project
+licenses, copyright notices, and the list of derived files.
 
-[zlib license](LICENSE). By [Jack Danger](https://github.com/jackdanger).
+[zlib license](LICENSE) for gzippy's own code, with third-party-derived
+files under their upstream licenses (MIT, Apache-2.0, BSD-3-Clause, zlib —
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+By [Jack Danger](https://github.com/jackdanger).

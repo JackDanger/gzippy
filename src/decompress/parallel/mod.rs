@@ -9,6 +9,9 @@
 //! source: `vendor/rapidgzip/src/rapidgzip/`. When a gz module "works but looks
 //! structurally off", the cited vendor `file` is the reference.
 //!
+//! Upstream license: rapidgzip is Copyright (c) 2019-2023 Maximilian Knespel,
+//! dual MIT/Apache-2.0, used here under MIT — see `THIRD_PARTY_NOTICES.md`.
+//!
 //! | gzippy module          | rapidgzip counterpart                         |
 //! |------------------------|-----------------------------------------------|
 //! | `single_member`        | `ParallelGzipReader` (entry / orchestration)  |

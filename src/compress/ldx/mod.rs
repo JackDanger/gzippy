@@ -1,6 +1,9 @@
 //! `ldx` — a FAITHFUL, function-by-function port of libdeflate's compressor
 //! (`vendor/libdeflate/lib/deflate_compress.c`, 4,155 lines) into pure Rust.
 //!
+//! Upstream license: libdeflate is Copyright 2016 Eric Biggers, Copyright
+//! 2024 Google LLC, MIT — see `THIRD_PARTY_NOTICES.md` at the repo root.
+//!
 //! # Why this module exists, and why it is SEPARATE from `super::deflate`
 //!
 //! Our shipping encoder is not libdeflate's. It is FOUR lineages stitched together
