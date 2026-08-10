@@ -5,6 +5,9 @@
 //! `tests.rs`; reached only via the CLI's `-F`/`-I`/`-J` flags (see
 //! [`encoder::ZopfliGzEncoder`] and [`tuning::ZopfliTuning`]).
 //!
+//! Upstream license: this tree derives from Zopfli (Copyright 2011 Google
+//! Inc., Apache-2.0) — see `THIRD_PARTY_NOTICES.md` at the repo root.
+//!
 //! See `docs/compressor-architecture.md` for the full module map and the
 //! staged migration plan this module is Stage A of.
 

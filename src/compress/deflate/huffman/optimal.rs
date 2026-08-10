@@ -4,6 +4,9 @@
 //! module (Stage A moved it here structurally; Stage C, this module, adds the
 //! RLE-shaping functions that were reachable only from `parse::ultra` before).
 //!
+//! Upstream license: the Zopfli sources ported here are Copyright 2011
+//! Google Inc., Apache-2.0 — see `THIRD_PARTY_NOTICES.md` at the repo root.
+//!
 //! Two sources are ported here:
 //!
 //! - Bounded package-merge length-limiting (`length_limited_code_lengths` +

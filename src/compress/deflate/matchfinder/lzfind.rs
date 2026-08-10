@@ -1,6 +1,9 @@
 //! Binary-tree matchfinder — faithful Rust port of ECT's LzFind `Bt3Zip`
 //! (7-zip `LzFind.c` as trimmed by Felix Hanau in Efficient Compression Tool).
 //!
+//! Upstream license: LzFind.c is "2009-04-22 : Igor Pavlov : Public domain",
+//! as modified in ECT (Felix Hanau, Apache-2.0) — see `THIRD_PARTY_NOTICES.md`.
+//!
 //! This is the matchfinder that drives ECT's optimal-parse DP and is the lever
 //! behind ECT's best-in-class deflate ratio. It maintains a per-hash-bucket
 //! binary search tree over the sliding window and, for each position, emits the
