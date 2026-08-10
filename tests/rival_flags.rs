@@ -35,7 +35,8 @@
 //! gzippy follows the gzip/pigz scale 0..=9 (+10..12), where -0 is pigz's
 //! STORE (no compression). Consequences for an igzip script pointed here:
 //!
-//!   igzip -0  -> gzippy stores: output LARGER than input. Silent, extreme.
+//!   igzip -0  -> gzippy stores (the gzip/pigz contract, kept) — now with a
+//!                LOUD stderr warning naming the divergence and issue #305.
 //!   igzip -1  -> weak-fast gzip L1 (roughly comparable intent; ratio differs).
 //!   igzip -2  -> gzip L2, a weak-fast level — but -2 is igzip's DEFAULT,
 //!                sized between our L6-ish intent. Valid gzip, silently
@@ -43,23 +44,28 @@
 //!   igzip -3  -> gzip L3 — but -3 is igzip's BEST (`--best`). A user asking
 //!                igzip for maximum compression gets our third-weakest level.
 //!   igzip -z  -> igzip: "compress (default)", a no-op modifier. gzippy: the
-//!                pigz meaning, SWITCH CONTAINER TO ZLIB — writes FILE.zz.
+//!                pigz meaning (zlib container) — unimplemented, REJECTED
+//!                with an error that explains the collision.
 //!
-//! There is no error in any of these cases; each is pinned below.
+//! The -0 warning, the -z rejection, and the --help documentation of this
+//! scale collision are the flag-honesty PR's mitigation; the -2/-3 rows
+//! remain silent divergences (both valid gzip), pinned below.
 //!
-//! ## Triage table (matches the PR body)
+//! ## Triage table (updated by the flag-honesty PR, which mitigated every
+//! ## silent-wrong row into a clean rejection or a fix — the missing FEATURES
+//! ## stay tracked in issues #302/#303/#305)
 //!
-//! | rival flag                | our behaviour                                   | severity |
+//! | rival flag                | our behaviour                                   | status |
 //! |---------------------------|--------------------------------------------------|----------|
-//! | pigz -R/--rsyncable       | accepted, routed, output NOT rsyncable (4% resync vs pigz 94%) | silent-wrong HIGH |
-//! | pigz -z/--zlib            | accepted; emits GZIP bytes with .zz suffix; own -d then fails on stdin path | silent-wrong HIGH |
-//! | pigz -K/--zip             | accepted; emits GZIP bytes with .zip suffix (no PK entry) | silent-wrong HIGH |
-//! | pigz -b/--blocksize N     | bare N is BYTES; pigz N means N KiB (128 -> clean error; 4096 -> silently 1024x smaller blocks) | silent-wrong HIGH |
-//! | pigz -H/--huffman         | accepted, silently a no-op (help text still claims it) | silent-wrong MED |
-//! | pigz -U/--rle             | accepted, silently a no-op (help text still claims it) | silent-wrong MED |
-//! | pigz -i/--independent     | accepted, output byte-identical to without (no independence guarantee asserted) | silent-noop MED |
-//! | pigz -C/--comment ccc     | honoured in file mode; silently DROPPED on the -c/stdout path | silent-wrong MED |
-//! | pigz -A/--alias xxx       | accepted, silently ignored (only meaningful with --zip, which is itself broken) | silent-noop LOW |
+//! | pigz -R/--rsyncable       | REJECTED in compress mode, exit 2, names issue #302 (was: accepted, output NOT rsyncable) | clean-reject |
+//! | pigz -z/--zlib            | REJECTED in compress mode, exit 2, names issue #303 (was: gzip bytes under .zz) | clean-reject |
+//! | pigz -K/--zip             | REJECTED in compress mode, exit 2, names issue #303 (was: gzip bytes under .zip) | clean-reject |
+//! | pigz -b/--blocksize N     | FIXED: bare N is KiB, pigz's documented unit (was: bytes) | ok |
+//! | pigz -H/--huffman         | REJECTED in compress mode, exit 2 (was: silent no-op advertised in --help) | clean-reject |
+//! | pigz -U/--rle             | REJECTED in compress mode, exit 2 (was: silent no-op advertised in --help) | clean-reject |
+//! | pigz -i/--independent     | REJECTED in compress mode, exit 2 (was: silent no-op, no independence guarantee) | clean-reject |
+//! | pigz -C/--comment ccc     | honoured on the multi-thread file path; REJECTED (never dropped) on the -c/stdout path (exit 2) and on the single-thread file path (exit 1) | ok/clean-reject |
+//! | pigz -A/--alias xxx       | REJECTED in compress mode, exit 2, names issue #303 (was: silently ignored) | clean-reject |
 //! | pigz -F/--first           | collides: our -F takes a VALUE (zopfli iterations); consumes the next argv | misparse-but-errs MED |
 //! | pigz -I/--iterations n    | collides: our -I is a flag (no-block-split); n becomes a FILE operand | misparse-but-errs MED |
 //! | pigz -O/--oneblock        | clean reject ("Unknown option: -O")             | clean-reject |
@@ -67,12 +73,16 @@
 //! | igzip -o FILE             | clean reject ("Unknown option: -o")             | clean-reject |
 //! | igzip -T/--threads n      | clean reject ("Unknown option: -T"; ours is -p) | clean-reject |
 //! | igzip --rm                | clean reject ("Unknown option: --rm")           | clean-reject |
-//! | igzip -0                  | STORE (larger than input); igzip -0 compresses  | silent-wrong HIGH |
-//! | igzip -2 / -3             | weak-fast gzip levels; igzip's default/best      | silent-wrong MED |
-//! | igzip -z                  | zlib-container collision (see pigz -z row)       | silent-wrong HIGH |
+//! | igzip -0                  | STORE (gzip/pigz contract) + LOUD stderr warning naming issue #305 (was: silent) | divergence, loud |
+//! | igzip -2 / -3             | weak-fast gzip levels; igzip's default/best; documented in --help | divergence MED |
+//! | igzip -z                  | REJECTED in compress mode; the error names the pigz/igzip -z collision (#303/#305) | clean-reject |
 //! | igzip keep-by-default     | we DELETE the input after compress (gzip rule); igzip keeps | divergence MED |
 //! | libdeflate-gzip -1..-12   | supported, valid gzip at every level             | ok |
 //! | libdeflate-gzip -c -d -f -h -k -q -S -t -V | supported                      | ok |
+//!
+//! Rejections are COMPRESS-MODE ONLY: on decompress/test/list these flags are
+//! inert for the rivals too, so `-d` pipelines carrying them keep working
+//! (pinned below in `rejected_flags_still_inert_on_decompress`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -169,6 +179,39 @@ fn assert_clean_reject(args: &[&str], token: &str) {
     );
 }
 
+/// Assert `args` is a flag-honesty rejection: exit code EXACTLY 2
+/// (warning-class refusal before any work), stderr names every `token`,
+/// no output written to stdout, and the input file left untouched.
+fn assert_honesty_reject(args: &[&str], tokens: &[&str]) {
+    let d = tempdir();
+    write_file(d.path(), "in.txt", &synth(4096));
+    let mut full: Vec<&str> = args.to_vec();
+    full.push("in.txt");
+    let out = run(d.path(), &full);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gzippy {full:?} must exit 2 (loud refusal, nothing attempted); \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for token in tokens {
+        assert!(
+            stderr.contains(token),
+            "gzippy {full:?} stderr must mention {token:?}; got: {stderr}"
+        );
+    }
+    assert!(
+        out.stdout.is_empty(),
+        "gzippy {full:?} must write nothing before refusing"
+    );
+    assert!(
+        d.path().join("in.txt").exists(),
+        "gzippy {full:?} must leave the input file untouched"
+    );
+}
+
 // ===========================================================================
 // pigz surface
 // ===========================================================================
@@ -197,43 +240,13 @@ fn pigz_blocksize_k_suffix_accepted() {
 }
 
 #[test]
-fn pigz_blocksize_bare_number_is_bytes_not_kib() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour:
-    // pigz(1): "-b, --blocksize mmm  Set compression block size to mmmK" —
-    // a bare number is KIBIBYTES. gzippy parses a bare number as BYTES:
-    //   * `-b 128` (pigz: 128 KiB, its default) is a clean error here
-    //     ("Block size must be at least 1K") — loud, safe;
-    //   * `-b 4096` (pigz: 4 MiB) is silently accepted as 4096 BYTES —
-    //     1024x smaller blocks, silently different framing and ratio.
-    // The identity below proves the bare-number unit is bytes: 131072 bare
-    // must equal 128k. Under pigz semantics they would differ (128 MiB vs
-    // 128 KiB grids on a 256 KiB input).
-    let d = tempdir();
-    let data = synth(256 * 1024);
-    write_file(d.path(), "in.txt", &data);
-
-    let small = run(d.path(), &["-b", "128", "-c", "in.txt"]);
-    assert!(
-        !small.status.success(),
-        "current behaviour: bare -b 128 (bytes) is below the 1K floor and \
-         must error; if this now succeeds, the -b unit may have changed — \
-         re-triage the pigz -b row"
-    );
-
-    let bare = compress_stdout(d.path(), &["-p", "4", "-b", "131072"], "in.txt");
-    let suffixed = compress_stdout(d.path(), &["-p", "4", "-b", "128k"], "in.txt");
-    assert_eq!(
-        bare, suffixed,
-        "current behaviour: bare 131072 == 128k, i.e. the bare -b unit is \
-         BYTES. pigz's unit is KiB — see the divergence test below."
-    );
-}
-
-#[test]
-#[ignore] // DIVERGENCE from pigz contract: bare -b N means N KiB in pigz.
 fn pigz_blocksize_contract_bare_number_means_kib() {
-    // pigz(1): `-b 128` is pigz's default block size (128 KiB) and must be
-    // accepted; a pigz-compatible gzippy would treat `-b 128` == `-b 128k`.
+    // FIXED (issue #304): pigz(1): "-b, --blocksize mmm  Set compression
+    // block size to mmmK" — a bare number is KIBIBYTES, and gzippy now
+    // honours that unit. `-b 128` (pigz's default, 128 KiB) must be accepted
+    // and produce the same bytes as the explicit `-b 128k`. The bytes-unit
+    // era is over: bare 131072 now means 128 MiB (one block on this input),
+    // NOT 131072 bytes, so it must DIFFER from the 128k grid.
     let d = tempdir();
     let data = synth(256 * 1024);
     write_file(d.path(), "in.txt", &data);
@@ -248,26 +261,25 @@ fn pigz_blocksize_contract_bare_number_means_kib() {
         bare.stdout, suffixed,
         "pigz -b contract: bare number is KiB"
     );
+    let huge_bare = compress_stdout(d.path(), &["-p", "4", "-b", "131072"], "in.txt");
+    assert_ne!(
+        huge_bare, suffixed,
+        "bare 131072 must mean 128 MiB (KiB unit), not 131072 bytes; \
+         identical output to 128k would mean the unit regressed to bytes — \
+         re-triage issue #304"
+    );
 }
 
 #[test]
-fn pigz_rsyncable_accepted_and_roundtrips() {
-    // pigz -R / --rsyncable: accepted, exit 0, routed to a dedicated path
-    // (output differs from the plain path), valid gzip. Whether the OUTPUT
-    // actually has the rsyncable property is the ignored divergence test
-    // below — measured 2026-08-09 it does NOT.
-    let d = tempdir();
-    let data = synth(256 * 1024);
-    write_file(d.path(), "in.txt", &data);
-    let rsync = compress_stdout(d.path(), &["-p", "4", "-R"], "in.txt");
-    assert_roundtrips(d.path(), &rsync, &data, "-R");
-    let plain = compress_stdout(d.path(), &["-p", "4"], "in.txt");
-    assert_ne!(
-        rsync, plain,
-        "-R is expected to route to the dedicated rsyncable path (its bytes \
-         have always differed from the plain path); identical output would \
-         mean the flag became a full no-op — re-triage"
-    );
+fn pigz_rsyncable_rejected_loudly() {
+    // MITIGATED (issue #302): gzippy's -R output never had the rsyncable
+    // property (4% resync vs pigz's 94% on the probe below), so a backup
+    // pipeline relying on it silently lost incremental-rsync transfer.
+    // Until the property is actually implemented, -R must FAIL the script:
+    // exit 2, stderr naming the flag and the tracking issue, nothing
+    // written. Both stdout and file mode.
+    assert_honesty_reject(&["-p", "4", "-R", "-c"], &["rsyncable", "#302"]);
+    assert_honesty_reject(&["-p", "4", "-R", "-k"], &["rsyncable", "#302"]);
 }
 
 /// Rabin-Karp rolling hashes of every `w`-byte window of `b`.
@@ -319,7 +331,7 @@ fn resync_fraction(a: &[u8], b: &[u8], w: usize) -> f64 {
 }
 
 #[test]
-#[ignore] // DIVERGENCE from pigz contract: -R output is not actually rsyncable.
+#[ignore] // CONTRACT test for issue #302: un-ignore when --rsyncable is implemented.
 fn pigz_rsyncable_contract_output_resyncs_after_edit() {
     // pigz(1) -R: "Input-determined block locations for rsync" — after a
     // small local edit, the bulk of the compressed stream must re-align so
@@ -329,8 +341,8 @@ fn pigz_rsyncable_contract_output_resyncs_after_edit() {
     //     pigz -R      resynced 375/397 blocks (94%)
     //     pigz plain   23/394  (6%)
     //     gzippy -R    16/391  (4%)   <- WORSE than gzippy plain (62/391)
-    // gzippy -R exits 0 and emits valid gzip WITHOUT the property the flag
-    // exists to provide — the silent-wrong case for backup pipelines.
+    // gzippy -R is now REJECTED loudly (flag-honesty PR); this contract test
+    // stays as the acceptance bar for the real implementation.
     let d = tempdir();
     let data = synth(256 * 1024);
     let mut edited = data.clone();
@@ -351,108 +363,63 @@ fn pigz_rsyncable_contract_output_resyncs_after_edit() {
 }
 
 #[test]
-fn pigz_huffman_flag_is_silent_noop() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour:
-    // pigz(1) -H / --huffman: "Use only Huffman coding for compression" — a
-    // strategy change. gzippy parses the flag (cli.rs sets args.huffman) but
-    // NOTHING consumes it: output is byte-identical with and without. Worse,
-    // `gzippy --help` still advertises "-H, --huffman  Huffman-only
-    // compression". Silent no-op of an advertised flag.
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(64 * 1024));
-    for p in ["1", "4"] {
-        let with = compress_stdout(d.path(), &["-p", p, "-H"], "in.txt");
-        let without = compress_stdout(d.path(), &["-p", p], "in.txt");
-        assert_eq!(
-            with, without,
-            "current behaviour at -p {p}: -H is a byte-for-byte no-op. If \
-             this fails, -H gained behaviour — update the triage table and \
-             the pigz -H issue."
-        );
-    }
+fn pigz_huffman_flag_rejected_loudly() {
+    // MITIGATED: pigz(1) -H / --huffman: "Use only Huffman coding for
+    // compression" — a strategy change gzippy never implemented. It used to
+    // be parsed, silently ignored, AND advertised in --help. Now: exit 2,
+    // stderr names the flag, and --help no longer claims it.
+    assert_honesty_reject(&["-H", "-c"], &["-H", "--huffman"]);
+    assert_honesty_reject(&["-p", "4", "-H", "-k"], &["-H", "--huffman"]);
 }
 
 #[test]
-fn pigz_rle_flag_is_silent_noop() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour:
-    // pigz(1) -U / --rle: "Use run-length encoding for compression". Parsed
-    // (cli.rs sets args.rle), never consumed, advertised in --help. Same
-    // class as -H.
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(64 * 1024));
-    for p in ["1", "4"] {
-        let with = compress_stdout(d.path(), &["-p", p, "-U"], "in.txt");
-        let without = compress_stdout(d.path(), &["-p", p], "in.txt");
-        assert_eq!(
-            with, without,
-            "current behaviour at -p {p}: -U is a byte-for-byte no-op"
-        );
-    }
+fn pigz_rle_flag_rejected_loudly() {
+    // MITIGATED: pigz(1) -U / --rle: "Use run-length encoding for
+    // compression". Same class as -H: was a silent no-op advertised in
+    // --help; now a loud refusal, de-advertised.
+    assert_honesty_reject(&["-U", "-c"], &["-U", "--rle"]);
 }
 
 #[test]
-fn pigz_independent_flag_is_silent_noop_on_stdout_path() {
-    // pigz(1) -i / --independent: "Compress blocks independently for damage
-    // recovery". Pinned current behaviour: output is byte-identical with and
-    // without -i at L6 and L9, -p1 and -p4 (measured 2026-08-09). Note
-    // src/compress/io.rs:203 consults args.independent only for levels 7-9,
-    // and even at L9 the stdout-path bytes do not change. No independence
-    // property is asserted or denied here — only that the flag changes
-    // nothing observable, so a pigz user cannot tell whether they got it.
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(64 * 1024));
-    for level in ["-6", "-9"] {
-        for p in ["1", "4"] {
-            let with = compress_stdout(d.path(), &[level, "-p", p, "-i"], "in.txt");
-            let without = compress_stdout(d.path(), &[level, "-p", p], "in.txt");
-            assert_eq!(
-                with, without,
-                "current behaviour at {level} -p {p}: -i is a byte-for-byte no-op"
-            );
-        }
-    }
+fn pigz_independent_flag_rejected_loudly() {
+    // MITIGATED: pigz(1) -i / --independent: "Compress blocks independently
+    // for damage recovery". gzippy never guaranteed (or denied) the
+    // independence property — the flag changed nothing observable, so a
+    // pigz user could not tell whether they got their damage-recovery
+    // boundaries. Refuse loudly instead of silently ignoring.
+    assert_honesty_reject(&["-i", "-c"], &["-i", "--independent"]);
+    assert_honesty_reject(&["-9", "-p", "4", "-i", "-k"], &["-i", "--independent"]);
 }
 
 #[test]
-fn pigz_zlib_flag_currently_emits_gzip_magic() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour:
-    // pigz(1) -z / --zlib: "Compress to zlib (.zz) instead of gzip format".
-    // gzippy accepts -z, switches the SUFFIX to .zz — and then emits GZIP
-    // bytes (magic 1f 8b, not a zlib 0x78 CMF). File mode therefore writes
-    // FILE.zz containing a gzip stream, and gzippy's own `-d -c FILE.zz`
-    // rejects it ("zlib decompression failed"), because decompression routes
-    // by the suffix the compressor just lied with.
+fn pigz_zlib_flag_rejected_loudly() {
+    // MITIGATED (issue #303): pigz(1) -z / --zlib: "Compress to zlib (.zz)
+    // instead of gzip format". gzippy used to accept -z, switch the SUFFIX
+    // to .zz — and then emit GZIP bytes, which its own `-d` then rejected.
+    // Now: exit 2, stderr names the flag and the issue, and file mode never
+    // writes the mislabeled FILE.zz.
+    assert_honesty_reject(&["-z", "-c"], &["-z", "--zlib", "#303"]);
+
     let d = tempdir();
-    let data = synth(16 * 1024);
-    write_file(d.path(), "in.txt", &data);
-
-    let out = compress_stdout(d.path(), &["-z"], "in.txt");
-    assert_eq!(
-        &out[..2],
-        &[0x1f, 0x8b],
-        "current behaviour: -z output starts with the GZIP magic; pigz emits \
-         a zlib stream (first byte 0x78). If this fails, -z gained a real \
-         zlib container — update the triage table, the issue, and the \
-         ignored contract test."
-    );
-
-    // File mode: the suffix claims zlib while the bytes are gzip.
+    write_file(d.path(), "in.txt", &synth(16 * 1024));
     let file_mode = run(d.path(), &["-z", "-k", "in.txt"]);
-    assert!(
-        file_mode.status.success(),
-        "current behaviour: file-mode -z exits 0; stderr: {}",
-        String::from_utf8_lossy(&file_mode.stderr)
-    );
-    let zz = fs::read(d.path().join("in.txt.zz")).expect("current behaviour: -z writes FILE.zz");
     assert_eq!(
-        &zz[..2],
-        &[0x1f, 0x8b],
-        "current behaviour: FILE.zz contains gzip bytes"
+        file_mode.status.code(),
+        Some(2),
+        "file-mode -z must refuse loudly"
+    );
+    assert!(
+        !d.path().join("in.txt.zz").exists() && !d.path().join("in.txt.gz").exists(),
+        "-z must write nothing before refusing"
+    );
+    assert!(
+        d.path().join("in.txt").exists(),
+        "-z must leave the input untouched"
     );
 }
 
 #[test]
-#[ignore] // DIVERGENCE from pigz contract: -z must emit a zlib stream.
+#[ignore] // CONTRACT test for issue #303: un-ignore when -z emits a real zlib stream.
 fn pigz_zlib_contract_emits_zlib_stream() {
     // pigz(1) -z: the output must be RFC 1950 zlib — CMF low nibble 8
     // (deflate), and (CMF<<8|FLG) divisible by 31. And our own decoder must
@@ -479,26 +446,17 @@ fn pigz_zlib_contract_emits_zlib_stream() {
 }
 
 #[test]
-fn pigz_zip_flag_currently_emits_gzip_magic() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour:
-    // pigz(1) -K / --zip: "Compress to PKWare zip (.zip) single entry
-    // format". gzippy accepts -K, switches the suffix to .zip, and emits
-    // GZIP bytes (no PK\x03\x04 local-file header). A downstream `unzip`
-    // will refuse the file a script just named FILE.zip.
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(16 * 1024));
-    let out = compress_stdout(d.path(), &["-K"], "in.txt");
-    assert_eq!(
-        &out[..2],
-        &[0x1f, 0x8b],
-        "current behaviour: -K output starts with the GZIP magic; pigz emits \
-         PK zip. If this fails, -K gained a real zip container — update the \
-         triage table and issue."
-    );
+fn pigz_zip_flag_rejected_loudly() {
+    // MITIGATED (issue #303): pigz(1) -K / --zip: "Compress to PKWare zip
+    // (.zip) single entry format". gzippy used to accept -K, switch the
+    // suffix to .zip, and emit GZIP bytes a downstream `unzip` refuses.
+    // Now: exit 2, stderr names the flag and the issue.
+    assert_honesty_reject(&["-K", "-c"], &["-K", "--zip", "#303"]);
+    assert_honesty_reject(&["-K", "-k"], &["-K", "--zip", "#303"]);
 }
 
 #[test]
-#[ignore] // DIVERGENCE from pigz contract: -K must emit a PK zip entry.
+#[ignore] // CONTRACT test for issue #303: un-ignore when -K emits a PK zip entry.
 fn pigz_zip_contract_emits_pk_zip() {
     let d = tempdir();
     write_file(d.path(), "in.txt", &synth(16 * 1024));
@@ -507,30 +465,25 @@ fn pigz_zip_contract_emits_pk_zip() {
 }
 
 #[test]
-fn pigz_alias_flag_is_silently_ignored() {
-    // pigz(1) -A xxx / --alias xxx: "Use xxx as the name for any --zip entry
-    // from stdin". Pinned current behaviour: accepted (exit 0) and ignored —
-    // args.alias has no consumer. Low severity only because --zip itself
-    // does not produce zip (see above); if -K is ever fixed, -A must be
-    // wired up in the same change or this becomes a real silent-wrong.
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(4096));
-    let with = compress_stdout(d.path(), &["-A", "entryname"], "in.txt");
-    let without = compress_stdout(d.path(), &[], "in.txt");
-    assert_eq!(
-        with, without,
-        "current behaviour: -A is a byte-for-byte no-op"
-    );
+fn pigz_alias_flag_rejected_loudly() {
+    // MITIGATED (issue #303): pigz(1) -A xxx / --alias xxx: "Use xxx as the
+    // name for any --zip entry from stdin". It was accepted and silently
+    // ignored. -A is only meaningful with --zip, which is itself
+    // unimplemented — reject both, and wire -A up in the same change that
+    // implements -K.
+    assert_honesty_reject(&["-A", "entryname", "-c"], &["-A", "--alias", "#303"]);
 }
 
 #[test]
 fn pigz_comment_stored_in_file_mode() {
     // pigz(1) -C ccc / --comment ccc: "Put comment ccc in the gzip or zip
-    // header". SUPPORTED in file mode: FLG.FCOMMENT (0x10) set and the
-    // NUL-terminated comment present.
+    // header". SUPPORTED on the multi-thread file path: FLG.FCOMMENT (0x10)
+    // set and the NUL-terminated comment present. (-p 4 pins the route: the
+    // single-thread encoder writes a fixed header and -C is REJECTED there —
+    // see pigz_comment_rejected_where_it_would_be_dropped.)
     let d = tempdir();
     write_file(d.path(), "in.txt", &synth(4096));
-    let out = run(d.path(), &["-C", "hello", "-k", "in.txt"]);
+    let out = run(d.path(), &["-p", "4", "-C", "hello", "-k", "in.txt"]);
     assert!(
         out.status.success(),
         "file-mode -C failed: {}",
@@ -550,20 +503,32 @@ fn pigz_comment_stored_in_file_mode() {
 }
 
 #[test]
-fn pigz_comment_dropped_on_stdout_path() {
-    // DIVERGENCE from pigz contract, pinned at current behaviour: the SAME
-    // -C flag that works in file mode is silently dropped on the -c/stdout
-    // path — FLG.FCOMMENT stays clear (measured 2026-08-09). pigz stores the
-    // comment on both paths.
+fn pigz_comment_rejected_where_it_would_be_dropped() {
+    // MITIGATED: the SAME -C flag that works on the multi-thread file path
+    // used to be silently DROPPED on the -c/stdout path (minimal header) and
+    // on the single-thread file path (fixed header, no FCOMMENT field).
+    // pigz stores the comment everywhere. Until gzippy does too, every
+    // route that cannot store it must refuse, never drop:
+    //   * stdout path: exit 2, up-front honesty rejection;
+    //   * -p1 file path: per-file error (exit 1), dispatch-level guard.
+    assert_honesty_reject(&["-C", "hello", "-c"], &["-C", "--comment"]);
+
     let d = tempdir();
     write_file(d.path(), "in.txt", &synth(4096));
-    let out = compress_stdout(d.path(), &["-C", "hello"], "in.txt");
-    assert_eq!(
-        out[3] & 0x10,
-        0,
-        "current behaviour: stdout path drops the -C comment (FCOMMENT \
-         clear). If this fails, the divergence was fixed — update the triage \
-         table and drop this pin in favour of the file-mode assertion."
+    let p1 = run(d.path(), &["-p", "1", "-C", "hello", "-k", "in.txt"]);
+    assert!(
+        !p1.status.success(),
+        "-C on the single-thread file path must refuse (its header has no \
+         FCOMMENT field), not silently drop the comment"
+    );
+    let stderr = String::from_utf8_lossy(&p1.stderr);
+    assert!(
+        stderr.contains("-C"),
+        "-p1 -C refusal must name the flag; got: {stderr}"
+    );
+    assert!(
+        !d.path().join("in.txt.gz").exists(),
+        "-p1 -C must not leave a comment-less output file behind"
     );
 }
 
@@ -692,26 +657,44 @@ fn igzip_keep_by_default_divergence_we_delete() {
 }
 
 #[test]
-fn igzip_level_zero_maps_to_store_not_fastest_compression() {
-    // DIVERGENCE from igzip semantics, pinned at current behaviour:
-    // igzip levels are 0..=3 and level 0 is igzip's FASTEST REAL COMPRESSOR
-    // (igzip_lib.h: ISAL_DEF_MIN_LEVEL 0). gzippy's -0 is pigz's -0: STORE.
-    // An `igzip -0` pipeline pointed here silently emits output LARGER than
-    // its input. Both behaviours are valid gzip; the divergence is the
-    // silent loss of all compression.
+fn igzip_level_zero_stores_with_loud_warning() {
+    // DIVERGENCE from igzip semantics, now LOUD (issue #305): igzip levels
+    // are 0..=3 and level 0 is igzip's FASTEST REAL COMPRESSOR
+    // (igzip_lib.h: ISAL_DEF_MIN_LEVEL 0). gzippy's -0 is the gzip/pigz -0:
+    // STORE — the documented pigz contract, which the charter's
+    // least-surprise rule keeps (pigz -0 scripts must still get store, so
+    // remapping or rejecting -0 would trade one silent-wrong for another).
+    // The igzip-shaped hazard (an `igzip -0` backup silently emitting output
+    // LARGER than its input) is cured by a stderr warning naming the
+    // divergence and the issue; -q suppresses it.
     let d = tempdir();
     let data = synth(64 * 1024);
     write_file(d.path(), "in.txt", &data);
-    let out = compress_stdout(d.path(), &["-0"], "in.txt");
+
+    let out = run(d.path(), &["-0", "-c", "in.txt"]);
     assert!(
-        out.len() > data.len(),
-        "current behaviour: -0 stores (output {} > input {}). igzip -0 \
-         compresses. If this fails, the -0 mapping changed — re-triage the \
-         igzip level-mapping issue.",
-        out.len(),
+        out.status.success(),
+        "-0 must still succeed (pigz contract)"
+    );
+    assert!(
+        out.stdout.len() > data.len(),
+        "pigz contract: -0 stores (output {} > input {})",
+        out.stdout.len(),
         data.len()
     );
-    assert_roundtrips(d.path(), &out, &data, "-0 store");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("igzip") && stderr.contains("#305"),
+        "-0 must WARN about the igzip level-scale divergence; got: {stderr}"
+    );
+    assert_roundtrips(d.path(), &out.stdout, &data, "-0 store");
+
+    let quiet = run(d.path(), &["-0", "-q", "-c", "in.txt"]);
+    assert!(quiet.status.success());
+    assert!(
+        quiet.stderr.is_empty(),
+        "-q must suppress the -0 divergence warning"
+    );
 }
 
 #[test]
@@ -742,26 +725,60 @@ fn igzip_levels_two_and_three_map_to_weak_gzip_levels() {
 }
 
 #[test]
-fn igzip_compress_flag_z_collides_with_zlib_container() {
-    // DIVERGENCE from igzip semantics, pinned at current behaviour:
-    // igzip_cli.c: `-z, --compress  compress file (default)` — a no-op
-    // modifier. gzippy gives -z the PIGZ meaning: switch container to zlib,
-    // which today means "write FILE.zz with gzip bytes inside" (see the
-    // pigz -z pins). So `igzip -z FILE` pointed here produces FILE.zz
-    // instead of FILE.gz — downstream globs for *.gz find nothing.
+fn igzip_compress_flag_z_rejected_with_collision_explanation() {
+    // MITIGATED (issues #303/#305): igzip_cli.c: `-z, --compress  compress
+    // file (default)` — a no-op modifier. gzippy gives -z the PIGZ meaning
+    // (zlib container), which is unimplemented and now rejected. An igzip
+    // script's `-z FILE` therefore FAILS with an error that explains the
+    // collision (pigz's -z wins; igzip's -z is a plain-compress no-op)
+    // instead of silently writing FILE.zz where *.gz globs find nothing.
     let d = tempdir();
     write_file(d.path(), "in.txt", &synth(4096));
     let out = run(d.path(), &["-z", "-k", "in.txt"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "-z must refuse loudly in compress mode"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success(),
-        "current behaviour: -z file mode exits 0; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("igzip") && stderr.contains("pigz"),
+        "the -z error must explain the pigz/igzip collision; got: {stderr}"
     );
     assert!(
-        d.path().join("in.txt.zz").exists() && !d.path().join("in.txt.gz").exists(),
-        "current behaviour: -z writes FILE.zz, not FILE.gz. igzip's -z is a \
-         plain 'compress' no-op and would write FILE.gz."
+        !d.path().join("in.txt.zz").exists() && !d.path().join("in.txt.gz").exists(),
+        "-z must write nothing before refusing"
     );
+}
+
+#[test]
+fn rejected_flags_still_inert_on_decompress() {
+    // The honesty rejections are COMPRESS-MODE ONLY. pigz accepts and
+    // ignores these flags on decompress, so a `-d` pipeline carrying them
+    // must keep working here too.
+    let d = tempdir();
+    let data = synth(16 * 1024);
+    write_file(d.path(), "in.txt", &data);
+    let gz = compress_stdout(d.path(), &["-p", "4"], "in.txt");
+    write_file(d.path(), "in.txt.gz", &gz);
+    for flags in [
+        &["-d", "-c", "-R"][..],
+        &["-d", "-c", "-H", "-U", "-i"][..],
+        &["-t", "-R"][..],
+    ] {
+        let mut full: Vec<&str> = flags.to_vec();
+        full.push("in.txt.gz");
+        let out = run(d.path(), &full);
+        assert!(
+            out.status.success(),
+            "gzippy {full:?} must stay inert on decompress/test (pigz \
+             semantics); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if flags.contains(&"-c") {
+            assert_eq!(out.stdout, data, "roundtrip bytes under inert flags");
+        }
+    }
 }
 
 // ===========================================================================
