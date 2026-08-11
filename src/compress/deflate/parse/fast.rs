@@ -1395,25 +1395,16 @@ fn est_match_bits(len: u32, dist: usize) -> u32 {
     let lslot = length_slot(len) as usize;
     let len_sym_bits = if lslot < 24 { 7 } else { 8 };
     let dslot = offset_slot(dist as u32) as usize;
-    // Elided bound (measured as a live `len=30` panic guard in the release
-    // binary's `fastloop_l1`, x3 inline copies, one execution per lazy-peek
-    // cost-gate evaluation): `offset_slot`'s postcondition is `slot <= 29`
-    // (OFFSET_SLOT values <= 15, const-asserted in tables.rs, plus
-    // `n << 1 <= 14`), and `OFFSET_EXTRA_BITS.len() == 30`. Callers of this
-    // function (the two cost-gate sites in `process_position_l1` /
-    // `process_position_l1_lean`) pass `dist` already validated by
-    // `(1..=WINDOW).contains(&dist)`, satisfying `offset_slot`'s own
-    // 1..=32768 contract. `LENGTH_EXTRA_BITS[lslot]` stays checked: the
-    // release binary carries NO guard for it (LLVM already proves
-    // `lslot <= 28` from the const table), so touching it could only add
-    // register pressure (hard stop 4).
-    debug_assert!(dslot < OFFSET_EXTRA_BITS.len());
-    len_sym_bits
-        + LENGTH_EXTRA_BITS[lslot] as u32
-        + 5
-        // SAFETY: `dslot <= 29 < 30 == OFFSET_EXTRA_BITS.len()` per
-        // `offset_slot`'s const-asserted postcondition (see above).
-        + unsafe { *OFFSET_EXTRA_BITS.get_unchecked(dslot) } as u32
+    // Both table indexings DELIBERATELY stay checked. A `get_unchecked` on
+    // `OFFSET_EXTRA_BITS[dslot]` (provable: offset_slot's postcondition is
+    // <= 29) was built and MEASURED WORSE at L1 on trainer (i7-13700T,
+    // cachegrind Ir, 2026-08-11, per-site bisection probe/irab-v2 vs -v5):
+    // combined with the tables.rs elisions it flipped text L1 from -1.2% to
+    // +1.1% and halved the binary/noise L1 wins — a codegen interaction in
+    // the fat-LTO fastloop body, not an instruction-count effect. Hard stop
+    // 4: the aarch64 binary carries a len=30 guard here, and removing it
+    // still lost. Re-measure at L1 on x86 before ever adding unsafe here.
+    len_sym_bits + LENGTH_EXTRA_BITS[lslot] as u32 + 5 + OFFSET_EXTRA_BITS[dslot] as u32
 }
 
 /// Flat per-literal bit estimate paired with [`est_match_bits`] — the RFC
