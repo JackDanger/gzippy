@@ -86,8 +86,43 @@ campaign goal is rival-anchored Pareto dominance per label, not preservation of 
 interior number; margin is capital, and a rule that forbids spending it converts wins
 into cages.
 
-**6. Net improvement.** Total improvement on failing cells must exceed total harm on
-passing cells by at least 2x. This stops closing one easy cell by worsening many hard ones.
+**6. Net improvement — over residual harm** *(made coherent with clause 5's margin-floor
+semantics 2026-08-11; implemented in
+[fulcrum#26](https://github.com/JackDanger/fulcrum/pull/26)).*
+
+> ~~Total improvement on failing cells must exceed total harm on passing cells by at
+> least 2x.~~
+>
+> **Struck 2026-08-11** as written, because "total harm" summed every positive delta on
+> passing cells — including the very erosions clause 5 had just ACCEPTED as margin-spend.
+> Receipt: the #310 run accepted 54 erosions under the margin floor with clean audit
+> chains and zero convictions, then failed clause 6 on "harm" 1.3537 of which 0.7487 was
+> that same accepted spend. Double-counting authorized spend made clause 6 the new
+> flat-budget-in-disguise.
+
+Total improvement on failing cells must exceed **2x the residual harm** on passing
+cells. Residual harm is what the clause-3/5 chains left standing:
+
+* **confirmed-real unaccepted** erosions and flips, charged at their *confirmed* deltas;
+* **size regressions** on passing cells — size is exact, so every positive size delta is
+  real, within the flat budget or not;
+* **UNDECIDED wall suspects** at their census deltas, conservatively — missing floor
+  coverage or confirm-cap overflow never becomes free.
+
+Erosions clause 5 ACCEPTED as margin-spend are priced by the floor, **not harm**;
+LAYOUT-ARTIFACT acquittals are measured noise; sub-budget wall census drift is priced by
+clause 5's flat budget. All three are excluded and **itemized on the clause-6 output
+line** (and in `try.json` under `adjudication.clause6`) — an exclusion is never silent.
+Improvement is unchanged: summed census ratio gains on cells failing at base, the same
+quantity clause 4's fail-gap tracks. This still stops closing one easy cell by worsening
+many hard ones — but by pricing unauthorized worsening, not by re-billing spend the
+margin floor already authorized.
+
+The confirm short-circuit follows the same accounting: `fulcrum try` skips cross-layout
+confirms only when the verdict is NO-SHIP even under best-case acquittal of every
+suspect. With residual-harm accounting an acquittal shrinks clause-6 harm, so confirms
+that could rescue a verdict now RUN instead of being skipped against a pre-verdict that
+counted the suspects as harm.
 
 **7. Cross-architecture.** Rules 3-6 hold on every architecture we measure (aarch64, Intel,
 AMD Zen2). A win on one architecture and a loss on another is not a win. Wall verdicts come
