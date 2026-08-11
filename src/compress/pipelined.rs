@@ -257,12 +257,21 @@ impl PipelinedGzEncoder {
             return Ok(0);
         }
         if self.num_threads > 1
-            && self.compression_level == 9
+            && (self.compression_level == 8 || self.compression_level == 9)
             && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
         {
-            // L9 T>1: the chunk workers run the NEAR-OPTIMAL parse
-            // (`params_parallel(9)` routes to the L11 T>1 knobs — see the
-            // measured receipt in `level.rs`). Two candidates, picked by size:
+            // L8/L9 T>1: the chunk workers run the NEAR-OPTIMAL parse
+            // (`params_parallel(8)`/`params_parallel(9)` route to the L11 T>1
+            // knobs — see the measured receipts in `level.rs`). L8 joined L9
+            // here after the nearoptimal-down-ladder probe (2026-08-11)
+            // measured its old SEQUENTIAL triple pick-min (chunked Lazy2 +
+            // whole_parallel + whole_t1) as a strict Pareto LOSS against this
+            // structure on every fixture: 881 -> ~381 ms on 8 MiB text at -p4
+            // while the output shrinks 2,444,590 -> 2,260,495 (its old best
+            // bytes LOST to gzip -8 there). The probe also measured L6/L7 and
+            // they do NOT pay (no failing cell, 2.5-7.3x pure added wall
+            // against 2-5x slack) — the scope boundary is measured, not
+            // inherited. Two candidates, picked by size:
             //
             //   chunked  — near-optimal per ≤512 KiB chunk, parallel workers.
             //              2-7% smaller than every rival AND than both #290
@@ -275,24 +284,29 @@ impl PipelinedGzEncoder {
             //              or the cost-model parse loses to a continuous Lazy2.
             //
             // The #289/#290 `whole_parallel` (parallel-knob continuous) candidate
-            // is GONE at L9: with `params_parallel(9)` now NearOptimal it would
-            // be a SERIAL whole-file near-optimal encode — strictly slower than
-            // the chunked pass running the same parse in parallel — and
-            // `parse_resumable` cannot run NearOptimal at all. Its former wins
-            // are covered: the chunked near-optimal output was smaller than the
-            // parallel-knob continuous output on every measured fixture.
+            // is GONE at L8/L9: with `params_parallel` now NearOptimal at both
+            // levels it would be a SERIAL whole-file near-optimal encode —
+            // strictly slower than the chunked pass running the same parse in
+            // parallel — and `parse_resumable` cannot run NearOptimal at all.
+            // Its former wins are covered: the chunked near-optimal output was
+            // smaller than the parallel-knob continuous output on every
+            // measured fixture (at L8 it was also smaller than the shipped
+            // triple's min on all five).
             //
             // The two survivors run CONCURRENTLY (the #293 T1 pick-min
             // precedent): pick-min wall is max(candidates), not sum. Measured
-            // on 8 MiB text at -p4 (M1): 1,030 ms (three sequential candidates,
-            // main) -> ~800 ms here, with the output 185 KB smaller.
+            // on 8 MiB text at -p4 (M1): L9 1,030 ms (three sequential
+            // candidates, main) -> ~800 ms here with the output 185 KB
+            // smaller; L8 881 ms -> max(381, 375) ms with the output 184 KB
+            // smaller.
+            let level = self.compression_level;
             let header = self.gzip_header_bytes();
             let (chunked, whole_t1) = std::thread::scope(|scope| {
                 let guard = scope.spawn(|| {
                     let mut v = Vec::new();
                     v.extend_from_slice(&header);
                     crate::compress::deflate::encode_deflate_stateful_to_writer(
-                        data, &mut v, 9, false,
+                        data, &mut v, level, false,
                     )
                     .map(|_| v)
                 });
@@ -312,52 +326,6 @@ impl PipelinedGzEncoder {
             } else {
                 chunked
             };
-            writer.write_all(&best)?;
-            return Ok(data.len() as u64);
-        }
-        if self.num_threads > 1
-            && self.compression_level == 8
-            && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
-        {
-            // L8 T>1 (unchanged from #289/#290): the pipelined chunk grid pays a
-            // seam tax on tabular/text inputs (per-chunk `skip_bytes` dict seed +
-            // forced block restarts) that a continuous `ParseState` path avoids —
-            // but the parallel-knob whole-file path regresses a few
-            // already-passing binary cells. A third T1-knob continuous candidate
-            // ties libdeflate on the tabular cells where the seam tax equals the
-            // gap exactly. Pick the smallest gzip of the three (monotone
-            // non-worse vs chunked main by construction). L8 keeps Lazy2 knobs
-            // (`params_parallel` L8 arm) — it is the documented exclusion from
-            // depth scaling and was left out of the L9 near-optimal routing on
-            // the L4-max-clean-subset principle: extend only with a measurement.
-            let level = self.compression_level;
-            let header = self.gzip_header_bytes();
-
-            let mut chunked = Vec::new();
-            self.compress_parallel_pipeline_pure(data, &mut chunked)?;
-
-            let mut whole_parallel = Vec::with_capacity(chunked.len());
-            whole_parallel.extend_from_slice(&header);
-            crate::compress::deflate::encode_deflate_stateful_to_writer(
-                data,
-                &mut whole_parallel,
-                level,
-                true,
-            )?;
-
-            let mut whole_t1 = Vec::with_capacity(chunked.len());
-            whole_t1.extend_from_slice(&header);
-            crate::compress::deflate::encode_deflate_stateful_to_writer(
-                data,
-                &mut whole_t1,
-                level,
-                false,
-            )?;
-
-            let best = [chunked, whole_parallel, whole_t1]
-                .into_iter()
-                .min_by_key(|v| v.len())
-                .expect("three candidates");
             writer.write_all(&best)?;
             return Ok(data.len() as u64);
         }
