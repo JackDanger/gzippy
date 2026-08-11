@@ -12,11 +12,13 @@
 # ours_ir_per_b / ldx_ir_per_b are the seed-time absolutes (provenance, not asserted).
 # Regenerate: UPDATE_IR_VS_LDX=1 cargo test --release --test ir_vs_ldx update_ldx_pins -- --ignored --nocapture
 # Pinned on host 'trainer' , gzippy @ 44ce795d, 2026-08-04.
+# text L6/L9 margins TIGHTENED (0.624->0.608, 0.659->0.646) on trainer, gzippy @ f352d97e,
+# 2026-08-11 (bounds-elision lever): the suite's own improvement advisory; ratchet only tightens.
 fixture	level	ours_ir_per_b	ldx_ir_per_b	margin
 text	1	37.02	62.02	0.597
 text	2	74.60	112.72	0.662
-text	6	148.70	238.66	0.624
-text	9	447.72	680.28	0.659
+text	6	148.70	238.66	0.608
+text	9	447.72	680.28	0.646
 tabular	1	29.58	48.15	0.615
 tabular	2	57.10	86.99	0.657
 tabular	6	89.27	144.63	0.618
