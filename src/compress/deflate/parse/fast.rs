@@ -1395,7 +1395,25 @@ fn est_match_bits(len: u32, dist: usize) -> u32 {
     let lslot = length_slot(len) as usize;
     let len_sym_bits = if lslot < 24 { 7 } else { 8 };
     let dslot = offset_slot(dist as u32) as usize;
-    len_sym_bits + LENGTH_EXTRA_BITS[lslot] as u32 + 5 + OFFSET_EXTRA_BITS[dslot] as u32
+    // Elided bound (measured as a live `len=30` panic guard in the release
+    // binary's `fastloop_l1`, x3 inline copies, one execution per lazy-peek
+    // cost-gate evaluation): `offset_slot`'s postcondition is `slot <= 29`
+    // (OFFSET_SLOT values <= 15, const-asserted in tables.rs, plus
+    // `n << 1 <= 14`), and `OFFSET_EXTRA_BITS.len() == 30`. Callers of this
+    // function (the two cost-gate sites in `process_position_l1` /
+    // `process_position_l1_lean`) pass `dist` already validated by
+    // `(1..=WINDOW).contains(&dist)`, satisfying `offset_slot`'s own
+    // 1..=32768 contract. `LENGTH_EXTRA_BITS[lslot]` stays checked: the
+    // release binary carries NO guard for it (LLVM already proves
+    // `lslot <= 28` from the const table), so touching it could only add
+    // register pressure (hard stop 4).
+    debug_assert!(dslot < OFFSET_EXTRA_BITS.len());
+    len_sym_bits
+        + LENGTH_EXTRA_BITS[lslot] as u32
+        + 5
+        // SAFETY: `dslot <= 29 < 30 == OFFSET_EXTRA_BITS.len()` per
+        // `offset_slot`'s const-asserted postcondition (see above).
+        + unsafe { *OFFSET_EXTRA_BITS.get_unchecked(dslot) } as u32
 }
 
 /// Flat per-literal bit estimate paired with [`est_match_bits`] — the RFC
@@ -2766,8 +2784,17 @@ fn parse_tail(
             {
                 local.hash_computations += 1;
             }
-            let cand = head[h];
-            head[h] = pos as u32;
+            // Elided bounds (measured as live runtime-len panic guards in the
+            // release binary's `parse_tail` — the fastloop bodies already
+            // elide the identical accesses, this tail loop was the leftover):
+            // `lz_hash(_, HASH_BITS)` output is `< 2^16 == HASH_SIZE ==
+            // head.len()` — the same proof as `fastloop_l1`'s head accesses.
+            // Callers ([`run`], [`run_resumable`]) always pass the
+            // HASH_SIZE-element table from `acquire_head_table`.
+            debug_assert!(h < head.len());
+            // SAFETY: `h < HASH_SIZE == head.len()` per the lz_hash bound.
+            let cand = unsafe { *head.get_unchecked(h) };
+            unsafe { *head.get_unchecked_mut(h) = pos as u32 };
             #[cfg(feature = "anatomy-counters")]
             {
                 local.head_table_reads += 1;
@@ -2806,7 +2833,11 @@ fn parse_tail(
                         // SAFETY: nh < match_end = pos+length <= in_end, and
                         // buf's pad covers the 4-byte load past in_end.
                         let s = unsafe { load_u32(base, nh) };
-                        head[lz_hash(s, HASH_BITS) as usize] = nh as u32;
+                        // SAFETY: `lz_hash(_, HASH_BITS)` output is
+                        // `< HASH_SIZE == head.len()`, as above.
+                        unsafe {
+                            *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32
+                        };
                         #[cfg(feature = "anatomy-counters")]
                         {
                             local.hash_computations += 1;
@@ -2843,7 +2874,10 @@ fn parse_tail(
         if max_len < SHORTEST_MATCH {
             local.no_probe_literals += 1;
         }
-        sink.push_literal_fast(buf[pos]);
+        debug_assert!(pos < buf.len());
+        // SAFETY: `pos < block_end_target <= in_end <= buf.len()` (the loop
+        // condition), same proof as the fastloop literal emits.
+        sink.push_literal_fast(unsafe { *buf.get_unchecked(pos) });
         pos += 1;
     }
     pos

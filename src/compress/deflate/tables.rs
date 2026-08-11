@@ -86,6 +86,30 @@ const fn build_length_slot() -> [u8; (DEFLATE_MAX_MATCH_LEN + 1) as usize] {
 /// libdeflate's `deflate_offset_slot[]`; generated from [`OFFSET_SLOT_BASE`].
 pub const OFFSET_SLOT: [u8; 256] = build_offset_slot();
 
+// Value-range proofs for the two slot tables, used by bounds-elided consumers
+// (`offset_slot`'s `+ (n << 1)` result and `est_match_bits`' extra-bits
+// lookups in `parse/fast.rs`). These are compile-time facts about the const
+// tables, so an edit that widens either range fails the build here instead of
+// silently invalidating a `get_unchecked` proof downstream.
+const _: () = {
+    let mut i = 0;
+    while i < OFFSET_SLOT.len() {
+        assert!(
+            OFFSET_SLOT[i] <= 15,
+            "OFFSET_SLOT value > 15 breaks offset_slot()'s <= 29 postcondition"
+        );
+        i += 1;
+    }
+    let mut j = 0;
+    while j < LENGTH_SLOT.len() {
+        assert!(
+            LENGTH_SLOT[j] <= 28,
+            "LENGTH_SLOT value > 28 breaks length_slot()'s <= 28 postcondition"
+        );
+        j += 1;
+    }
+};
+
 const fn build_offset_slot() -> [u8; 256] {
     let mut t = [0u8; 256];
     let mut off = 1usize;
@@ -111,22 +135,62 @@ pub const PRECODE_EXTRA_BITS: [u8; DEFLATE_NUM_PRECODE_SYMS] =
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
 
 /// Return the length slot for a match length in `3..=258`.
+///
+/// Postcondition: the returned slot is `<= 28` (const-asserted above).
 #[inline]
 pub fn length_slot(len: u32) -> u8 {
-    LENGTH_SLOT[len as usize]
+    // Elided bound (measured as a live `len=259` panic guard in the release
+    // binary's `parse_tail`/`parse::compress`): the caller contract is
+    // `len <= DEFLATE_MAX_MATCH_LEN (258)` and the table has 259 entries.
+    // Callers (audited 2026-08-11, all uphold 3..=258):
+    //   * `Sink::push_match`/`push_match_fast` (parse/mod.rs) — both
+    //     `debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN)
+    //     .contains(&length))` before calling; their own callers feed
+    //     `lz_extend`/matchfinder lengths clamped to `DEFLATE_MAX_MATCH_LEN`.
+    //   * `EmitTables::build` (parse/mod.rs) — explicit
+    //     `for len in DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN`.
+    //   * `est_match_bits` (parse/fast.rs) — `length` from `lz_extend(..,
+    //     DEFLATE_MAX_MATCH_LEN)`.
+    //   * `DeflateCosts::set_from_codes` (costs.rs:151) — explicit
+    //     `for len in MIN_MATCH_LEN..=MAX_MATCH_LEN`.
+    //   * `default_length_cost` (costs.rs:219) — called from the
+    //     `MIN_MATCH_LEN..=MAX_MATCH_LEN` init loop only.
+    //   * `Optimizer::tally_and_build` (near_optimal.rs:284) — `length` is a
+    //     DP item length `<= DEFLATE_MAX_MATCH_LEN` by construction.
+    //   * test code (tables.rs / parse/mod.rs emit_tests) — literal in-range
+    //     values.
+    debug_assert!(
+        (DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN).contains(&len),
+        "length_slot: len {len} outside 3..=258"
+    );
+    // SAFETY: `len <= 258 < LENGTH_SLOT.len() == 259` per the audited caller
+    // contract above; debug builds still bounds-check via the debug_assert.
+    unsafe { *LENGTH_SLOT.get_unchecked(len as usize) }
 }
 
 /// Return the offset slot for a match offset in `1..=32768`.
 ///
 /// Port of `deflate_get_offset_slot()` — uses the 256-entry small map plus the
 /// "each slot [16..30) is 128x a slot [2..16)" identity for larger offsets.
+/// Postcondition: the returned slot is `<= 29` (`OFFSET_SLOT` values are
+/// `<= 15`, const-asserted above, plus `n << 1 <= 14`).
 #[inline]
 pub fn offset_slot(offset: u32) -> u8 {
     debug_assert!((1..=32768).contains(&offset));
     // n = (offset <= 256) ? 0 : 7, expressed branchlessly. In C this is an
     // unsigned wrapping subtraction; mirror it with wrapping_sub on u32.
     let n = (256u32.wrapping_sub(offset)) >> 29;
-    OFFSET_SLOT[((offset - 1) >> n) as usize] + ((n as u8) << 1)
+    // Elided bound (measured as the hottest live panic guard in the release
+    // binary: `len=256` cmp+branch in `fastloop_l1` x5, `fastloop_l1_lean`
+    // x2, `parse_tail`, `parse::compress` — one execution per emitted match).
+    // The `& 0xFF` mask is an IDENTITY for every in-contract offset, so it
+    // changes no output byte: offset <= 256 => n = 0 and offset - 1 <= 255;
+    // offset in 257..=32768 => 256 - offset wraps high so n = 7 and
+    // (offset - 1) >> 7 <= 32767 >> 7 = 255. One AND replaces the cmp+branch
+    // cluster; the debug_assert above still rejects out-of-contract offsets
+    // in debug builds. Mask chosen over `get_unchecked` per the
+    // provable-by-construction preference (1 ALU, no unsafe).
+    OFFSET_SLOT[(((offset - 1) >> n) & 0xFF) as usize] + ((n as u8) << 1)
 }
 
 /// Frequencies that reproduce the RFC 1951 §3.2.6 fixed literal/length code.
