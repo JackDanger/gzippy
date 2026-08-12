@@ -213,9 +213,9 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 ///
 /// The rule applied is one step of parse strategy at UNCHANGED knobs, which the ladder sweep
 /// measured as strictly smaller at fixed depth. Levels with no stronger strategy available
-/// (L0/L1 chainless, L3 already Lazy, L8 already Lazy2, L10-12 already NearOptimal) are
-/// returned unchanged, so T>1 output at those levels is untouched. L9 is the exception:
-/// it takes the FULL step up to the near-optimal parser (see the first branch below).
+/// (L0/L1 chainless, L3 already Lazy, L10-12 already NearOptimal) are
+/// returned unchanged, so T>1 output at those levels is untouched. L8 and L9 are the
+/// exceptions: they take the FULL step up to the near-optimal parser (first branch below).
 pub fn params_parallel(level: u32) -> LevelParams {
     // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
     // routing decision (the map is free to change; CLAUDE.md "Every technique is
@@ -248,7 +248,29 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // L11's knobs (not L10's): L10 is non-monotone vs L9 on the binary class
     // (+2,057 B at 1 MiB, would OPEN cells); L11/L12 are smaller than L9
     // everywhere measured, and L12's extra passes buy ~nothing (<0.01%) here.
-    if level == 9 {
+    //
+    // L8 JOINS L9 (nearoptimal-down-ladder probe, 2026-08-11, M1 laptop, same
+    // 8 MiB fixtures, `-p4`, main@bee336b9 + this branch). L8 was the WEAKEST
+    // T>1 level: excluded from depth scaling (the engine.wasm clause-3 flip
+    // documented below), so its T4 triple pick-min shipped whole_t1 bytes that
+    // LOSE to gzip -8 on the match-rich classes, and ran its three candidates
+    // SEQUENTIALLY (881 ms on 8 MiB text at -p4 vs L7's 110 ms). The same
+    // near-optimal routing is a strict Pareto win at L8 on every fixture:
+    //
+    //   size:  text    ship8 2,444,590 -> 2,260,495  (gzip -8 2,425,693: LOSS -> WIN)
+    //          binary  ship8 5,117,867 -> 5,093,556  (gzip -8 5,108,313: LOSS -> WIN)
+    //          tabular ship8 1,888,600 -> 1,832,677  (margin +56 KB)
+    //          weights ship8 7,774,144 -> 7,766,521; noise byte-identical (stored)
+    //   wall:  max(chunked 381 ms, whole_t1 guard 375 ms) vs the sequential
+    //          triple's 881 ms on text — 1.3-2.4x FASTER across fixtures.
+    //
+    // The down-ladder probe also measured L6/L7 and they DO NOT pay: no failing
+    // fixture cell exists at L6/L7 T4 (the chunked Lazy+depth-x4 configs already
+    // beat every rival), and the near-optimal cost multiplier there is pure
+    // added wall (L7: 2.5-4.9x, L6: 2.4-7.3x vs shipped) against T4 board slack
+    // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
+    // near-optimal-class wall for worse bytes. Scope stops at L8.
+    if level == 8 || level == 9 {
         return params_parallel(11);
     }
     let mut p = params_inner(level);
@@ -300,6 +322,11 @@ pub fn params_parallel(level: u32) -> LevelParams {
         p.strategy = Strategy::Lazy;
         p.max_search_depth = p.max_search_depth.saturating_mul(4);
     } else {
+        // The `level == 8` arm below is now unreachable (L8 returns early via
+        // the near-optimal routing above); it is kept verbatim with its
+        // receipt because the engine.wasm non-monotonicity it records is a
+        // depth-scaling fact about Lazy2, not about L8 the level, and it must
+        // be re-consulted if the near-optimal routing is ever reverted.
         p.max_search_depth = if level == 8 {
             p.max_search_depth
         } else {
