@@ -52,7 +52,9 @@ pub use fast::tune;
 // Recorded because a retraction that does not reach every statement of the thing gets
 // re-inherited by the next session that reads the file. A stale comment proposing
 // forbidden work is not inert documentation; it is an instruction.
+mod far_len3;
 mod greedy;
+use far_len3::FarLen3Gate;
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
 /// REOPEN it rests on.

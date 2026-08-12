@@ -13,7 +13,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, BlockRole, InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, far_len3, BlockRole, FarLen3Gate, InputMode, ParseState, Sink, StaticCodes,
+    STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -180,8 +181,26 @@ pub(super) fn run_block(
     let mut max_len = DEFLATE_MAX_MATCH_LEN;
     let mut nice_len = params.nice_match_length.min(max_len);
     let min_len = calculate_min_match_len(&buf[in_next..in_end], params.max_search_depth);
+    // Far-len-3 cost gate: recomputed from the block's running frequencies at
+    // the same cadence the lazy parser refreshes `min_len` (10 KB, then
+    // doubling). Starts inert (= the shipped fixed guard) — it only opens
+    // once this block's own statistics prove a far len-3 beats the three
+    // literals it replaces.
+    let mut far_len3 = FarLen3Gate::INERT;
+    let mut next_recalc = in_next + (in_end - in_next).min(10000);
 
     loop {
+        if in_next >= next_recalc {
+            if params.far_len3_gate {
+                far_len3 = FarLen3Gate::recalc(
+                    &sink.litlen_freqs,
+                    &sink.offset_freqs,
+                    far_len3::GREEDY_MARGIN_EIGHTH_BITS,
+                );
+            }
+            next_recalc += (in_end - next_recalc).min(in_next - block_begin);
+        }
+
         adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - in_next);
         let (length, offset) = mf.longest_match(
             buf,
@@ -206,6 +225,48 @@ pub(super) fn run_block(
                 next_hashes,
             );
             in_next += length as usize;
+        } else if length >= min_len
+            && far_len3.allows(offset, buf[in_next], buf[in_next + 1], buf[in_next + 2])
+        {
+            // Cost-gated far len-3 (see `far_len3.rs`). Greedy has no
+            // lookahead, so a chance len-3 here would SHADOW a longer match
+            // starting one position later — the mechanism that made the
+            // ungated accept bleed on executables while the lazy levels
+            // stayed near-clean. Probe position +1 first (the probe also
+            // performs that position's matchfinder insert, so the skip below
+            // starts one position later than the normal accept arm's).
+            adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - (in_next + 1));
+            let (next_len, next_offset) = mf.longest_match(
+                buf,
+                in_base,
+                in_next + 1,
+                DEFLATE_MIN_MATCH_LEN, // only a STRICTLY longer match shadows
+                max_len,
+                nice_len,
+                params.max_search_depth,
+                params.good_match,
+                next_hashes,
+            );
+            if next_len > DEFLATE_MIN_MATCH_LEN {
+                // The len-3 was a shadow: literal here, longer match at +1.
+                sink.push_literal(buf[in_next]);
+                sink.push_match(next_len, next_offset);
+                mf.skip_bytes(
+                    buf,
+                    in_base,
+                    in_next + 2,
+                    in_end,
+                    (next_len - 1) as usize,
+                    next_hashes,
+                );
+                in_next += 1 + next_len as usize;
+            } else {
+                // Nothing longer behind it: take the far len-3. Position +1
+                // is already inserted by the probe; only +2 remains.
+                sink.push_match(DEFLATE_MIN_MATCH_LEN, offset);
+                mf.skip_bytes(buf, in_base, in_next + 2, in_end, 1, next_hashes);
+                in_next += DEFLATE_MIN_MATCH_LEN as usize;
+            }
         } else {
             sink.push_literal(buf[in_next]);
             in_next += 1;
