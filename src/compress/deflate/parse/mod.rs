@@ -1470,9 +1470,35 @@ struct EmitTables {
 
 impl EmitTables {
     fn build(litcode: &HuffmanCode, offcode: &HuffmanCode) -> Self {
+        // Hoisted length proofs (measured as 6 live per-iteration panic
+        // guards in the release binary's `emit_sequences`, executed once per
+        // symbol-loop iteration of every per-block table build): `lens`/
+        // `codewords` are `Vec`s, so the compiler re-checked their runtime
+        // length inside each loop. One fixed-size-array view per input
+        // replaces all of them — every subsequent index is against a
+        // compile-time-length array with a provably in-range index
+        // (`b < 256`, `sym = 257 + slot <= 285 < 288` via `length_slot`'s
+        // <= 28 postcondition, `slot < 30 <= 32`, `DEFLATE_END_OF_BLOCK ==
+        // 256 < 288`). Safe code: `try_into` is ONE check per build, and
+        // every `HuffmanCode` reaching here is built by `make_huffman_code*`
+        // with exactly DEFLATE_NUM_LITLEN_SYMS / DEFLATE_NUM_OFFSET_SYMS
+        // entries, so the expect never fires in practice.
+        let lit_lens: &[u8; DEFLATE_NUM_LITLEN_SYMS] = litcode.lens[..DEFLATE_NUM_LITLEN_SYMS]
+            .try_into()
+            .expect("litcode.lens has DEFLATE_NUM_LITLEN_SYMS entries");
+        let lit_cw: &[u32; DEFLATE_NUM_LITLEN_SYMS] = litcode.codewords[..DEFLATE_NUM_LITLEN_SYMS]
+            .try_into()
+            .expect("litcode.codewords has DEFLATE_NUM_LITLEN_SYMS entries");
+        let off_lens: &[u8; DEFLATE_NUM_OFFSET_SYMS] = offcode.lens[..DEFLATE_NUM_OFFSET_SYMS]
+            .try_into()
+            .expect("offcode.lens has DEFLATE_NUM_OFFSET_SYMS entries");
+        let off_cw: &[u32; DEFLATE_NUM_OFFSET_SYMS] = offcode.codewords[..DEFLATE_NUM_OFFSET_SYMS]
+            .try_into()
+            .expect("offcode.codewords has DEFLATE_NUM_OFFSET_SYMS entries");
+
         let mut lit = [0u32; NUM_LITERALS];
         for (b, e) in lit.iter_mut().enumerate() {
-            *e = litcode.codewords[b] | ((litcode.lens[b] as u32) << 24);
+            *e = lit_cw[b] | ((lit_lens[b] as u32) << 24);
         }
         // MAX_LITLEN_CODEWORD_LEN (14) + max extra length bits (5) <= 24, so the
         // concatenation stays below the nbits byte (C's STATIC_ASSERT at :1642).
@@ -1481,19 +1507,16 @@ impl EmitTables {
             let slot = length_slot(len) as usize;
             let sym = DEFLATE_FIRST_LEN_SYM + slot;
             let extra_bits = len - LENGTH_SLOT_BASE[slot];
-            let litlen_len = litcode.lens[sym] as u32;
-            full_len[len as usize] = (litcode.codewords[sym] | (extra_bits << litlen_len))
-                | (((litcode.lens[sym] + LENGTH_EXTRA_BITS[slot]) as u32) << 24);
+            let litlen_len = lit_lens[sym] as u32;
+            full_len[len as usize] = (lit_cw[sym] | (extra_bits << litlen_len))
+                | (((lit_lens[sym] + LENGTH_EXTRA_BITS[slot]) as u32) << 24);
         }
         let mut off = [0u32; DEFLATE_NUM_OFFSET_SYMS];
         for (slot, e) in off.iter_mut().enumerate().take(OFFSET_EXTRA_BITS.len()) {
-            let cwlen = offcode.lens[slot] as u32;
-            *e = offcode.codewords[slot]
-                | (cwlen << 16)
-                | ((cwlen + OFFSET_EXTRA_BITS[slot] as u32) << 24);
+            let cwlen = off_lens[slot] as u32;
+            *e = off_cw[slot] | (cwlen << 16) | ((cwlen + OFFSET_EXTRA_BITS[slot] as u32) << 24);
         }
-        let eob = litcode.codewords[DEFLATE_END_OF_BLOCK]
-            | ((litcode.lens[DEFLATE_END_OF_BLOCK] as u32) << 24);
+        let eob = lit_cw[DEFLATE_END_OF_BLOCK] | ((lit_lens[DEFLATE_END_OF_BLOCK] as u32) << 24);
         EmitTables {
             lit,
             full_len,
