@@ -37,6 +37,70 @@ use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
 use crate::utils::preserve_metadata;
 
+/// The fixed 10-byte gzip header every T1 encoder emits (CM=8, FLG=0,
+/// MTIME=0, XFL=0, OS=0xff) — see the literal in
+/// `deflate::encode_gzip_unpadded_slice_to_writer` and its whole-buffer /
+/// streaming siblings.
+const T1_MINIMAL_GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+
+/// Splices a full FNAME/MTIME gzip header over the fixed minimal header the
+/// T1 encoders emit (issue #309: gzip's contract stores FNAME and MTIME when
+/// compressing a named FILE; `gzip -l`/`gzip -dN` rely on them).
+///
+/// The T1 encoders write header + DEFLATE stream + trailer through one
+/// writer, always starting with exactly [`T1_MINIMAL_GZIP_HEADER`]. This
+/// adapter swallows those 10 bytes, emits `replacement` in their place, and
+/// passes everything after them through untouched — the DEFLATE bytes and
+/// trailer cannot change, so T1 `-c` output (every graded board/tie-guard
+/// cell) is not routed through this type at all and file output differs from
+/// it ONLY in the header. Fails closed: if the swallowed bytes are not the
+/// expected minimal header, it errors rather than emit a corrupt member.
+struct HeaderSpliceWriter<W: Write> {
+    inner: W,
+    replacement: Vec<u8>,
+    /// Bytes of the minimal header consumed so far (0..=10).
+    seen: usize,
+}
+
+impl<W: Write> HeaderSpliceWriter<W> {
+    fn new(inner: W, replacement: Vec<u8>) -> Self {
+        Self {
+            inner,
+            replacement,
+            seen: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for HeaderSpliceWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.seen < T1_MINIMAL_GZIP_HEADER.len() {
+            let take = (T1_MINIMAL_GZIP_HEADER.len() - self.seen).min(buf.len());
+            if buf[..take] != T1_MINIMAL_GZIP_HEADER[self.seen..self.seen + take] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "T1 encoder did not emit the fixed minimal gzip header; \
+                     refusing to splice FNAME/MTIME over unknown bytes",
+                ));
+            }
+            if self.seen == 0 && take > 0 {
+                self.inner.write_all(&self.replacement)?;
+            }
+            self.seen += take;
+            if take == buf.len() {
+                return Ok(take);
+            }
+            let n = self.inner.write(&buf[take..])?;
+            return Ok(take + n);
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return compress_stdin(args);
@@ -209,17 +273,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         content_type,
     );
 
-    // Flag honesty, -C/--comment: run() already rejects -C on the stdout
-    // path. BOTH single-thread file routes below (`use_t1_mmap` and the
-    // T1 branch inside `compress_with_pipeline_sized`) write a fixed gzip
-    // header with no FCOMMENT field, so a comment would be silently
-    // DROPPED — refuse instead. The multi-thread file path stores it.
-    if args.comment.is_some() && opt_config.thread_count == 1 {
-        return Err(GzippyError::invalid_argument(
-            "-C/--comment is not stored by the single-threaded encoder; use -p 2 or more, or drop -C"
-                .to_string(),
-        ));
-    }
+    // -C/--comment: run() already rejects -C on the stdout path (minimal
+    // header there, deliberately — see the tie cage). Both single-thread
+    // FILE routes below splice the full FNAME/MTIME/FCOMMENT header via
+    // `HeaderSpliceWriter` (issue #309), so the comment IS stored at every
+    // thread count in file mode and the former -p1 refusal is gone.
 
     if args.verbosity >= 2 {
         eprintln!(
@@ -355,7 +413,12 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let mut out = BufWriter::with_capacity(1024 * 1024, stdout());
             encode(&mut out)
         } else {
-            let mut out = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+            // File output: gzip's contract stores FNAME + MTIME (issue #309).
+            // The graded `-c` output above is untouched.
+            let mut out = HeaderSpliceWriter::new(
+                BufWriter::new(File::create(output_path.as_ref().unwrap())?),
+                header_info.to_member_header(),
+            );
             encode(&mut out)
         }
     } else if args.stdout {
@@ -370,14 +433,29 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         )
     } else {
         let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-        crate::compress::compress_with_pipeline_sized(
-            input_file,
-            output_file,
-            args,
-            &opt_config,
-            &header_info,
-            Some(file_size as usize),
-        )
+        if opt_config.thread_count == 1 && !explicit_zopfli {
+            // The T1 branch inside `compress_with_pipeline_sized` writes the
+            // fixed minimal header; splice the full FNAME/MTIME header over
+            // it (issue #309). The zopfli and T>1 branches build their own
+            // full header from `header_info` and must NOT be wrapped.
+            crate::compress::compress_with_pipeline_sized(
+                input_file,
+                HeaderSpliceWriter::new(output_file, header_info.to_member_header()),
+                args,
+                &opt_config,
+                &header_info,
+                Some(file_size as usize),
+            )
+        } else {
+            crate::compress::compress_with_pipeline_sized(
+                input_file,
+                output_file,
+                args,
+                &opt_config,
+                &header_info,
+                Some(file_size as usize),
+            )
+        }
     };
 
     crate::set_output_file(None);

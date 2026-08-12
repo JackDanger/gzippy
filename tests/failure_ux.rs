@@ -210,6 +210,104 @@ fn decompress_restores_mode_and_mtime() {
     );
 }
 
+/// gzip contract (probed, GNU gzip 1.14, 2026-08-12): compressing a named
+/// FILE stores FNAME and MTIME in the gzip header — `gzip f` and `gzip -c f`
+/// both emit FLG=0x08 with the file's mtime; only stdin input omits FNAME.
+/// Issue #309: the -p1 file routes (mmap >128 KiB and streaming below it)
+/// wrote FLG=0x00/MTIME=0, so `gzip -l`/`gzip -dN` could not restore
+/// name/time from a -p1 archive while a -p4 archive worked. Pinned here on
+/// BOTH -p1 routes and the -p4 route by parsing the header bytes directly —
+/// no decoder fallback (the .gz file's own fs metadata) can fake a pass.
+#[test]
+fn file_output_header_stores_fname_and_mtime_on_p1_and_p4() {
+    // 64 KiB rides the T1 streaming route, 256 KiB the T1 mmap route
+    // (128 KiB threshold, pinned in t1_mmap_route.rs); 256 KiB at -p4 rides
+    // the parallel pipelined route.
+    for (threads, len) in [("1", 64 * 1024), ("1", 256 * 1024), ("4", 256 * 1024)] {
+        let what = format!("-p{threads}, {len} B");
+        let dir = tempdir();
+        let input = write_file(dir.path(), "meta.txt", &text_bytes(len));
+        set_mode_and_mtime(&input, FIXTURE_MODE, FIXTURE_MTIME);
+
+        let out = run(dir.path(), &["-p", threads, "-k", "meta.txt"]);
+        assert!(out.status.success(), "compress failed ({what}): {out:?}");
+        let gz = fs::read(dir.path().join("meta.txt.gz")).expect("read .gz");
+
+        assert_eq!(&gz[..3], &[0x1f, 0x8b, 0x08], "gzip magic/CM ({what})");
+        assert_eq!(
+            gz[3] & 0x08,
+            0x08,
+            "FLG.FNAME must be set on file output ({what})"
+        );
+        let hdr_mtime = u32::from_le_bytes([gz[4], gz[5], gz[6], gz[7]]);
+        assert_eq!(
+            u64::from(hdr_mtime),
+            FIXTURE_MTIME,
+            "header MTIME must be the input's mtime ({what})"
+        );
+        // No FEXTRA is ever set, so FNAME starts at byte 10.
+        let fname_end = 10
+            + gz[10..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL-terminated FNAME");
+        assert_eq!(
+            &gz[10..fname_end],
+            b"meta.txt",
+            "FNAME must be the input basename ({what})"
+        );
+    }
+}
+
+/// The restore leg of the pin above: rename the archive AND scrub its fs
+/// mtime, so `-d -N` can recover the original name and time ONLY from the
+/// header fields. (The older decompress_restores_mode_and_mtime test cannot
+/// distinguish header MTIME from the fs-mtime fallback that
+/// preserve_metadata copies onto the .gz.) Runs both -p1 and -p4 archives.
+#[test]
+fn decompress_dash_n_restores_name_and_mtime_from_header_alone() {
+    for threads in ["1", "4"] {
+        let dir = tempdir();
+        let payload = text_bytes(256 * 1024);
+        let input = write_file(dir.path(), "meta.txt", &payload);
+        set_mode_and_mtime(&input, FIXTURE_MODE, FIXTURE_MTIME);
+
+        let out = run(dir.path(), &["-p", threads, "meta.txt"]);
+        assert!(
+            out.status.success(),
+            "compress failed (-p{threads}): {out:?}"
+        );
+
+        // Break both filesystem fallbacks: the archive name no longer hints
+        // the original, and its fs mtime is wrong on purpose.
+        let moved = dir.path().join("opaque-blob.gz");
+        fs::rename(dir.path().join("meta.txt.gz"), &moved).expect("rename archive");
+        set_mode_and_mtime(&moved, 0o644, FIXTURE_MTIME + 86_400);
+
+        let out = run(dir.path(), &["-d", "-N", "opaque-blob.gz"]);
+        assert!(
+            out.status.success(),
+            "decompress failed (-p{threads}): {out:?}"
+        );
+
+        let restored = dir.path().join("meta.txt");
+        assert!(
+            restored.exists(),
+            "-dN must restore the header FNAME (-p{threads})"
+        );
+        assert_eq!(
+            fs::read(&restored).expect("read restored"),
+            payload,
+            "payload mismatch (-p{threads})"
+        );
+        assert_eq!(
+            mtime_secs(&restored),
+            FIXTURE_MTIME,
+            "-dN must restore the header MTIME, not the archive's fs mtime (-p{threads})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Input removal ordering
 // ---------------------------------------------------------------------------

@@ -115,16 +115,39 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     let gz = std::fs::read(dir.path().join("inplace.bin.gz")).expect("output file written");
     assert_eq!(roundtrip(&gz), data, "in-place mmap-route roundtrip");
 
-    // The -c flow over the same input must produce the same bytes (both are
-    // the same encoder behind the same route).
+    // The -c flow over the same input runs the same encoder behind the same
+    // route, so the compressed BODY must be identical. The headers differ by
+    // contract (issue #309): file output stores FNAME+MTIME the way gzip
+    // does, while -c keeps the minimal 10-byte header (what libdeflate-gzip
+    // emits on -c; every graded invocation is -c).
     let stdout_run = gzippy()
         .args(["-1", "-p1", "-c", path.to_str().unwrap()])
         .assert()
         .success();
+    let cgz = stdout_run.get_output().stdout.clone();
     assert_eq!(
-        gz,
-        stdout_run.get_output().stdout,
-        "in-place and -c outputs differ"
+        &cgz[..10],
+        &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
+    );
+    assert_eq!(
+        gz[3] & 0x08,
+        0x08,
+        "file output must set FLG.FNAME (issue #309)"
+    );
+    let fname_end = 10
+        + gz[10..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL-terminated FNAME");
+    assert_eq!(
+        &gz[10..fname_end],
+        b"inplace.bin",
+        "FNAME must be the input basename"
+    );
+    assert_eq!(
+        &gz[fname_end + 1..],
+        &cgz[10..],
+        "in-place and -c outputs must differ ONLY in the gzip header"
     );
 }
 

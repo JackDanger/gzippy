@@ -217,26 +217,7 @@ impl PipelinedGzEncoder {
         if self.minimal_gzip_header {
             return vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         }
-        let mut header = Vec::with_capacity(64);
-        let mut flags: u8 = 0x00;
-        if self.header_info.filename.is_some() {
-            flags |= 0x08;
-        }
-        if self.header_info.comment.is_some() {
-            flags |= 0x10;
-        }
-        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
-        header.extend_from_slice(&self.header_info.mtime.to_le_bytes());
-        header.extend_from_slice(&[0x00, 0xff]);
-        if let Some(ref name) = self.header_info.filename {
-            header.extend_from_slice(name.as_bytes());
-            header.push(0);
-        }
-        if let Some(ref comment) = self.header_info.comment {
-            header.extend_from_slice(comment.as_bytes());
-            header.push(0);
-        }
-        header
+        self.header_info.to_member_header()
     }
 
     /// Compress a pre-read buffer to a single-member gzip stream using the
