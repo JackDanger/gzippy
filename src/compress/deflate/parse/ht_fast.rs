@@ -148,6 +148,7 @@ pub(super) fn run(
             &mut header_scratch,
             &mut code_scratch,
             params.try_exact_huffman,
+            None,
         );
         return;
     }
@@ -234,6 +235,7 @@ pub(super) fn run(
             &mut header_scratch,
             &mut code_scratch,
             params.try_exact_huffman,
+            None,
         );
         if in_next >= in_end {
             return;

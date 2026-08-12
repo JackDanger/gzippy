@@ -43,10 +43,18 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // High-level sag on prose: L7 is the best level on `text`.
     ("text", 7), // L7 305775 -> L8 306342 (+567 B)
     ("text", 8), // L8 306342 -> L9 306755 (+413 B)
-    // Stored (L0) beats L1 on incompressible input: L0 emits the optimal
-    // 17-block stored grid (+0 B slack) while L1 pays issue #266's
-    // 32-block 65535+1 alternating grid (+75 B).
-    ("noise", 0), // L0 1048679 -> L1 1048754 (+75 B)
+    // ("noise", 0) HEALED by the issue #266 fix (stored-span coalescing in
+    // `parse::StoredCoalescer`): L1 now emits the same optimal 17-block
+    // stored grid as L0 (both 1048679 B). That fix exposed the successor
+    // sag below.
+    // L1's now-optimal 17-block stored grid beats L2-L9's 18 blocks: the
+    // greedy/lazy paths parse on the SOFT_MAX_BLOCK (300,000 B) grid and
+    // emit each block's stored payload uncoalesced (65535x4 + 37860 runt
+    // per parse block) — byte-identical to libdeflate's own L2-L9 grid
+    // (tie-cage cells), so healing it means deliberately breaking those
+    // ties in our favor by extending StoredCoalescer to greedy/lazy — a
+    // separate, tie-guard-adjudicated lever, not part of the #266 fix.
+    ("noise", 1), // L1 1048679 -> L2 1048684 (+5 B)
 ];
 
 /// Optimal stored framing for an n-byte input: gzip header (10) + trailer (8)
@@ -57,20 +65,19 @@ fn optimal_stored_framing(n: usize) -> usize {
 }
 
 /// Measured maximum slack over the optimal stored bound, T1, levels 0-9, on
-/// the 1 MiB `noise` fixture. The 75 B maximum is at L1 and is issue #266:
-/// the stored-block emitter there uses a 65535+1-byte alternating grid,
-/// emitting 32 blocks where libdeflate emits the optimal 17 — 15 extra
-/// 5-byte headers. (L0 is exactly optimal at 0 B; L2-L9 sit at 5 B, one
-/// extra block header.) When #266 is fixed this const ratchets DOWN — the
-/// tightening guard in `assert_noise_bounded` fails if the worst measured
-/// level ever passes with margin below the pin, so a loose pin cannot linger.
-const T1_MAX_SLACK: usize = 75;
+/// the 1 MiB `noise` fixture. With issue #266 fixed (stored-span coalescing:
+/// L0/L1 now emit the optimal 17-block maximal grid, 0 B slack) the worst
+/// level is L2-L9's 5 B — one extra block header from the SOFT_MAX_BLOCK
+/// (300,000 B) parse grid, whose 300000-mod-65535 runt sub-blocks libdeflate
+/// shares. This const ratchets DOWN — the tightening guard in
+/// `assert_noise_bounded` fails if the worst measured level ever passes with
+/// margin below the pin, so a loose pin cannot linger.
+const T1_MAX_SLACK: usize = 5;
 
 /// Same bound at T4 (parallel path): each chunk seam adds framing, so the
-/// slack is measured separately — 90 B max at L1 (issue #266's 75 B plus
-/// seam framing), 20 B at L2-L9, 0 B at L0. Ratchets down like
-/// [`T1_MAX_SLACK`].
-const T4_MAX_SLACK: usize = 75;
+/// slack is measured separately. With #266 fixed the in-process pipeline's
+/// worst level also sits at 5 B. Ratchets down like [`T1_MAX_SLACK`].
+const T4_MAX_SLACK: usize = 5;
 
 /// Compress in-process at T1 through the production whole-buffer entry point.
 fn compress_t1(data: &[u8], level: u32) -> Vec<u8> {

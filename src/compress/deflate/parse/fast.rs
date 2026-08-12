@@ -55,7 +55,7 @@ use super::super::tables::{
     OFFSET_EXTRA_BITS,
 };
 use super::NUM_LITERALS;
-use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes};
+use super::{bsr32, emit_block, emit_block_static_or_stored, Sink, StaticCodes, StoredCoalescer};
 
 /// Per-`run()`-call local accumulator for the fast-path anatomy counters
 /// (`anatomy-counters` feature only; see `anatomy_counters.rs`'s `fast_*` doc
@@ -2988,6 +2988,12 @@ pub(super) fn run<const ACCEL: bool>(
 
     // Per-block accumulator: tokens + litlen/offset histograms built as-you-go.
     let mut sink = Sink::acquire();
+    // Consecutive stored-choosing blocks coalesce into one maximal 65,535-byte
+    // sub-block grid instead of a per-parse-block 65535+1 alternation — see
+    // `StoredCoalescer` (issue #266). Flushed by any Huffman block, by the
+    // BFINAL stored block, and unconditionally after the loop (non-final
+    // streaming chunks end without BFINAL).
+    let mut pending_stored = StoredCoalescer::default();
     // One dynamic-header scratch buffer for the WHOLE `run()` call (see
     // `greedy.rs`'s sibling declaration / `HeaderScratch`'s doc comment).
     let mut header_scratch = HeaderScratch::new();
@@ -3092,9 +3098,18 @@ pub(super) fn run<const ACCEL: bool>(
                     &mut header_scratch,
                     &mut code_scratch,
                     false,
+                    Some(&mut pending_stored),
                 );
             } else {
-                emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+                emit_block_static_or_stored(
+                    bw,
+                    buf,
+                    block_begin,
+                    &sink,
+                    statics,
+                    is_final,
+                    Some(&mut pending_stored),
+                );
             }
             let literal_count: u32 = sink.litlen_freqs[..NUM_LITERALS].iter().sum();
             let match_count: u32 = sink.litlen_freqs[DEFLATE_FIRST_LEN_SYM..].iter().sum();
@@ -3293,12 +3308,21 @@ pub(super) fn run<const ACCEL: bool>(
                 &mut header_scratch,
                 &mut code_scratch,
                 false,
+                Some(&mut pending_stored),
             );
         } else {
             // L0: cheapest of static / stored only — no per-block dynamic
             // Huffman build (see `emit_block_static_or_stored`'s doc comment
             // for why this is the L0-vs-L1 cost/ratio trade).
-            emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+            emit_block_static_or_stored(
+                bw,
+                buf,
+                block_begin,
+                &sink,
+                statics,
+                is_final,
+                Some(&mut pending_stored),
+            );
         }
 
         // HASH3-GATE composition lever: decide the gate for the NEXT block
@@ -3363,6 +3387,12 @@ pub(super) fn run<const ACCEL: bool>(
         }
     }
 
+    // A non-final call (`!is_last`) can end with its last block(s) still
+    // pending in the coalescer (the BFINAL path flushed inside the emit).
+    // The caller writes to `bw` next (e.g. a sync-flush marker), so the span
+    // must be on the wire before returning. No-op when empty.
+    pending_stored.flush(bw, buf, false);
+
     // Return the head table(s) to this thread's pool for the next `run()`
     // call (see `acquire_head_table`'s doc comment). `head3` is only
     // released when it was actually acquired (mirrors the condition at its
@@ -3408,6 +3438,12 @@ pub(in crate::compress::deflate) struct FastResume {
     /// One-block-lag COST-GATE arm, carried like `hash3_active_next`.
     cost_gate_active_next: bool,
     cost_gate_seeded: bool,
+    /// The stored-span coalescer's <= 65,535-byte pending remainder, carried
+    /// ACROSS refill seams so streamed L1 keeps the whole-buffer stored grid
+    /// (issue #266 fix; see [`StoredCoalescer`]). [`run_resumable`]'s
+    /// `in_base` accounting keeps the remainder's bytes alive through the
+    /// caller's slide, and [`Self::rebase`] moves it with them.
+    stored_pending: StoredCoalescer,
 }
 
 impl FastResume {
@@ -3425,6 +3461,7 @@ impl FastResume {
             peek_active_next: !LAZY_PEEK_GATED || LAZY_PEEK_GATE_INITIAL_ACTIVE,
             cost_gate_active_next: false,
             cost_gate_seeded: false,
+            stored_pending: StoredCoalescer::default(),
         }
     }
 
@@ -3443,6 +3480,10 @@ impl FastResume {
     /// `NO_POS` reject through the same branch.
     pub(super) fn rebase(&mut self, shift: usize) {
         debug_assert!(shift <= u32::MAX as usize);
+        // The pending stored remainder moves with its bytes. `run_resumable`
+        // lowered `in_base` to cover it, so `max_shift` cannot have discarded
+        // it (asserted inside).
+        self.stored_pending.rebase(shift);
         let s = shift as u32;
         for e in self
             .head
@@ -3627,6 +3668,12 @@ pub(super) fn run_resumable(
 
         sink.block_length = pos - block_begin;
         let is_final = role.is_final() && pos == in_end;
+        // The coalescer is CARRIED in `fr` (unlike [`run`]'s per-call local):
+        // its <= 65,535-byte remainder survives refill seams, so streamed L1
+        // emits exactly the whole-buffer stored grid (the invariant
+        // `tests/streaming_identity.rs` pins). A Bounded call never reaches
+        // `in_end` (the lookahead break fires first), so BFINAL is always
+        // decided by a Drain-call block, exactly as in a whole-buffer run.
         if use_dynamic {
             emit_block(
                 bw,
@@ -3638,9 +3685,18 @@ pub(super) fn run_resumable(
                 &mut header_scratch,
                 &mut code_scratch,
                 false,
+                Some(&mut fr.stored_pending),
             );
         } else {
-            emit_block_static_or_stored(bw, buf, block_begin, &sink, statics, is_final);
+            emit_block_static_or_stored(
+                bw,
+                buf,
+                block_begin,
+                &sink,
+                statics,
+                is_final,
+                Some(&mut fr.stored_pending),
+            );
         }
 
         // One-block-lag gate recompute, identical to [`run`]'s chainless arm —
@@ -3669,13 +3725,23 @@ pub(super) fn run_resumable(
         }
     }
 
-    // Keep `ParseState`'s slide invariant (`in_base` a multiple of the window
-    // with `in_next - in_base` in `0..WINDOW`): the fast tables store
-    // absolute positions, so `in_base` is not consulted during the parse —
-    // it exists purely to drive the caller's `max_shift`/`shift_down`
-    // arithmetic, which slides the buffer in whole-window steps and then
-    // rebases the tables (see [`FastResume::rebase`]).
-    state.in_base = pos & !(WINDOW - 1);
+    // `in_base` drives the caller's `max_shift`/`shift_down` arithmetic (the
+    // fast tables store absolute positions, so it is not consulted during
+    // the parse; slides stay whole-window steps and then rebase the tables —
+    // see [`FastResume::rebase`]). Normally it tracks `pos`; when a stored
+    // remainder is pending (<= 65,535 bytes ending at `pos`, see
+    // `StoredCoalescer`), it is lowered to cover the remainder's first byte
+    // so `max_shift` (which keeps one full window behind `in_base`) cannot
+    // slide the remainder's not-yet-emitted bytes out of the buffer. That
+    // widens `in_next - in_base` to at most ~3 windows on all-stored input —
+    // well inside the streaming buffer's slack — and only for the fast path,
+    // whose tables never index relative to `in_base`.
+    let retain_from = if fr.stored_pending.is_pending() {
+        fr.stored_pending.pending_start().min(pos)
+    } else {
+        pos
+    };
+    state.in_base = retain_from & !(WINDOW - 1);
 
     // One flush per call — see `FastLocalCounters`'s doc comment.
     #[cfg(feature = "anatomy-counters")]

@@ -633,7 +633,7 @@ noise	1	bitstream_flush_word_calls	0
 noise	1	block_split_observations	0
 noise	1	blocks_emitted_dynamic	0
 noise	1	blocks_emitted_fixed	0
-noise	1	blocks_emitted_stored	32
+noise	1	blocks_emitted_stored	17
 noise	1	bt_child_table_reads	0
 noise	1	bt_child_table_writes	0
 noise	1	bt_hash_computations	0
