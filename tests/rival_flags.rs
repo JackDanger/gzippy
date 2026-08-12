@@ -64,7 +64,7 @@
 //! | pigz -H/--huffman         | REJECTED in compress mode, exit 2 (was: silent no-op advertised in --help) | clean-reject |
 //! | pigz -U/--rle             | REJECTED in compress mode, exit 2 (was: silent no-op advertised in --help) | clean-reject |
 //! | pigz -i/--independent     | REJECTED in compress mode, exit 2 (was: silent no-op, no independence guarantee) | clean-reject |
-//! | pigz -C/--comment ccc     | honoured on the multi-thread file path; REJECTED (never dropped) on the -c/stdout path (exit 2) and on the single-thread file path (exit 1) | ok/clean-reject |
+//! | pigz -C/--comment ccc     | honoured on the FILE path at every thread count (issue #309 gave T1 the full header); REJECTED (never dropped) on the -c/stdout path (exit 2, minimal header there by design) | ok/clean-reject |
 //! | pigz -A/--alias xxx       | REJECTED in compress mode, exit 2, names issue #303 (was: silently ignored) | clean-reject |
 //! | pigz -F/--first           | collides: our -F takes a VALUE (zopfli iterations); consumes the next argv | misparse-but-errs MED |
 //! | pigz -I/--iterations n    | collides: our -I is a flag (no-block-split); n becomes a FILE operand | misparse-but-errs MED |
@@ -477,59 +477,45 @@ fn pigz_alias_flag_rejected_loudly() {
 #[test]
 fn pigz_comment_stored_in_file_mode() {
     // pigz(1) -C ccc / --comment ccc: "Put comment ccc in the gzip or zip
-    // header". SUPPORTED on the multi-thread file path: FLG.FCOMMENT (0x10)
-    // set and the NUL-terminated comment present. (-p 4 pins the route: the
-    // single-thread encoder writes a fixed header and -C is REJECTED there —
-    // see pigz_comment_rejected_where_it_would_be_dropped.)
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(4096));
-    let out = run(d.path(), &["-p", "4", "-C", "hello", "-k", "in.txt"]);
-    assert!(
-        out.status.success(),
-        "file-mode -C failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let gz = fs::read(d.path().join("in.txt.gz")).expect("in.txt.gz written");
-    assert_eq!(&gz[..2], &[0x1f, 0x8b]);
-    assert_ne!(
-        gz[3] & 0x10,
-        0,
-        "FLG.FCOMMENT must be set by -C in file mode"
-    );
-    assert!(
-        gz.windows(6).any(|w| w == b"hello\0"),
-        "NUL-terminated comment must be present in the header"
-    );
+    // header". SUPPORTED on the FILE path at EVERY thread count:
+    // FLG.FCOMMENT (0x10) set and the NUL-terminated comment present.
+    // (-p 1 used to REJECT here — the T1 encoders wrote a fixed header with
+    // no FCOMMENT field — until issue #309 gave the T1 file dispatch the
+    // same full header the T>1 path writes.)
+    for threads in ["1", "4"] {
+        let d = tempdir();
+        write_file(d.path(), "in.txt", &synth(4096));
+        let out = run(d.path(), &["-p", threads, "-C", "hello", "-k", "in.txt"]);
+        assert!(
+            out.status.success(),
+            "file-mode -C -p{threads} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let gz = fs::read(d.path().join("in.txt.gz")).expect("in.txt.gz written");
+        assert_eq!(&gz[..2], &[0x1f, 0x8b]);
+        assert_ne!(
+            gz[3] & 0x10,
+            0,
+            "FLG.FCOMMENT must be set by -C in file mode (-p{threads})"
+        );
+        assert!(
+            gz.windows(6).any(|w| w == b"hello\0"),
+            "NUL-terminated comment must be present in the header (-p{threads})"
+        );
+    }
 }
 
 #[test]
 fn pigz_comment_rejected_where_it_would_be_dropped() {
-    // MITIGATED: the SAME -C flag that works on the multi-thread file path
-    // used to be silently DROPPED on the -c/stdout path (minimal header) and
-    // on the single-thread file path (fixed header, no FCOMMENT field).
-    // pigz stores the comment everywhere. Until gzippy does too, every
-    // route that cannot store it must refuse, never drop:
-    //   * stdout path: exit 2, up-front honesty rejection;
-    //   * -p1 file path: per-file error (exit 1), dispatch-level guard.
+    // MITIGATED: the -c/stdout path writes the minimal 10-byte header BY
+    // DESIGN (it is what libdeflate-gzip emits on -c, and every graded
+    // board/tie-guard invocation is `-c`), so a comment there would be
+    // silently DROPPED. pigz stores the comment everywhere; until the
+    // stdout path grows a header, it must refuse, never drop: exit 2,
+    // up-front honesty rejection. (The single-thread FILE path used to be
+    // the second reject leg here; issue #309 made it STORE the comment —
+    // pinned in pigz_comment_stored_in_file_mode.)
     assert_honesty_reject(&["-C", "hello", "-c"], &["-C", "--comment"]);
-
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(4096));
-    let p1 = run(d.path(), &["-p", "1", "-C", "hello", "-k", "in.txt"]);
-    assert!(
-        !p1.status.success(),
-        "-C on the single-thread file path must refuse (its header has no \
-         FCOMMENT field), not silently drop the comment"
-    );
-    let stderr = String::from_utf8_lossy(&p1.stderr);
-    assert!(
-        stderr.contains("-C"),
-        "-p1 -C refusal must name the flag; got: {stderr}"
-    );
-    assert!(
-        !d.path().join("in.txt.gz").exists(),
-        "-p1 -C must not leave a comment-less output file behind"
-    );
 }
 
 #[test]
@@ -691,9 +677,21 @@ fn igzip_level_zero_stores_with_loud_warning() {
 
     let quiet = run(d.path(), &["-0", "-q", "-c", "in.txt"]);
     assert!(quiet.status.success());
+    // The anatomy instrument builds (`--features anatomy-counters` /
+    // `anatomy-wall`) UNCONDITIONALLY print their counter dump to stderr at
+    // exit (main.rs `flush_to_stderr`) — that is the instrument's output
+    // channel, not a user-facing warning, and -q must not silence an
+    // instrument. Assert "no user-facing stderr" rather than "empty stderr":
+    // instrument lines are ANATOMY_*-prefixed (reconcile-failure detail
+    // lines are indented continuations).
+    let user_stderr: Vec<&str> = std::str::from_utf8(&quiet.stderr)
+        .expect("stderr utf8")
+        .lines()
+        .filter(|l| !l.starts_with("ANATOMY_") && !l.starts_with("  "))
+        .collect();
     assert!(
-        quiet.stderr.is_empty(),
-        "-q must suppress the -0 divergence warning"
+        user_stderr.is_empty(),
+        "-q must suppress the -0 divergence warning; got: {user_stderr:?}"
     );
 }
 
