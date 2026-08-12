@@ -103,7 +103,7 @@ binary	9	huffman_tree_nodes_visited	0	37844
 binary	9	literals_emitted	574565	1720806
 binary	9	match_length_bytes_total	474011	1424922
 binary	9	matches_emitted	25270	75245
-noise	1	blocks_emitted_stored	32	32
+noise	1	blocks_emitted_stored	17	18
 noise	1	fast_hash_computations	1050269	1148497
 noise	1	fast_head_table_reads	1048607	1048580
 noise	1	fast_head_table_writes	1048573	1146868
