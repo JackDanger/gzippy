@@ -105,6 +105,32 @@ pub struct LevelParams {
     /// T>1-only: hash inserts per accepted match interior (vendor shifts the
     /// full bucket every skipped byte; default L1 is 3).
     pub fast_hash_update_inserts: usize,
+    /// **T1-ONLY (L1): MATCH REACH.** Selects the `REACH == true`
+    /// monomorphization of `parse::fast`'s L1 fastloop, which shifts the whole
+    /// 2-way bucket on every match-interior insert the way the vendor's
+    /// `ht_matchfinder_skip_bytes` does. Paired with
+    /// [`Self::fast_hash_update_inserts`] `== usize::MAX`; the two are one
+    /// lever and are set together by [`apply_l1_match_reach_t1_knobs`], whose
+    /// doc comment holds the whole measurement.
+    ///
+    /// `false` at T>1 BY CONSTRUCTION, and the reason is the WALL BUDGET, not
+    /// byte-identity — the same shape as [`Self::try_exact_huffman`] with the
+    /// thread counts swapped. Scoped adjudication of the unscoped lever
+    /// (solvency, `try-l1-reach/try.json`, 208 in-scope cells) closed all four
+    /// record-file size cells and then failed clause 3 on ONE cell:
+    /// `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail, cross-layout CONFIRMED
+    /// REAL at median ln +0.1186. That is a T4 cell, in the thin-margin
+    /// pigz-at-T4 class that also convicted #310, and the dense insert's
+    /// maintenance cost lands hardest exactly where pigz's margin is thinnest.
+    /// The two cells the lever closes at T1 —
+    /// `libdeflate:{access.log,ecoli.fastq}:L1:T1:size` — do not need T>1 to
+    /// move at all, so T>1 is left as `main`: the T4 wall cell cannot flip
+    /// because its BYTES cannot change.
+    ///
+    /// Revival of the T>1 half is the wall-budget-scoped density (insert-all
+    /// only while the block's measured cost stays inside the level's budget),
+    /// i.e. the cost-model direction — NOT a second constant here.
+    pub fast_dense_interior_insert: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -135,11 +161,54 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
-    // MATCH REACH (2026-08-13). `usize::MAX` = index EVERY position of an
-    // accepted match's interior, which is what the vendor does; the previous
-    // `8` is igzip's LIMIT_HASH_UPDATE, which indexes a short prefix and jumps
-    // the cursor over the rest.
-    //
+    // igzip's LIMIT_HASH_UPDATE (`vendor/isa-l/igzip/igzip_base.c:71-86`):
+    // index a short prefix of an accepted match's interior, then jump the
+    // cursor over the rest. T>1 KEEPS THIS; T1 replaces it — see
+    // [`apply_l1_match_reach_t1_knobs`].
+    p.fast_hash_update_inserts = 8;
+    p.fast_lazy_peek_cost_gate = true;
+    p.fast_lazy_peek_cost_margin_bits = 0;
+}
+
+/// **T1-ONLY (L1): MATCH REACH.** Index EVERY position of an accepted match's
+/// interior (`usize::MAX`) and shift the whole 2-way bucket while doing it —
+/// what the vendor does. Applied by [`params_baseline`] only; `params_parallel`
+/// stops at [`apply_l1_fast_parallel_knobs`] above, so T>1 keeps igzip's `8`
+/// and its output is byte-for-byte `main`'s.
+///
+/// # Why T1 only — the coordinate, stated separately from the mechanism
+///
+/// The mechanism below is INTRINSIC and holds at every thread count. The
+/// SCOPE is a coordinate-dependent verdict and holds only where it was
+/// measured. The unscoped lever (PR #319) was adjudicated on solvency
+/// (`try-l1-reach/try.json`, scoped `levels=1`, 208 in-scope cells graded):
+/// clause 4 closed ALL FOUR record-file cells,
+/// `libdeflate:{access.log,ecoli.fastq}:L1:{T1,T4}:size`, and clause 3 then
+/// failed on ONE cell — `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail,
+/// cross-layout CONFIRMED REAL, median ln +0.1186 (6-10x the layout floor).
+/// Clause 3 is absolute, so the whole lever was NO-SHIP.
+///
+/// Every cell in that flip is at T>1, and the T1 half of the win needs
+/// nothing from T>1. Gating here keeps `libdeflate:access.log:L1:T1:size` and
+/// `libdeflate:ecoli.fastq:L1:T1:size` closing while leaving the T4 bitstream
+/// IDENTICAL — so `pigz:ecoli.fastq:L1:T4:wall` cannot flip BY CONSTRUCTION,
+/// not by a re-measurement that might come back differently. This is the
+/// #310 pattern inverted: #310 kept T1 and paid at T4; here the margin is at
+/// T4, so T4 is what we keep.
+///
+/// The Ir cost lands on the T1 side and is real, not free: trainer
+/// (i7-13700T) cachegrind `-p1`, L1, frozen fixtures — text +7.93%, tabular
+/// +12.23%, binary +8.01%, noise +1.80%. L6/L9 are untouched to the
+/// instruction. It buys 23/23 tune files smaller at L1/T1 and a cliff that
+/// goes from 3.4467x libdeflate to 0.9950x.
+///
+/// The T>1 half is NOT abandoned and NOT falsified — it is parked on a
+/// different mechanism: density scoped by the block's measured wall budget
+/// (the cost-model direction), where no constant decides and the data does.
+/// Do not revive it by flipping this flag on in `params_parallel`.
+///
+/// # The mechanism (intrinsic; holds at every thread count)
+fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
     // THE VENDOR DIFFERENCE. `vendor/libdeflate/lib/ht_matchfinder.h:196`
     // (`ht_matchfinder_skip_bytes`) is called with `count = length - 1` after
     // every accepted match and inserts all of them — libdeflate's L1 table is
@@ -180,8 +249,12 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     // expensive symbol there is. Only stride 1, i.e. this line, closes the
     // class, so the stride parameter was deleted rather than shipped at 1.
     p.fast_hash_update_inserts = usize::MAX;
-    p.fast_lazy_peek_cost_gate = true;
-    p.fast_lazy_peek_cost_margin_bits = 0;
+    // The dense insert ALONE is worse, not better: `markup.xml` L1/T1 goes
+    // WIN -> LOSS (+21,920 B) with `usize::MAX` and no bucket shift, because a
+    // slot-0-only interior insert evicts good anchors with no second chance.
+    // COMPOSITION IS REQUIRED — the two lines below and above are one lever,
+    // and the flag is what selects `parse::fast`'s `REACH == true` fastloop.
+    p.fast_dense_interior_insert = true;
 }
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
@@ -213,6 +286,9 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     ladder_tune::apply(&mut p);
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
+        // T1 ONLY. `params_parallel` deliberately does NOT call this — see its
+        // doc comment for the adjudicated T4 wall cell that is the reason.
+        apply_l1_match_reach_t1_knobs(&mut p);
     }
     p
 }
@@ -430,6 +506,17 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // L1 AT T>1: enable the 2-way bucket inside `parse::fast` (search-only lever
     // (b) from the L1-band mission brief, gated to short accepts). Keeps lazy
     // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
+    //
+    // ⚠ AND NOTHING MORE. `apply_l1_match_reach_t1_knobs` — the dense
+    // match-interior insert + bucket shift — is called by `params_baseline`
+    // (T1) and DELIBERATELY NOT HERE, so L1 T>1 keeps igzip's
+    // `fast_hash_update_inserts = 8`, keeps `fast_dense_interior_insert =
+    // false`, and emits byte-for-byte what `main` emits. Reason, adjudicated
+    // on solvency: the unscoped lever flipped `pigz:ecoli.fastq:L1:T4:wall`
+    // pass -> fail, cross-layout CONFIRMED REAL (median ln +0.1186), which is
+    // clause 3 and therefore absolute. Read
+    // `apply_l1_match_reach_t1_knobs`'s doc comment before adding a line
+    // here; the T>1 revival is the wall-budget-scoped density, NOT this flag.
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
     }
@@ -534,6 +621,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast0,
@@ -554,6 +642,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast,
@@ -569,6 +658,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -637,6 +727,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -664,6 +755,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -679,6 +771,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -694,6 +787,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -709,6 +803,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -724,6 +819,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -739,6 +835,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -756,6 +853,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -776,6 +874,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -796,6 +895,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
