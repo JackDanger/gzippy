@@ -1605,6 +1605,73 @@ fn hash3_better(cur_len: u32, cur_dist: usize, next_len: u32, next_dist: usize) 
         > 2
 }
 
+/// BATCHED interior SHIFT-insert over positions `[from, to)` of the
+/// interleaved 2-slot L1 bucket table — the maintenance kernel behind vendor
+/// `ht_matchfinder_skip_bytes` semantics (insert EVERY match-interior byte,
+/// shifting slot 0 into slot 1 on each write).
+///
+/// The batching is the wall lever (igzip precedent:
+/// `igzip_deflate_hash.asm`'s `isal_deflate_hash_crc_01` processes FOUR
+/// positions per iteration with pipelined hashes). A match interior is
+/// embarrassingly batchable: every position and its hash input are known up
+/// front, and nothing in this span probes the table — so the four loads and
+/// four `lz_hash` multiplies below form four INDEPENDENT dependency chains
+/// the core can pipeline, instead of the naive loop's
+/// load->hash->address->store per-byte round trip. The bucket STORES then
+/// run strictly in position order: two lanes may alias the same bucket, and
+/// slot 1 must end holding the second-newest occurrence, which the scalar
+/// order guarantees (each lane's slot-0 read happens after all earlier
+/// lanes' stores in program order — byte-identical bucket contents to the
+/// one-position loop, by construction).
+///
+/// # Safety
+/// Caller must uphold `to <= in_end` with `buf`'s `BUF_PAD` covering a
+/// 4-byte load at every `p < to`, and `head.len() == L1_HEAD_ENTRIES`
+/// (`lz_hash` output `< HASH_SIZE`, so `2h + 1` is in bounds).
+#[inline(always)]
+fn interior_shift_insert_batch(base: *const u8, head: &mut [u32], from: usize, to: usize) {
+    let hp = head.as_mut_ptr();
+    let mut nh = from;
+    // SAFETY (whole function): per the doc comment — every `load_u32` is at
+    // a position `< to <= in_end` (pad covers the 4-byte read), and every
+    // bucket pointer is `hp + 2h` with `h < HASH_SIZE`.
+    while nh + 4 <= to {
+        unsafe {
+            // Four independent load+hash chains, no table access between
+            // them — the pipelined phase.
+            let s0 = load_u32(base, nh);
+            let s1 = load_u32(base, nh + 1);
+            let s2 = load_u32(base, nh + 2);
+            let s3 = load_u32(base, nh + 3);
+            let b0 = hp.add((lz_hash(s0, HASH_BITS) as usize) << 1);
+            let b1 = hp.add((lz_hash(s1, HASH_BITS) as usize) << 1);
+            let b2 = hp.add((lz_hash(s2, HASH_BITS) as usize) << 1);
+            let b3 = hp.add((lz_hash(s3, HASH_BITS) as usize) << 1);
+            // Shift-insert stores, position order (see the doc comment's
+            // aliasing argument).
+            *b0.add(1) = *b0;
+            *b0 = nh as u32;
+            *b1.add(1) = *b1;
+            *b1 = (nh + 1) as u32;
+            *b2.add(1) = *b2;
+            *b2 = (nh + 2) as u32;
+            *b3.add(1) = *b3;
+            *b3 = (nh + 3) as u32;
+        }
+        nh += 4;
+    }
+    // Remainder (< 4 positions): the naive one-position kernel.
+    while nh < to {
+        unsafe {
+            let s = load_u32(base, nh);
+            let b = hp.add((lz_hash(s, HASH_BITS) as usize) << 1);
+            *b.add(1) = *b;
+            *b = nh as u32;
+        }
+        nh += 1;
+    }
+}
+
 /// Process ONE L1 position given its hash `h` and an ALREADY-LOADED candidate
 /// `cand` (the caller is responsible for having read `head[h]` — this
 /// function never re-reads it, only writes the insert). Returns the new
@@ -1973,26 +2040,16 @@ fn process_position_l1(
         } else {
             (pos + 1 + limit_hash_update_inserts).min(match_end)
         };
-        let mut nh = pos + 1;
-        while nh < insert_end {
-            // SAFETY: nh < match_end = pos+length <= in_end, and
-            // buf's pad covers the 4-byte load past in_end.
-            let s = unsafe { load_u32(base, nh) };
-            // Interior SHIFT-insert, same 2-slot protocol as the probe
-            // position above (`slot1 <- slot0; slot0 <- nh`) — the second
-            // maintenance defect this lever fixes: overwriting slot 0
-            // WITHOUT the shift left slot 1 holding stale generations
-            // instead of the second-newest occurrence. One cache line per
-            // bucket, so the shift is a same-line read+2 stores.
-            // SAFETY: `lz_hash` output `< HASH_SIZE`, so `2h + 1 <
-            // L1_HEAD_ENTRIES == head.len()`, as above.
-            unsafe {
-                let b = head.as_mut_ptr().add((lz_hash(s, HASH_BITS) as usize) << 1);
-                *b.add(1) = *b;
-                *b = nh as u32;
-            }
-            nh += 1;
-        }
+        // Interior SHIFT-insert, same 2-slot protocol as the probe position
+        // above (`slot1 <- slot0; slot0 <- nh`) — the second maintenance
+        // defect the interleaved-bucket lever fixed: overwriting slot 0
+        // WITHOUT the shift left slot 1 holding stale generations instead of
+        // the second-newest occurrence. BATCHED 4 positions per iteration
+        // (see [`interior_shift_insert_batch`]); bucket contents are
+        // byte-identical to the one-position loop by construction.
+        // SAFETY-CONTRACT: `insert_end <= match_end <= in_end` (pad covers
+        // the 4-byte loads), `head.len() == L1_HEAD_ENTRIES`.
+        interior_shift_insert_batch(base, head, pos + 1, insert_end);
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
         // insert policy: only under `hash3.insert_always` — under the sparse
         // policy, a match's interior positions never enter `head3`, matching
@@ -2210,22 +2267,11 @@ fn process_position_l1_lean(
         } else {
             (pos + 1 + limit_hash_update_inserts).min(match_end)
         };
-        let mut nh = pos + 1;
-        while nh < insert_end {
-            // SAFETY: nh < match_end = pos+length <= in_end, and
-            // buf's pad covers the 4-byte load past in_end.
-            let s = unsafe { load_u32(base, nh) };
-            // Interior SHIFT-insert — same protocol as
-            // [`process_position_l1`]'s interior loop (see the comment
-            // there). SAFETY: `lz_hash` output `< HASH_SIZE`, so `2h + 1 <
-            // L1_HEAD_ENTRIES == head.len()`, as above.
-            unsafe {
-                let b = head.as_mut_ptr().add((lz_hash(s, HASH_BITS) as usize) << 1);
-                *b.add(1) = *b;
-                *b = nh as u32;
-            }
-            nh += 1;
-        }
+        // Interior SHIFT-insert — same protocol and same BATCHED kernel as
+        // [`process_position_l1`]'s interior loop (see the comments there).
+        // SAFETY-CONTRACT: `insert_end <= match_end <= in_end` (pad covers
+        // the 4-byte loads), `head.len() == L1_HEAD_ENTRIES`.
+        interior_shift_insert_batch(base, head, pos + 1, insert_end);
         // No HASH3-PROBE interior insert here (see this function's doc
         // comment) — `head3` does not exist in this function at all.
         #[cfg(feature = "anatomy-counters")]
@@ -2917,31 +2963,38 @@ fn parse_tail<const ACCEL: bool>(
                     } else {
                         (pos + 1 + limit_hash_update_inserts).min(match_end)
                     };
-                    let mut nh = pos + 1;
-                    while nh < insert_end {
-                        // SAFETY: nh < match_end = pos+length <= in_end, and
-                        // buf's pad covers the 4-byte load past in_end.
-                        let s = unsafe { load_u32(base, nh) };
-                        let hh = lz_hash(s, HASH_BITS) as usize;
-                        if !ACCEL {
-                            // Interior SHIFT-insert (see `process_position_l1`).
-                            // SAFETY: `2*hh + 1 < 2*HASH_SIZE == head.len()`,
-                            // as above.
-                            unsafe {
-                                *head.get_unchecked_mut((hh << 1) + 1) =
-                                    *head.get_unchecked(hh << 1);
-                                *head.get_unchecked_mut(hh << 1) = nh as u32;
-                            }
-                        } else {
-                            // SAFETY: `hh < HASH_SIZE == head.len()`, as above.
-                            unsafe { *head.get_unchecked_mut(hh) = nh as u32 };
-                        }
+                    if !ACCEL {
+                        // Interior SHIFT-insert via the BATCHED kernel —
+                        // same protocol and same code as the fastloop's
+                        // interior (see [`interior_shift_insert_batch`]).
+                        // SAFETY-CONTRACT: `insert_end <= match_end <=
+                        // in_end` (pad covers the 4-byte loads),
+                        // `head.len() == L1_HEAD_ENTRIES`.
+                        interior_shift_insert_batch(base, head, pos + 1, insert_end);
                         #[cfg(feature = "anatomy-counters")]
                         {
-                            local.hash_computations += 1;
-                            local.interior_writes += 1;
+                            let interior = (insert_end - (pos + 1)) as u64;
+                            local.hash_computations += interior;
+                            local.interior_writes += interior;
                         }
-                        nh += 1;
+                    } else {
+                        let mut nh = pos + 1;
+                        while nh < insert_end {
+                            // SAFETY: nh < match_end = pos+length <= in_end,
+                            // and buf's pad covers the 4-byte load past
+                            // in_end.
+                            let s = unsafe { load_u32(base, nh) };
+                            let hh = lz_hash(s, HASH_BITS) as usize;
+                            // SAFETY: `hh < HASH_SIZE == head.len()`, as
+                            // above.
+                            unsafe { *head.get_unchecked_mut(hh) = nh as u32 };
+                            #[cfg(feature = "anatomy-counters")]
+                            {
+                                local.hash_computations += 1;
+                                local.interior_writes += 1;
+                            }
+                            nh += 1;
+                        }
                     }
 
                     sink.push_match_fast(length, dist as u32);
