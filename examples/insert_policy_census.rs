@@ -39,6 +39,12 @@ struct Row {
     keyed: [u64; THRESHOLDS.len()],
     /// Input bytes inside a match of length >= THRESHOLDS[i].
     cov: [u64; THRESHOLDS.len()],
+    /// ORACLE FLOOR: distinct interior positions that a later match actually
+    /// used as its source. An adaptive/deferred policy that indexed only the
+    /// interiors that pay off could not go below this and still emit this
+    /// stream; the gap between it and `dense` is the waste any such policy is
+    /// competing for.
+    used_interiors: u64,
 }
 
 fn load(target: &str) -> (String, Vec<u8>) {
@@ -77,7 +83,31 @@ fn census(name: String, input: &[u8], level: u32) -> Row {
         dense: 0,
         keyed: [0; THRESHOLDS.len()],
         cov: [0; THRESHOLDS.len()],
+        used_interiors: 0,
     };
+    // Interior map: position is inside (not the first byte of) some match.
+    let mut interior = vec![false; input.len()];
+    for t in &tokens {
+        if t.is_literal() {
+            continue;
+        }
+        let s = t.pos as usize + 1;
+        let e = (t.pos as usize + t.len as usize).min(input.len());
+        for b in interior.iter_mut().take(e).skip(s) {
+            *b = true;
+        }
+    }
+    let mut counted = vec![false; input.len()];
+    for t in &tokens {
+        if t.is_literal() {
+            continue;
+        }
+        let src = t.pos as usize - t.dist as usize;
+        if interior[src] && !counted[src] {
+            counted[src] = true;
+            r.used_interiors += 1;
+        }
+    }
     for t in &tokens {
         if t.is_literal() {
             r.literals += 1;
@@ -129,7 +159,9 @@ fn main() {
         .collect();
 
     let mut out = String::new();
-    out.push_str("name\tlevel\tbytes\tlit_rate\tmlen_mean\tcap8_pb\tdense_pb\textra_dense_pb");
+    out.push_str(
+        "name\tlevel\tbytes\tlit_rate\tmlen_mean\tcap8_pb\tdense_pb\textra_dense_pb\toracle_pb",
+    );
     for thr in THRESHOLDS {
         out.push_str(&format!("\textra_k{thr}_pb\tcov_ge{thr}"));
     }
@@ -142,7 +174,7 @@ fn main() {
             0.0
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{:.4}\t{:.1}\t{:.4}\t{:.4}\t{:.4}",
+            "{}\t{}\t{}\t{:.4}\t{:.1}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
             r.name,
             level,
             r.bytes,
@@ -151,6 +183,7 @@ fn main() {
             r.cap8 as f64 / b,
             r.dense as f64 / b,
             (r.dense - r.cap8) as f64 / b,
+            r.used_interiors as f64 / b,
         ));
         for i in 0..THRESHOLDS.len() {
             out.push_str(&format!(

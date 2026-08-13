@@ -170,7 +170,7 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
 /// [`LevelParams::fast_dense_interior_min_len`]. Chosen on the response
 /// surface and the TUNE corpus (never on the holdout, which is graded once,
 /// afterwards, as the unbiased check).
-pub(crate) const L1_DENSE_INTERIOR_MIN_LEN: u32 = 128;
+pub(crate) const L1_DENSE_INTERIOR_MIN_LEN: u32 = u32::MAX;
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
 ///
