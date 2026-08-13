@@ -126,7 +126,7 @@ FORCE:
 #                              clause by `fulcrum try`. Add ARGS=--size-only for the cheap
 #                              leg. Both arms built from git refs; NO-OPs refused.
 # =============================================================================
-.PHONY: board-size board-size-promote lever
+.PHONY: board-size board-size-promote lever holdout surface
 
 board-size: $(GZIPPY_BIN)
 	@scripts/campaign/board-size.sh tune
@@ -137,6 +137,28 @@ board-size-promote: $(GZIPPY_BIN)
 lever:
 	@test -n "$(REF)" || { echo "usage: make lever REF=<git-ref> [ARGS=--size-only]" >&2; exit 2; }
 	@scripts/campaign/lever.sh "$(REF)" $(ARGS)
+
+# =============================================================================
+# Generalization instruments — "have we overfit to the 22-file board?"
+#   make holdout    Grade size on the NEVER-TUNE holdout corpus (generated from
+#                   seeds, archive types absent from the tuning corpus) and
+#                   compare the win-rate to the SAME grading on the tune board.
+#                   A materially lower holdout win-rate is the overfit alarm.
+#                   NOTHING may ever be tuned against these files.
+#   make surface    Walk the content response surface (entropy x period x match
+#                   profile x alphabet x records) and print the CLIFFS: adjacent
+#                   points where ratio-vs-rival crosses 1.0 or jumps >2 points.
+#                   Each cliff is a generalization boundary, coordinates named.
+# Both are MEASUREMENTS, not ratchets: tests pin the generators, never a ratio.
+# See docs/generalization-instruments.md.
+# =============================================================================
+holdout: $(GZIPPY_BIN)
+	@scripts/campaign/holdout.sh $(ARGS)
+
+surface: $(GZIPPY_BIN)
+	@cargo build --release --example surface_probe
+	@./target/release/examples/surface_probe --gzippy $(GZIPPY_BIN) \
+	  --out $(or $(OUT),/tmp/surface.tsv)
 
 # What has already been tried and refuted — run this BEFORE proposing anything.
 
