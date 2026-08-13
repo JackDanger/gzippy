@@ -1048,6 +1048,19 @@ const PF_DIST: usize = 4;
 /// speed/ratio knee for THIS finder; higher values were tried and reverted,
 /// see the commit message).
 pub(super) const LIMIT_HASH_UPDATE_INSERTS_L0: usize = 2;
+
+/// PROBE KNOB (probe/l1-stride-inserts): stride between interior insert
+/// positions in the L1 shift-insert loops. `1` = insert every interior byte
+/// (vendor `ht_matchfinder_skip_bytes` semantics, byte-identical to the
+/// interleaved-bucket carrier this branch is built on). `S > 1` inserts
+/// `pos+1, pos+1+S, pos+1+2S, ...` — the surviving revival direction after
+/// PR #317 falsified batching: the maintenance bill is irreducible scalar
+/// work PER INSERT (~0.72 Ir/byte at insert-all), so the only way to cut it
+/// 2-3x is to perform FEWER inserts. The 2-slot shift is kept on every
+/// write (it carried ecoli's win; density carried access.log's — see
+/// project_l1_bucket_maintenance_mechanism.md). Swept by rebuilding with
+/// S in {1,2,3,4}; the shipped pick, if any, hard-codes one value.
+pub(super) const L1_INTERIOR_INSERT_STRIDE: usize = 1;
 /// `l1-tune`-only CONTENT-ADAPTIVE CHAIN MATCHING: process one block's range
 /// `[pos, block_end_target)` with the hash-chains finder instead of the
 /// chainless single-probe finder, pushing into the SAME `sink` the chainless
@@ -1991,7 +2004,7 @@ fn process_position_l1(
                 *b.add(1) = *b;
                 *b = nh as u32;
             }
-            nh += 1;
+            nh += L1_INTERIOR_INSERT_STRIDE;
         }
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
         // insert policy: only under `hash3.insert_always` — under the sparse
@@ -2012,14 +2025,13 @@ fn process_position_l1(
             }
         }
         // Counted ONCE for the whole interior loop (not per iteration —
-        // `insert_end - (pos + 1)` is exactly the iteration count above,
-        // known without re-walking): this branch only runs on an
-        // ACCEPTED match, already the less-frequent outcome, so this is
-        // a smaller win than the miss/too-short derivations above, but
-        // free to take.
+        // the strided iteration count is derived in closed form, known
+        // without re-walking): this branch only runs on an ACCEPTED match,
+        // already the less-frequent outcome, so this is a smaller win than
+        // the miss/too-short derivations above, but free to take.
         #[cfg(feature = "anatomy-counters")]
         {
-            let interior = (insert_end - (pos + 1)) as u64;
+            let interior = (insert_end - (pos + 1)).div_ceil(L1_INTERIOR_INSERT_STRIDE) as u64;
             local.hash_computations += interior;
             local.interior_writes += interior;
         }
@@ -2224,13 +2236,13 @@ fn process_position_l1_lean(
                 *b.add(1) = *b;
                 *b = nh as u32;
             }
-            nh += 1;
+            nh += L1_INTERIOR_INSERT_STRIDE;
         }
         // No HASH3-PROBE interior insert here (see this function's doc
         // comment) — `head3` does not exist in this function at all.
         #[cfg(feature = "anatomy-counters")]
         {
-            let interior = (insert_end - (pos + 1)) as u64;
+            let interior = (insert_end - (pos + 1)).div_ceil(L1_INTERIOR_INSERT_STRIDE) as u64;
             local.hash_computations += interior;
             local.interior_writes += interior;
         }
