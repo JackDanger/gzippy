@@ -92,6 +92,7 @@ pub mod decompress;
 #[doc(hidden)]
 pub mod error;
 pub mod fixtures;
+pub mod holdout;
 
 // ── Stable public surface ─────────────────────────────────────────────────────
 pub use decompress::DecodePath;

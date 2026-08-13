@@ -150,6 +150,218 @@ pub fn generate_sized(name: &str, len: usize) -> Vec<u8> {
     out
 }
 
+// ============================================================================
+// Response-surface sampler — the parameterized end of the generator family.
+//
+// The named fixtures above are POINTS chosen to imitate corpus classes. The
+// sampler below is the SPACE those points live in: content is generated along
+// five explicit axes so `examples/surface_probe.rs` can walk the space,
+// measure ratio-vs-rival at each point, and flag CLIFFS (adjacent points where
+// the verdict flips or jumps). Each cliff is a generalization boundary with
+// its content coordinates named — the failure modes a NEW archive type would
+// hit, discovered before any user hits them.
+//
+// The sampler is measurement support: tests pin the generator BYTES (so a
+// surface is comparable run-to-run) but never the ratios (the surface is a
+// measurement, not a ratchet).
+// ============================================================================
+
+/// One point in content space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceParams {
+    /// Target order-0 entropy of fresh literals, bits/byte (2..=8). The
+    /// generator hits it by mixing a hot subset with the full alphabet; the
+    /// probe reports the MEASURED entropy beside the target.
+    pub entropy_bits: u8,
+    /// Back-reference distance: every emitted match copies from exactly this
+    /// many bytes back (16..=8192), so the axis walks match distance from
+    /// "well inside every window" to "chunk-boundary scale".
+    pub period: u16,
+    /// Match-length profile: false = short (3..=8), true = long (32..=258).
+    pub long_matches: bool,
+    /// Fresh-literal alphabet size (4..=256).
+    pub alphabet: u16,
+    /// Record structure: insert a fixed 16-byte skeleton every ~256 bytes
+    /// (the CSV/JSONL "field grid" shape) or not.
+    pub records: bool,
+}
+
+impl SurfaceParams {
+    /// Stable id naming the coordinates: `e{bits}_p{period}_{short|long}_a{n}_r{0|1}`.
+    pub fn id(&self) -> String {
+        format!(
+            "e{}_p{}_{}_a{}_r{}",
+            self.entropy_bits,
+            self.period,
+            if self.long_matches { "long" } else { "short" },
+            self.alphabet,
+            self.records as u8
+        )
+    }
+}
+
+/// The declared axis grids. Adjacency for cliff detection is one step along
+/// one of these lists with every other coordinate held fixed.
+pub const SURFACE_ENTROPY: &[u8] = &[2, 4, 6, 8];
+pub const SURFACE_PERIODS: &[u16] = &[16, 128, 1024, 8192];
+
+/// The declared sample: 60 deterministic points.
+///  - 32: full entropy x period grid, alphabet 256, both match profiles.
+///  - 12: small alphabet (16), entropy 2/3/4 x all periods, short matches.
+///  -  8: record structure ON, alphabet 64, entropy 3/5, all periods, short.
+///  -  8: record structure ON vs OFF pairs at alphabet 64, entropy 3/5,
+///        period 128/8192, long matches (the records axis under long matches).
+///  Adjacent pairs along every axis exist inside each block, so cliff
+///  detection has one-step neighbours everywhere.
+pub fn surface_points() -> Vec<SurfaceParams> {
+    let mut pts = Vec::with_capacity(60);
+    for &long_matches in &[false, true] {
+        for &entropy_bits in SURFACE_ENTROPY {
+            for &period in SURFACE_PERIODS {
+                pts.push(SurfaceParams {
+                    entropy_bits,
+                    period,
+                    long_matches,
+                    alphabet: 256,
+                    records: false,
+                });
+            }
+        }
+    }
+    for &entropy_bits in &[2u8, 3, 4] {
+        for &period in SURFACE_PERIODS {
+            pts.push(SurfaceParams {
+                entropy_bits,
+                period,
+                long_matches: false,
+                alphabet: 16,
+                records: false,
+            });
+        }
+    }
+    for &entropy_bits in &[3u8, 5] {
+        for &period in SURFACE_PERIODS {
+            pts.push(SurfaceParams {
+                entropy_bits,
+                period,
+                long_matches: false,
+                alphabet: 64,
+                records: true,
+            });
+        }
+    }
+    for &entropy_bits in &[3u8, 5] {
+        for &period in &[128u16, 8192] {
+            for &records in &[false, true] {
+                pts.push(SurfaceParams {
+                    entropy_bits,
+                    period,
+                    long_matches: true,
+                    alphabet: 64,
+                    records,
+                });
+            }
+        }
+    }
+    pts
+}
+
+/// Mixture weight q such that drawing uniform-from-hot (size `hot`) with
+/// probability q and uniform-from-`alphabet` otherwise has order-0 entropy
+/// `target` bits. Binary search; entropy is monotone decreasing in q.
+fn surface_mix(target: f64, hot: usize, alphabet: usize) -> f64 {
+    let ent = |q: f64| -> f64 {
+        let p_hot = q / hot as f64 + (1.0 - q) / alphabet as f64;
+        let p_cold = (1.0 - q) / alphabet as f64;
+        let mut h = -(hot as f64) * p_hot * p_hot.log2();
+        if alphabet > hot && p_cold > 0.0 {
+            h -= (alphabet - hot) as f64 * p_cold * p_cold.log2();
+        }
+        h
+    };
+    if ent(0.0) <= target {
+        return 0.0;
+    }
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..48 {
+        let mid = (lo + hi) / 2.0;
+        if ent(mid) > target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo + hi) / 2.0
+}
+
+/// Generate a surface point. Append-only, so as with [`generate_sized`] a
+/// shorter output is a byte-exact prefix of a longer one — the pinned test
+/// hashes 64 KiB while the probe runs 1 MiB of the same stream.
+pub fn surface_generate(p: &SurfaceParams, len: usize) -> Vec<u8> {
+    assert!((2..=8).contains(&p.entropy_bits));
+    assert!(p.alphabet >= 4 && p.alphabet <= 256);
+    let alphabet = p.alphabet as usize;
+    let target = f64::from(p.entropy_bits).min((alphabet as f64).log2());
+    // Hot set: small enough that q -> 1 undershoots the lowest target, large
+    // enough to give the search room; never more than half the alphabet.
+    let hot = (1usize << (p.entropy_bits.saturating_sub(1))).clamp(2, alphabet / 2);
+    let q = surface_mix(target, hot, alphabet);
+    let q_scaled = (q * f64::from(u32::MAX)) as u64;
+
+    // Seed derived from the coordinates so every point is its own stream.
+    let mut seed = 0x5375_7266_0000_0001u64;
+    for v in [
+        p.entropy_bits as u64,
+        p.period as u64,
+        p.long_matches as u64,
+        p.alphabet as u64,
+        p.records as u64,
+    ] {
+        seed = (seed ^ v).wrapping_mul(0x100_0000_01b3);
+    }
+    let mut rng = XorShift(seed | 1);
+
+    let mut out: Vec<u8> = Vec::with_capacity(len + 512);
+    let mut since_record = 0usize;
+    let mut recno = 0u32;
+    while out.len() < len {
+        if p.records && since_record >= 240 {
+            // 16-byte skeleton: a fixed frame with a slow counter — the
+            // "field grid" every structured format carries.
+            out.extend_from_slice(format!("\n#R{recno:08}|F0|\t").as_bytes());
+            recno += 1;
+            since_record = 0;
+            continue;
+        }
+        let dist = p.period as usize;
+        if out.len() >= dist && rng.next() % 100 < 35 {
+            // one back-reference at exactly `period` distance (may overlap
+            // itself when the length exceeds the distance — RLE-like, legal)
+            let l = if p.long_matches {
+                32 + (rng.next() % 227) as usize
+            } else {
+                3 + (rng.next() % 6) as usize
+            };
+            for _ in 0..l {
+                let b = out[out.len() - dist];
+                out.push(b);
+            }
+            since_record += l;
+        } else {
+            // one fresh literal from the entropy-controlled distribution
+            let sym = if (rng.next() & 0xffff_ffff) < q_scaled {
+                rng.next() % hot as u64
+            } else {
+                rng.next() % alphabet as u64
+            };
+            out.push(sym as u8);
+            since_record += 1;
+        }
+    }
+    out.truncate(len);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +411,85 @@ mod tests {
             } else {
                 eprintln!("fixture {name}: fnv={h:#018x} (pin this)");
             }
+        }
+    }
+
+    /// Pin the response-surface GENERATOR, never its ratios: a surface TSV is
+    /// only comparable to an earlier one if each point's bytes are identical.
+    /// One sha256 over (id, per-point sha256 at 64 KiB) for all declared
+    /// points; on mismatch every per-point line is printed for repinning.
+    /// 64 KiB is a prefix of the probe's 1 MiB stream (append-only property
+    /// guarded in surface_points_are_prefix_stable).
+    #[test]
+    fn surface_generators_are_frozen() {
+        let pts = surface_points();
+        assert_eq!(pts.len(), 60, "declared sample size changed");
+        // Ids must be unique or the TSV/cliff coordinates are ambiguous.
+        let mut manifest = String::new();
+        for p in &pts {
+            let sha = crate::holdout::sha256_hex(&surface_generate(p, 64 << 10));
+            manifest.push_str(&format!("{}\t{}\n", p.id(), sha));
+        }
+        let got = crate::holdout::sha256_hex(manifest.as_bytes());
+        let want = "e2f23a2e680ac6c8ca39834819ef1d604ba6080a95bd7f1df5eb2252a76872f2";
+        if got != want {
+            eprint!("{manifest}");
+            assert_eq!(
+                got, want,
+                "surface generator bytes changed — every archived surface TSV \
+                 is now incomparable; repin the manifest sha above consciously"
+            );
+        }
+    }
+
+    /// The probe hashes 64 KiB but measures 1 MiB; that is only one stream if
+    /// generation is append-only. Guard the prefix property on a spread of
+    /// points (cheap; full grid would re-generate 62 MiB).
+    #[test]
+    fn surface_points_are_prefix_stable() {
+        for p in surface_points().iter().step_by(9) {
+            let long = surface_generate(p, 256 << 10);
+            let short = surface_generate(p, 64 << 10);
+            assert_eq!(short[..], long[..64 << 10], "{}", p.id());
+        }
+    }
+
+    /// The entropy axis must actually order the content: measured order-0
+    /// entropy of fresh literals rises strictly with the axis coordinate.
+    /// (Matches copy earlier bytes, so measure a matchless configuration.)
+    #[test]
+    fn surface_entropy_axis_is_monotone() {
+        let mut last = -1.0f64;
+        for &e in SURFACE_ENTROPY {
+            let p = SurfaceParams {
+                entropy_bits: e,
+                period: 8192,
+                long_matches: false,
+                alphabet: 256,
+                records: false,
+            };
+            // period 8192 with 64 KiB still emits matches; measure literals
+            // via a histogram of the whole output — matches only repeat
+            // earlier literals, so the histogram stays distribution-shaped.
+            let data = surface_generate(&p, 64 << 10);
+            let mut hist = [0u64; 256];
+            for &b in &data {
+                hist[b as usize] += 1;
+            }
+            let n = data.len() as f64;
+            let h: f64 = hist
+                .iter()
+                .filter(|&&c| c > 0)
+                .map(|&c| {
+                    let pr = c as f64 / n;
+                    -pr * pr.log2()
+                })
+                .sum();
+            assert!(
+                h > last,
+                "entropy axis not monotone: e{e} measured {h:.3} <= previous {last:.3}"
+            );
+            last = h;
         }
     }
 }

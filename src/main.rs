@@ -63,6 +63,8 @@ mod infra; // thread_pool, scheduler, io_thread
 #[cfg(test)]
 mod fixtures; // frozen mechanism fixtures (the lib exports these as `gzippy::fixtures`)
 #[cfg(test)]
+mod holdout; // NEVER-TUNE holdout generators + sha256 (fixtures' pins use it)
+#[cfg(test)]
 mod tests;
 
 use cli::GzippyArgs;
