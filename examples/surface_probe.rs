@@ -1,6 +1,12 @@
 //! surface_probe — walk the response surface, name the cliffs.
 //!
 //! Usage:  surface_probe [--gzippy <path>] [--out <tsv>] [--len <bytes>]
+//!                       [--keep <dir>] [--only <point-id>]
+//!
+//! `--keep` writes each generated point into <dir> instead of deleting it, and
+//! `--only` restricts the walk to one point id. A cliff is only useful if its
+//! coordinates can be handed to the next instrument (`divergence_accounting`,
+//! `fulcrum why`), and that needs the bytes on disk.
 //!
 //! For each of the ~60 declared points in `gzippy::fixtures::surface_points()`
 //! (axes: literal entropy, repeat period, match-length profile, alphabet size,
@@ -67,11 +73,15 @@ fn main() {
     let mut gzippy_path: Option<String> = None;
     let mut out_path: Option<String> = None;
     let mut len: usize = 1 << 20;
+    let mut keep_dir: Option<String> = None;
+    let mut only: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--gzippy" => gzippy_path = Some(args.next().expect("--gzippy PATH")),
             "--out" => out_path = Some(args.next().expect("--out FILE")),
             "--len" => len = args.next().expect("--len N").parse().expect("--len N"),
+            "--keep" => keep_dir = Some(args.next().expect("--keep DIR")),
+            "--only" => only = Some(args.next().expect("--only POINT_ID")),
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(2);
@@ -100,7 +110,14 @@ fn main() {
     let tmp = std::env::temp_dir().join(format!("surface_probe_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("tmpdir");
 
-    let pts = surface_points();
+    let mut pts = surface_points();
+    if let Some(id) = &only {
+        pts.retain(|p| &p.id() == id);
+        assert!(!pts.is_empty(), "--only {id} matched no declared point");
+    }
+    if let Some(d) = &keep_dir {
+        std::fs::create_dir_all(d).expect("keep dir");
+    }
     // rows[(point_idx, level)] -> (ours, libdeflate, gzip)
     let mut rows: BTreeMap<(usize, u32), (usize, usize, usize)> = BTreeMap::new();
     let mut tsv = String::new();
@@ -111,7 +128,10 @@ fn main() {
     for (i, p) in pts.iter().enumerate() {
         let data = surface_generate(p, len);
         let h0 = order0_entropy(&data);
-        let input = tmp.join(p.id());
+        let input = match &keep_dir {
+            Some(d) => std::path::Path::new(d).join(p.id()),
+            None => tmp.join(p.id()),
+        };
         std::fs::write(&input, &data).expect("write point");
         for level in LEVELS {
             let ours = run_compress(
@@ -172,7 +192,9 @@ fn main() {
                 ours.len() as f64 / gzr.len() as f64,
             ));
         }
-        std::fs::remove_file(&input).ok();
+        if keep_dir.is_none() {
+            std::fs::remove_file(&input).ok();
+        }
         eprint!("\rsurface_probe: {}/{} points", i + 1, pts.len());
     }
     eprintln!();
