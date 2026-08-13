@@ -1449,6 +1449,16 @@ pub(super) struct Bucket2Cfg {
     /// `ht_matchfinder` probes both bucket slots on every lookup; our gated
     /// upgrade only ran on short accepts, leaving miss-path literals.
     pub probe_on_miss: bool,
+    /// LENGTH-KEYED interior density: an accepted match at least this long
+    /// indexes its WHOLE interior and shifts the bucket on every write, the
+    /// way `ht_matchfinder_skip_bytes` always does; shorter matches keep
+    /// igzip's `LIMIT_HASH_UPDATE` prefix. `u32::MAX` = never (today's
+    /// behaviour). Lives here rather than beside `limit_hash_update_inserts`
+    /// because the dense write is a BUCKET-MAINTENANCE policy — it needs
+    /// `enabled`/`head2` to be meaningful — and because this struct already
+    /// reaches every L1 call site. See
+    /// [`super::super::level::LevelParams::fast_dense_interior_min_len`].
+    pub dense_min_len: u32,
 }
 
 impl Bucket2Cfg {
@@ -1456,6 +1466,7 @@ impl Bucket2Cfg {
         enabled: false,
         gate_max_len: 8,
         probe_on_miss: false,
+        dense_min_len: u32::MAX,
     };
 }
 
@@ -1933,21 +1944,56 @@ fn process_position_l1(
             local.probe_outcome_accepted += 1;
             local.positions_processed_matches += length as u64;
         }
-        // LIMIT_HASH_UPDATE (see the tail loop for the full note).
+        // LIMIT_HASH_UPDATE (see the tail loop for the full note), plus the
+        // LENGTH-KEYED escape from it (`Bucket2Cfg::dense_min_len`).
         let match_end = pos + length as usize;
-        let insert_end = if limit_hash_update_inserts == usize::MAX {
+        // One `cmp` per ACCEPTED match — not per position, and not per
+        // interior byte. `length <= DEFLATE_MAX_MATCH_LEN == 258 < u32::MAX`,
+        // so the `u32::MAX` default makes this branch never-taken in
+        // behaviour and perfectly predicted in fact.
+        let dense = length >= bucket2.dense_min_len && bucket2.enabled;
+        let insert_end = if limit_hash_update_inserts == usize::MAX || dense {
             match_end
         } else {
             (pos + 1 + limit_hash_update_inserts).min(match_end)
         };
         let mut nh = pos + 1;
-        while nh < insert_end {
-            // SAFETY: nh < match_end = pos+length <= in_end, and
-            // buf's pad covers the 4-byte load past in_end.
-            let s = unsafe { load_u32(base, nh) };
-            // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
-            nh += 1;
+        if dense {
+            // DENSE + SHIFT, exactly `ht_matchfinder_skip_bytes`
+            // (`vendor/libdeflate/lib/ht_matchfinder.h:196-228`): every skipped
+            // byte is indexed AND the bucket is shifted, so slot 0's previous
+            // occupant survives in slot 1. The two are ONE mechanism, not two
+            // knobs — PR #319 measured the dense insert WITHOUT the shift
+            // flipping `markup.xml` L1/T1 WIN -> LOSS (+21,920 B), because
+            // indexing an interior evicts a good anchor with no second chance.
+            // Kept as a SEPARATE loop from the capped one below so that content
+            // whose matches are all short executes byte-for-byte the code
+            // `main` ships: no extra store, no extra load, no `head2` register
+            // pressure on the path that pays the wall bill.
+            while nh < insert_end {
+                // SAFETY: nh < match_end = pos+length <= in_end, and
+                // buf's pad covers the 4-byte load past in_end.
+                let s = unsafe { load_u32(base, nh) };
+                let hi = lz_hash(s, HASH_BITS) as usize;
+                // SAFETY: `hi < HASH_SIZE == head2.len()`; `head2` is a real
+                // slice because `dense` requires `bucket2.enabled` (`head2` is
+                // an EMPTY slice when bucket2 is off — that is the safety
+                // bound, which is why the conjunct is inside `dense`).
+                unsafe {
+                    *head2.get_unchecked_mut(hi) = *head.get_unchecked(hi);
+                    *head.get_unchecked_mut(hi) = nh as u32;
+                }
+                nh += 1;
+            }
+        } else {
+            while nh < insert_end {
+                // SAFETY: nh < match_end = pos+length <= in_end, and
+                // buf's pad covers the 4-byte load past in_end.
+                let s = unsafe { load_u32(base, nh) };
+                // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
+                unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+                nh += 1;
+            }
         }
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
         // insert policy: only under `hash3.insert_always` — under the sparse
@@ -2933,6 +2979,7 @@ pub(super) fn run<const ACCEL: bool>(
                     bucket2_cfg.gate_max_len
                 },
                 probe_on_miss: bucket2_cfg.probe_on_miss,
+                dense_min_len: bucket2_cfg.dense_min_len,
             }
         }
         #[cfg(not(feature = "l1-tune"))]
@@ -3582,6 +3629,7 @@ pub(super) fn run_resumable(
         enabled: params.fast_bucket2,
         gate_max_len: params.fast_bucket2_gate_max_len,
         probe_on_miss: params.fast_bucket2_probe_on_miss,
+        dense_min_len: params.fast_dense_interior_min_len,
     };
     let cost_gate_cfg = LazyPeekCostGateCfg {
         enabled: params.fast_lazy_peek_cost_gate,

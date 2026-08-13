@@ -471,6 +471,7 @@ pub(super) fn compress(
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
                 probe_on_miss: params.fast_bucket2_probe_on_miss,
+                dense_min_len: params.fast_dense_interior_min_len,
             };
             let cost_gate = fast::LazyPeekCostGateCfg {
                 enabled: params.fast_lazy_peek_cost_gate,
@@ -499,6 +500,7 @@ pub(super) fn compress(
                 enabled: params.fast_bucket2,
                 gate_max_len: params.fast_bucket2_gate_max_len,
                 probe_on_miss: params.fast_bucket2_probe_on_miss,
+                dense_min_len: params.fast_dense_interior_min_len,
             };
             let cost_gate = fast::LazyPeekCostGateCfg {
                 enabled: params.fast_lazy_peek_cost_gate,

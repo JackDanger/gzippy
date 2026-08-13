@@ -105,6 +105,31 @@ pub struct LevelParams {
     /// T>1-only: hash inserts per accepted match interior (vendor shifts the
     /// full bucket every skipped byte; default L1 is 3).
     pub fast_hash_update_inserts: usize,
+    /// LENGTH-KEYED interior density: index the WHOLE interior (and shift the
+    /// 2-way bucket, as `ht_matchfinder_skip_bytes` does) of an accepted match
+    /// at least this long, instead of only the first
+    /// [`Self::fast_hash_update_inserts`] positions. `u32::MAX` = never, which
+    /// is igzip's `LIMIT_HASH_UPDATE` behaviour unchanged.
+    ///
+    /// The vendor difference this closes: libdeflate's
+    /// `ht_matchfinder_skip_bytes` indexes EVERY skipped byte
+    /// (`vendor/libdeflate/lib/ht_matchfinder.h:196-228`), so a position inside
+    /// a long match is still findable later; ours (igzip's
+    /// `LIMIT_HASH_UPDATE`, `vendor/isa-l/igzip/igzip_base.c:71-86`) indexes 8
+    /// and jumps. Doing what libdeflate does UNCONDITIONALLY is measured and
+    /// PARKED (PRs #296/#310/#317/#319/#320): the bill is ~0.72 Ir per extra
+    /// insert and it lands on match-dense files with no slack.
+    ///
+    /// Keying it on match LENGTH is not a content detector — it is a local
+    /// property of the decision just taken, and it is the same SHAPE of rule
+    /// zlib-ng uses in `deflate_fast.c:79` (`match_len <= max_insert_length`
+    /// gates the same insert loop). zlib keys it the other way, for speed on
+    /// long matches; the direction here is ours and is justified by
+    /// measurement, not by precedent: the reach payoff is concentrated in long
+    /// matches (the cliff content's mean accepted length is 114-177) while the
+    /// wall bill is paid by files whose long-match coverage is near zero
+    /// (`data.json` 2.9% of bytes at len>=128, `ecoli.fastq` 0.06%).
+    pub fast_dense_interior_min_len: u32,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -136,9 +161,16 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
     p.fast_hash_update_inserts = 8;
+    p.fast_dense_interior_min_len = L1_DENSE_INTERIOR_MIN_LEN;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
 }
+
+/// The length-keyed density threshold at L1 — see
+/// [`LevelParams::fast_dense_interior_min_len`]. Chosen on the response
+/// surface and the TUNE corpus (never on the holdout, which is graded once,
+/// afterwards, as the unbiased check).
+pub(crate) const L1_DENSE_INTERIOR_MIN_LEN: u32 = 128;
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
 ///
@@ -490,6 +522,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast0,
@@ -510,6 +543,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast,
@@ -525,6 +559,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -593,6 +628,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -620,6 +656,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -635,6 +672,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -650,6 +688,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -665,6 +704,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -680,6 +720,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -695,6 +736,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -712,6 +754,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -732,6 +775,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -752,6 +796,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_min_len: u32::MAX,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
