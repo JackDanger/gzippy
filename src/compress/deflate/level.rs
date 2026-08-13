@@ -252,8 +252,9 @@ fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
     // The dense insert ALONE is worse, not better: `markup.xml` L1/T1 goes
     // WIN -> LOSS (+21,920 B) with `usize::MAX` and no bucket shift, because a
     // slot-0-only interior insert evicts good anchors with no second chance.
-    // COMPOSITION IS REQUIRED — the two lines below and above are one lever,
-    // and the flag is what selects `parse::fast`'s `REACH == true` fastloop.
+    // COMPOSITION IS REQUIRED — the line above and the line below are one
+    // lever, and the flag is what selects `parse::fast`'s `REACH == true`
+    // fastloop. `l1_match_reach_is_t1_only` asserts they never separate.
     p.fast_dense_interior_insert = true;
 }
 
@@ -1035,6 +1036,84 @@ mod tests {
             assert_eq!(p.strategy, Strategy::NearOptimal, "level {l}");
             assert!(p.nice_match_length <= DEFLATE_MAX_MATCH_LEN, "level {l}");
             assert!(p.near_optimal.max_optim_passes >= 1, "level {l}");
+        }
+    }
+
+    /// The L1 MATCH-REACH knobs are T1-ONLY. This is the assertion the whole
+    /// clause-3 argument for that lever rests on, so it is a test and not a
+    /// sentence: `pigz:ecoli.fastq:L1:T4:wall` is adjudicated PASS only while
+    /// T>1 emits `main`'s bytes, and T>1 emits `main`'s bytes only while
+    /// `params_parallel(1)` declines these two knobs.
+    ///
+    /// This pins a ROUTE, not a VALUE — non-negotiable #5's cage was
+    /// `max_search_depth == 35`, a number `CLAUDE.md` declares free to change.
+    /// Nothing here asserts what the T>1 insert count IS (it may be retuned
+    /// freely); it asserts only that T>1 is not on the "index every interior
+    /// position" setting and T1 is. Changing that is a promotion decision with
+    /// a measured T4 wall cell attached, and this test is what makes it fail
+    /// closed instead of silently.
+    ///
+    /// The intended way to make this test go red is revival condition (2):
+    /// density scoped by the block's measured wall budget. That is a different
+    /// mechanism, and it must be re-adjudicated, not slipped in.
+    #[test]
+    fn l1_match_reach_is_t1_only() {
+        let t1 = params(1);
+        let t_gt_1 = params_parallel(1);
+
+        assert!(
+            t1.fast_dense_interior_insert,
+            "T1 L1 lost the match-reach bucket shift — the two record-file \
+             cells (libdeflate:{{access.log,ecoli.fastq}}:L1:T1:size) close \
+             only with it"
+        );
+        assert_eq!(
+            t1.fast_hash_update_inserts,
+            usize::MAX,
+            "T1 L1 is no longer indexing the whole match interior; the dense \
+             insert and the bucket shift are ONE lever (the insert alone is a \
+             WIN -> LOSS flip on markup.xml) and must move together"
+        );
+
+        assert!(
+            !t_gt_1.fast_dense_interior_insert,
+            "T>1 L1 picked up the match-reach bucket shift. That changes T>1 \
+             OUTPUT BYTES, which is the only thing keeping \
+             pigz:ecoli.fastq:L1:T4:wall from the flip that made PR #319 \
+             NO-SHIP on clause 3 (cross-layout CONFIRMED REAL, median ln \
+             +0.1186)."
+        );
+        assert!(
+            t_gt_1.fast_hash_update_inserts < usize::MAX,
+            "T>1 L1 is now indexing the whole match interior — same flip, \
+             same cell. The value itself is free to tune; 'index everything' \
+             is the setting that was measured to cost the wall cell."
+        );
+
+        // The two knobs are one lever on BOTH sides: neither may be set
+        // without the other, or the half-lever regression (dense insert, no
+        // shift) is reachable.
+        for (name, p) in [("T1", t1), ("T>1", t_gt_1)] {
+            assert_eq!(
+                p.fast_dense_interior_insert,
+                p.fast_hash_update_inserts == usize::MAX,
+                "{name} L1 has half the match-reach lever: dense insert with \
+                 no bucket shift measured +21,920 B on markup.xml (WIN -> LOSS)"
+            );
+        }
+
+        // No OTHER level has the knob, at either thread count: the lever's
+        // scope claim is `levels=1`, and 207 of 207 T1 cells outside L1
+        // (23 corpus files x levels 0,2..9) were verified byte-identical to
+        // main on that basis.
+        for l in (0..=12u32).filter(|&l| l != 1) {
+            for (name, p) in [("params", params(l)), ("params_parallel", params_parallel(l))] {
+                assert!(
+                    !p.fast_dense_interior_insert,
+                    "{name}({l}) carries the L1 match-reach knob; the lever is \
+                     scoped to level 1"
+                );
+            }
         }
     }
 }
