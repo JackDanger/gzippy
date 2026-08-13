@@ -55,6 +55,22 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // ties in our favor by extending StoredCoalescer to greedy/lazy — a
     // separate, tie-guard-adjudicated lever, not part of the #266 fix.
     ("noise", 1), // L1 1048679 -> L2 1048684 (+5 B)
+    // L1 -> L2 on `binary`: 662577 -> 666108 (+3531 B), opened 2026-08-13 by
+    // the L1 MATCH-REACH lever (dense match-interior indexing + the 2-way
+    // bucket shift that the vendor's `ht_matchfinder_skip_bytes` does and we
+    // did not). THE SAG IS L1 GETTING BETTER, NOT L2 GETTING WORSE: L2 is
+    // unchanged at 666,108 B — byte-for-byte what it was before the lever —
+    // while L1 fell from 666,379 to 662,577 (-0.57%) and now beats it.
+    //
+    // Healing it means improving L2, which this lever must not touch: L2 on
+    // this fixture sits 4 B under libdeflate-gzip -2 (666,108 vs 666,112),
+    // i.e. inside the tie cage, where clause 3 refuses any flip and
+    // `scripts/campaign/tie-guard.sh` is the adjudicator. L2 is also a
+    // different parser entirely (Greedy + the hc matchfinder), so the reach
+    // mechanism proved here does not transfer as a one-line change. Listed
+    // rather than fixed, and it must be UNLISTED by whoever closes L2 — the
+    // test fails if this pair ever heals, so the list still only shrinks.
+    ("binary", 1),
 ];
 
 /// Optimal stored framing for an n-byte input: gzip header (10) + trailer (8)
