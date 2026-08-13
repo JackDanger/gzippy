@@ -682,6 +682,25 @@ currently passes the full Gate-0 suite (`profile rss` fails on both, `lib levels
 solvency) and `make deploy` correctly refuses to certify them; fix those two gates
 before trusting a fresh instrument there.
 
+**The ARM wall leg (stood up 2026-08-12, owner decision).** The local M1 is now the
+ARM wall box; solvency stays the wall AUTHORITY, and igzip is x86-only — legitimately
+absent from the ARM grid, which grades against three rivals pinned by absolute path in
+`~/gzippy-bench/ARM-RIVALS.txt`: GNU gzip 1.14, pigz 2.8, libdeflate-gzip 1.25 (all
+Homebrew). Two caveats live in that file: `/usr/bin/gzip` is Apple gzip 479 and is
+never graded — scripts must invoke `/opt/homebrew/bin/gzip` explicitly — and the x86
+boards grade GNU gzip 1.13, so the ARM gzip rival is one minor version ahead. The
+corpus is a per-file sha256-verified mirror of solvency's 22 files at
+`~/gzippy-bench/corpus/`, and measurement runs use the dedicated clone
+`~/gzippy-bench/gzippy`, never a working checkout. Two scripts:
+`~/gzippy-bench/calibrate-m1.sh` (layout floors — `fulcrum layout calibrate`, full
+corpus, L1-9, T1+T4, 4 variants, n=25, out `~/gzippy-bench/layout-m1`) and
+`~/gzippy-bench/arm-wall-board.sh` (the wall census vs the three rivals, mirroring
+`scripts/campaign/board-wall.sh` guards W2-W4). **QUIET-WINDOW RULE:** both scripts
+refuse to start while cargo/rustc processes are running, and neither may be launched
+while agents are building — the M1 L1/T1 layout lottery is ±3-7%, so every M1 wall
+number is INFORMATIONAL until the layout-m1 floors exist, and solvency remains the
+only box whose wall verdicts convict.
+
 ## L1 IS THE LARGEST FAILING CLASS, AND IT IS NOT THE SEAM (measured 2026-08-01)
 
 The board had been decomposed by rival x thread count, which surfaced the T4 seam
