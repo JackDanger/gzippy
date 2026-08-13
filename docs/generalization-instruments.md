@@ -84,10 +84,20 @@ five axes:
 `gzip -dc` (mismatch aborts), each scored against libdeflate and gzip.
 
 **Cliffs.** Two points are adjacent when they differ along exactly ONE axis by
-one grid step. A cliff is an adjacent pair where ratio-vs-rival crosses 1.0
-(the verdict flips) or moves more than 2 points. Each cliff prints its rival,
-level, axis and both coordinates — a named generalization boundary, i.e. the
-failure mode a new archive type hits when its content crosses that line.
+one grid step. A cliff is an adjacent pair where the verdict is at stake:
+
+* `CROSS` — the verdict flips: one side ≤ 1.0, the other > 1.0.
+* `NEAR-JUMP` — the ratio moves more than 2 points AND an endpoint sits within
+  2 points of 1.0, so the next axis step could flip it.
+
+Large moves far from the line (0.98 → 0.92, two comfortable wins) are counted
+but not listed. That distinction matters: the first version of the rule flagged
+any >2-point move and produced 290 "cliffs" on 60 points — a list that long is a
+shrug, not a finding.
+
+Each cliff prints its rival, level, axis and both coordinates — a named
+generalization boundary, i.e. the failure mode a new archive type hits when its
+content crosses that line.
 
 Cliffs are diagnostics, not gates. The useful reading is the AXIS: a cliff on
 `period` says our verdict depends on match distance; a cliff on `entropy` says

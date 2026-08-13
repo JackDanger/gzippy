@@ -95,22 +95,26 @@ GEN="$REPO/target/release/examples/holdout_gen"
   exit 3; }
 echo "  materialized $(wc -l < "$OUT/holdout-manifest.tsv" | tr -d ' ') members, pins verified"
 
-# --- grade one corpus directory into a TSV -----------------------------------
+# --- grade a list of files into a TSV ----------------------------------------
 # Columns: corpus_set file level threads rival ours rival_bytes win
 # `win` is 1 when ours <= rival (CLAUDE.md: "output at least as small AT THE
 # LEVEL THE USER TYPED"). A cell whose roundtrip fails is not scored — it ABORTS
 # the run, because a corrupt-but-smaller output must never be able to score.
-grade() { # <set-name> <dir> <tsv>
-  local set_name="$1" dir="$2" tsv="$3"
+#
+# Files are passed as REAL PATHS, never staged as symlinks: gzip's CLI (and ours,
+# correctly) refuses a symbolic link without -f, so a staged-symlink corpus dir
+# aborted the board leg on its first file. Cite the contract, not a workaround.
+grade() { # <set-name> <tsv> <file>...
+  local set_name="$1" tsv="$2"; shift 2
   : > "$tsv"
-  local f base L T r ours rb sha_in sha_rt cmdout
-  for f in "$dir"/*; do
+  local f base L T r ours rb sha_in sha_rt
+  for f in "$@"; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
     sha_in="$(shasum -a 256 "$f" | cut -d' ' -f1)"
     for L in $LEVELS; do
       # rival sizes that do not depend on thread count: measure once, reuse.
-      local gz_b ld_b ig_b
+      local gz_b ld_b
       gz_b="$(gzip -"$L" -c "$f" </dev/null 2>/dev/null | wc -c | tr -d ' ')"
       ld_b=""; [ -n "$LD" ] && ld_b="$("$LD" -"$L" -c "$f" </dev/null 2>/dev/null | wc -c | tr -d ' ')"
       for T in $THREADS; do
@@ -141,7 +145,7 @@ grade() { # <set-name> <dir> <tsv>
   done
 }
 
-grade holdout "$HOLD" "$OUT/holdout.tsv"
+grade holdout "$OUT/holdout.tsv" "$HOLD"/*
 
 BOARD_TSV=""
 if [ "$HOLDOUT_ONLY" = 0 ]; then
@@ -151,11 +155,12 @@ if [ "$HOLDOUT_ONLY" = 0 ]; then
     # The comparison leg is the TUNE set: the files parameters were actually
     # fitted on. Comparing against GATE would understate the overfit signal,
     # since GATE is itself (partly) held out.
-    TUNE="$WORK/tune"; mkdir -p "$TUNE"
+    TUNE_FILES=()
     while IFS= read -r m; do
-      [ -f "$CORPUS/$m" ] && ln -sf "$CORPUS/$m" "$TUNE/$m"
+      [ -f "$CORPUS/$m" ] && TUNE_FILES+=("$CORPUS/$m")
     done < <(python3 -c 'import json,sys;print("\n".join(json.load(open(sys.argv[1]))["tune"]["files"]))' "$SPLIT")
-    grade board "$TUNE" "$OUT/board.tsv"
+    [ "${#TUNE_FILES[@]}" -gt 0 ] || { echo "holdout: TUNE set resolved to zero files under $CORPUS" >&2; exit 2; }
+    grade board "$OUT/board.tsv" "${TUNE_FILES[@]}"
     BOARD_TSV="$OUT/board.tsv"
   else
     echo "  board leg SKIPPED — no corpus at $CORPUS (set CAMPAIGN_CORPUS_ROOT)"

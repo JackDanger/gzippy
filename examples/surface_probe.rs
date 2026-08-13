@@ -186,7 +186,22 @@ fn main() {
     // ── Cliff detection ────────────────────────────────────────────────────
     // Adjacency: fix four axes, sort the points sharing them by the fifth,
     // pair consecutive values. Works uniformly across the sub-grids.
-    let mut cliffs = 0u32;
+    //
+    // WHAT COUNTS AS A CLIFF. The first version flagged any adjacent pair whose
+    // ratio moved >2 points and produced 290 "cliffs" on 60 points — a list
+    // that long is a shrug, not a finding, and most of it was ratio drift
+    // between two comfortable WINS (0.98 -> 0.92), which is not a
+    // generalization boundary at all. A boundary is where the VERDICT is at
+    // stake, so a pair qualifies only when:
+    //   CROSS      — the verdict flips: one side <= 1.0, the other > 1.0.
+    //   NEAR-JUMP  — |dr| > 2 points AND some endpoint is within `NEAR` of the
+    //                verdict line, i.e. the next axis step could flip it.
+    // Everything else is reported only as a count, not as a coordinate.
+    const NEAR: f64 = 0.02;
+    let mut crossings: Vec<String> = Vec::new();
+    let mut near_jumps: Vec<String> = Vec::new();
+    let mut far_jumps = 0u32;
+    let mut axis_counts: BTreeMap<(&str, &str), u32> = BTreeMap::new();
     for (axis_i, (axis_name, get)) in AXES.iter().enumerate() {
         let mut groups: BTreeMap<Vec<i64>, Vec<usize>> = BTreeMap::new();
         for (i, p) in pts.iter().enumerate() {
@@ -214,24 +229,50 @@ fn main() {
                         let r_b = sb.0 as f64 / sb.1 as f64;
                         let crosses = (r_a - 1.0) * (r_b - 1.0) < 0.0;
                         let jumps = (r_a - r_b).abs() > JUMP;
-                        if crosses || jumps {
-                            cliffs += 1;
-                            println!(
-                                "CLIFF\trival={rival}\tL{level}\taxis={axis_name}\t{}\tfrom={} r={:.4}\tto={} r={:.4}",
-                                if crosses { "crosses-1.0" } else { "jump>2pt" },
-                                pts[a].id(),
-                                r_a,
-                                pts[b].id(),
-                                r_b,
-                            );
+                        let near = r_a.max(r_b) > 1.0 - NEAR;
+                        if !crosses && !jumps {
+                            continue;
+                        }
+                        if !crosses && !near {
+                            far_jumps += 1;
+                            continue;
+                        }
+                        let kind = if crosses { "CROSS" } else { "NEAR-JUMP" };
+                        let line = format!(
+                            "CLIFF\t{kind}\trival={rival}\tL{level}\taxis={axis_name}\t\
+                             from={} r={r_a:.4}\tto={} r={r_b:.4}\td={:+.4}",
+                            pts[a].id(),
+                            pts[b].id(),
+                            r_b - r_a,
+                        );
+                        *axis_counts.entry((*axis_name, rival)).or_default() += 1;
+                        if crosses {
+                            crossings.push(line);
+                        } else {
+                            near_jumps.push(line);
                         }
                     }
                 }
             }
         }
     }
+    println!(
+        "# CLIFFS: {} verdict CROSSings, {} NEAR-JUMPs (within {:.0} pt of 1.0); \
+         {far_jumps} large moves away from the line are counted only.",
+        crossings.len(),
+        near_jumps.len(),
+        NEAR * 100.0,
+    );
+    for l in crossings.iter().chain(near_jumps.iter()) {
+        println!("{l}");
+    }
+    println!("# BY AXIS x RIVAL (cliffs at the verdict line)");
+    for ((axis, rival), n) in &axis_counts {
+        println!("#   {axis:<14} {rival:<11} {n}");
+    }
     eprintln!(
-        "surface_probe: {cliffs} cliff(s) across {} points x {:?}",
+        "surface_probe: {} cliff(s) at the verdict line across {} points x {:?}",
+        crossings.len() + near_jumps.len(),
         pts.len(),
         LEVELS
     );
