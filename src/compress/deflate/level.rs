@@ -135,7 +135,51 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
-    p.fast_hash_update_inserts = 8;
+    // MATCH REACH (2026-08-13). `usize::MAX` = index EVERY position of an
+    // accepted match's interior, which is what the vendor does; the previous
+    // `8` is igzip's LIMIT_HASH_UPDATE, which indexes a short prefix and jumps
+    // the cursor over the rest.
+    //
+    // THE VENDOR DIFFERENCE. `vendor/libdeflate/lib/ht_matchfinder.h:196`
+    // (`ht_matchfinder_skip_bytes`) is called with `count = length - 1` after
+    // every accepted match and inserts all of them — libdeflate's L1 table is
+    // dense at 1.000 inserts/byte. Ours was NOT: measured with
+    // `--features anatomy-counters` on `e8_p8192_long_a256_r0` at L1/T1
+    // (M1, 2026-08-13), 181,096 head writes over 1,048,576 bytes = **0.173
+    // inserts/byte**, because 940,664 of those bytes (89.7%) sit inside an
+    // accepted match whose interior past position 8 we never indexed. That is
+    // the same 0.276-vs-1.000 structural gap the deleted `ht_fast.rs:200`
+    // record's replacement measurement found; this is its cause.
+    //
+    // WHY IT COSTS SIZE. A position that was never inserted cannot be FOUND as
+    // a match source later, so on content whose repeats are longer than the
+    // prefix the next repeat's source is an un-indexed interior, the probe
+    // misses, and we emit literals where the vendor emits a long match.
+    // `examples/divergence_accounting --level 1` attributes the +96,482 B gap
+    // on that point EXACTLY (residual 0 bits): 2,386 `we_lit_they_match`
+    // decisions = +87,475 B (91%) where libdeflate takes a ~177-byte match at
+    // distance 8192, plus 1,200 `diff_len` where our mean length is 66 against
+    // their 195.
+    //
+    // WHY THIS MECHANISM AND NOT ANOTHER. The `diff_dist` bucket names it: on
+    // 402 decisions we take the SAME length as libdeflate at a mean distance of
+    // 20,582 while they take 8,192 — we match an OLDER copy of the same bytes,
+    // which is only possible if the NEARER source is missing from the table. A
+    // max-distance or `nice_length` cutoff would fail the opposite way (near
+    // found, far missed), and a truncated `lz_extend` would show shorter
+    // lengths at the SAME distance. Both are refuted by that one bucket.
+    //
+    // THE COST, AND THE CHEAPER POINT THAT WAS BUILT AND REJECTED. A strided
+    // tail (index every k-th interior position after the dense prefix) was
+    // implemented and swept on the cliff point: stride 1 -> 1.0022x
+    // libdeflate, 2 -> 1.1195x, 4 -> 1.2272x, 8 -> 1.3487x, 16 -> 1.5123x
+    // against 3.4467x at the old prefix-only setting. The stride does NOT pay:
+    // a repeat whose source is un-indexed is found within k-1 further
+    // positions, but the bytes skipped in the meantime become LITERALS, and on
+    // high-entropy content a literal is a full 8 bits — the single most
+    // expensive symbol there is. Only stride 1, i.e. this line, closes the
+    // class, so the stride parameter was deleted rather than shipped at 1.
+    p.fast_hash_update_inserts = usize::MAX;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
 }
