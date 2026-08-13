@@ -1945,8 +1945,25 @@ fn process_position_l1(
             // SAFETY: nh < match_end = pos+length <= in_end, and
             // buf's pad covers the 4-byte load past in_end.
             let s = unsafe { load_u32(base, nh) };
+            let hi = lz_hash(s, HASH_BITS) as usize;
+            // SHIFT THE WHOLE BUCKET, exactly as the vendor's skip loop does
+            // (`vendor/libdeflate/lib/ht_matchfinder.h:196`
+            // `ht_matchfinder_skip_bytes`: `for (i = 1; i < BUCKET_SIZE; i++)
+            // hash_tab[base+i] = hash_tab[base+i-1]; hash_tab[base] =
+            // cur_pos;`). Without this the interior insert OVERWRITES slot 0
+            // and drops its previous occupant on the floor, so indexing a
+            // match's interior evicts good anchors with no second chance —
+            // measured, and it is not a small effect: `markup.xml` L1/T1 goes
+            // +21,920 B (a WIN -> LOSS flip) with the dense insert and no
+            // shift, and recovers to a WIN with it. The probe site above
+            // already shifts (see `cand2`); only this loop did not.
+            if bucket2.enabled {
+                // SAFETY: `hi < HASH_SIZE == head2.len()` when bucket2 is on,
+                // the same bound the probe site's `head2` accesses use.
+                unsafe { *head2.get_unchecked_mut(hi) = *head.get_unchecked(hi) };
+            }
             // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+            unsafe { *head.get_unchecked_mut(hi) = nh as u32 };
             nh += 1;
         }
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
