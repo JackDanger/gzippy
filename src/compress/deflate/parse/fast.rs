@@ -1611,7 +1611,7 @@ fn hash3_better(cur_len: u32, cur_dist: usize, next_len: u32, next_dist: usize) 
 /// `fast_end <= in_end - DEFLATE_MAX_MATCH_LEN` (see [`run`]'s `fast_end`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn process_position_l1(
+fn process_position_l1<const REACH: bool>(
     pos: usize,
     h: usize,
     cand: u32,
@@ -1945,8 +1945,36 @@ fn process_position_l1(
             // SAFETY: nh < match_end = pos+length <= in_end, and
             // buf's pad covers the 4-byte load past in_end.
             let s = unsafe { load_u32(base, nh) };
+            let hi = lz_hash(s, HASH_BITS) as usize;
+            // SHIFT THE WHOLE BUCKET, exactly as the vendor's skip loop does
+            // (`vendor/libdeflate/lib/ht_matchfinder.h:196`
+            // `ht_matchfinder_skip_bytes`: `for (i = 1; i < BUCKET_SIZE; i++)
+            // hash_tab[base+i] = hash_tab[base+i-1]; hash_tab[base] =
+            // cur_pos;`). Without this the interior insert OVERWRITES slot 0
+            // and drops its previous occupant on the floor, so indexing a
+            // match's interior evicts good anchors with no second chance —
+            // measured, and it is not a small effect: `markup.xml` L1/T1 goes
+            // +21,920 B (a WIN -> LOSS flip) with the dense insert and no
+            // shift, and recovers to a WIN with it. The probe site above
+            // already shifts (see `cand2`); only this loop did not.
+            // `REACH` is a CONST generic, so at the `REACH == false`
+            // monomorphization (T>1, `params_parallel`) this whole block —
+            // and the `hi` binding's only extra use — is compiled away and
+            // the loop is byte-for-byte the code `main` ships. The
+            // `bucket2.enabled` conjunct is the SAFETY bound, not a second
+            // policy switch: `head2` is an EMPTY slice when bucket2 is off
+            // (see `run`'s `head2` init), so the unchecked write must not be
+            // reached in that state. Every caller that sets `REACH` also
+            // sets `fast_bucket2` (`apply_l1_match_reach_t1_knobs` runs only
+            // after `apply_l1_fast_parallel_knobs`), so the conjunct is
+            // always true where it is evaluated.
+            if REACH && bucket2.enabled {
+                // SAFETY: `hi < HASH_SIZE == head2.len()` when bucket2 is on,
+                // the same bound the probe site's `head2` accesses use.
+                unsafe { *head2.get_unchecked_mut(hi) = *head.get_unchecked(hi) };
+            }
             // SAFETY: `lz_hash` output `< HASH_SIZE`, as above.
-            unsafe { *head.get_unchecked_mut(lz_hash(s, HASH_BITS) as usize) = nh as u32 };
+            unsafe { *head.get_unchecked_mut(hi) = nh as u32 };
             nh += 1;
         }
         // HASH3-PROBE interior insert (gated the SAME as the top-of-function
@@ -2345,7 +2373,7 @@ fn fastloop_l0(
 /// corpora (text6/bin6/sil40), both boxes. See [`fastloop_l0`]'s doc comment
 /// for why L0 does NOT share this function even behind a dead branch.
 #[allow(clippy::too_many_arguments)]
-fn fastloop_l1(
+fn fastloop_l1<const REACH: bool>(
     mut pos: usize,
     fast_end: usize,
     buf: &[u8],
@@ -2422,7 +2450,7 @@ fn fastloop_l1(
                 local.k2_batch_iterations += 1;
             }
 
-            let after0 = process_position_l1(
+            let after0 = process_position_l1::<REACH>(
                 pos,
                 h0,
                 cand0,
@@ -2463,7 +2491,7 @@ fn fastloop_l1(
                 // the up-to-date value is `pos` itself, not the stale
                 // pre-write `cand1_raw`.
                 let cand1 = if h1 == h0 { pos as u32 } else { cand1_raw };
-                pos = process_position_l1(
+                pos = process_position_l1::<REACH>(
                     after0,
                     h1,
                     cand1,
@@ -2517,7 +2545,7 @@ fn fastloop_l1(
         {
             local.head_table_reads += 1;
         }
-        pos = process_position_l1(
+        pos = process_position_l1::<REACH>(
             pos,
             h,
             cand,
@@ -2896,7 +2924,7 @@ fn parse_tail(
 /// compiled away entirely — L1's fastloop is exactly the code that existed
 /// before the accel lever was added, not "the same logic with a runtime
 /// branch". Only the `run::<true>` instantiation (L0) carries the ramp.
-pub(super) fn run<const ACCEL: bool>(
+pub(super) fn run<const ACCEL: bool, const REACH: bool>(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
@@ -3222,7 +3250,7 @@ pub(super) fn run<const ACCEL: bool>(
                         &mut local,
                     )
                 } else {
-                    fastloop_l1(
+                    fastloop_l1::<REACH>(
                         pos,
                         fast_end,
                         buf,
@@ -3260,7 +3288,7 @@ pub(super) fn run<const ACCEL: bool>(
                         &mut local,
                     )
                 } else if hash3_active || bucket2.enabled {
-                    fastloop_l1(
+                    fastloop_l1::<REACH>(
                         pos,
                         fast_end,
                         buf,
@@ -3561,7 +3589,7 @@ impl Drop for FastResume {
 /// preserve, and it is measurement-only by charter.
 #[cfg(not(feature = "l1-tune"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run_resumable(
+pub(super) fn run_resumable<const REACH: bool>(
     buf: &[u8],
     state: &mut super::ParseState,
     from: usize,
@@ -3644,7 +3672,7 @@ pub(super) fn run_resumable(
             // (L1-only path; L0 never streams through a parser — the
             // streaming encoder handles level 0 as stored blocks itself).
             pos = if hash3_active || bucket2.enabled {
-                fastloop_l1(
+                fastloop_l1::<REACH>(
                     pos,
                     fast_end,
                     buf,

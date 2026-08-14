@@ -105,6 +105,32 @@ pub struct LevelParams {
     /// T>1-only: hash inserts per accepted match interior (vendor shifts the
     /// full bucket every skipped byte; default L1 is 3).
     pub fast_hash_update_inserts: usize,
+    /// **T1-ONLY (L1): MATCH REACH.** Selects the `REACH == true`
+    /// monomorphization of `parse::fast`'s L1 fastloop, which shifts the whole
+    /// 2-way bucket on every match-interior insert the way the vendor's
+    /// `ht_matchfinder_skip_bytes` does. Paired with
+    /// [`Self::fast_hash_update_inserts`] `== usize::MAX`; the two are one
+    /// lever and are set together by [`apply_l1_match_reach_t1_knobs`], whose
+    /// doc comment holds the whole measurement.
+    ///
+    /// `false` at T>1 BY CONSTRUCTION, and the reason is the WALL BUDGET, not
+    /// byte-identity — the same shape as [`Self::try_exact_huffman`] with the
+    /// thread counts swapped. Scoped adjudication of the unscoped lever
+    /// (solvency, `try-l1-reach/try.json`, 208 in-scope cells) closed all four
+    /// record-file size cells and then failed clause 3 on ONE cell:
+    /// `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail, cross-layout CONFIRMED
+    /// REAL at median ln +0.1186. That is a T4 cell, in the thin-margin
+    /// pigz-at-T4 class that also convicted #310, and the dense insert's
+    /// maintenance cost lands hardest exactly where pigz's margin is thinnest.
+    /// The two cells the lever closes at T1 —
+    /// `libdeflate:{access.log,ecoli.fastq}:L1:T1:size` — do not need T>1 to
+    /// move at all, so T>1 is left as `main`: the T4 wall cell cannot flip
+    /// because its BYTES cannot change.
+    ///
+    /// Revival of the T>1 half is the wall-budget-scoped density (insert-all
+    /// only while the block's measured cost stays inside the level's budget),
+    /// i.e. the cost-model direction — NOT a second constant here.
+    pub fast_dense_interior_insert: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -135,9 +161,101 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
+    // igzip's LIMIT_HASH_UPDATE (`vendor/isa-l/igzip/igzip_base.c:71-86`):
+    // index a short prefix of an accepted match's interior, then jump the
+    // cursor over the rest. T>1 KEEPS THIS; T1 replaces it — see
+    // [`apply_l1_match_reach_t1_knobs`].
     p.fast_hash_update_inserts = 8;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
+}
+
+/// **T1-ONLY (L1): MATCH REACH.** Index EVERY position of an accepted match's
+/// interior (`usize::MAX`) and shift the whole 2-way bucket while doing it —
+/// what the vendor does. Applied by [`params_baseline`] only; `params_parallel`
+/// stops at [`apply_l1_fast_parallel_knobs`] above, so T>1 keeps igzip's `8`
+/// and its output is byte-for-byte `main`'s.
+///
+/// # Why T1 only — the coordinate, stated separately from the mechanism
+///
+/// The mechanism below is INTRINSIC and holds at every thread count. The
+/// SCOPE is a coordinate-dependent verdict and holds only where it was
+/// measured. The unscoped lever (PR #319) was adjudicated on solvency
+/// (`try-l1-reach/try.json`, scoped `levels=1`, 208 in-scope cells graded):
+/// clause 4 closed ALL FOUR record-file cells,
+/// `libdeflate:{access.log,ecoli.fastq}:L1:{T1,T4}:size`, and clause 3 then
+/// failed on ONE cell — `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail,
+/// cross-layout CONFIRMED REAL, median ln +0.1186 (6-10x the layout floor).
+/// Clause 3 is absolute, so the whole lever was NO-SHIP.
+///
+/// Every cell in that flip is at T>1, and the T1 half of the win needs
+/// nothing from T>1. Gating here keeps `libdeflate:access.log:L1:T1:size` and
+/// `libdeflate:ecoli.fastq:L1:T1:size` closing while leaving the T4 bitstream
+/// IDENTICAL — so `pigz:ecoli.fastq:L1:T4:wall` cannot flip BY CONSTRUCTION,
+/// not by a re-measurement that might come back differently. This is the
+/// #310 pattern inverted: #310 kept T1 and paid at T4; here the margin is at
+/// T4, so T4 is what we keep.
+///
+/// The Ir cost lands on the T1 side and is real, not free: trainer
+/// (i7-13700T) cachegrind `-p1`, L1, frozen fixtures — text +7.93%, tabular
+/// +12.23%, binary +8.01%, noise +1.80%. L6/L9 are untouched to the
+/// instruction. It buys 23/23 tune files smaller at L1/T1 and a cliff that
+/// goes from 3.4467x libdeflate to 0.9950x.
+///
+/// The T>1 half is NOT abandoned and NOT falsified — it is parked on a
+/// different mechanism: density scoped by the block's measured wall budget
+/// (the cost-model direction), where no constant decides and the data does.
+/// Do not revive it by flipping this flag on in `params_parallel`.
+///
+/// # The mechanism (intrinsic; holds at every thread count)
+fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
+    // THE VENDOR DIFFERENCE. `vendor/libdeflate/lib/ht_matchfinder.h:196`
+    // (`ht_matchfinder_skip_bytes`) is called with `count = length - 1` after
+    // every accepted match and inserts all of them — libdeflate's L1 table is
+    // dense at 1.000 inserts/byte. Ours was NOT: measured with
+    // `--features anatomy-counters` on `e8_p8192_long_a256_r0` at L1/T1
+    // (M1, 2026-08-13), 181,096 head writes over 1,048,576 bytes = **0.173
+    // inserts/byte**, because 940,664 of those bytes (89.7%) sit inside an
+    // accepted match whose interior past position 8 we never indexed. That is
+    // the same 0.276-vs-1.000 structural gap the deleted `ht_fast.rs:200`
+    // record's replacement measurement found; this is its cause.
+    //
+    // WHY IT COSTS SIZE. A position that was never inserted cannot be FOUND as
+    // a match source later, so on content whose repeats are longer than the
+    // prefix the next repeat's source is an un-indexed interior, the probe
+    // misses, and we emit literals where the vendor emits a long match.
+    // `examples/divergence_accounting --level 1` attributes the +96,482 B gap
+    // on that point EXACTLY (residual 0 bits): 2,386 `we_lit_they_match`
+    // decisions = +87,475 B (91%) where libdeflate takes a ~177-byte match at
+    // distance 8192, plus 1,200 `diff_len` where our mean length is 66 against
+    // their 195.
+    //
+    // WHY THIS MECHANISM AND NOT ANOTHER. The `diff_dist` bucket names it: on
+    // 402 decisions we take the SAME length as libdeflate at a mean distance of
+    // 20,582 while they take 8,192 — we match an OLDER copy of the same bytes,
+    // which is only possible if the NEARER source is missing from the table. A
+    // max-distance or `nice_length` cutoff would fail the opposite way (near
+    // found, far missed), and a truncated `lz_extend` would show shorter
+    // lengths at the SAME distance. Both are refuted by that one bucket.
+    //
+    // THE COST, AND THE CHEAPER POINT THAT WAS BUILT AND REJECTED. A strided
+    // tail (index every k-th interior position after the dense prefix) was
+    // implemented and swept on the cliff point: stride 1 -> 1.0022x
+    // libdeflate, 2 -> 1.1195x, 4 -> 1.2272x, 8 -> 1.3487x, 16 -> 1.5123x
+    // against 3.4467x at the old prefix-only setting. The stride does NOT pay:
+    // a repeat whose source is un-indexed is found within k-1 further
+    // positions, but the bytes skipped in the meantime become LITERALS, and on
+    // high-entropy content a literal is a full 8 bits — the single most
+    // expensive symbol there is. Only stride 1, i.e. this line, closes the
+    // class, so the stride parameter was deleted rather than shipped at 1.
+    p.fast_hash_update_inserts = usize::MAX;
+    // The dense insert ALONE is worse, not better: `markup.xml` L1/T1 goes
+    // WIN -> LOSS (+21,920 B) with `usize::MAX` and no bucket shift, because a
+    // slot-0-only interior insert evicts good anchors with no second chance.
+    // COMPOSITION IS REQUIRED — the line above and the line below are one
+    // lever, and the flag is what selects `parse::fast`'s `REACH == true`
+    // fastloop. `l1_match_reach_is_t1_only` asserts they never separate.
+    p.fast_dense_interior_insert = true;
 }
 
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
@@ -169,6 +287,9 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     ladder_tune::apply(&mut p);
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
+        // T1 ONLY. `params_parallel` deliberately does NOT call this — see its
+        // doc comment for the adjudicated T4 wall cell that is the reason.
+        apply_l1_match_reach_t1_knobs(&mut p);
     }
     p
 }
@@ -386,6 +507,17 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // L1 AT T>1: enable the 2-way bucket inside `parse::fast` (search-only lever
     // (b) from the L1-band mission brief, gated to short accepts). Keeps lazy
     // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
+    //
+    // ⚠ AND NOTHING MORE. `apply_l1_match_reach_t1_knobs` — the dense
+    // match-interior insert + bucket shift — is called by `params_baseline`
+    // (T1) and DELIBERATELY NOT HERE, so L1 T>1 keeps igzip's
+    // `fast_hash_update_inserts = 8`, keeps `fast_dense_interior_insert =
+    // false`, and emits byte-for-byte what `main` emits. Reason, adjudicated
+    // on solvency: the unscoped lever flipped `pigz:ecoli.fastq:L1:T4:wall`
+    // pass -> fail, cross-layout CONFIRMED REAL (median ln +0.1186), which is
+    // clause 3 and therefore absolute. Read
+    // `apply_l1_match_reach_t1_knobs`'s doc comment before adding a line
+    // here; the T>1 revival is the wall-budget-scoped density, NOT this flag.
     if level == 1 {
         apply_l1_fast_parallel_knobs(&mut p);
     }
@@ -490,6 +622,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast0,
@@ -510,6 +643,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast,
@@ -525,6 +659,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -593,6 +728,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -620,6 +756,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -635,6 +772,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -650,6 +788,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -665,6 +804,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -680,6 +820,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -695,6 +836,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -712,6 +854,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -732,6 +875,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -752,6 +896,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
+            fast_dense_interior_insert: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -891,6 +1036,87 @@ mod tests {
             assert_eq!(p.strategy, Strategy::NearOptimal, "level {l}");
             assert!(p.nice_match_length <= DEFLATE_MAX_MATCH_LEN, "level {l}");
             assert!(p.near_optimal.max_optim_passes >= 1, "level {l}");
+        }
+    }
+
+    /// The L1 MATCH-REACH knobs are T1-ONLY. This is the assertion the whole
+    /// clause-3 argument for that lever rests on, so it is a test and not a
+    /// sentence: `pigz:ecoli.fastq:L1:T4:wall` is adjudicated PASS only while
+    /// T>1 emits `main`'s bytes, and T>1 emits `main`'s bytes only while
+    /// `params_parallel(1)` declines these two knobs.
+    ///
+    /// This pins a ROUTE, not a VALUE — non-negotiable #5's cage was
+    /// `max_search_depth == 35`, a number `CLAUDE.md` declares free to change.
+    /// Nothing here asserts what the T>1 insert count IS (it may be retuned
+    /// freely); it asserts only that T>1 is not on the "index every interior
+    /// position" setting and T1 is. Changing that is a promotion decision with
+    /// a measured T4 wall cell attached, and this test is what makes it fail
+    /// closed instead of silently.
+    ///
+    /// The intended way to make this test go red is revival condition (2):
+    /// density scoped by the block's measured wall budget. That is a different
+    /// mechanism, and it must be re-adjudicated, not slipped in.
+    #[test]
+    fn l1_match_reach_is_t1_only() {
+        let t1 = params(1);
+        let t_gt_1 = params_parallel(1);
+
+        assert!(
+            t1.fast_dense_interior_insert,
+            "T1 L1 lost the match-reach bucket shift — the two record-file \
+             cells (libdeflate:{{access.log,ecoli.fastq}}:L1:T1:size) close \
+             only with it"
+        );
+        assert_eq!(
+            t1.fast_hash_update_inserts,
+            usize::MAX,
+            "T1 L1 is no longer indexing the whole match interior; the dense \
+             insert and the bucket shift are ONE lever (the insert alone is a \
+             WIN -> LOSS flip on markup.xml) and must move together"
+        );
+
+        assert!(
+            !t_gt_1.fast_dense_interior_insert,
+            "T>1 L1 picked up the match-reach bucket shift. That changes T>1 \
+             OUTPUT BYTES, which is the only thing keeping \
+             pigz:ecoli.fastq:L1:T4:wall from the flip that made PR #319 \
+             NO-SHIP on clause 3 (cross-layout CONFIRMED REAL, median ln \
+             +0.1186)."
+        );
+        assert!(
+            t_gt_1.fast_hash_update_inserts < usize::MAX,
+            "T>1 L1 is now indexing the whole match interior — same flip, \
+             same cell. The value itself is free to tune; 'index everything' \
+             is the setting that was measured to cost the wall cell."
+        );
+
+        // The two knobs are one lever on BOTH sides: neither may be set
+        // without the other, or the half-lever regression (dense insert, no
+        // shift) is reachable.
+        for (name, p) in [("T1", t1), ("T>1", t_gt_1)] {
+            assert_eq!(
+                p.fast_dense_interior_insert,
+                p.fast_hash_update_inserts == usize::MAX,
+                "{name} L1 has half the match-reach lever: dense insert with \
+                 no bucket shift measured +21,920 B on markup.xml (WIN -> LOSS)"
+            );
+        }
+
+        // No OTHER level has the knob, at either thread count: the lever's
+        // scope claim is `levels=1`, and 207 of 207 T1 cells outside L1
+        // (23 corpus files x levels 0,2..9) were verified byte-identical to
+        // main on that basis.
+        for l in (0..=12u32).filter(|&l| l != 1) {
+            for (name, p) in [
+                ("params", params(l)),
+                ("params_parallel", params_parallel(l)),
+            ] {
+                assert!(
+                    !p.fast_dense_interior_insert,
+                    "{name}({l}) carries the L1 match-reach knob; the lever is \
+                     scoped to level 1"
+                );
+            }
         }
     }
 }
