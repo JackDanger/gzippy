@@ -98,11 +98,11 @@ const SUBSTRINGS: &[&str] = &[
     // loops below (the watch went 0-match, exactly the rename event the
     // canary exists to catch — caught 2026-08-08, adjusted here with the
     // pins regenerated in the same commit).
-    // #320's T1-only REACH route monomorphizes `fastloop_l1<const REACH>` into
-    // two symbols; pin each variant — a plain `fastloop_l1` substring also
-    // hits `fastloop_l1_lean` and fails the duplicate-symbol guard.
-    "fastloop_l1::<false>",
-    "fastloop_l1::<true>",
+    // REACH + INTERLEAVED monomorphize `fastloop_l1`; pin each outlined
+    // variant. The T>1 interleaved monomorph (`::<false, true>`) may inline on
+    // some targets — if it appears outlined on the trainer, add a fourth pin.
+    "fastloop_l1::<false, false>",
+    "fastloop_l1::<true, false>",
     "fast::fastloop_l1_lean",
     "greedy::run_resumable",
     "lazy::run_resumable",

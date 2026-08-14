@@ -23,12 +23,12 @@ aarch64-apple-darwin	MatchFinder>::get_matches	1540	<gzippy::compress::deflate::
 aarch64-apple-darwin	build_dynamic_header	1596	gzippy::compress::deflate::huffman::header::build_dynamic_header
 aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>	7612	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>
 aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>	7688	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>
-aarch64-apple-darwin	deflate_into	1496	gzippy::compress::deflate::deflate_into
+aarch64-apple-darwin	deflate_into	1460	gzippy::compress::deflate::deflate_into
 aarch64-apple-darwin	emit_block	6148	gzippy::compress::deflate::parse::emit_block
 aarch64-apple-darwin	emit_sequences	3740	gzippy::compress::deflate::parse::emit_sequences
-aarch64-apple-darwin	fast::fastloop_l1_lean	6928	gzippy::compress::deflate::parse::fast::fastloop_l1_lean
-aarch64-apple-darwin	fastloop_l1::<false>	17988	gzippy::compress::deflate::parse::fast::fastloop_l1::<false>
-aarch64-apple-darwin	fastloop_l1::<true>	17588	gzippy::compress::deflate::parse::fast::fastloop_l1::<true>
+aarch64-apple-darwin	fast::fastloop_l1_lean	6928	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false>
+aarch64-apple-darwin	fastloop_l1::<false, false>	18132	gzippy::compress::deflate::parse::fast::fastloop_l1::<false, false>
+aarch64-apple-darwin	fastloop_l1::<true, false>	17688	gzippy::compress::deflate::parse::fast::fastloop_l1::<true, false>
 aarch64-apple-darwin	greedy::run_resumable	5888	gzippy::compress::deflate::parse::greedy::run_resumable
 aarch64-apple-darwin	lazy::run_resumable	10456	gzippy::compress::deflate::parse::lazy::run_resumable
 aarch64-apple-darwin	make_huffman_code_into	676	gzippy::compress::deflate::huffman::fast::make_huffman_code_into
@@ -40,9 +40,9 @@ x86_64-unknown-linux-gnu	compress_buffer_pure::<std::io::buffered::bufwriter::Bu
 x86_64-unknown-linux-gnu	deflate_into	1520	gzippy::compress::deflate::deflate_into
 x86_64-unknown-linux-gnu	emit_block	8496	gzippy::compress::deflate::parse::emit_block
 x86_64-unknown-linux-gnu	emit_sequences	2640	gzippy::compress::deflate::parse::emit_sequences
-x86_64-unknown-linux-gnu	fast::fastloop_l1_lean	7888	gzippy::compress::deflate::parse::fast::fastloop_l1_lean
-x86_64-unknown-linux-gnu	fastloop_l1::<false>	19472	gzippy::compress::deflate::parse::fast::fastloop_l1::<false>
-x86_64-unknown-linux-gnu	fastloop_l1::<true>	19040	gzippy::compress::deflate::parse::fast::fastloop_l1::<true>
+x86_64-unknown-linux-gnu	fast::fastloop_l1_lean	7888	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false>
+x86_64-unknown-linux-gnu	fastloop_l1::<false, false>	19472	gzippy::compress::deflate::parse::fast::fastloop_l1::<false, false>
+x86_64-unknown-linux-gnu	fastloop_l1::<true, false>	19040	gzippy::compress::deflate::parse::fast::fastloop_l1::<true, false>
 x86_64-unknown-linux-gnu	greedy::run_resumable	9536	gzippy::compress::deflate::parse::greedy::run_resumable
 x86_64-unknown-linux-gnu	lazy::run_resumable	11280	gzippy::compress::deflate::parse::lazy::run_resumable
 x86_64-unknown-linux-gnu	make_huffman_code_into	752	gzippy::compress::deflate::huffman::fast::make_huffman_code_into

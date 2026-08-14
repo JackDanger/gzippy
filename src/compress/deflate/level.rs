@@ -102,8 +102,14 @@ pub struct LevelParams {
     /// T>1-only: probe the second bucket slot on a primary miss (vendor
     /// `ht_matchfinder` probes both slots every lookup).
     pub fast_bucket2_probe_on_miss: bool,
-    /// T>1-only: hash inserts per accepted match interior (vendor shifts the
-    /// full bucket every skipped byte; default L1 is 3).
+    /// Hash inserts per accepted match interior. L1 T>1
+    /// ([`apply_l1_fast_parallel_knobs`]) ships `usize::MAX` — insert EVERY
+    /// skipped byte, exactly libdeflate's `ht_matchfinder_skip_bytes` — since
+    /// the interleaved-bucket lever made full maintenance one cache line per
+    /// insert. L1 T1 keeps the shipped cap of 8 (the maintenance bill is
+    /// ~6-15% of L1 wall on match-dense files and T1's slack is thin — PR
+    /// #296's clause-5 adjudication). Non-L1 levels keep the igzip-style
+    /// small cap (only the fast path reads this).
     pub fast_hash_update_inserts: usize,
     /// **T1-ONLY (L1): MATCH REACH.** Selects the `REACH == true`
     /// monomorphization of `parse::fast`'s L1 fastloop, which shifts the whole
@@ -131,6 +137,17 @@ pub struct LevelParams {
     /// only while the block's measured cost stays inside the level's budget),
     /// i.e. the cost-model direction — NOT a second constant here.
     pub fast_dense_interior_insert: bool,
+    /// T>1-only: vendor-exact bucket MAINTENANCE for the L1 head table — the
+    /// INTERLEAVED 2-slot bucket layout (`parse/fast.rs`'s
+    /// [`L1_HEAD_ENTRIES`]) with a slot-shift on EVERY insert (probe,
+    /// interior, warmup, tail), i.e. `ht_matchfinder`'s protocol. Set only by
+    /// [`apply_l1_fast_parallel_knobs`] (T>1); T1 keeps the two-array
+    /// `head`/`head2` layout where only PROBE-position inserts shift and
+    /// interior/warmup/tail inserts overwrite slot 0 — byte-frozen by the
+    /// tie cage (see `scripts/campaign/tie-guard.sh`). Selected as a const
+    /// generic at `parse::compress`'s dispatch so the T1 monomorphization
+    /// compiles to the pre-lever code, not a runtime-branched hybrid.
+    pub fast_interleaved_bucket: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -156,8 +173,10 @@ pub struct LevelParams {
     pub near_optimal: NearOptimalParams,
 }
 
-/// L1 parse knobs shared by T1 (`params`) and T>1 (`params_parallel`).
-fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
+/// L1 parse knobs shared by T1 (`params`) and T>1 (`params_parallel`) —
+/// the values main shipped before the interleaved-bucket lever, byte-frozen
+/// on the T1 route by the tie cage.
+fn apply_l1_fast_shared_knobs(p: &mut LevelParams) {
     p.fast_bucket2 = true;
     p.fast_bucket2_gate_max_len = 64;
     p.fast_bucket2_probe_on_miss = true;
@@ -258,6 +277,33 @@ fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
     p.fast_dense_interior_insert = true;
 }
 
+/// L1 knobs for the T>1 route ONLY: the shared set plus vendor-exact bucket
+/// maintenance (PR #296, re-scoped to T>1).
+///
+/// Insert EVERY interior (match-skip) byte, shifting the interleaved 2-slot
+/// bucket on each write — vendor `ht_matchfinder_skip_bytes` semantics. The
+/// old cap of 8 plus shift-free interior overwrites left the bucket holding
+/// stale generations; measured on solvency (2026-08-09, L1, main@03200049)
+/// the pair of fixes flips access.log (-70,953 B vs libdeflate) and
+/// ecoli.fastq (-7,579 B) and collapses the diff_dist divergence class to
+/// exactly 0. See `parse/fast.rs`'s `L1_HEAD_ENTRIES` for the layout that
+/// makes this affordable.
+///
+/// T>1-ONLY because the maintenance bill is REAL at T1: #296's solvency
+/// adjudication measured insert-every-interior-byte at ~6-15% of L1 T1 wall
+/// on match-dense files (data.json L1:T1 0.548 -> 0.638), a clause-5
+/// NO-SHIP against T1's thin slack, while the same bill at T4 is absorbed
+/// by 249-330% slack (and several T4 wall cells got FASTER). Pay where the
+/// slack lives — the #297 pattern. The two L1 T1 size cells this leaves
+/// open (libdeflate:{access.log,ecoli.fastq}:L1:T1) revive on a CHEAPER T1
+/// maintenance scheme (batched/prefetched interior inserts), not on
+/// re-widening this knob.
+fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
+    apply_l1_fast_shared_knobs(p);
+    p.fast_interleaved_bucket = true;
+    p.fast_hash_update_inserts = usize::MAX;
+}
+
 /// Resolve a compression level (clamped to 0..=12) to its parser parameters.
 ///
 /// The `max_search_depth`/`nice_match_length` values transliterate the vendor
@@ -286,7 +332,7 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     #[cfg(feature = "ladder-tune")]
     ladder_tune::apply(&mut p);
     if level == 1 {
-        apply_l1_fast_parallel_knobs(&mut p);
+        apply_l1_fast_shared_knobs(&mut p);
         // T1 ONLY. `params_parallel` deliberately does NOT call this — see its
         // doc comment for the adjudicated T4 wall cell that is the reason.
         apply_l1_match_reach_t1_knobs(&mut p);
@@ -623,6 +669,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast0,
@@ -644,6 +691,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Fast,
@@ -660,6 +708,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -729,6 +778,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -757,6 +807,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Greedy,
@@ -773,6 +824,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -789,6 +841,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -805,6 +858,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy,
@@ -821,6 +875,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -837,6 +892,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::Lazy2,
@@ -855,6 +911,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -876,6 +933,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -897,6 +955,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_bucket2_probe_on_miss: false,
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
+            fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             strategy: Strategy::NearOptimal,
@@ -1039,23 +1098,11 @@ mod tests {
         }
     }
 
-    /// The L1 MATCH-REACH knobs are T1-ONLY. This is the assertion the whole
-    /// clause-3 argument for that lever rests on, so it is a test and not a
-    /// sentence: `pigz:ecoli.fastq:L1:T4:wall` is adjudicated PASS only while
-    /// T>1 emits `main`'s bytes, and T>1 emits `main`'s bytes only while
-    /// `params_parallel(1)` declines these two knobs.
-    ///
-    /// This pins a ROUTE, not a VALUE — non-negotiable #5's cage was
-    /// `max_search_depth == 35`, a number `CLAUDE.md` declares free to change.
-    /// Nothing here asserts what the T>1 insert count IS (it may be retuned
-    /// freely); it asserts only that T>1 is not on the "index every interior
-    /// position" setting and T1 is. Changing that is a promotion decision with
-    /// a measured T4 wall cell attached, and this test is what makes it fail
-    /// closed instead of silently.
-    ///
-    /// The intended way to make this test go red is revival condition (2):
-    /// density scoped by the block's measured wall budget. That is a different
-    /// mechanism, and it must be re-adjudicated, not slipped in.
+    /// The L1 MATCH-REACH knobs are T1-ONLY; the interleaved-bucket lever is
+    /// T>1-ONLY. This is the assertion the whole clause-3 argument for REACH
+    /// rests on: `pigz:ecoli.fastq:L1:T4:wall` flipped when the two-array
+    /// REACH route ran at T>1 (PR #319). #310's interleaved route is a
+    /// different monomorphization and was adjudicated separately.
     #[test]
     fn l1_match_reach_is_t1_only() {
         let t1 = params(1);
@@ -1074,38 +1121,46 @@ mod tests {
              insert and the bucket shift are ONE lever (the insert alone is a \
              WIN -> LOSS flip on markup.xml) and must move together"
         );
+        assert!(
+            !t1.fast_interleaved_bucket,
+            "T1 L1 must not take the T>1 interleaved-bucket route"
+        );
 
         assert!(
             !t_gt_1.fast_dense_interior_insert,
-            "T>1 L1 picked up the match-reach bucket shift. That changes T>1 \
-             OUTPUT BYTES, which is the only thing keeping \
-             pigz:ecoli.fastq:L1:T4:wall from the flip that made PR #319 \
-             NO-SHIP on clause 3 (cross-layout CONFIRMED REAL, median ln \
-             +0.1186)."
+            "T>1 L1 picked up the match-reach bucket shift. That is the \
+             two-array REACH route whose unscoped adjudication failed clause 3 \
+             on pigz:ecoli.fastq:L1:T4:wall."
         );
         assert!(
-            t_gt_1.fast_hash_update_inserts < usize::MAX,
-            "T>1 L1 is now indexing the whole match interior — same flip, \
-             same cell. The value itself is free to tune; 'index everything' \
-             is the setting that was measured to cost the wall cell."
+            t_gt_1.fast_interleaved_bucket,
+            "T>1 L1 lost the interleaved-bucket route — the lever that closes \
+             libdeflate:{{access.log,ecoli.fastq}}:L1:T4:size"
+        );
+        assert_eq!(
+            t_gt_1.fast_hash_update_inserts,
+            usize::MAX,
+            "T>1 L1 interleaved bucket pairs with dense interior insert"
         );
 
-        // The two knobs are one lever on BOTH sides: neither may be set
-        // without the other, or the half-lever regression (dense insert, no
-        // shift) is reachable.
-        for (name, p) in [("T1", t1), ("T>1", t_gt_1)] {
-            assert_eq!(
-                p.fast_dense_interior_insert,
-                p.fast_hash_update_inserts == usize::MAX,
-                "{name} L1 has half the match-reach lever: dense insert with \
-                 no bucket shift measured +21,920 B on markup.xml (WIN -> LOSS)"
-            );
-        }
+        assert!(
+            !(t1.fast_dense_interior_insert && t1.fast_interleaved_bucket),
+            "REACH and INTERLEAVED are mutually exclusive on T1"
+        );
+        assert!(
+            !(t_gt_1.fast_dense_interior_insert && t_gt_1.fast_interleaved_bucket),
+            "REACH and INTERLEAVED are mutually exclusive at T>1"
+        );
 
-        // No OTHER level has the knob, at either thread count: the lever's
-        // scope claim is `levels=1`, and 207 of 207 T1 cells outside L1
-        // (23 corpus files x levels 0,2..9) were verified byte-identical to
-        // main on that basis.
+        // REACH is one lever on T1: dense insert and bucket shift move together.
+        assert_eq!(
+            t1.fast_dense_interior_insert,
+            t1.fast_hash_update_inserts == usize::MAX,
+            "T1 L1 has half the match-reach lever: dense insert with no \
+             bucket shift measured +21,920 B on markup.xml (WIN -> LOSS)"
+        );
+
+        // No OTHER level has either knob, at either thread count.
         for l in (0..=12u32).filter(|&l| l != 1) {
             for (name, p) in [
                 ("params", params(l)),
@@ -1113,8 +1168,11 @@ mod tests {
             ] {
                 assert!(
                     !p.fast_dense_interior_insert,
-                    "{name}({l}) carries the L1 match-reach knob; the lever is \
-                     scoped to level 1"
+                    "{name}({l}) carries the L1 match-reach knob"
+                );
+                assert!(
+                    !p.fast_interleaved_bucket,
+                    "{name}({l}) carries the L1 interleaved-bucket knob"
                 );
             }
         }
