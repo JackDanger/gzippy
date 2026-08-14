@@ -21,5 +21,5 @@
 #   UPDATE_DIVERGENCE_ACCOUNTING=1 cargo test --release --test divergence_accounting
 fixture	level	ours_bytes	ldx_bytes	gap_bits	we_lit_they_match	diff_len	diff_dist	we_match_they_lit	table_drift	headers_eob
 text	1	360089	359332	6056	3134	-149	0	-1859	8589	-3659
-tabular	1	285059	306208	-169192	-163945	-1158	0	-1444	-2391	-254
-binary	1	662559	673068	-84072	-26023	-1648	0	-59934	3569	-36
+tabular	1	285060	306208	-169184	-163968	-1158	0	-1432	-2375	-251
+binary	1	662559	673068	-84072	-26023	-1648	0	-59934	3564	-31
