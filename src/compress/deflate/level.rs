@@ -169,6 +169,10 @@ pub struct LevelParams {
     /// 2026-08-09) — one cell, but the tie cage refuses any flip. Re-judge
     /// L4 if the gate's model ever prices the whole-block code externality.
     pub far_len3_gate: bool,
+    /// L2-only: every len-3 goes through the shadow probe before accept
+    /// (zlib `deflate_fast` accepts len-3 at any offset; probe blocks the
+    /// executable tie flips the ungated accept caused).
+    pub greedy_len3_shadow: bool,
     /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
     pub near_optimal: NearOptimalParams,
 }
@@ -677,6 +681,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 32,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         // Native L1 is the igzip-class one-pass FAST path (Increment 4):
@@ -699,6 +704,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 32,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
@@ -716,6 +722,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 10,
             good_match: 0,
             far_len3_gate: true,
+            greedy_len3_shadow: true,
             near_optimal: NONE_NO,
         },
         // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
@@ -786,6 +793,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 14,
             good_match: 0,
             far_len3_gate: true,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
@@ -815,6 +823,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 30,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
@@ -832,6 +841,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 30,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
@@ -849,6 +859,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 65,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
@@ -866,6 +877,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 130,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
@@ -883,6 +895,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
@@ -900,6 +913,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NONE_NO,
         },
         // Native near-optimal parser (`deflate_compress_near_optimal`,
@@ -919,6 +933,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 75,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 2,
                 min_improvement_to_continue: 32,
@@ -941,6 +956,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 150,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 4,
                 min_improvement_to_continue: 16,
@@ -963,6 +979,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 10,
                 min_improvement_to_continue: 1,
