@@ -1107,7 +1107,10 @@ mod tests {
         // (23 corpus files x levels 0,2..9) were verified byte-identical to
         // main on that basis.
         for l in (0..=12u32).filter(|&l| l != 1) {
-            for (name, p) in [("params", params(l)), ("params_parallel", params_parallel(l))] {
+            for (name, p) in [
+                ("params", params(l)),
+                ("params_parallel", params_parallel(l)),
+            ] {
                 assert!(
                     !p.fast_dense_interior_insert,
                     "{name}({l}) carries the L1 match-reach knob; the lever is \
