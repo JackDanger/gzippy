@@ -93,3 +93,8 @@ page-4095B
 small-256B
 sil*.tar
 shortmatch-*.bin
+
+# Build artifacts from instrumented runs (--target-dir); 654 files / 73 MB were
+# committed by accident in #255 and shipped in every clone since.
+target-trace/
+target-*/
