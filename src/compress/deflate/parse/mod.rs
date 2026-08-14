@@ -445,11 +445,9 @@ pub(super) fn compress(
         // (L0) monomorphizes with the scan-step ramp; `::<false>` (L1)
         // monomorphizes with that code compiled away entirely, not merely
         // runtime-disabled.
-        // `REACH == false`: L0's fastloop is `fastloop_l0`, which has no
-        // 2-way bucket and no interior-insert shift at all, so the parameter
-        // is inert here — passed `false` because that is the state L0 has
-        // always been in, not because L0 was measured either way.
-        Strategy::Fast0 => fast::run::<true, false>(
+        // L0: neither REACH nor INTERLEAVED — `fastloop_l0` has no 2-way
+        // bucket and no interior-insert shift at all.
+        Strategy::Fast0 => fast::run::<true, false, false>(
             buf,
             data_start,
             in_end,
@@ -481,16 +479,26 @@ pub(super) fn compress(
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
             };
-            // REACH DISPATCH — see `level::apply_l1_match_reach_t1_knobs`.
-            // `REACH` is a CONST generic, so this ONE branch (taken once per
-            // whole-buffer call, not once per position) picks between two
-            // monomorphizations of the entire L1 parser. The
-            // `REACH == false` one is the code `main` ships, with the
-            // interior-insert bucket shift compiled out rather than
-            // runtime-disabled; T>1 gets exactly that one because
-            // `params_parallel` leaves the flag `false`.
-            if params.fast_dense_interior_insert {
-                fast::run::<false, true>(
+            // REACH / INTERLEAVED dispatch — const generics, one branch per
+            // whole-buffer call. T>1 (`fast_interleaved_bucket`) and T1 REACH
+            // (`fast_dense_interior_insert`) are mutually exclusive by construction.
+            if params.fast_interleaved_bucket {
+                fast::run::<false, false, true>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    fast::FAST_BLOCK_LENGTH,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            } else if params.fast_dense_interior_insert {
+                fast::run::<false, true, false>(
                     buf,
                     data_start,
                     in_end,
@@ -505,7 +513,7 @@ pub(super) fn compress(
                     budget,
                 )
             } else {
-                fast::run::<false, false>(
+                fast::run::<false, false, false>(
                     buf,
                     data_start,
                     in_end,
@@ -534,9 +542,24 @@ pub(super) fn compress(
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
             };
-            // Same REACH dispatch as the default-build arm above.
-            if params.fast_dense_interior_insert {
-                fast::run::<false, true>(
+            // Same REACH / INTERLEAVED dispatch as the default-build arm above.
+            if params.fast_interleaved_bucket {
+                fast::run::<false, false, true>(
+                    buf,
+                    data_start,
+                    in_end,
+                    statics,
+                    bw,
+                    is_last,
+                    t.block_length,
+                    true,
+                    params.fast_hash_update_inserts,
+                    bucket2,
+                    cost_gate,
+                    budget,
+                )
+            } else if params.fast_dense_interior_insert {
+                fast::run::<false, true, false>(
                     buf,
                     data_start,
                     in_end,
@@ -551,7 +574,7 @@ pub(super) fn compress(
                     budget,
                 )
             } else {
-                fast::run::<false, false>(
+                fast::run::<false, false, false>(
                     buf,
                     data_start,
                     in_end,
