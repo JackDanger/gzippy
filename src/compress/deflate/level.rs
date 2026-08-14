@@ -735,7 +735,7 @@ fn params_inner(level: u32) -> LevelParams {
             max_search_depth: 12,
             nice_match_length: 14,
             good_match: 0,
-            far_len3_gate: false,
+            far_len3_gate: true,
             near_optimal: NONE_NO,
         },
         // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
