@@ -14,8 +14,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, far_len3, recalculate_min_match_len, BlockRole, FarLen3Gate, InputMode, ParseState,
-    Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
+    emit_block, far_len3, l3_sparse_split_hold, recalculate_min_match_len, BlockRole, FarLen3Gate,
+    InputMode, ParseState, Sink, StaticCodes, STREAM_BLOCK_LOOKAHEAD,
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
@@ -105,6 +105,7 @@ pub(super) fn run_resumable(
         ..Default::default()
     };
     let mut in_next = from;
+    let mut blocks_completed = 0u32;
 
     loop {
         if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
@@ -115,6 +116,12 @@ pub(super) fn run_resumable(
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
         sink.sparse_split_guard_mul = params.lazy_sparse_len3_guard_mul;
+        sink.sparse_split_hold = l3_sparse_split_hold(
+            params.lazy_sparse_len3_guard_mul,
+            blocks_completed,
+            from,
+            block_begin,
+        );
 
         // `anatomy-wall` region: `parse_match` — see `greedy.rs`'s sibling
         // call site for the fused-bucket rationale (identical here: the
@@ -147,6 +154,7 @@ pub(super) fn run_resumable(
             params.try_exact_huffman,
             None,
         );
+        blocks_completed += 1;
         if in_next == in_end {
             return in_next;
         }
