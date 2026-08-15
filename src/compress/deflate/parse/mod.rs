@@ -192,6 +192,11 @@ pub(crate) struct Sink {
     /// this replaces `Vec::len`, which `continue_block` had to LOAD on every
     /// token where libdeflate compares a pointer already in a register.
     nseqs: usize,
+    /// L3-only adaptive split gate (`lazy_sparse_len3_guard_mul`; 0 = off).
+    sparse_split_guard_mul: u32,
+    /// When true, non-ultra-sparse blocks need [`L3_NON_ULTRA_SPLIT_MIN_BYTES`]
+    /// before an entropy split (high block-rate inputs only).
+    sparse_split_hold: bool,
 }
 
 thread_local! {
@@ -276,6 +281,8 @@ impl Sink {
             block_length: 0,
             stats: BlockSplitStats::new(),
             nseqs: 0,
+            sparse_split_guard_mul: 0,
+            sparse_split_hold: false,
         }
     }
 
@@ -287,6 +294,8 @@ impl Sink {
         self.offset_freqs = [0; DEFLATE_NUM_OFFSET_SYMS];
         self.block_length = 0;
         self.stats.reset();
+        self.sparse_split_guard_mul = 0;
+        self.sparse_split_hold = false;
     }
 
     /// `deflate_choose_literal` (with split-stat gathering always on, as greedy
@@ -836,6 +845,70 @@ fn adjust_max_and_nice_len(max_len: &mut u32, nice_len: &mut u32, remaining: usi
     }
 }
 
+/// Ultra-sparse block test (shared with L3 lazy len-3 guard): `nseqs*64 ≤ bytes`
+/// AND `nseqs*M < bytes`. `guard_mul == 0` means disabled.
+#[inline]
+fn block_ultra_sparse(sink: &Sink, bytes_in_block: usize, guard_mul: u32) -> bool {
+    guard_mul > 0
+        && sink.nseqs.saturating_mul(64) <= bytes_in_block
+        && sink.nseqs.saturating_mul(guard_mul as usize) < bytes_in_block
+}
+
+/// Minimum in-block bytes before adaptive split on semi-sparse L3 blocks.
+const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
+
+/// Latch the over-split hold after this many completed blocks.
+pub(super) const L3_OVER_SPLIT_LATCH_BLOCKS: u32 = 8;
+
+/// Arm when mean block size is in this band (ecoli FASTQ over-split signature).
+pub(super) const L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES: usize = 50_000;
+pub(super) const L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES: usize = 65_000;
+
+/// Arm when block rate is at or below this (blocks per MiB).
+pub(super) const L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB: u32 = 20;
+
+/// Whether the L3 over-split hold is active for the current block.
+#[inline]
+pub(super) fn l3_sparse_split_hold(guard_mul: u32, latched: bool) -> bool {
+    guard_mul > 0 && latched
+}
+
+/// Decide whether to arm the split hold for the rest of the file.
+#[inline]
+pub(super) fn l3_sparse_split_latch(
+    guard_mul: u32,
+    blocks_completed: u32,
+    file_start: usize,
+    block_begin: usize,
+) -> bool {
+    if guard_mul == 0 || blocks_completed != L3_OVER_SPLIT_LATCH_BLOCKS {
+        return false;
+    }
+    let bytes = block_begin - file_start;
+    if bytes == 0 {
+        return false;
+    }
+    let prior_avg = bytes / blocks_completed as usize;
+    let blocks_per_mib = blocks_completed.saturating_mul(1_048_576) / bytes as u32;
+    blocks_per_mib <= L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB
+        && prior_avg > L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES
+        && prior_avg < L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES
+}
+
+/// Whether adaptive block-split may run at this position (L3 gate).
+///
+/// Non-ultra-sparse blocks over-split on FASTQ; hold them to
+/// [`L3_NON_ULTRA_SPLIT_MIN_BYTES`] before entropy split. Ultra-sparse blocks
+/// keep libdeflate's adaptive cadence.
+#[inline]
+fn sparse_split_active(sink: &Sink, bytes_in_block: usize, sparse_split_guard_mul: u32) -> bool {
+    if sparse_split_guard_mul == 0 || !sink.sparse_split_hold {
+        return true;
+    }
+    block_ultra_sparse(sink, bytes_in_block, sparse_split_guard_mul)
+        || bytes_in_block >= L3_NON_ULTRA_SPLIT_MIN_BYTES
+}
+
 /// Whether the block loop should continue after emitting a token.
 #[inline]
 fn continue_block(
@@ -845,11 +918,18 @@ fn continue_block(
     in_max_block_end: usize,
     in_end: usize,
 ) -> bool {
-    in_next < in_max_block_end
-        && sink.nseqs < SEQ_STORE_LENGTH
-        && !sink
-            .stats
-            .should_end_block(in_next - block_begin, in_end - in_next)
+    let bytes_in_block = in_next - block_begin;
+    let guard_mul = sink.sparse_split_guard_mul;
+    let end_block = if guard_mul > 0 {
+        sparse_split_active(sink, bytes_in_block, guard_mul)
+            && sink
+                .stats
+                .should_end_block(bytes_in_block, in_end - in_next)
+    } else {
+        sink.stats
+            .should_end_block(bytes_in_block, in_end - in_next)
+    };
+    in_next < in_max_block_end && sink.nseqs < SEQ_STORE_LENGTH && !end_block
 }
 
 // ---- minimum-match-length heuristics ----

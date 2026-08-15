@@ -13,8 +13,8 @@ use super::super::matchfinder::hc::HcMatchfinder;
 use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
-    emit_block, far_len3, BlockRole, FarLen3Gate, InputMode, ParseState, Sink, StaticCodes,
-    STREAM_BLOCK_LOOKAHEAD,
+    emit_block, far_len3, l3_sparse_split_hold, l3_sparse_split_latch, BlockRole, FarLen3Gate,
+    InputMode, ParseState, Sink, StaticCodes, L3_OVER_SPLIT_LATCH_BLOCKS, STREAM_BLOCK_LOOKAHEAD,
 };
 
 pub(super) fn run(
@@ -95,6 +95,9 @@ pub(super) fn run_resumable(
         ..Default::default()
     };
     let mut in_next = from;
+    let mut blocks_completed = 0u32;
+    let mut split_hold_latched = false;
+    let mut split_hold_decided = false;
 
     loop {
         if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
@@ -104,6 +107,22 @@ pub(super) fn run_resumable(
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
+        sink.sparse_split_guard_mul = params.lazy_sparse_len3_guard_mul;
+        if !split_hold_decided {
+            if l3_sparse_split_latch(
+                params.lazy_sparse_len3_guard_mul,
+                blocks_completed,
+                from,
+                block_begin,
+            ) {
+                split_hold_latched = true;
+                split_hold_decided = true;
+            } else if blocks_completed > L3_OVER_SPLIT_LATCH_BLOCKS {
+                split_hold_decided = true;
+            }
+        }
+        sink.sparse_split_hold = budget == HeaderBudget::Lean
+            && l3_sparse_split_hold(params.lazy_sparse_len3_guard_mul, split_hold_latched);
 
         // `anatomy-wall` region: `parse_match` — one timer per INTERNAL
         // BLOCK, matching `fast.rs`'s L0/L1 convention (see
@@ -139,6 +158,7 @@ pub(super) fn run_resumable(
             params.try_exact_huffman,
             None,
         );
+        blocks_completed += 1;
         if in_next == in_end {
             return in_next;
         }
