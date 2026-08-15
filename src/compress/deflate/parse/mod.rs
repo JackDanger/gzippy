@@ -857,22 +857,42 @@ fn block_ultra_sparse(sink: &Sink, bytes_in_block: usize, guard_mul: u32) -> boo
 /// Minimum in-block bytes before adaptive split on semi-sparse L3 blocks.
 const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
 
-/// Mean prior uncompressed block size below which L3 enables the split hold.
-const L3_OVER_SPLIT_AVG_BLOCK_BYTES: usize = 45_000;
+/// Latch the over-split hold after this many completed blocks.
+pub(super) const L3_OVER_SPLIT_LATCH_BLOCKS: u32 = 8;
+
+/// Arm when mean block size is in this band (ecoli FASTQ over-split signature).
+pub(super) const L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES: usize = 50_000;
+pub(super) const L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES: usize = 65_000;
+
+/// Arm when block rate is at or below this (blocks per MiB).
+pub(super) const L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB: u32 = 20;
 
 /// Whether the L3 over-split hold is active for the current block.
 #[inline]
-pub(super) fn l3_sparse_split_hold(
+pub(super) fn l3_sparse_split_hold(guard_mul: u32, latched: bool) -> bool {
+    guard_mul > 0 && latched
+}
+
+/// Decide whether to arm the split hold for the rest of the file.
+#[inline]
+pub(super) fn l3_sparse_split_latch(
     guard_mul: u32,
     blocks_completed: u32,
     file_start: usize,
     block_begin: usize,
 ) -> bool {
-    if guard_mul == 0 || blocks_completed < 4 {
+    if guard_mul == 0 || blocks_completed != L3_OVER_SPLIT_LATCH_BLOCKS {
         return false;
     }
-    let prior_avg = (block_begin - file_start) / (blocks_completed as usize);
-    prior_avg < L3_OVER_SPLIT_AVG_BLOCK_BYTES
+    let bytes = block_begin - file_start;
+    if bytes == 0 {
+        return false;
+    }
+    let prior_avg = bytes / blocks_completed as usize;
+    let blocks_per_mib = blocks_completed.saturating_mul(1_048_576) / bytes as u32;
+    blocks_per_mib <= L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB
+        && prior_avg > L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES
+        && prior_avg < L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES
 }
 
 /// Whether adaptive block-split may run at this position (L3 gate).
