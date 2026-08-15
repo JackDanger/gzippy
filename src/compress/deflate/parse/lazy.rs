@@ -225,7 +225,17 @@ pub(super) fn run_block(
 
         if cur_len < min_len
             || (cur_len == DEFLATE_MIN_MATCH_LEN
-                && cur_offset > 8192
+                && cur_offset > {
+                    let m = params.lazy_sparse_len3_guard_mul;
+                    if m > 0
+                        && sink.nseqs.saturating_mul(64) <= sink.block_length
+                        && sink.nseqs.saturating_mul(m as usize) < sink.block_length
+                    {
+                        4096
+                    } else {
+                        8192
+                    }
+                }
                 && !(params.far_len3_gate
                     && far_len3.allows(
                         cur_offset,
