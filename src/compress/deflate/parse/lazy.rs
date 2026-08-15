@@ -338,7 +338,14 @@ pub(super) fn run_block(
             }
         }
 
-        if !continue_block(sink, in_next, block_begin, in_max_block_end, in_end) {
+        if !continue_block(
+            sink,
+            in_next,
+            block_begin,
+            in_max_block_end,
+            in_end,
+            params.lazy_sparse_len3_guard_mul,
+        ) {
             break;
         }
     }

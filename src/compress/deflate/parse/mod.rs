@@ -78,7 +78,7 @@ pub(crate) const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
 /// This is a POLICY cap, enforced by [`continue_block`], and only the greedy and
 /// lazy parsers consult it. It is NOT the size of the backing store; see
 /// [`SEQ_STORE_CAPACITY`].
-const SEQ_STORE_LENGTH: usize = 50_000;
+const SEQ_STORE_LENGTH: usize = 30000;
 
 /// Allocated length of [`Sink::seqs`] — the worst-case number of sequences any
 /// parser can put in one block.
@@ -836,6 +836,42 @@ fn adjust_max_and_nice_len(max_len: &mut u32, nice_len: &mut u32, remaining: usi
     }
 }
 
+/// Ultra-sparse block test (shared with L3 lazy len-3 guard): `nseqs*64 ≤ bytes`
+/// AND `nseqs*M < bytes`. `guard_mul == 0` means disabled.
+#[inline]
+fn block_ultra_sparse(sink: &Sink, bytes_in_block: usize, guard_mul: u32) -> bool {
+    guard_mul > 0
+        && sink.nseqs.saturating_mul(64) <= bytes_in_block
+        && sink.nseqs.saturating_mul(guard_mul as usize) < bytes_in_block
+}
+
+/// Minimum in-block bytes before adaptive split is considered on non-ultra-sparse
+/// L3 blocks (`lazy_sparse_len3_guard_mul=224` only).
+const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
+
+/// Minimum in-block bytes before adaptive split is considered (L3 gate).
+#[inline]
+fn sparse_split_min_bytes(guard_mul: u32, sink: &Sink, bytes_in_block: usize) -> usize {
+    if guard_mul == 0 {
+        return MIN_BLOCK_LENGTH;
+    }
+    if block_ultra_sparse(sink, bytes_in_block, guard_mul) {
+        MIN_BLOCK_LENGTH
+    } else {
+        L3_NON_ULTRA_SPLIT_MIN_BYTES
+    }
+}
+
+/// Whether adaptive block-split may run at this position (L3 gate).
+#[inline]
+fn sparse_split_active(sink: &Sink, bytes_in_block: usize, sparse_split_guard_mul: u32) -> bool {
+    if sparse_split_guard_mul == 0 {
+        return true;
+    }
+    block_ultra_sparse(sink, bytes_in_block, sparse_split_guard_mul)
+        || bytes_in_block >= sparse_split_min_bytes(sparse_split_guard_mul, sink, bytes_in_block)
+}
+
 /// Whether the block loop should continue after emitting a token.
 #[inline]
 fn continue_block(
@@ -844,12 +880,21 @@ fn continue_block(
     block_begin: usize,
     in_max_block_end: usize,
     in_end: usize,
+    sparse_split_guard_mul: u32,
 ) -> bool {
-    in_next < in_max_block_end
-        && sink.nseqs < SEQ_STORE_LENGTH
-        && !sink
-            .stats
-            .should_end_block(in_next - block_begin, in_end - in_next)
+    let bytes_in_block = in_next - block_begin;
+    let end_block = if sparse_split_guard_mul > 0 {
+        sparse_split_active(sink, bytes_in_block, sparse_split_guard_mul)
+            && bytes_in_block
+                >= sparse_split_min_bytes(sparse_split_guard_mul, sink, bytes_in_block)
+            && sink
+                .stats
+                .should_end_block(bytes_in_block, in_end - in_next)
+    } else {
+        sink.stats
+            .should_end_block(bytes_in_block, in_end - in_next)
+    };
+    in_next < in_max_block_end && sink.nseqs < SEQ_STORE_LENGTH && !end_block
 }
 
 // ---- minimum-match-length heuristics ----
