@@ -252,6 +252,14 @@ pub(super) fn run_block(
             && in_next + 2 < in_end
             && offset > 4096
             && sink.nseqs * 64 > sink.block_length * 6
+            && far_len3.shadow_entry_qualifies(
+                sink.nseqs,
+                sink.block_length,
+                offset,
+                buf[in_next],
+                buf[in_next + 1],
+                buf[in_next + 2],
+            )
         {
             adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - (in_next + 1));
             let (next_len, next_offset) = mf.longest_match(
@@ -277,10 +285,18 @@ pub(super) fn run_block(
                     next_hashes,
                 );
                 in_next += 1 + next_len as usize;
-            } else {
+            } else if far_len3.shadow_force_len3(
+                offset,
+                buf[in_next],
+                buf[in_next + 1],
+                buf[in_next + 2],
+            ) {
                 sink.push_match(DEFLATE_MIN_MATCH_LEN, offset);
                 mf.skip_bytes(buf, in_base, in_next + 2, in_end, 1, next_hashes);
                 in_next += DEFLATE_MIN_MATCH_LEN as usize;
+            } else {
+                sink.push_literal(buf[in_next]);
+                in_next += 1;
             }
         } else if length >= min_len
             && far_len3.allows(offset, buf[in_next], buf[in_next + 1], buf[in_next + 2])
