@@ -620,6 +620,7 @@ impl PipelinedGzEncoder {
                     is_last,
                     output,
                     true,
+                    data_len,
                 );
 
                 let mut hasher = crc32fast::Hasher::new();

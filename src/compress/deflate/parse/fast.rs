@@ -1514,6 +1514,21 @@ fn ultra_sparse_bytes(sink: &Sink, bytes_in_block: usize, sparse_guard_mul: u32)
         && sink.nseqs.saturating_mul(sparse_guard_mul as usize) < bytes_in_block
 }
 
+/// Mid-block ultra-sparse tier arms only on large inputs (weights.safetensors
+/// ~91 MiB clears at 80 MiB; photo.jpg ~6.5 MiB and movie.mp4 ~13 MiB do not).
+pub(super) const L1_SPARSE_LARGE_INPUT_MIN_BYTES: usize = 80 * 1024 * 1024;
+
+#[inline]
+fn midblock_ultra_sparse(
+    sink: &Sink,
+    bytes_in_block: usize,
+    sparse_guard_mul: u32,
+    input_total_len: usize,
+) -> bool {
+    input_total_len >= L1_SPARSE_LARGE_INPUT_MIN_BYTES
+        && ultra_sparse_bytes(sink, bytes_in_block, sparse_guard_mul)
+}
+
 /// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
 /// (2026-07-22 campaign): a conditional second-bucket probe. Bucket slot 1
 /// (`head[2h + 1]`) holds the position ONE GENERATION behind slot 0 (see the
@@ -1683,6 +1698,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
     sparse_block_active: bool,
     cost_gate_cfg: LazyPeekCostGateCfg,
     block_begin: usize,
+    input_total_len: usize,
 ) -> usize {
     // Head-table insert, layout per route (see [`L1_HEAD_ENTRIES`]):
     //
@@ -1942,7 +1958,12 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
             let (cost_gate, cost_margin) = {
                 let bytes_in_block = pos.saturating_sub(block_begin);
                 let sparse_tier = sparse_block_active
-                    || ultra_sparse_bytes(sink, bytes_in_block, cost_gate_cfg.sparse_guard_mul);
+                    || midblock_ultra_sparse(
+                        sink,
+                        bytes_in_block,
+                        cost_gate_cfg.sparse_guard_mul,
+                        input_total_len,
+                    );
                 let margin = if sparse_tier {
                     cost_gate_cfg.sparse_margin_bits
                 } else {
@@ -1990,10 +2011,11 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
             let not_worth_it = cost_gate
                 && (cost_gate_block_active
                     || sparse_block_active
-                    || ultra_sparse_bytes(
+                    || midblock_ultra_sparse(
                         sink,
                         pos.saturating_sub(block_begin),
                         cost_gate_cfg.sparse_guard_mul,
+                        input_total_len,
                     ))
                 && est_match_bits(length, dist) as i32
                     > (EST_LITERAL_BITS * length) as i32 + cost_margin;
@@ -2537,6 +2559,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
     sparse_block_active: bool,
     cost_gate_cfg: LazyPeekCostGateCfg,
     block_begin: usize,
+    input_total_len: usize,
 ) -> usize {
     while pos < fast_end {
         // SF1-C software-pipeline: warm the head-table line for the
@@ -2623,6 +2646,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
                 sparse_block_active,
                 cost_gate_cfg,
                 block_begin,
+                input_total_len,
             );
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2671,6 +2695,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
                     sparse_block_active,
                     cost_gate_cfg,
                     block_begin,
+                    input_total_len,
                 );
                 #[cfg(feature = "anatomy-counters")]
                 {
@@ -2734,6 +2759,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
             sparse_block_active,
             cost_gate_cfg,
             block_begin,
+            input_total_len,
         );
         #[cfg(feature = "anatomy-counters")]
         {
@@ -3133,6 +3159,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
     buf: &[u8],
     data_start: usize,
     in_end: usize,
+    input_total_len: usize,
     statics: &StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
@@ -3423,6 +3450,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                 && (literal_count as u64 * 100)
                     >= (cost_gate_cfg.lit_threshold_pct as u64 * total as u64);
             sparse_block_active_next = cost_gate_cfg.sparse_guard_mul > 0
+                && input_total_len >= L1_SPARSE_LARGE_INPUT_MIN_BYTES
                 && ultra_sparse_bytes(&sink, sink.block_length, cost_gate_cfg.sparse_guard_mul);
             if pos == in_end {
                 break;
@@ -3513,6 +3541,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                         sparse_block_active,
                         cost_gate_cfg,
                         block_begin,
+                        input_total_len,
                     )
                 };
             }
@@ -3551,6 +3580,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                         sparse_block_active,
                         cost_gate_cfg,
                         block_begin,
+                        input_total_len,
                     )
                 } else {
                     fastloop_l1_lean::<INTERLEAVED>(
@@ -3644,6 +3674,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                 && (literal_count as u64 * 100)
                     >= (cost_gate_cfg.lit_threshold_pct as u64 * total as u64);
             sparse_block_active_next = cost_gate_cfg.sparse_guard_mul > 0
+                && input_total_len >= L1_SPARSE_LARGE_INPUT_MIN_BYTES
                 && ultra_sparse_bytes(&sink, sink.block_length, cost_gate_cfg.sparse_guard_mul);
         }
 
@@ -3856,6 +3887,7 @@ pub(super) fn run_resumable<const REACH: bool>(
 ) -> usize {
     debug_assert!(in_end >= from);
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
+    let input_total_len = state.input_total_len;
 
     let bucket2 = Bucket2Cfg {
         enabled: params.fast_bucket2,
@@ -3949,6 +3981,7 @@ pub(super) fn run_resumable<const REACH: bool>(
                     sparse_block_active,
                     cost_gate_cfg,
                     block_begin,
+                    input_total_len,
                 )
             } else {
                 fastloop_l1_lean::<false>(

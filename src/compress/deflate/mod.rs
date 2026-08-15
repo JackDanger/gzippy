@@ -171,7 +171,17 @@ pub fn encode_deflate_segment_to_sink(
             *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
             return;
         }
-        deflate_into(&mut bw, &buf, 0, data.len(), level, is_last, true, parallel);
+        deflate_into(
+            &mut bw,
+            &buf,
+            0,
+            data.len(),
+            data.len(),
+            level,
+            is_last,
+            true,
+            parallel,
+        );
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
         // [dict | data | pad] and parse over the data region with the dictionary
@@ -186,7 +196,15 @@ pub fn encode_deflate_segment_to_sink(
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
         deflate_into(
-            &mut bw, &buf, dict_len, in_end, level, is_last, true, parallel,
+            &mut bw,
+            &buf,
+            dict_len,
+            in_end,
+            data.len(),
+            level,
+            is_last,
+            true,
+            parallel,
         );
     }
 
@@ -229,6 +247,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
     is_last: bool,
     out: &mut Vec<u8>,
     parallel: bool,
+    input_total_len: usize,
 ) -> bitstream::ChunkMeta {
     STORED_BLOCK_EMITTED.with(|f| f.set(false));
     let mut bw = BitWriter::from_vec(std::mem::take(out));
@@ -245,6 +264,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
             &buf,
             0,
             data.len(),
+            input_total_len,
             level,
             is_last,
             false,
@@ -261,7 +281,15 @@ pub fn encode_deflate_splice_chunk_to_sink(
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
         deflate_into(
-            &mut bw, &buf, dict_len, in_end, level, is_last, false, parallel,
+            &mut bw,
+            &buf,
+            dict_len,
+            in_end,
+            input_total_len,
+            level,
+            is_last,
+            false,
+            parallel,
         );
     }
 
@@ -361,7 +389,16 @@ fn deflate_one_shot_t1_zlib_pick_min(
 
     let encode = |params: &level::LevelParams| -> Vec<u8> {
         let mut bw = BitWriter::from_vec(Vec::new());
-        parse::compress(buf, data_start, in_end, params, is_last, budget, &mut bw);
+        parse::compress(
+            buf,
+            data_start,
+            in_end,
+            in_end - data_start,
+            params,
+            is_last,
+            budget,
+            &mut bw,
+        );
         if !is_last && sync_flush {
             emit_stored_block(&mut bw, &[], false);
         }
@@ -388,6 +425,7 @@ fn deflate_into(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
+    input_total_len: usize,
     level: u32,
     is_last: bool,
     sync_flush: bool,
@@ -411,7 +449,16 @@ fn deflate_into(
         } else {
             encode_types::HeaderBudget::Lean
         };
-        parse::compress(buf, data_start, in_end, &params, is_last, budget, bw);
+        parse::compress(
+            buf,
+            data_start,
+            in_end,
+            input_total_len,
+            &params,
+            is_last,
+            budget,
+            bw,
+        );
     }
 
     // Non-final chunk in a CONCATENATED stream: close on a clean byte boundary
@@ -453,7 +500,17 @@ pub fn encode_deflate_slack_padded_to_sink(
         return;
     }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
-    deflate_into(&mut bw, buf, 0, logical_len, level, true, true, false);
+    deflate_into(
+        &mut bw,
+        buf,
+        0,
+        logical_len,
+        logical_len,
+        level,
+        true,
+        true,
+        false,
+    );
     *out = bw.finish();
 }
 
@@ -559,6 +616,7 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     writer: &mut W,
     level: u32,
     stream_chunk: usize,
+    size_hint: Option<usize>,
 ) -> std::io::Result<u64> {
     use std::io::ErrorKind;
 
@@ -575,6 +633,7 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     let mut buf = vec![0u8; cap];
 
     let mut state = parse::ParseState::new();
+    state.input_total_len = size_hint.unwrap_or(0);
     let mut in_next = 0usize; // parse position, in buffer coordinates
     let mut avail = 0usize; // valid bytes in buf
     let mut eof = false;
@@ -611,6 +670,7 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
                     });
                     total += k as u64;
                     avail += k;
+                    state.input_total_len = state.input_total_len.max(total as usize);
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -862,7 +922,7 @@ fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Writ
         return Ok(logical_len as u64);
     }
     let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
-    encode_gzip_single_pass(reader, writer, level, stream_chunk)
+    encode_gzip_single_pass(reader, writer, level, stream_chunk, size_hint)
 }
 
 /// Gzip-compress `data` — a borrowed slice that CANNOT carry trailing pad
@@ -966,6 +1026,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     } else {
         let params = level::params(level);
         let mut state = parse::ParseState::new();
+        state.input_total_len = len;
         let mut in_next = 0usize;
 
         // PASS 1 — the bulk, parsed IN PLACE over the caller's slice. The
@@ -1080,6 +1141,7 @@ pub fn encode_deflate_stateful_to_writer<W: std::io::Write>(
         HeaderBudget::Lean
     };
     let mut state = parse::ParseState::new();
+    state.input_total_len = len;
     let mut in_next = 0usize;
 
     if len > INPLACE_TAIL_PAD {
