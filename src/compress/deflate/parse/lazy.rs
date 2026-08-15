@@ -132,8 +132,8 @@ pub(super) fn run_resumable(
                 split_hold_decided = true;
             }
         }
-        sink.sparse_split_hold =
-            l3_sparse_split_hold(params.lazy_sparse_len3_guard_mul, split_hold_latched);
+        sink.sparse_split_hold = budget == HeaderBudget::Lean
+            && l3_sparse_split_hold(params.lazy_sparse_len3_guard_mul, split_hold_latched);
 
         // `anatomy-wall` region: `parse_match` — see `greedy.rs`'s sibling
         // call site for the fused-bucket rationale (identical here: the
