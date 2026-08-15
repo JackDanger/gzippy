@@ -251,7 +251,7 @@ pub(super) fn run_block(
             && in_next + DEFLATE_MIN_MATCH_LEN as usize <= in_end
             && in_next + 2 < in_end
             && offset > 4096
-            && sink.nseqs * 64 > sink.block_length
+            && sink.nseqs * 64 > sink.block_length * 6
         {
             adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - (in_next + 1));
             let (next_len, next_offset) = mf.longest_match(
