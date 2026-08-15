@@ -487,6 +487,8 @@ pub(super) fn compress(
                 enabled: params.fast_lazy_peek_cost_gate,
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
+                sparse_guard_mul: params.fast_lazy_peek_sparse_guard_mul,
+                sparse_margin_bits: params.fast_lazy_peek_sparse_margin_bits,
             };
             // REACH / INTERLEAVED dispatch — const generics, one branch per
             // whole-buffer call. T>1 (`fast_interleaved_bucket`) and T1 REACH
@@ -550,6 +552,8 @@ pub(super) fn compress(
                 enabled: params.fast_lazy_peek_cost_gate,
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
+                sparse_guard_mul: params.fast_lazy_peek_sparse_guard_mul,
+                sparse_margin_bits: params.fast_lazy_peek_sparse_margin_bits,
             };
             // Same REACH / INTERLEAVED dispatch as the default-build arm above.
             if params.fast_interleaved_bucket {
