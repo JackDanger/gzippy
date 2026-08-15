@@ -246,8 +246,46 @@ pub(super) fn run_block(
                 next_hashes,
             );
             in_next += length as usize;
+        } else if length == DEFLATE_MIN_MATCH_LEN
+            && params.greedy_len3_shadow
+            && in_next + DEFLATE_MIN_MATCH_LEN as usize <= in_end
+            && in_next + 2 < in_end
+            && offset > 4096
+            && (far_len3.allows(offset, buf[in_next], buf[in_next + 1], buf[in_next + 2])
+                || sink.nseqs * 64 > sink.block_length)
+        {
+            adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - (in_next + 1));
+            let (next_len, next_offset) = mf.longest_match(
+                buf,
+                in_base,
+                in_next + 1,
+                DEFLATE_MIN_MATCH_LEN,
+                max_len,
+                nice_len,
+                params.max_search_depth,
+                params.good_match,
+                next_hashes,
+            );
+            if next_len > DEFLATE_MIN_MATCH_LEN {
+                sink.push_literal(buf[in_next]);
+                sink.push_match(next_len, next_offset);
+                mf.skip_bytes(
+                    buf,
+                    in_base,
+                    in_next + 2,
+                    in_end,
+                    (next_len - 1) as usize,
+                    next_hashes,
+                );
+                in_next += 1 + next_len as usize;
+            } else {
+                sink.push_match(DEFLATE_MIN_MATCH_LEN, offset);
+                mf.skip_bytes(buf, in_base, in_next + 2, in_end, 1, next_hashes);
+                in_next += DEFLATE_MIN_MATCH_LEN as usize;
+            }
         } else if length >= min_len
             && far_len3.allows(offset, buf[in_next], buf[in_next + 1], buf[in_next + 2])
+            && !params.greedy_len3_shadow
         {
             // Cost-gated far len-3 (see `far_len3.rs`). Greedy has no
             // lookahead, so a chance len-3 here would SHADOW a longer match
