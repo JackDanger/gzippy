@@ -104,6 +104,7 @@ pub(super) fn run_resumable(
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
+        sink.sparse_split_guard_mul = params.lazy_sparse_len3_guard_mul;
 
         // `anatomy-wall` region: `parse_match` — one timer per INTERNAL
         // BLOCK, matching `fast.rs`'s L0/L1 convention (see
@@ -273,14 +274,7 @@ pub(super) fn run_block(
             in_next += 1;
         }
 
-        if !continue_block(
-            sink,
-            in_next,
-            block_begin,
-            in_max_block_end,
-            in_end,
-            params.lazy_sparse_len3_guard_mul,
-        ) {
+        if !continue_block(sink, in_next, block_begin, in_max_block_end, in_end) {
             break;
         }
     }

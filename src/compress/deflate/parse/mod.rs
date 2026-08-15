@@ -78,7 +78,7 @@ pub(crate) const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
 /// This is a POLICY cap, enforced by [`continue_block`], and only the greedy and
 /// lazy parsers consult it. It is NOT the size of the backing store; see
 /// [`SEQ_STORE_CAPACITY`].
-const SEQ_STORE_LENGTH: usize = 30000;
+const SEQ_STORE_LENGTH: usize = 50_000;
 
 /// Allocated length of [`Sink::seqs`] — the worst-case number of sequences any
 /// parser can put in one block.
@@ -192,6 +192,8 @@ pub(crate) struct Sink {
     /// this replaces `Vec::len`, which `continue_block` had to LOAD on every
     /// token where libdeflate compares a pointer already in a register.
     nseqs: usize,
+    /// L3-only adaptive split gate (`lazy_sparse_len3_guard_mul`; 0 = off).
+    sparse_split_guard_mul: u32,
 }
 
 thread_local! {
@@ -276,6 +278,7 @@ impl Sink {
             block_length: 0,
             stats: BlockSplitStats::new(),
             nseqs: 0,
+            sparse_split_guard_mul: 0,
         }
     }
 
@@ -287,6 +290,7 @@ impl Sink {
         self.offset_freqs = [0; DEFLATE_NUM_OFFSET_SYMS];
         self.block_length = 0;
         self.stats.reset();
+        self.sparse_split_guard_mul = 0;
     }
 
     /// `deflate_choose_literal` (with split-stat gathering always on, as greedy
@@ -880,13 +884,12 @@ fn continue_block(
     block_begin: usize,
     in_max_block_end: usize,
     in_end: usize,
-    sparse_split_guard_mul: u32,
 ) -> bool {
     let bytes_in_block = in_next - block_begin;
-    let end_block = if sparse_split_guard_mul > 0 {
-        sparse_split_active(sink, bytes_in_block, sparse_split_guard_mul)
-            && bytes_in_block
-                >= sparse_split_min_bytes(sparse_split_guard_mul, sink, bytes_in_block)
+    let guard_mul = sink.sparse_split_guard_mul;
+    let end_block = if guard_mul > 0 {
+        sparse_split_active(sink, bytes_in_block, guard_mul)
+            && bytes_in_block >= sparse_split_min_bytes(guard_mul, sink, bytes_in_block)
             && sink
                 .stats
                 .should_end_block(bytes_in_block, in_end - in_next)

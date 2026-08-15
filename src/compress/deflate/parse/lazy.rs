@@ -114,6 +114,7 @@ pub(super) fn run_resumable(
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);
         sink.begin();
+        sink.sparse_split_guard_mul = params.lazy_sparse_len3_guard_mul;
 
         // `anatomy-wall` region: `parse_match` — see `greedy.rs`'s sibling
         // call site for the fused-bucket rationale (identical here: the
@@ -338,14 +339,7 @@ pub(super) fn run_block(
             }
         }
 
-        if !continue_block(
-            sink,
-            in_next,
-            block_begin,
-            in_max_block_end,
-            in_end,
-            params.lazy_sparse_len3_guard_mul,
-        ) {
+        if !continue_block(sink, in_next, block_begin, in_max_block_end, in_end) {
             break;
         }
     }
