@@ -858,7 +858,7 @@ fn block_ultra_sparse(sink: &Sink, bytes_in_block: usize, guard_mul: u32) -> boo
 const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
 
 /// Mean prior uncompressed block size below which L3 enables the split hold.
-const L3_OVER_SPLIT_AVG_BLOCK_BYTES: usize = 50_000;
+const L3_OVER_SPLIT_AVG_BLOCK_BYTES: usize = 45_000;
 
 /// Whether the L3 over-split hold is active for the current block.
 #[inline]
@@ -868,7 +868,7 @@ pub(super) fn l3_sparse_split_hold(
     file_start: usize,
     block_begin: usize,
 ) -> bool {
-    if guard_mul == 0 || blocks_completed < 2 {
+    if guard_mul == 0 || blocks_completed < 4 {
         return false;
     }
     let prior_avg = (block_begin - file_start) / (blocks_completed as usize);
