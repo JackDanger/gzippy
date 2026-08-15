@@ -1529,6 +1529,14 @@ fn midblock_ultra_sparse(
         && ultra_sparse_bytes(sink, bytes_in_block, sparse_guard_mul)
 }
 
+#[inline]
+fn disable_sparse_tier_if_small(cfg: &mut LazyPeekCostGateCfg, input_total_len: usize) {
+    if input_total_len < L1_SPARSE_LARGE_INPUT_MIN_BYTES {
+        cfg.sparse_guard_mul = 0;
+        cfg.sparse_margin_bits = 0;
+    }
+}
+
 /// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
 /// (2026-07-22 campaign): a conditional second-bucket probe. Bucket slot 1
 /// (`head[2h + 1]`) holds the position ONE GENERATION behind slot 0 (see the
@@ -3167,11 +3175,12 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
     use_dynamic: bool,
     limit_hash_update_inserts: usize,
     bucket2_cfg: Bucket2Cfg,
-    cost_gate_cfg: LazyPeekCostGateCfg,
+    mut cost_gate_cfg: LazyPeekCostGateCfg,
     budget: super::super::encode_types::HeaderBudget,
 ) {
     debug_assert!(in_end > data_start, "empty data handled by the caller");
     debug_assert!(buf.len() >= in_end + super::BUF_PAD);
+    disable_sparse_tier_if_small(&mut cost_gate_cfg, input_total_len);
     debug_assert!(
         !(ACCEL && INTERLEAVED),
         "the interleaved bucket is an L1 (T>1) layout; L0 keeps the single-slot table"
@@ -3894,13 +3903,14 @@ pub(super) fn run_resumable<const REACH: bool>(
         gate_max_len: params.fast_bucket2_gate_max_len,
         probe_on_miss: params.fast_bucket2_probe_on_miss,
     };
-    let cost_gate_cfg = LazyPeekCostGateCfg {
+    let mut cost_gate_cfg = LazyPeekCostGateCfg {
         enabled: params.fast_lazy_peek_cost_gate,
         margin_bits: params.fast_lazy_peek_cost_margin_bits,
         lit_threshold_pct: 98,
         sparse_guard_mul: params.fast_lazy_peek_sparse_guard_mul,
         sparse_margin_bits: params.fast_lazy_peek_sparse_margin_bits,
     };
+    disable_sparse_tier_if_small(&mut cost_gate_cfg, state.input_total_len);
     let limit_hash_update_inserts = params.fast_hash_update_inserts;
 
     let hash3 = Hash3Cfg::shipped();
