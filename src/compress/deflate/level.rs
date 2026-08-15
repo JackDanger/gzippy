@@ -152,6 +152,11 @@ pub struct LevelParams {
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
     pub fast_lazy_peek_cost_margin_bits: i32,
+    /// L1-only ultra-sparse COST-GATE tier: when `nseqs*64 <= bytes_in_block`
+    /// and `nseqs*M < bytes_in_block`, apply `sparse_margin_bits` and activate
+    /// the gate even below `lit_threshold_pct`. `M=0` disables.
+    pub fast_lazy_peek_sparse_guard_mul: u32,
+    pub fast_lazy_peek_sparse_margin_bits: i32,
     pub strategy: Strategy,
     /// Cap on hash-chain nodes searched per position (`c->max_search_depth`).
     pub max_search_depth: u32,
@@ -191,6 +196,8 @@ fn apply_l1_fast_shared_knobs(p: &mut LevelParams) {
     p.fast_hash_update_inserts = 8;
     p.fast_lazy_peek_cost_gate = true;
     p.fast_lazy_peek_cost_margin_bits = 0;
+    p.fast_lazy_peek_sparse_guard_mul = 224;
+    p.fast_lazy_peek_sparse_margin_bits = -11;
 }
 
 /// **T1-ONLY (L1): MATCH REACH.** Index EVERY position of an accepted match's
@@ -666,6 +673,7 @@ fn params_inner(level: u32) -> LevelParams {
     };
     const BUCKET2_OFF: (bool, u32) = (false, 8);
     const LAZY_SPARSE_LEN3_GUARD_MUL_OFF: u32 = 0;
+    const FAST_LAZY_PEEK_SPARSE_OFF: (u32, i32) = (0, 0);
     match level {
         0 => LevelParams {
             try_exact_huffman: false,
@@ -677,6 +685,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Fast0,
             max_search_depth: 0,
             nice_match_length: 32,
@@ -700,6 +710,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Fast,
             max_search_depth: 1,
             nice_match_length: 32,
@@ -718,6 +730,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Greedy,
             max_search_depth: 6,
             nice_match_length: 10,
@@ -789,6 +803,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 12,
             nice_match_length: 14,
@@ -819,6 +835,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Greedy,
             max_search_depth: 16,
             nice_match_length: 30,
@@ -837,6 +855,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 16,
             nice_match_length: 30,
@@ -855,6 +875,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 35,
             nice_match_length: 65,
@@ -873,6 +895,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
             max_search_depth: 100,
             nice_match_length: 130,
@@ -891,6 +915,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy2,
             max_search_depth: 300,
             nice_match_length: max_match,
@@ -909,6 +935,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy2,
             max_search_depth: 600,
             nice_match_length: max_match,
@@ -929,6 +957,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 35,
             nice_match_length: 75,
@@ -952,6 +982,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 100,
             nice_match_length: 150,
@@ -975,6 +1007,8 @@ fn params_inner(level: u32) -> LevelParams {
             fast_interleaved_bucket: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
+            fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
+            fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::NearOptimal,
             max_search_depth: 300,
             nice_match_length: max_match,

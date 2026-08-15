@@ -443,6 +443,7 @@ pub(super) fn compress(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
+    input_total_len: usize,
     params: &LevelParams,
     is_last: bool,
     budget: HeaderBudget,
@@ -460,6 +461,7 @@ pub(super) fn compress(
             buf,
             data_start,
             in_end,
+            input_total_len,
             statics,
             bw,
             is_last,
@@ -487,6 +489,8 @@ pub(super) fn compress(
                 enabled: params.fast_lazy_peek_cost_gate,
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
+                sparse_guard_mul: params.fast_lazy_peek_sparse_guard_mul,
+                sparse_margin_bits: params.fast_lazy_peek_sparse_margin_bits,
             };
             // REACH / INTERLEAVED dispatch — const generics, one branch per
             // whole-buffer call. T>1 (`fast_interleaved_bucket`) and T1 REACH
@@ -496,6 +500,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -511,6 +516,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -526,6 +532,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -550,6 +557,8 @@ pub(super) fn compress(
                 enabled: params.fast_lazy_peek_cost_gate,
                 margin_bits: params.fast_lazy_peek_cost_margin_bits,
                 lit_threshold_pct: 98,
+                sparse_guard_mul: params.fast_lazy_peek_sparse_guard_mul,
+                sparse_margin_bits: params.fast_lazy_peek_sparse_margin_bits,
             };
             // Same REACH / INTERLEAVED dispatch as the default-build arm above.
             if params.fast_interleaved_bucket {
@@ -557,6 +566,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -572,6 +582,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -587,6 +598,7 @@ pub(super) fn compress(
                     buf,
                     data_start,
                     in_end,
+                    input_total_len,
                     statics,
                     bw,
                     is_last,
@@ -641,6 +653,9 @@ pub(super) struct ParseState {
     /// created lazily by `fast::run_resumable` on its first call. `None` for
     /// every other strategy — they carry their state in `mf` above.
     pub fast: Option<fast::FastResume>,
+    /// Uncompressed input length when known. L1 ultra-sparse mid-block tier
+    /// arms only once this reaches [`fast::L1_SPARSE_LARGE_INPUT_MIN_BYTES`].
+    pub input_total_len: usize,
 }
 
 impl ParseState {
@@ -652,6 +667,7 @@ impl ParseState {
             in_base: 0,
             next_hashes: [0u32; 2],
             fast: None,
+            input_total_len: 0,
         }
     }
 
@@ -2299,7 +2315,16 @@ mod l1_bakeoff {
 
         let params = crate::compress::deflate::level::params(1);
         let mut a = BitWriter::new();
-        compress(&buf, 0, in_end, &params, true, HeaderBudget::Lean, &mut a);
+        compress(
+            &buf,
+            0,
+            in_end,
+            in_end,
+            &params,
+            true,
+            HeaderBudget::Lean,
+            &mut a,
+        );
         let fast_bytes = a.finish().len();
 
         let mut b = BitWriter::new();
