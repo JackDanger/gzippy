@@ -208,7 +208,7 @@ impl FarLen3Gate {
             return false;
         }
         if self.inert() {
-            return nseqs.saturating_mul(64) > block_length.saturating_mul(12);
+            return nseqs.saturating_mul(64) > block_length.saturating_mul(9);
         }
         // Open blocks: the shadow arm is for gzip-style forced len-3 on dense
         // inert blocks (dd79_bin6). Open-block entry over-accepts on mixed
