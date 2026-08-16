@@ -174,6 +174,10 @@ pub struct LevelParams {
     /// 2026-08-09) — one cell, but the tie cage refuses any flip. Re-judge
     /// L4 if the gate's model ever prices the whole-block code externality.
     pub far_len3_gate: bool,
+    /// L2-only: far len-3 at offset > 4096 goes through the shadow probe
+    /// (zlib `deflate_fast` accepts len-3 at any offset). Gated by
+    /// `far_len3.allows` OR a match-dense block (`nseqs*64 > block_length`).
+    pub greedy_len3_shadow: bool,
     /// L3-only lazy parser: when `nseqs*64 <= block_length` and
     /// `nseqs*M < block_length` (ultra-sparse), use offset-4096 instead of 8192
     /// for the len-3 guard. `0` = disabled (shipped 8192 everywhere).
@@ -692,6 +696,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 32,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -717,6 +722,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 32,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -737,6 +743,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 10,
             good_match: 0,
             far_len3_gate: true,
+            greedy_len3_shadow: true,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -810,6 +817,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 14,
             good_match: 0,
             far_len3_gate: true,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: 224,
             near_optimal: NONE_NO,
         },
@@ -842,6 +850,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 30,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -862,6 +871,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 30,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -882,6 +892,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 65,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -902,6 +913,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 130,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -922,6 +934,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -942,6 +955,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NONE_NO,
         },
@@ -964,6 +978,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 75,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 2,
@@ -989,6 +1004,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: 150,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 4,
@@ -1014,6 +1030,7 @@ fn params_inner(level: u32) -> LevelParams {
             nice_match_length: max_match,
             good_match: 0,
             far_len3_gate: false,
+            greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 10,

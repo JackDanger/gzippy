@@ -85,6 +85,8 @@ pub(super) struct FarLen3Gate {
     /// `log2(total_litlen / freq)`; unseen bytes are priced as freq-1
     /// (a novel byte is the most expensive literal the block can emit).
     lit_cost: [u32; 256],
+    /// Frequency-weighted mean ideal literal cost (eighth-bits) for this block.
+    mean_lit_eighth: u32,
     /// False = every slot closed; lets the parser skip the lookups.
     any_open: bool,
 }
@@ -95,6 +97,7 @@ impl FarLen3Gate {
     pub(super) const INERT: Self = Self {
         match_cost: [CLOSED; DEFLATE_NUM_OFFSET_SYMS],
         lit_cost: [0; 256],
+        mean_lit_eighth: 0,
         any_open: false,
     };
 
@@ -122,10 +125,17 @@ impl FarLen3Gate {
         let log_ll = log2_fp3(total_litlen as u32);
         let mut lit_cost = [0u32; 256];
         for (b, &f) in litlen_freqs[..NUM_LITERALS].iter().enumerate() {
-            // Unseen byte: price as if it occurred once (log2(T/1) = log_ll),
-            // the dearest a literal can be under this block's code.
             lit_cost[b] = log_ll - log2_fp3(f.max(1));
         }
+        let mut lit_weighted = 0u64;
+        let mut lit_count = 0u64;
+        for (b, &f) in litlen_freqs[..NUM_LITERALS].iter().enumerate() {
+            if f > 0 {
+                lit_weighted += lit_cost[b] as u64 * f as u64;
+                lit_count += f as u64;
+            }
+        }
+        let mean_lit_eighth = (lit_weighted / lit_count.max(1)) as u32;
         let len3_sym_bits = log_ll - log2_fp3(f_len3);
         let log_off = log2_fp3(total_off);
         let mut match_cost = [CLOSED; DEFLATE_NUM_OFFSET_SYMS];
@@ -149,8 +159,22 @@ impl FarLen3Gate {
         Self {
             match_cost,
             lit_cost,
+            mean_lit_eighth,
             any_open,
         }
+    }
+
+    #[inline(always)]
+    fn trigram_lit_cost(&self, b0: u8, b1: u8, b2: u8) -> u32 {
+        self.lit_cost[b0 as usize] + self.lit_cost[b1 as usize] + self.lit_cost[b2 as usize]
+    }
+
+    #[inline(always)]
+    fn trigram_expensive(&self, b0: u8, b1: u8, b2: u8) -> bool {
+        let min_c = self.lit_cost[b0 as usize]
+            .min(self.lit_cost[b1 as usize])
+            .min(self.lit_cost[b2 as usize]);
+        min_c > self.mean_lit_eighth
     }
 
     /// Per-position accept test: does a len-3 match at `offset` beat the
@@ -161,9 +185,46 @@ impl FarLen3Gate {
         if !self.any_open {
             return false;
         }
-        let lits =
-            self.lit_cost[b0 as usize] + self.lit_cost[b1 as usize] + self.lit_cost[b2 as usize];
+        let lits = self.trigram_lit_cost(b0, b1, b2);
         self.match_cost[offset_slot(offset) as usize] <= lits
+    }
+
+    #[inline(always)]
+    pub(super) fn inert(&self) -> bool {
+        !self.any_open
+    }
+
+    #[inline(always)]
+    pub(super) fn shadow_entry_qualifies(
+        &self,
+        nseqs: usize,
+        block_length: usize,
+        offset: u32,
+        b0: u8,
+        b1: u8,
+        b2: u8,
+    ) -> bool {
+        if self.allows(offset, b0, b1, b2) {
+            return false;
+        }
+        if self.inert() {
+            return nseqs.saturating_mul(64) > block_length.saturating_mul(9);
+        }
+        // Open blocks: the shadow arm is for gzip-style forced len-3 on dense
+        // inert blocks (dd79_bin6). Open-block entry over-accepts on mixed
+        // content (symbols.dwarf) without buying dd79.
+        false
+    }
+
+    #[inline(always)]
+    pub(super) fn shadow_force_len3(&self, offset: u32, b0: u8, b1: u8, b2: u8) -> bool {
+        if self.allows(offset, b0, b1, b2) {
+            return true;
+        }
+        if self.inert() {
+            return true;
+        }
+        self.trigram_expensive(b0, b1, b2)
     }
 }
 
