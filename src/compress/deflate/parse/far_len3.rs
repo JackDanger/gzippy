@@ -43,6 +43,11 @@ use super::{bsr32, NUM_LITERALS};
 /// with greedy's +1 shadow probe (see `greedy.rs`).
 pub(super) const GREEDY_MARGIN_EIGHTH_BITS: u32 = 16;
 
+/// Extra eighth-bit slack on [`FarLen3Gate::allows`] when the three literals
+/// replaced are all expensive vs the block mean. Passed into [`FarLen3Gate::recalc`]
+/// by the greedy parser only (`0` = off).
+pub(super) const TRIGRAM_EXPENSIVE_ACCEPT_SLACK_EIGHTH: u32 = 1;
+
 /// Deterministic fixed-point `log2(x)` in eighth-bit units (3 fractional
 /// bits), integer-only. No libm: size is arch-invariant and must stay so —
 /// a platform-dependent `log2f` ulp would change output bytes per arch.
@@ -87,6 +92,8 @@ pub(super) struct FarLen3Gate {
     lit_cost: [u32; 256],
     /// Frequency-weighted mean ideal literal cost (eighth-bits) for this block.
     mean_lit_eighth: u32,
+    /// Greedy-only borderline accept slack (eighth-bits); lazy passes `0`.
+    accept_slack_eighth: u32,
     /// False = every slot closed; lets the parser skip the lookups.
     any_open: bool,
 }
@@ -98,15 +105,17 @@ impl FarLen3Gate {
         match_cost: [CLOSED; DEFLATE_NUM_OFFSET_SYMS],
         lit_cost: [0; 256],
         mean_lit_eighth: 0,
+        accept_slack_eighth: 0,
         any_open: false,
     };
 
     /// Rebuild from the block's running frequencies. `margin_eighth_bits` is
-    /// the caller's accept margin (see the per-parser constants above).
+    /// the caller's accept margin; `accept_slack_eighth` is greedy-only slack.
     pub(super) fn recalc(
         litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
         offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
         margin_eighth_bits: u32,
+        accept_slack_eighth: u32,
     ) -> Self {
         // Length 3 is length-slot 0 => symbol DEFLATE_FIRST_LEN_SYM (257).
         let f_len3 = litlen_freqs[DEFLATE_FIRST_LEN_SYM];
@@ -160,6 +169,7 @@ impl FarLen3Gate {
             match_cost,
             lit_cost,
             mean_lit_eighth,
+            accept_slack_eighth,
             any_open,
         }
     }
@@ -177,6 +187,14 @@ impl FarLen3Gate {
         min_c > self.mean_lit_eighth
     }
 
+    #[inline(always)]
+    fn trigram_all_expensive(&self, b0: u8, b1: u8, b2: u8) -> bool {
+        let m = self.mean_lit_eighth;
+        self.lit_cost[b0 as usize] > m
+            && self.lit_cost[b1 as usize] > m
+            && self.lit_cost[b2 as usize] > m
+    }
+
     /// Per-position accept test: does a len-3 match at `offset` beat the
     /// THREE ACTUAL BYTES `b0 b1 b2` it would replace? Called only on the
     /// cold arm (len-3 candidate already past the old fixed cutoff).
@@ -186,7 +204,13 @@ impl FarLen3Gate {
             return false;
         }
         let lits = self.trigram_lit_cost(b0, b1, b2);
-        self.match_cost[offset_slot(offset) as usize] <= lits
+        let mc = self.match_cost[offset_slot(offset) as usize];
+        if mc <= lits {
+            return true;
+        }
+        self.accept_slack_eighth > 0
+            && self.trigram_all_expensive(b0, b1, b2)
+            && mc <= lits + self.accept_slack_eighth
     }
 
     #[inline(always)]
@@ -256,7 +280,7 @@ mod tests {
     fn no_evidence_means_no_accept() {
         let ll = [0u32; DEFLATE_NUM_LITLEN_SYMS];
         let of = [0u32; DEFLATE_NUM_OFFSET_SYMS];
-        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS);
+        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS, 0);
         assert!(!g.any_open);
         assert!(!g.allows(32000, 0, 0, 0));
 
@@ -266,7 +290,7 @@ mod tests {
             *f = 100;
         }
         let of2 = [10u32; DEFLATE_NUM_OFFSET_SYMS];
-        assert!(!FarLen3Gate::recalc(&ll2, &of2, GREEDY_MARGIN_EIGHTH_BITS).any_open);
+        assert!(!FarLen3Gate::recalc(&ll2, &of2, GREEDY_MARGIN_EIGHTH_BITS, 0).any_open);
 
         // INERT refuses everything by construction.
         assert!(!FarLen3Gate::INERT.allows(1, 255, 255, 255));
@@ -291,7 +315,7 @@ mod tests {
         for f in of.iter_mut() {
             *f = 1000;
         }
-        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS);
+        let g = FarLen3Gate::recalc(&ll, &of, GREEDY_MARGIN_EIGHTH_BITS, 0);
         assert!(g.any_open);
         // Rare bytes (~11 bits each under this code) at a far slot
         // (slot 27: 12 extra bits): match wins.
