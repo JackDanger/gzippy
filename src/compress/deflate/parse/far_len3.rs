@@ -210,7 +210,10 @@ impl FarLen3Gate {
         if self.inert() {
             return nseqs.saturating_mul(64) > block_length.saturating_mul(12);
         }
-        self.trigram_expensive(b0, b1, b2)
+        // Open blocks: the shadow arm is for gzip-style forced len-3 on dense
+        // inert blocks (dd79_bin6). Open-block entry over-accepts on mixed
+        // content (symbols.dwarf) without buying dd79.
+        false
     }
 
     #[inline(always)]
