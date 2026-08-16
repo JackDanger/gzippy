@@ -217,6 +217,7 @@ pub(super) fn run_block(
                     &sink.litlen_freqs,
                     &sink.offset_freqs,
                     far_len3::GREEDY_MARGIN_EIGHTH_BITS,
+                    far_len3::TRIGRAM_EXPENSIVE_ACCEPT_SLACK_EIGHTH,
                 );
             }
             next_recalc += (in_end - next_recalc).min(in_next - block_begin);
