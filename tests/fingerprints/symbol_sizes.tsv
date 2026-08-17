@@ -23,7 +23,7 @@ aarch64-apple-darwin	MatchFinder>::get_matches	1540	<gzippy::compress::deflate::
 aarch64-apple-darwin	build_dynamic_header	1596	gzippy::compress::deflate::huffman::header::build_dynamic_header
 aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>	7624	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>
 aarch64-apple-darwin	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>	7700	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>
-aarch64-apple-darwin	deflate_into	1816	gzippy::compress::deflate::deflate_into
+aarch64-apple-darwin	deflate_into	1928	gzippy::compress::deflate::deflate_into
 aarch64-apple-darwin	emit_block	6148	gzippy::compress::deflate::parse::emit_block
 aarch64-apple-darwin	emit_sequences	3740	gzippy::compress::deflate::parse::emit_sequences
 aarch64-apple-darwin	fastloop_l1::<false, false, false>	19540	gzippy::compress::deflate::parse::fast::fastloop_l1::<false, false, false>
@@ -31,8 +31,8 @@ aarch64-apple-darwin	fastloop_l1::<false, false, true>	19612	gzippy::compress::d
 aarch64-apple-darwin	fastloop_l1::<true, false, false>	19312	gzippy::compress::deflate::parse::fast::fastloop_l1::<true, false, false>
 aarch64-apple-darwin	fastloop_l1_lean::<false, false>	6928	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false, false>
 aarch64-apple-darwin	fastloop_l1_lean::<false, true>	6956	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false, true>
-aarch64-apple-darwin	greedy::run_resumable	8804	gzippy::compress::deflate::parse::greedy::run_resumable
-aarch64-apple-darwin	lazy::run_resumable	11056	gzippy::compress::deflate::parse::lazy::run_resumable
+aarch64-apple-darwin	greedy::run_resumable	9512	gzippy::compress::deflate::parse::greedy::run_resumable
+aarch64-apple-darwin	lazy::run_resumable	11860	gzippy::compress::deflate::parse::lazy::run_resumable
 aarch64-apple-darwin	make_huffman_code_into	676	gzippy::compress::deflate::huffman::fast::make_huffman_code_into
 aarch64-apple-darwin	optimize_and_flush	7060	<gzippy::compress::deflate::parse::near_optimal::Optimizer>::optimize_and_flush
 x86_64-unknown-linux-gnu	MatchFinder>::get_matches	1696	<gzippy::compress::deflate::matchfinder::lzfind::MatchFinder>::get_matches
@@ -43,6 +43,6 @@ x86_64-unknown-linux-gnu	deflate_into	1888	gzippy::compress::deflate::deflate_in
 x86_64-unknown-linux-gnu	emit_block	8496	gzippy::compress::deflate::parse::emit_block
 x86_64-unknown-linux-gnu	emit_sequences	2640	gzippy::compress::deflate::parse::emit_sequences
 x86_64-unknown-linux-gnu	greedy::run_resumable	12048	gzippy::compress::deflate::parse::greedy::run_resumable
-x86_64-unknown-linux-gnu	lazy::run_resumable	11280	gzippy::compress::deflate::parse::lazy::run_resumable
+x86_64-unknown-linux-gnu	lazy::run_resumable	13776	gzippy::compress::deflate::parse::lazy::run_resumable
 x86_64-unknown-linux-gnu	make_huffman_code_into	752	gzippy::compress::deflate::huffman::fast::make_huffman_code_into
 x86_64-unknown-linux-gnu	optimize_and_flush	7696	<gzippy::compress::deflate::parse::near_optimal::Optimizer>::optimize_and_flush
