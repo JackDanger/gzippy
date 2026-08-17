@@ -353,7 +353,7 @@ pub fn params_l2_gzip_deflate_fast() -> LevelParams {
     p.greedy_len3_shadow = false;
     p.forced_min_match_len = 3;
     p.greedy_accept_far_len3 = true;
-    p.hash3_chain_depth = 8;
+    p.hash3_chain_depth = super::matchfinder::hc::HC_HASH3_CHAIN_DEPTH;
     p
 }
 
