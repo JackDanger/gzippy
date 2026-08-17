@@ -53,7 +53,9 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // (tie-cage cells), so healing it means deliberately breaking those
     // ties in our favor by extending StoredCoalescer to greedy/lazy — a
     // separate, tie-guard-adjudicated lever, not part of the #266 fix.
-    ("noise", 1), // L1 1048679 -> L2 1048684 (+5 B)
+    // ("noise", 1) HEALED by L2 mmap pick-min (#332): L2 now matches L1's
+    // optimal 17-block stored grid (both 1048679 B). The +5 B sag moved to L3.
+    ("noise", 2), // L2 1048679 -> L3 1048684 (+5 B)
     // L1 -> L2 on `binary`: 662577 -> 666108 (+3531 B), opened 2026-08-13 by
     // the L1 MATCH-REACH lever (dense match-interior indexing + the 2-way
     // bucket shift that the vendor's `ht_matchfinder_skip_bytes` does and we
