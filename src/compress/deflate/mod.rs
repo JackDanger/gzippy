@@ -1036,6 +1036,23 @@ fn encode_unpadded_gzip_bytes(
     Ok(gz)
 }
 
+/// T1 mmap L1: gzip `MIN_MATCH` 3-byte primary hash wins `photo.jpg` T1; igzip
+/// 4-byte wins libdeflate ties elsewhere. Pick-min both (L4/L8/L9 precedent).
+fn encode_gzip_unpadded_l1_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let igzip = encode_unpadded_gzip_bytes(data, 1, level::params(1))?;
+    let gzip = encode_unpadded_gzip_bytes(data, 1, level::params_l1_gzip_primary())?;
+    let best = if gzip.len() < igzip.len() {
+        gzip
+    } else {
+        igzip
+    };
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
 /// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
 /// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
 /// precedent) without changing `params(4)` for streaming or T>1 routes.
@@ -1090,6 +1107,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         let gz = encode_gzip_slack_padded_to_vec(&input, len, level);
         writer.write_all(&gz)?;
         return Ok(len as u64);
+    }
+
+    if level == 1 && len > 0 {
+        return encode_gzip_unpadded_l1_pickmin(data, writer);
     }
 
     if level == 4 && len > 0 {

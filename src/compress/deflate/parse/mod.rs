@@ -433,6 +433,60 @@ impl Sink {
     }
 }
 
+/// L1 [`fast::run`] dispatch: `GZIP_HASH` is a const generic, so the mmap
+/// pick-min gzip arm is selected via a runtime branch over two monomorphizations.
+#[allow(clippy::too_many_arguments)]
+fn fast_run_dispatch<const REACH: bool, const INTERLEAVED: bool>(
+    gzip_primary: bool,
+    buf: &[u8],
+    data_start: usize,
+    in_end: usize,
+    input_total_len: usize,
+    statics: &StaticCodes,
+    bw: &mut BitWriter,
+    is_last: bool,
+    block_length: usize,
+    use_dynamic: bool,
+    limit_hash_update_inserts: usize,
+    bucket2: fast::Bucket2Cfg,
+    cost_gate: fast::LazyPeekCostGateCfg,
+    budget: HeaderBudget,
+) {
+    if gzip_primary {
+        fast::run::<false, REACH, INTERLEAVED, true>(
+            buf,
+            data_start,
+            in_end,
+            input_total_len,
+            statics,
+            bw,
+            is_last,
+            block_length,
+            use_dynamic,
+            limit_hash_update_inserts,
+            bucket2,
+            cost_gate,
+            budget,
+        );
+    } else {
+        fast::run::<false, REACH, INTERLEAVED, false>(
+            buf,
+            data_start,
+            in_end,
+            input_total_len,
+            statics,
+            bw,
+            is_last,
+            block_length,
+            use_dynamic,
+            limit_hash_update_inserts,
+            bucket2,
+            cost_gate,
+            budget,
+        );
+    }
+}
+
 /// Compress `buf[data_start..in_end]` into DEFLATE blocks appended to `bw`.
 ///
 /// `buf` MUST have at least [`BUF_PAD`] trailing bytes beyond `in_end`. Bytes in
@@ -457,7 +511,7 @@ pub(super) fn compress(
         // runtime-disabled.
         // L0: neither REACH nor INTERLEAVED — `fastloop_l0` has no 2-way
         // bucket and no interior-insert shift at all.
-        Strategy::Fast0 => fast::run::<true, false, false>(
+        Strategy::Fast0 => fast::run::<true, false, false, false>(
             buf,
             data_start,
             in_end,
@@ -496,7 +550,8 @@ pub(super) fn compress(
             // whole-buffer call. T>1 (`fast_interleaved_bucket`) and T1 REACH
             // (`fast_dense_interior_insert`) are mutually exclusive by construction.
             if params.fast_interleaved_bucket {
-                fast::run::<false, false, true>(
+                fast_run_dispatch::<false, true>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -512,7 +567,8 @@ pub(super) fn compress(
                     budget,
                 )
             } else if params.fast_dense_interior_insert {
-                fast::run::<false, true, false>(
+                fast_run_dispatch::<true, false>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -528,7 +584,8 @@ pub(super) fn compress(
                     budget,
                 )
             } else {
-                fast::run::<false, false, false>(
+                fast_run_dispatch::<false, false>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -562,7 +619,8 @@ pub(super) fn compress(
             };
             // Same REACH / INTERLEAVED dispatch as the default-build arm above.
             if params.fast_interleaved_bucket {
-                fast::run::<false, false, true>(
+                fast_run_dispatch::<false, true>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -578,7 +636,8 @@ pub(super) fn compress(
                     budget,
                 )
             } else if params.fast_dense_interior_insert {
-                fast::run::<false, true, false>(
+                fast_run_dispatch::<true, false>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -594,7 +653,8 @@ pub(super) fn compress(
                     budget,
                 )
             } else {
-                fast::run::<false, false, false>(
+                fast_run_dispatch::<false, false>(
+                    params.fast_gzip_primary,
                     buf,
                     data_start,
                     in_end,
@@ -788,7 +848,39 @@ pub(super) fn parse_resumable(
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => {
             if params.fast_dense_interior_insert {
-                fast::run_resumable::<true>(
+                if params.fast_gzip_primary {
+                    fast::run_resumable::<true, true>(
+                        buf,
+                        state,
+                        from,
+                        in_end,
+                        params,
+                        statics,
+                        bw,
+                        role,
+                        input_mode,
+                        fast::FAST_BLOCK_LENGTH,
+                        true,
+                        budget,
+                    )
+                } else {
+                    fast::run_resumable::<true, false>(
+                        buf,
+                        state,
+                        from,
+                        in_end,
+                        params,
+                        statics,
+                        bw,
+                        role,
+                        input_mode,
+                        fast::FAST_BLOCK_LENGTH,
+                        true,
+                        budget,
+                    )
+                }
+            } else if params.fast_gzip_primary {
+                fast::run_resumable::<false, true>(
                     buf,
                     state,
                     from,
@@ -803,7 +895,7 @@ pub(super) fn parse_resumable(
                     budget,
                 )
             } else {
-                fast::run_resumable::<false>(
+                fast::run_resumable::<false, false>(
                     buf,
                     state,
                     from,
