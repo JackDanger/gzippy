@@ -37,9 +37,9 @@ const LEVELS: std::ops::RangeInclusive<u32> = 0..=9;
 /// A pair listed here that STOPS sagging fails the test with instructions to
 /// delete it, so this list is honest and can only shrink.
 const KNOWN_SAGS: &[(&str, u32)] = &[
-    // The L3->L4 sag, the synthetic twin of the real-corpus L4 defect:
-    ("tabular", 3), // L3 255735 -> L4 271505 (+15770 B)
-    ("binary", 3),  // L3 661353 -> L4 663583 (+2230 B)
+    // The L3->L4 sag on synthetic tabular HEALED by mmap pick-min entry-point wiring
+    // (#330 L4 + #331 encode_gzip_bytes_to_vec / slack-padded paths): L4 252274 <= L3 255735.
+    ("binary", 3), // L3 661353 -> L4 663583 (+2230 B)
     // High-level sag on prose: L7 is the best level on `text`.
     ("text", 7), // L7 305775 -> L8 306342 (+567 B)
     ("text", 8), // L8 306342 -> L9 306755 (+413 B)
