@@ -627,6 +627,16 @@ pub fn encode_deflate_slack_padded_to_sink(
         ));
         return;
     }
+    if level_uses_t1_mmap_pick_min(level) && logical_len > 0 {
+        let data = &buf[..logical_len];
+        let deflate = match level {
+            1 => deflate_one_shot_t1_l1_pick_min(data),
+            4 => deflate_one_shot_t1_l4_pick_min(data),
+            _ => unreachable!(),
+        };
+        out.extend_from_slice(&deflate);
+        return;
+    }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
     deflate_into(
         &mut bw,
@@ -659,7 +669,16 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
         // OS=255 (unknown).
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        encode_deflate_bytes_to_sink(data, &[], level, &mut out);
+        if level_uses_t1_mmap_pick_min(level) && !data.is_empty() {
+            let deflate = match level {
+                1 => deflate_one_shot_t1_l1_pick_min(data),
+                4 => deflate_one_shot_t1_l4_pick_min(data),
+                _ => unreachable!(),
+            };
+            out.extend_from_slice(&deflate);
+        } else {
+            encode_deflate_bytes_to_sink(data, &[], level, &mut out);
+        }
 
         let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
         out.extend_from_slice(&crc.to_le_bytes());
