@@ -237,6 +237,7 @@ pub(super) fn run_block(
             nice_len,
             params.max_search_depth,
             params.good_match,
+            params.hash3_chain_depth,
             next_hashes,
         );
 
@@ -278,6 +279,7 @@ pub(super) fn run_block(
                 nice_len,
                 params.max_search_depth,
                 params.good_match,
+                params.hash3_chain_depth,
                 next_hashes,
             );
             if next_len > DEFLATE_MIN_MATCH_LEN {
@@ -325,6 +327,7 @@ pub(super) fn run_block(
                 nice_len,
                 params.max_search_depth,
                 params.good_match,
+                params.hash3_chain_depth,
                 next_hashes,
             );
             if next_len > DEFLATE_MIN_MATCH_LEN {

@@ -242,6 +242,7 @@ pub(super) fn run_block(
             nice_len,
             depth,
             params.good_match,
+            params.hash3_chain_depth,
             next_hashes,
         );
 
@@ -298,6 +299,7 @@ pub(super) fn run_block(
                     nice_len,
                     depth >> 1,
                     params.good_match,
+                    params.hash3_chain_depth,
                     next_hashes,
                 );
                 in_next += 1;
@@ -321,6 +323,7 @@ pub(super) fn run_block(
                         nice_len,
                         depth >> 2,
                         params.good_match,
+                        params.hash3_chain_depth,
                         next_hashes,
                     );
                     in_next += 1;

@@ -269,6 +269,7 @@ impl HcMatchfinder {
         nice_len: u32,
         max_search_depth: u32,
         good_match: u32,
+        hash3_chain_depth: u32,
         next_hashes: &mut [u32; 2],
     ) -> (u32, u32) {
         // `bucket-oracle-null-mf` (Cargo.toml doc comment): the CEILING
@@ -293,6 +294,7 @@ impl HcMatchfinder {
                 nice_len,
                 max_search_depth,
                 good_match,
+                hash3_chain_depth,
                 next_hashes,
             );
             return (best_len_in, 1);
@@ -346,7 +348,9 @@ impl HcMatchfinder {
                 *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
                 *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
                 *self.next_tab.get_unchecked_mut(cur_pos) = cur_node4;
-                *self.next3_tab.get_unchecked_mut(cur_pos) = cur_node3;
+                if hash3_chain_depth > 0 {
+                    *self.next3_tab.get_unchecked_mut(cur_pos) = cur_node3;
+                }
                 (cur_node3, cur_node4)
             };
 
@@ -389,7 +393,7 @@ impl HcMatchfinder {
                         // Depth is env-gated for measurement; 1 reproduces the old
                         // singleton behaviour exactly.
                         let mut node3 = cur_node3;
-                        let mut left = HC_HASH3_CHAIN_DEPTH;
+                        let mut left = hash3_chain_depth.max(1);
                         loop {
                             let mp = (in_base_v as isize + node3 as isize) as usize;
                             // SAFETY: `cutoff < node3` so `mp < in_next`, and it points
@@ -405,7 +409,7 @@ impl HcMatchfinder {
                                 break;
                             }
                             left -= 1;
-                            if left == 0 {
+                            if left == 0 || hash3_chain_depth == 0 {
                                 break;
                             }
                             // SAFETY: masked chain index `< next3_tab.len()`.
@@ -761,6 +765,7 @@ mod tests {
             nice_len: u32,
             max_search_depth: u32,
             good_match: u32,
+            _hash3_chain_depth: u32,
             next_hashes: &mut [u32; 2],
         ) -> (u32, u32) {
             let mut best_len = best_len_in;
@@ -982,6 +987,7 @@ mod tests {
                 nice_len,
                 max_search_depth,
                 0,
+                0,
                 &mut nh_new,
             );
             let (l_ref, o_ref) = mf_ref.longest_match(
@@ -992,6 +998,7 @@ mod tests {
                 max_len,
                 nice_len,
                 max_search_depth,
+                0,
                 0,
                 &mut nh_ref,
             );
@@ -1189,6 +1196,7 @@ mod tests {
             258,
             32,
             0,
+            0,
             &mut next_hashes,
         );
         assert!(len >= 4, "expected a match, got len {len}");
@@ -1219,6 +1227,7 @@ mod tests {
                 (in_end - pos) as u32,
                 258,
                 32,
+                0,
                 0,
                 &mut next_hashes,
             );
