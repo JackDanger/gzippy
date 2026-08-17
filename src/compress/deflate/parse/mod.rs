@@ -794,14 +794,14 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
     ) {
         return true;
     }
-    // `Strategy::Fast` (L1) streams via `fast::run_resumable` — but only in a
-    // default build. The `l1-tune` dev search harness carries per-`run`-call
-    // lever state (bucket2's `head2`, chain-mode's lazy hc) that the resume
-    // path does not preserve, so tune builds keep the whole-buffer fallback;
-    // they are measurement-only and never ship.
+    // `Strategy::Fast` (L1) streams via `fast::run_resumable` in tune builds
+    // only. Shipped L1 runs mmap pick-min (`deflate_one_shot_t1_l1_pick_min`),
+    // which is whole-buffer only — the resumable fast path would diverge from
+    // `encode_gzip_slack_padded_to_vec` and mmap pick-min
+    // (`tests/streaming_identity.rs`).
     #[cfg(not(feature = "l1-tune"))]
     if matches!(strategy, Strategy::Fast) {
-        return true;
+        return false;
     }
     false
 }
