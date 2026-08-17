@@ -148,6 +148,9 @@ pub struct LevelParams {
     /// generic at `parse::compress`'s dispatch so the T1 monomorphization
     /// compiles to the pre-lever code, not a runtime-branched hybrid.
     pub fast_interleaved_bucket: bool,
+    /// T1 mmap pick-min only: gzip `MIN_MATCH` 3-byte primary hash. Shipped
+    /// `params(1)` keeps this false; [`params_l1_gzip_primary`] sets it.
+    pub fast_gzip_primary: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
     pub fast_lazy_peek_cost_gate: bool,
@@ -324,6 +327,13 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
 /// The `max_search_depth`/`nice_match_length` values transliterate the vendor
 /// presets exactly; the strategy mapping substitutes a fallback for the two
 /// strategies not yet implemented in this increment (see the module docs).
+/// Gzip-shaped L1 primary hash (3-byte keys) for mmap pick-min's second arm.
+pub fn params_l1_gzip_primary() -> LevelParams {
+    let mut p = params(1);
+    p.fast_gzip_primary = true;
+    p
+}
+
 pub fn params(level: u32) -> LevelParams {
     let p = params_baseline(level);
     // zlib-ng knobs apply only on the T1 whole-buffer pick-min path — see
@@ -687,6 +697,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -713,6 +724,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -734,6 +746,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -808,6 +821,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -841,6 +855,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -862,6 +877,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -883,6 +899,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -904,6 +921,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -925,6 +943,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -946,6 +965,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -969,6 +989,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -995,6 +1016,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
@@ -1021,6 +1043,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_hash_update_inserts: 3,
             fast_dense_interior_insert: false,
             fast_interleaved_bucket: false,
+            fast_gzip_primary: false,
             fast_lazy_peek_cost_gate: false,
             fast_lazy_peek_cost_margin_bits: 0,
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,

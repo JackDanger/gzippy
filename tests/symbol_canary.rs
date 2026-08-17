@@ -98,12 +98,14 @@ const SUBSTRINGS: &[&str] = &[
     // loops below (the watch went 0-match, exactly the rename event the
     // canary exists to catch — caught 2026-08-08, adjusted here with the
     // pins regenerated in the same commit).
-    // REACH + INTERLEAVED monomorphize `fastloop_l1`; pin each outlined
-    // variant. The T>1 interleaved monomorph (`::<false, true>`) may inline on
-    // some targets — if it appears outlined on the trainer, add a fourth pin.
-    "fastloop_l1::<false, false>",
-    "fastloop_l1::<true, false>",
-    "fast::fastloop_l1_lean",
+    // REACH + INTERLEAVED + GZIP_HASH monomorphize `fastloop_l1` (PR #331
+    // gzip-primary pick-min adds the third const generic); pin each outlined
+    // variant the shipped L1 path can call.
+    "fastloop_l1::<false, false, false>",
+    "fastloop_l1::<false, false, true>",
+    "fastloop_l1::<true, false, false>",
+    "fastloop_l1_lean::<false, false>",
+    "fastloop_l1_lean::<false, true>",
     "greedy::run_resumable",
     "lazy::run_resumable",
     "optimize_and_flush",

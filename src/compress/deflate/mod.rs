@@ -171,6 +171,19 @@ pub fn encode_deflate_segment_to_sink(
             *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
             return;
         }
+        if !parallel
+            && level_uses_t1_mmap_pick_min(level)
+            && is_last
+            && bw.byte_len() == 0
+            && !data.is_empty()
+        {
+            *out = match level {
+                1 => deflate_one_shot_t1_l1_pick_min(data),
+                4 => deflate_one_shot_t1_l4_pick_min(data),
+                _ => unreachable!(),
+            };
+            return;
+        }
         deflate_into(
             &mut bw,
             &buf,
@@ -372,6 +385,54 @@ fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
     matches!(level, 5..=7)
 }
 
+/// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
+#[inline]
+fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
+    matches!(level, 1 | 4)
+}
+
+/// Pick-min helper: parallel arms in release builds; sequential with winner-only
+/// counter attribution when `anatomy-counters` is on (both arms would otherwise
+/// double-count into the global snapshot).
+fn pick_min_two_vecs(
+    arm_a: impl FnOnce() -> Vec<u8> + Send,
+    arm_b: impl FnOnce() -> Vec<u8> + Send,
+) -> Vec<u8> {
+    #[cfg(feature = "anatomy-counters")]
+    {
+        use crate::compress::deflate::anatomy_counters::{self, COUNTERS};
+        let baseline = COUNTERS.snapshot();
+        anatomy_counters::reset();
+        let out_a = arm_a();
+        let snap_a = COUNTERS.snapshot();
+        anatomy_counters::reset();
+        let out_b = arm_b();
+        let snap_b = COUNTERS.snapshot();
+        let (out, snap) = if out_b.len() < out_a.len() {
+            (out_b, snap_b)
+        } else {
+            (out_a, snap_a)
+        };
+        COUNTERS.restore(&baseline);
+        COUNTERS.add_snapshot(&snap);
+        out
+    }
+    #[cfg(not(feature = "anatomy-counters"))]
+    {
+        std::thread::scope(|s| {
+            let a = s.spawn(arm_a);
+            let b = s.spawn(arm_b);
+            let out_a = a.join().expect("pick-min arm a");
+            let out_b = b.join().expect("pick-min arm b");
+            if out_b.len() < out_a.len() {
+                out_b
+            } else {
+                out_a
+            }
+        })
+    }
+}
+
 /// Pick-min: baseline vs zlib knobs; the two encodes run in parallel so wall
 /// ≈ max(arm) instead of sum(arm) — measured ~2× → ~1.1× on dickens L6 T1.
 fn deflate_one_shot_t1_zlib_pick_min(
@@ -405,19 +466,98 @@ fn deflate_one_shot_t1_zlib_pick_min(
         bw.finish()
     };
 
-    let (base, zlib_out) = std::thread::scope(|s| {
-        let b = s.spawn(|| encode(&baseline));
-        let z = s.spawn(|| encode(&zlib));
-        (
-            b.join().expect("pick-min baseline"),
-            z.join().expect("pick-min zlib"),
-        )
-    });
-    if zlib_out.len() < base.len() {
-        zlib_out
-    } else {
-        base
+    pick_min_two_vecs(|| encode(&baseline), || encode(&zlib))
+}
+
+/// Raw DEFLATE bytes via the mmap-route two-pass resumable parser.
+fn encode_unpadded_deflate_bytes(data: &[u8], params: level::LevelParams) -> Vec<u8> {
+    use encode_types::{BlockRole, HeaderBudget, InputMode};
+
+    let len = data.len();
+    let mut bw = BitWriter::from_vec(Vec::new());
+    let mut state = parse::ParseState::new();
+    state.input_total_len = len;
+    let mut in_next = 0usize;
+
+    if len > INPLACE_TAIL_PAD {
+        let avail = len - INPLACE_TAIL_PAD;
+        in_next = crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                data,
+                &mut state,
+                0,
+                avail,
+                &params,
+                BlockRole::Interior,
+                InputMode::Bounded,
+                HeaderBudget::Lean,
+                &mut bw,
+            )
+        });
     }
+
+    let shift = state.max_shift();
+    let tail_len = len - shift;
+    let tail_cap = tail_len + INPLACE_TAIL_PAD;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, tail_cap);
+    let mut tbuf = Vec::with_capacity(tail_cap);
+    tbuf.extend_from_slice(&data[shift..]);
+    tbuf.resize(tail_cap, 0);
+    if shift > 0 {
+        state.shift_down(shift);
+        in_next -= shift;
+    }
+    if in_next == tail_len {
+        emit_stored_block(&mut bw, &[], true);
+    } else {
+        crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                &tbuf,
+                &mut state,
+                in_next,
+                tail_len,
+                &params,
+                BlockRole::Final,
+                InputMode::Drain,
+                HeaderBudget::Lean,
+                &mut bw,
+            )
+        });
+    }
+    bw.finish()
+}
+
+fn gzip_wrap_unpadded_deflate(data: &[u8], deflate: Vec<u8>) -> Vec<u8> {
+    let len = data.len();
+    let out_cap = 10 + deflate.len() + 8;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, out_cap);
+    let mut gz = Vec::with_capacity(out_cap);
+    gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    gz.extend_from_slice(&deflate);
+    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
+    gz.extend_from_slice(&crc.to_le_bytes());
+    gz.extend_from_slice(&(len as u32).to_le_bytes());
+    gz
+}
+
+/// Pick-min: igzip vs gzip-primary L1 fast path (mmap + whole-buffer).
+fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
+    pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(1)),
+        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
+    )
+}
+
+/// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
+fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
+    let mut lazy_params = level::params(4);
+    lazy_params.strategy = level::Strategy::Lazy;
+    pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(4)),
+        || encode_unpadded_deflate_bytes(data, lazy_params),
+    )
 }
 
 fn deflate_into(
@@ -499,6 +639,16 @@ pub fn encode_deflate_slack_padded_to_sink(
         ));
         return;
     }
+    if level_uses_t1_mmap_pick_min(level) && logical_len > 0 {
+        let data = &buf[..logical_len];
+        let deflate = match level {
+            1 => deflate_one_shot_t1_l1_pick_min(data),
+            4 => deflate_one_shot_t1_l4_pick_min(data),
+            _ => unreachable!(),
+        };
+        out.extend_from_slice(&deflate);
+        return;
+    }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
     deflate_into(
         &mut bw,
@@ -531,7 +681,16 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
         // OS=255 (unknown).
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        encode_deflate_bytes_to_sink(data, &[], level, &mut out);
+        if level_uses_t1_mmap_pick_min(level) && !data.is_empty() {
+            let deflate = match level {
+                1 => deflate_one_shot_t1_l1_pick_min(data),
+                4 => deflate_one_shot_t1_l4_pick_min(data),
+                _ => unreachable!(),
+            };
+            out.extend_from_slice(&deflate);
+        } else {
+            encode_deflate_bytes_to_sink(data, &[], level, &mut out);
+        }
 
         let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
         out.extend_from_slice(&crc.to_le_bytes());
@@ -961,79 +1120,15 @@ fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Writ
 ///   padded buffer — the identical allocation the Read-based fallback in
 ///   [`encode_gzip_reader_to_writer_chunked_sized`] makes today, with the
 ///   copy sourced from the page cache instead of a `read(2)` loop.
-/// Whole-buffer gzip bytes for [`encode_gzip_unpadded_slice_to_writer`]'s
-/// two-pass inplace parse (header + deflate + crc/isize).
-fn encode_unpadded_gzip_bytes(
+/// T1 mmap L1: gzip `MIN_MATCH` 3-byte primary hash wins `photo.jpg` T1; igzip
+/// 4-byte wins libdeflate ties elsewhere. Pick-min both (L4/L8/L9 precedent).
+fn encode_gzip_unpadded_l1_pickmin<W: std::io::Write>(
     data: &[u8],
-    level: u32,
-    params: level::LevelParams,
-) -> std::io::Result<Vec<u8>> {
-    use encode_types::{BlockRole, HeaderBudget, InputMode};
-
-    let len = data.len();
-    let out_cap = estimate_output_cap(len, level, 32);
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, out_cap);
-    let mut out = Vec::with_capacity(out_cap);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    let mut bw = BitWriter::from_vec(out);
-
-    let mut state = parse::ParseState::new();
-    state.input_total_len = len;
-    let mut in_next = 0usize;
-
-    if len > INPLACE_TAIL_PAD {
-        let avail = len - INPLACE_TAIL_PAD;
-        in_next = crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                data,
-                &mut state,
-                0,
-                avail,
-                &params,
-                BlockRole::Interior,
-                InputMode::Bounded,
-                HeaderBudget::Lean,
-                &mut bw,
-            )
-        });
-    }
-
-    let shift = state.max_shift();
-    let tail_len = len - shift;
-    let tail_cap = tail_len + INPLACE_TAIL_PAD;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, tail_cap);
-    let mut tbuf = Vec::with_capacity(tail_cap);
-    tbuf.extend_from_slice(&data[shift..]);
-    tbuf.resize(tail_cap, 0);
-    if shift > 0 {
-        state.shift_down(shift);
-        in_next -= shift;
-    }
-    if in_next == tail_len {
-        emit_stored_block(&mut bw, &[], true);
-    } else {
-        crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                &tbuf,
-                &mut state,
-                in_next,
-                tail_len,
-                &params,
-                BlockRole::Final,
-                InputMode::Drain,
-                HeaderBudget::Lean,
-                &mut bw,
-            )
-        });
-    }
-
-    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
-    let mut gz = bw.finish();
-    gz.extend_from_slice(&crc.to_le_bytes());
-    gz.extend_from_slice(&(len as u32).to_le_bytes());
-    Ok(gz)
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l1_pick_min(data));
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
 }
 
 /// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
@@ -1043,15 +1138,7 @@ fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let greedy = encode_unpadded_gzip_bytes(data, 4, level::params(4))?;
-    let mut lazy_params = level::params(4);
-    lazy_params.strategy = level::Strategy::Lazy;
-    let lazy = encode_unpadded_gzip_bytes(data, 4, lazy_params)?;
-    let best = if lazy.len() < greedy.len() {
-        lazy
-    } else {
-        greedy
-    };
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l4_pick_min(data));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
@@ -1090,6 +1177,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         let gz = encode_gzip_slack_padded_to_vec(&input, len, level);
         writer.write_all(&gz)?;
         return Ok(len as u64);
+    }
+
+    if level == 1 && len > 0 {
+        return encode_gzip_unpadded_l1_pickmin(data, writer);
     }
 
     if level == 4 && len > 0 {

@@ -15,8 +15,8 @@
 # Regenerate (the diff is the change's mechanism — commit it in the same PR):
 #   UPDATE_ANATOMY_PINS=1 cargo test --release --test anatomy_pins --features anatomy-counters
 fixture	level	counter	value
-text	1	alloc_bytes	1573509
-text	1	alloc_events	4
+text	1	alloc_bytes	820442
+text	1	alloc_events	6
 text	1	bitstream_flush_word_calls	209759
 text	1	block_split_observations	0
 text	1	blocks_emitted_dynamic	16
@@ -219,8 +219,8 @@ text	9	literals_emitted_fast	0
 text	9	match_length_bytes_total	988213
 text	9	matches_emitted	112068
 text	9	matches_emitted_fast	0
-tabular	1	alloc_bytes	1573213
-tabular	1	alloc_events	3
+tabular	1	alloc_bytes	819850
+tabular	1	alloc_events	4
 tabular	1	bitstream_flush_word_calls	159250
 tabular	1	block_split_observations	0
 tabular	1	blocks_emitted_dynamic	16
@@ -423,8 +423,8 @@ tabular	9	literals_emitted_fast	0
 tabular	9	match_length_bytes_total	915720
 tabular	9	matches_emitted	71318
 tabular	9	matches_emitted_fast	0
-binary	1	alloc_bytes	1573218
-binary	1	alloc_events	3
+binary	1	alloc_bytes	820165
+binary	1	alloc_events	5
 binary	1	bitstream_flush_word_calls	196156
 binary	1	block_split_observations	0
 binary	1	blocks_emitted_dynamic	16
@@ -627,8 +627,8 @@ binary	9	literals_emitted_fast	0
 binary	9	match_length_bytes_total	474011
 binary	9	matches_emitted	25270
 binary	9	matches_emitted_fast	0
-noise	1	alloc_bytes	1573487
-noise	1	alloc_events	4
+noise	1	alloc_bytes	853164
+noise	1	alloc_events	6
 noise	1	bitstream_flush_word_calls	0
 noise	1	block_split_observations	0
 noise	1	blocks_emitted_dynamic	0

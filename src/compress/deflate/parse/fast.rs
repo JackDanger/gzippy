@@ -1231,6 +1231,27 @@ const ACCEL_MAX_STEP: usize = 8;
 /// of length >= 4 (its hash keys 4 bytes), coding anything shorter as literals.
 const SHORTEST_MATCH: u32 = 4;
 
+/// gzip `MIN_MATCH` (levels 1-3): 3-byte primary hash for mmap pick-min arm.
+const SHORTEST_MATCH_L1: u32 = 3;
+
+#[inline(always)]
+unsafe fn load_primary_hash<const GZIP_HASH: bool>(base: *const u8, pos: usize) -> u32 {
+    if GZIP_HASH {
+        load_u24(base, pos)
+    } else {
+        load_u32(base, pos)
+    }
+}
+
+#[inline(always)]
+const fn primary_min_match<const GZIP_HASH: bool>() -> u32 {
+    if GZIP_HASH {
+        SHORTEST_MATCH_L1
+    } else {
+        SHORTEST_MATCH
+    }
+}
+
 /// The minimum accepted length for a candidate found via the HASH3-PROBE
 /// lever's 3-byte-key `head3` table (see [`Hash3Cfg`]'s doc comment for the
 /// full story). DEFLATE's actual floor (`SHORTEST_MATCH` in zlib/pigz terms
@@ -1549,7 +1570,7 @@ fn disable_sparse_tier_if_small(cfg: &mut LazyPeekCostGateCfg, input_total_len: 
 /// candidate's match iff it is both a valid, in-window distance AND strictly
 /// longer than the primary; otherwise returns the inputs unchanged.
 #[inline(always)]
-fn bucket2_upgrade(
+fn bucket2_upgrade<const GZIP_HASH: bool>(
     pos: usize,
     buf: &[u8],
     cand2: u32,
@@ -1563,7 +1584,7 @@ fn bucket2_upgrade(
     let dist2 = pos.wrapping_sub(cand2 as usize);
     if (1..=WINDOW).contains(&dist2) {
         let length2 = lz_extend(buf, pos, cand2 as usize, 0, DEFLATE_MAX_MATCH_LEN);
-        if length2 >= SHORTEST_MATCH && length2 > length {
+        if length2 >= primary_min_match::<GZIP_HASH>() && length2 > length {
             return (length2, dist2);
         }
     }
@@ -1573,7 +1594,7 @@ fn bucket2_upgrade(
 /// Libdeflate `ht_matchfinder` probes both bucket slots every lookup; take the
 /// longer valid match (min length 4). No-op when bucket2 is off.
 #[inline(always)]
-fn bucket2_best_of_two(
+fn bucket2_best_of_two<const GZIP_HASH: bool>(
     pos: usize,
     buf: &[u8],
     cand: u32,
@@ -1588,7 +1609,8 @@ fn bucket2_best_of_two(
         let dist = pos.wrapping_sub(c as usize);
         if (1..=WINDOW).contains(&dist) {
             let length = lz_extend(buf, pos, c as usize, 0, DEFLATE_MAX_MATCH_LEN);
-            if length >= SHORTEST_MATCH && best.is_none_or(|(bl, _)| length > bl) {
+            if length >= primary_min_match::<GZIP_HASH>() && best.is_none_or(|(bl, _)| length > bl)
+            {
                 best = Some((length, dist));
             }
         }
@@ -1670,7 +1692,7 @@ fn hash3_better(cur_len: u32, cur_dist: usize, next_len: u32, next_dist: usize) 
 /// `fast_end <= in_end - DEFLATE_MAX_MATCH_LEN` (see [`run`]'s `fast_end`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
+fn process_position_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HASH: bool>(
     pos: usize,
     h: usize,
     cand: u32,
@@ -1817,7 +1839,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
     #[cfg(feature = "anatomy-counters")]
     let mut primary_too_short = false;
     if bucket2.enabled && bucket2.probe_on_miss {
-        accepted = bucket2_best_of_two(pos, buf, cand, cand2, bucket2);
+        accepted = bucket2_best_of_two::<GZIP_HASH>(pos, buf, cand, cand2, bucket2);
         #[cfg(feature = "anatomy-counters")]
         if accepted.is_none() {
             primary_too_short = false; // charged below as miss
@@ -1825,9 +1847,9 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
     } else if (1..=WINDOW).contains(&dist) {
         let cand_pos = cand as usize;
         // Byte-exact extend (never trusts the hash): a spurious
-        // candidate simply yields length < SHORTEST_MATCH -> literal.
+        // candidate simply yields length < primary_min_match -> literal.
         let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
-        if length >= SHORTEST_MATCH {
+        if length >= primary_min_match::<GZIP_HASH>() {
             accepted = Some((length, dist));
         } else {
             #[cfg(feature = "anatomy-counters")]
@@ -1889,7 +1911,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
         let (length, dist) = if bucket2.probe_on_miss {
             (length, dist)
         } else {
-            bucket2_upgrade(pos, buf, cand2, length, dist, bucket2)
+            bucket2_upgrade::<GZIP_HASH>(pos, buf, cand2, length, dist, bucket2)
         };
         // Lazy peek (see `LAZY_PEEK_MAX_LEN`'s doc comment): gated to
         // short accepted matches only, so this branch is rare (most
@@ -1925,7 +1947,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
             // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
             // both the 4-byte load and the up-to-258-byte
             // `lz_extend` below stay in bounds.
-            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let seq1 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2070,7 +2092,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
         while nh < insert_end {
             // SAFETY: nh < match_end = pos+length <= in_end, and
             // buf's pad covers the 4-byte load past in_end.
-            let s = unsafe { load_u32(base, nh) };
+            let s = unsafe { load_primary_hash::<GZIP_HASH>(base, nh) };
             if INTERLEAVED {
                 // Interior SHIFT-insert, same 2-slot protocol as the probe
                 // position above (`slot1 <- slot0; slot0 <- nh`) — the
@@ -2179,7 +2201,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool>(
 #[cfg(not(feature = "l1-tune"))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn process_position_l1_lean<const INTERLEAVED: bool>(
+fn process_position_l1_lean<const INTERLEAVED: bool, const GZIP_HASH: bool>(
     pos: usize,
     h: usize,
     cand: u32,
@@ -2221,9 +2243,9 @@ fn process_position_l1_lean<const INTERLEAVED: bool>(
     if (1..=WINDOW).contains(&dist) {
         let cand_pos = cand as usize;
         // Byte-exact extend (never trusts the hash): a spurious
-        // candidate simply yields length < SHORTEST_MATCH -> literal.
+        // candidate simply yields length < primary_min_match -> literal.
         let length = lz_extend(buf, pos, cand_pos, 0, DEFLATE_MAX_MATCH_LEN);
-        if length >= SHORTEST_MATCH {
+        if length >= primary_min_match::<GZIP_HASH>() {
             accepted = Some((length, dist));
         } else {
             #[cfg(feature = "anatomy-counters")]
@@ -2258,7 +2280,7 @@ fn process_position_l1_lean<const INTERLEAVED: bool>(
             // so `pos + 1 + 4 <= in_end` and `pos + 1 + 258 <= in_end`:
             // both the 4-byte load and the up-to-258-byte
             // `lz_extend` below stay in bounds.
-            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let seq1 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
             #[cfg(feature = "anatomy-counters")]
             {
@@ -2541,7 +2563,7 @@ fn fastloop_l0(
 /// corpora (text6/bin6/sil40), both boxes. See [`fastloop_l0`]'s doc comment
 /// for why L0 does NOT share this function even behind a dead branch.
 #[allow(clippy::too_many_arguments)]
-fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
+fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HASH: bool>(
     mut pos: usize,
     fast_end: usize,
     buf: &[u8],
@@ -2578,7 +2600,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
         // the prefetch address is a pure hint that never faults (interleaved
         // route: bucket base `2*fh0` — both slots share the line).
         unsafe {
-            let fseq0 = load_u32(base, pos + PF_DIST);
+            let fseq0 = load_primary_hash::<GZIP_HASH>(base, pos + PF_DIST);
             let fh0 = lz_hash(fseq0, HASH_BITS) as usize;
             let i0 = if INTERLEAVED { fh0 << 1 } else { fh0 };
             prefetch_write(head.as_ptr().add(i0) as *const u8);
@@ -2598,16 +2620,16 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
             // gap vs the pre-SF2 density. Same bounds reasoning as above
             // (`pos + 1 <= fast_end`).
             unsafe {
-                let fseq1 = load_u32(base, pos + 1 + PF_DIST);
+                let fseq1 = load_primary_hash::<GZIP_HASH>(base, pos + 1 + PF_DIST);
                 let fh1 = lz_hash(fseq1, HASH_BITS) as usize;
                 let i1 = if INTERLEAVED { fh1 << 1 } else { fh1 };
                 prefetch_write(head.as_ptr().add(i1) as *const u8);
             }
             // SAFETY: `pos + 1 < fast_end <= in_end - 258`, so both
             // `pos + 4 <= in_end` and `pos + 1 + 4 <= in_end`.
-            let seq0 = unsafe { load_u32(base, pos) };
+            let seq0 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos) };
             let h0 = lz_hash(seq0, HASH_BITS) as usize;
-            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let seq1 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
             // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE,
             // so `2h < L1_HEAD_ENTRIES` on the interleaved route (slot 0 of
@@ -2631,7 +2653,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
                 local.k2_batch_iterations += 1;
             }
 
-            let after0 = process_position_l1::<REACH, INTERLEAVED>(
+            let after0 = process_position_l1::<REACH, INTERLEAVED, GZIP_HASH>(
                 pos,
                 h0,
                 cand0,
@@ -2680,7 +2702,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
                 // `pos`, so the up-to-date value is `pos` itself, not the
                 // stale pre-write `cand1_raw`.
                 let cand1 = if h1 == h0 { pos as u32 } else { cand1_raw };
-                pos = process_position_l1::<REACH, INTERLEAVED>(
+                pos = process_position_l1::<REACH, INTERLEAVED, GZIP_HASH>(
                     after0,
                     h1,
                     cand1,
@@ -2725,7 +2747,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
         // (`pos + 1 == fast_end`) — process it scalar, byte-for-byte the
         // pre-SF2 loop body (fresh single newest-slot read).
         // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
-        let seq = unsafe { load_u32(base, pos) };
+        let seq = unsafe { load_primary_hash::<GZIP_HASH>(base, pos) };
         let h = lz_hash(seq, HASH_BITS) as usize;
         #[cfg(feature = "anatomy-counters")]
         {
@@ -2744,7 +2766,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
         {
             local.head_table_reads += 1;
         }
-        pos = process_position_l1::<REACH, INTERLEAVED>(
+        pos = process_position_l1::<REACH, INTERLEAVED, GZIP_HASH>(
             pos,
             h,
             cand,
@@ -2800,7 +2822,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool>(
 /// dispatch site.
 #[cfg(not(feature = "l1-tune"))]
 #[allow(clippy::too_many_arguments)]
-fn fastloop_l1_lean<const INTERLEAVED: bool>(
+fn fastloop_l1_lean<const INTERLEAVED: bool, const GZIP_HASH: bool>(
     mut pos: usize,
     fast_end: usize,
     buf: &[u8],
@@ -2816,7 +2838,7 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
         // comment for the mechanism and safety argument (identical here;
         // interleaved route prefetches bucket base `2*fh0`).
         unsafe {
-            let fseq0 = load_u32(base, pos + PF_DIST);
+            let fseq0 = load_primary_hash::<GZIP_HASH>(base, pos + PF_DIST);
             let fh0 = lz_hash(fseq0, HASH_BITS) as usize;
             let i0 = if INTERLEAVED { fh0 << 1 } else { fh0 };
             prefetch_write(head.as_ptr().add(i0) as *const u8);
@@ -2824,16 +2846,16 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
 
         if pos + 1 < fast_end {
             unsafe {
-                let fseq1 = load_u32(base, pos + 1 + PF_DIST);
+                let fseq1 = load_primary_hash::<GZIP_HASH>(base, pos + 1 + PF_DIST);
                 let fh1 = lz_hash(fseq1, HASH_BITS) as usize;
                 let i1 = if INTERLEAVED { fh1 << 1 } else { fh1 };
                 prefetch_write(head.as_ptr().add(i1) as *const u8);
             }
             // SAFETY: `pos + 1 < fast_end <= in_end - 258`, so both
             // `pos + 4 <= in_end` and `pos + 1 + 4 <= in_end`.
-            let seq0 = unsafe { load_u32(base, pos) };
+            let seq0 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos) };
             let h0 = lz_hash(seq0, HASH_BITS) as usize;
-            let seq1 = unsafe { load_u32(base, pos + 1) };
+            let seq1 = unsafe { load_primary_hash::<GZIP_HASH>(base, pos + 1) };
             let h1 = lz_hash(seq1, HASH_BITS) as usize;
             // SAFETY: `lz_hash(_, HASH_BITS)` output is always < HASH_SIZE,
             // so `2h < L1_HEAD_ENTRIES` on the interleaved route and
@@ -2852,7 +2874,7 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
                 local.k2_batch_iterations += 1;
             }
 
-            let after0 = process_position_l1_lean::<INTERLEAVED>(
+            let after0 = process_position_l1_lean::<INTERLEAVED, GZIP_HASH>(
                 pos,
                 h0,
                 cand0,
@@ -2873,7 +2895,7 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
                 // See [`fastloop_l1`]'s matching comment for why `cand1_raw`
                 // is reusable (or must be corrected to `pos`) here.
                 let cand1 = if h1 == h0 { pos as u32 } else { cand1_raw };
-                pos = process_position_l1_lean::<INTERLEAVED>(
+                pos = process_position_l1_lean::<INTERLEAVED, GZIP_HASH>(
                     after0,
                     h1,
                     cand1,
@@ -2898,7 +2920,7 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
 
         // Boundary: exactly one position left in the fast region.
         // SAFETY: `pos < fast_end <= in_end - 258`, so `pos + 4 <= in_end`.
-        let seq = unsafe { load_u32(base, pos) };
+        let seq = unsafe { load_primary_hash::<GZIP_HASH>(base, pos) };
         let h = lz_hash(seq, HASH_BITS) as usize;
         #[cfg(feature = "anatomy-counters")]
         {
@@ -2917,7 +2939,7 @@ fn fastloop_l1_lean<const INTERLEAVED: bool>(
         {
             local.head_table_reads += 1;
         }
-        pos = process_position_l1_lean::<INTERLEAVED>(
+        pos = process_position_l1_lean::<INTERLEAVED, GZIP_HASH>(
             pos,
             h,
             cand,
@@ -3005,7 +3027,7 @@ fn release_head_table(
 /// `ACCEL`. The tail's PROBE reads the newest slot only on both layouts —
 /// only bucket MAINTENANCE differs (the lever's scope).
 #[allow(clippy::too_many_arguments)]
-fn parse_tail<const INTERLEAVED: bool>(
+fn parse_tail<const INTERLEAVED: bool, const GZIP_HASH: bool>(
     mut pos: usize,
     block_end_target: usize,
     in_end: usize,
@@ -3024,9 +3046,9 @@ fn parse_tail<const INTERLEAVED: bool>(
             remaining as u32
         };
 
-        if max_len >= SHORTEST_MATCH {
-            // SAFETY: max_len >= 4 implies pos + 4 <= in_end, in bounds.
-            let seq = unsafe { load_u32(base, pos) };
+        if max_len >= primary_min_match::<GZIP_HASH>() {
+            // SAFETY: max_len >= MIN_MATCH implies pos + 4 <= in_end, in bounds.
+            let seq = unsafe { load_primary_hash::<GZIP_HASH>(base, pos) };
             let h = lz_hash(seq, HASH_BITS) as usize;
             #[cfg(feature = "anatomy-counters")]
             {
@@ -3058,7 +3080,7 @@ fn parse_tail<const INTERLEAVED: bool>(
                 // Byte-exact extend (never trusts the hash): a spurious
                 // candidate simply yields length < SHORTEST_MATCH -> literal.
                 let length = lz_extend(buf, pos, cand_pos, 0, max_len);
-                if length >= SHORTEST_MATCH {
+                if length >= primary_min_match::<GZIP_HASH>() {
                     #[cfg(feature = "anatomy-counters")]
                     {
                         local.probe_outcome_accepted += 1;
@@ -3081,7 +3103,7 @@ fn parse_tail<const INTERLEAVED: bool>(
                     while nh < insert_end {
                         // SAFETY: nh < match_end = pos+length <= in_end, and
                         // buf's pad covers the 4-byte load past in_end.
-                        let s = unsafe { load_u32(base, nh) };
+                        let s = unsafe { load_primary_hash::<GZIP_HASH>(base, nh) };
                         let hh = lz_hash(s, HASH_BITS) as usize;
                         if INTERLEAVED {
                             // Interior SHIFT-insert (see `process_position_l1`).
@@ -3123,7 +3145,7 @@ fn parse_tail<const INTERLEAVED: bool>(
         // probe, the `if` above never ran) — `no_probe_literals` is
         // exactly that case, and only that case.
         #[cfg(feature = "anatomy-counters")]
-        if max_len < SHORTEST_MATCH {
+        if max_len < primary_min_match::<GZIP_HASH>() {
             local.no_probe_literals += 1;
         }
         sink.push_literal_fast(buf[pos]);
@@ -3163,7 +3185,12 @@ fn parse_tail<const INTERLEAVED: bool>(
 /// (`run::<false, false>`) monomorphizes to the pre-lever two-array
 /// `head`/`head2` code — tie-cage-frozen bytes AND codegen, no runtime
 /// branch in the hot loops. `ACCEL && INTERLEAVED` is never instantiated.
-pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>(
+pub(super) fn run<
+    const ACCEL: bool,
+    const REACH: bool,
+    const INTERLEAVED: bool,
+    const GZIP_HASH: bool,
+>(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
@@ -3292,7 +3319,13 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
     while p < data_start {
         // SAFETY: p < data_start <= in_end, and buf has BUF_PAD >= 16 bytes past
         // in_end, so [p, p+4) is in bounds.
-        let seq = unsafe { load_u32(base, p) };
+        let seq = unsafe {
+            if ACCEL {
+                load_u32(base, p)
+            } else {
+                load_primary_hash::<GZIP_HASH>(base, p)
+            }
+        };
         let h = lz_hash(seq, HASH_BITS) as usize;
         if INTERLEAVED {
             // Interleaved shift-insert, same protocol as the hot loops.
@@ -3528,7 +3561,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                         &mut local,
                     )
                 } else {
-                    fastloop_l1::<REACH, INTERLEAVED>(
+                    fastloop_l1::<REACH, INTERLEAVED, GZIP_HASH>(
                         pos,
                         fast_end,
                         buf,
@@ -3569,7 +3602,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                         &mut local,
                     )
                 } else if hash3_active || bucket2.enabled {
-                    fastloop_l1::<REACH, INTERLEAVED>(
+                    fastloop_l1::<REACH, INTERLEAVED, GZIP_HASH>(
                         pos,
                         fast_end,
                         buf,
@@ -3592,7 +3625,7 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
                         input_total_len,
                     )
                 } else {
-                    fastloop_l1_lean::<INTERLEAVED>(
+                    fastloop_l1_lean::<INTERLEAVED, GZIP_HASH>(
                         pos,
                         fast_end,
                         buf,
@@ -3609,18 +3642,33 @@ pub(super) fn run<const ACCEL: bool, const REACH: bool, const INTERLEAVED: bool>
 
             // TAIL: the last <= DEFLATE_MAX_MATCH_LEN bytes of input (or of the
             // block), where `max_len` must be clamped per position.
-            pos = parse_tail::<INTERLEAVED>(
-                pos,
-                block_end_target,
-                in_end,
-                buf,
-                base,
-                &mut head,
-                &mut sink,
-                limit_hash_update_inserts,
-                #[cfg(feature = "anatomy-counters")]
-                &mut local,
-            );
+            pos = if ACCEL {
+                parse_tail::<INTERLEAVED, false>(
+                    pos,
+                    block_end_target,
+                    in_end,
+                    buf,
+                    base,
+                    &mut head,
+                    &mut sink,
+                    limit_hash_update_inserts,
+                    #[cfg(feature = "anatomy-counters")]
+                    &mut local,
+                )
+            } else {
+                parse_tail::<INTERLEAVED, GZIP_HASH>(
+                    pos,
+                    block_end_target,
+                    in_end,
+                    buf,
+                    base,
+                    &mut head,
+                    &mut sink,
+                    limit_hash_update_inserts,
+                    #[cfg(feature = "anatomy-counters")]
+                    &mut local,
+                )
+            };
         }); // end anatomy_wall_time!(parse_match_ns, ...)
 
         // The fast-path pushes skip per-push `block_length` bookkeeping; the
@@ -3880,7 +3928,7 @@ impl Drop for FastResume {
 /// preserve, and it is measurement-only by charter.
 #[cfg(not(feature = "l1-tune"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run_resumable<const REACH: bool>(
+pub(super) fn run_resumable<const REACH: bool, const GZIP_HASH: bool>(
     buf: &[u8],
     state: &mut super::ParseState,
     from: usize,
@@ -3971,7 +4019,7 @@ pub(super) fn run_resumable<const REACH: bool>(
             // T1-only (see `parse_resumable`'s `Strategy::Fast` arm) and
             // T1 stays on the frozen two-array bucket code.
             pos = if hash3_active || bucket2.enabled {
-                fastloop_l1::<REACH, false>(
+                fastloop_l1::<REACH, false, GZIP_HASH>(
                     pos,
                     fast_end,
                     buf,
@@ -3994,7 +4042,7 @@ pub(super) fn run_resumable<const REACH: bool>(
                     input_total_len,
                 )
             } else {
-                fastloop_l1_lean::<false>(
+                fastloop_l1_lean::<false, GZIP_HASH>(
                     pos,
                     fast_end,
                     buf,
@@ -4007,7 +4055,7 @@ pub(super) fn run_resumable<const REACH: bool>(
                     cost_gate_cfg,
                 )
             };
-            pos = parse_tail::<false>(
+            pos = parse_tail::<false, GZIP_HASH>(
                 pos,
                 block_end_target,
                 in_end,
