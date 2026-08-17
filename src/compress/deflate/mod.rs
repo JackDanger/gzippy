@@ -961,6 +961,101 @@ fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Writ
 ///   padded buffer — the identical allocation the Read-based fallback in
 ///   [`encode_gzip_reader_to_writer_chunked_sized`] makes today, with the
 ///   copy sourced from the page cache instead of a `read(2)` loop.
+/// Whole-buffer gzip bytes for [`encode_gzip_unpadded_slice_to_writer`]'s
+/// two-pass inplace parse (header + deflate + crc/isize).
+fn encode_unpadded_gzip_bytes(
+    data: &[u8],
+    level: u32,
+    params: level::LevelParams,
+) -> std::io::Result<Vec<u8>> {
+    use encode_types::{BlockRole, HeaderBudget, InputMode};
+
+    let len = data.len();
+    let out_cap = estimate_output_cap(len, level, 32);
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, out_cap);
+    let mut out = Vec::with_capacity(out_cap);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    let mut bw = BitWriter::from_vec(out);
+
+    let mut state = parse::ParseState::new();
+    state.input_total_len = len;
+    let mut in_next = 0usize;
+
+    if len > INPLACE_TAIL_PAD {
+        let avail = len - INPLACE_TAIL_PAD;
+        in_next = crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                data,
+                &mut state,
+                0,
+                avail,
+                &params,
+                BlockRole::Interior,
+                InputMode::Bounded,
+                HeaderBudget::Lean,
+                &mut bw,
+            )
+        });
+    }
+
+    let shift = state.max_shift();
+    let tail_len = len - shift;
+    let tail_cap = tail_len + INPLACE_TAIL_PAD;
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, tail_cap);
+    let mut tbuf = Vec::with_capacity(tail_cap);
+    tbuf.extend_from_slice(&data[shift..]);
+    tbuf.resize(tail_cap, 0);
+    if shift > 0 {
+        state.shift_down(shift);
+        in_next -= shift;
+    }
+    if in_next == tail_len {
+        emit_stored_block(&mut bw, &[], true);
+    } else {
+        crate::anatomy_wall_root!({
+            parse::parse_resumable(
+                &tbuf,
+                &mut state,
+                in_next,
+                tail_len,
+                &params,
+                BlockRole::Final,
+                InputMode::Drain,
+                HeaderBudget::Lean,
+                &mut bw,
+            )
+        });
+    }
+
+    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
+    let mut gz = bw.finish();
+    gz.extend_from_slice(&crc.to_le_bytes());
+    gz.extend_from_slice(&(len as u32).to_le_bytes());
+    Ok(gz)
+}
+
+/// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
+/// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
+/// precedent) without changing `params(4)` for streaming or T>1 routes.
+fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let greedy = encode_unpadded_gzip_bytes(data, 4, level::params(4))?;
+    let mut lazy_params = level::params(4);
+    lazy_params.strategy = level::Strategy::Lazy;
+    let lazy = encode_unpadded_gzip_bytes(data, 4, lazy_params)?;
+    let best = if lazy.len() < greedy.len() {
+        lazy
+    } else {
+        greedy
+    };
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
 pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
@@ -995,6 +1090,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         let gz = encode_gzip_slack_padded_to_vec(&input, len, level);
         writer.write_all(&gz)?;
         return Ok(len as u64);
+    }
+
+    if level == 4 && len > 0 {
+        return encode_gzip_unpadded_l4_pickmin(data, writer);
     }
 
     let out_cap = if level == 0 {
