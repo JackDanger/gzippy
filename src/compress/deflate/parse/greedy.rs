@@ -201,7 +201,11 @@ pub(super) fn run_block(
     let next_hashes: &mut [u32; 2] = next_hashes;
     let mut max_len = DEFLATE_MAX_MATCH_LEN;
     let mut nice_len = params.nice_match_length.min(max_len);
-    let min_len = calculate_min_match_len(&buf[in_next..in_end], params.max_search_depth);
+    let min_len = if params.forced_min_match_len != 0 {
+        params.forced_min_match_len
+    } else {
+        calculate_min_match_len(&buf[in_next..in_end], params.max_search_depth)
+    };
     // Far-len-3 cost gate: recomputed from the block's running frequencies at
     // the same cadence the lazy parser refreshes `min_len` (10 KB, then
     // doubling). Starts inert (= the shipped fixed guard) — it only opens
@@ -236,7 +240,9 @@ pub(super) fn run_block(
             next_hashes,
         );
 
-        if length >= min_len && (length > DEFLATE_MIN_MATCH_LEN || offset <= 4096) {
+        if length >= min_len
+            && (length > DEFLATE_MIN_MATCH_LEN || offset <= 4096 || params.greedy_accept_far_len3)
+        {
             sink.push_match(length, offset);
             mf.skip_bytes(
                 buf,

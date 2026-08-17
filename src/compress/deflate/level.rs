@@ -185,6 +185,12 @@ pub struct LevelParams {
     /// `nseqs*M < block_length` (ultra-sparse), use offset-4096 instead of 8192
     /// for the len-3 guard. `0` = disabled (shipped 8192 everywhere).
     pub lazy_sparse_len3_guard_mul: u32,
+    /// When nonzero, skip adaptive `choose_min_match_len` (gzip `deflate_fast`
+    /// always uses MIN_MATCH=3). Pick-min arms only — shipped `params(2)` keeps 0.
+    pub forced_min_match_len: u32,
+    /// Accept len-3 matches at any offset without the shadow probe (gzip
+    /// `deflate_fast`). Pick-min arms only.
+    pub greedy_accept_far_len3: bool,
     /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
     pub near_optimal: NearOptimalParams,
 }
@@ -331,6 +337,19 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
 pub fn params_l1_gzip_primary() -> LevelParams {
     let mut p = params(1);
     p.fast_gzip_primary = true;
+    p
+}
+
+/// Gzip `deflate_fast` L2 on the greedy path for mmap pick-min: chain 8,
+/// nice 16, always min-match 3, no far-len-3 gate/shadow deferral.
+pub fn params_l2_gzip_deflate_fast() -> LevelParams {
+    let mut p = params(2);
+    p.max_search_depth = 8;
+    p.nice_match_length = 16;
+    p.far_len3_gate = false;
+    p.greedy_len3_shadow = false;
+    p.forced_min_match_len = 3;
+    p.greedy_accept_far_len3 = true;
     p
 }
 
@@ -709,6 +728,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         // Native L1 is the igzip-class one-pass FAST path (Increment 4):
@@ -736,6 +757,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
@@ -758,6 +781,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: true,
             greedy_len3_shadow: true,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
@@ -833,6 +858,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: true,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: 224,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
@@ -867,6 +894,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
@@ -889,6 +918,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
@@ -911,6 +942,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
@@ -933,6 +966,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
@@ -955,6 +990,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
@@ -977,6 +1014,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NONE_NO,
         },
         // Native near-optimal parser (`deflate_compress_near_optimal`,
@@ -1001,6 +1040,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 2,
                 min_improvement_to_continue: 32,
@@ -1028,6 +1069,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 4,
                 min_improvement_to_continue: 16,
@@ -1055,6 +1098,8 @@ fn params_inner(level: u32) -> LevelParams {
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            forced_min_match_len: 0,
+            greedy_accept_far_len3: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 10,
                 min_improvement_to_continue: 1,
