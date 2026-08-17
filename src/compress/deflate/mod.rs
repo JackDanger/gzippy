@@ -552,26 +552,15 @@ fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
 }
 
 /// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
+/// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
 fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    let (baseline, gzip_fast, gzip_greedy) = std::thread::scope(|s| {
-        let baseline = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(2)));
-        let gzip_fast =
-            s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
-        let gzip_greedy =
-            s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()));
-        (
-            baseline.join().expect("pick-min L2 baseline"),
-            gzip_fast.join().expect("pick-min L2 gzip-fast"),
-            gzip_greedy.join().expect("pick-min L2 gzip-greedy"),
-        )
-    });
-    let best = if gzip_greedy.len() < baseline.len() {
+    let best = pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(2)),
+        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
+    );
+    let gzip_greedy = encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast());
+    if gzip_greedy.len() < best.len() {
         gzip_greedy
-    } else {
-        baseline
-    };
-    if gzip_fast.len() < best.len() {
-        gzip_fast
     } else {
         best
     }
