@@ -180,6 +180,7 @@ pub fn encode_deflate_segment_to_sink(
             *out = match level {
                 1 => deflate_one_shot_t1_l1_pick_min(data),
                 2 => deflate_one_shot_t1_l2_pick_min(data),
+                3 => deflate_one_shot_t1_l3_pick_min(data),
                 4 => deflate_one_shot_t1_l4_pick_min(data),
                 _ => unreachable!(),
             };
@@ -389,7 +390,7 @@ fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
 /// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
 #[inline]
 fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
-    matches!(level, 1 | 2 | 4)
+    matches!(level, 1..=4)
 }
 
 /// Pick-min helper: parallel arms in release builds; sequential with winner-only
@@ -566,6 +567,20 @@ fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Pick-min: Lazy vs libdeflate Greedy vs gzip `deflate_fast` at L3.
+fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
+    let best = pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(3)),
+        || encode_unpadded_deflate_bytes(data, level::params_l3_libdeflate_greedy()),
+    );
+    let gzip_fast = encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast());
+    if gzip_fast.len() < best.len() {
+        gzip_fast
+    } else {
+        best
+    }
+}
+
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
 fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
     let mut lazy_params = level::params(4);
@@ -660,6 +675,7 @@ pub fn encode_deflate_slack_padded_to_sink(
         let deflate = match level {
             1 => deflate_one_shot_t1_l1_pick_min(data),
             2 => deflate_one_shot_t1_l2_pick_min(data),
+            3 => deflate_one_shot_t1_l3_pick_min(data),
             4 => deflate_one_shot_t1_l4_pick_min(data),
             _ => unreachable!(),
         };
@@ -702,6 +718,7 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
             let deflate = match level {
                 1 => deflate_one_shot_t1_l1_pick_min(data),
                 2 => deflate_one_shot_t1_l2_pick_min(data),
+                3 => deflate_one_shot_t1_l3_pick_min(data),
                 4 => deflate_one_shot_t1_l4_pick_min(data),
                 _ => unreachable!(),
             };
@@ -1160,6 +1177,17 @@ fn encode_gzip_unpadded_l2_pickmin<W: std::io::Write>(
     Ok(data.len() as u64)
 }
 
+/// T1 mmap L3: gzip `deflate_fast` beats gzip on photo-like cells; libdeflate
+/// Greedy wins libdeflate ties. Pick-min three arms (L2 precedent).
+fn encode_gzip_unpadded_l3_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l3_pick_min(data));
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
 /// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
 /// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
 /// precedent) without changing `params(4)` for streaming or T>1 routes.
@@ -1214,6 +1242,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
 
     if level == 2 && len > 0 {
         return encode_gzip_unpadded_l2_pickmin(data, writer);
+    }
+
+    if level == 3 && len > 0 {
+        return encode_gzip_unpadded_l3_pickmin(data, writer);
     }
 
     if level == 4 && len > 0 {

@@ -357,6 +357,29 @@ pub fn params_l2_gzip_deflate_fast() -> LevelParams {
     p
 }
 
+/// libdeflate L3 is `deflate_compress_greedy` at depth 12 / nice 14 (we ship Lazy).
+pub fn params_l3_libdeflate_greedy() -> LevelParams {
+    let mut p = params(3);
+    p.strategy = Strategy::Greedy;
+    p.far_len3_gate = false;
+    p.greedy_len3_shadow = false;
+    p
+}
+
+/// Gzip `deflate_fast` L3 (`vendor/gzip/deflate.c` configuration_table[3]: chain 32, nice 32).
+pub fn params_l3_gzip_deflate_fast() -> LevelParams {
+    let mut p = params(3);
+    p.strategy = Strategy::Greedy;
+    p.max_search_depth = 32;
+    p.nice_match_length = 32;
+    p.far_len3_gate = false;
+    p.greedy_len3_shadow = false;
+    p.forced_min_match_len = 3;
+    p.greedy_accept_far_len3 = true;
+    p.hash3_chain_depth = super::matchfinder::hc::HC_HASH3_CHAIN_DEPTH;
+    p
+}
+
 pub fn params(level: u32) -> LevelParams {
     let p = params_baseline(level);
     // zlib-ng knobs apply only on the T1 whole-buffer pick-min path — see
