@@ -391,6 +391,48 @@ fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
     matches!(level, 1 | 4)
 }
 
+/// Pick-min helper: parallel arms in release builds; sequential with winner-only
+/// counter attribution when `anatomy-counters` is on (both arms would otherwise
+/// double-count into the global snapshot).
+fn pick_min_two_vecs(
+    arm_a: impl FnOnce() -> Vec<u8> + Send,
+    arm_b: impl FnOnce() -> Vec<u8> + Send,
+) -> Vec<u8> {
+    #[cfg(feature = "anatomy-counters")]
+    {
+        use crate::compress::deflate::anatomy_counters::{self, COUNTERS};
+        let baseline = COUNTERS.snapshot();
+        anatomy_counters::reset();
+        let out_a = arm_a();
+        let snap_a = COUNTERS.snapshot();
+        anatomy_counters::reset();
+        let out_b = arm_b();
+        let snap_b = COUNTERS.snapshot();
+        let (out, snap) = if out_b.len() < out_a.len() {
+            (out_b, snap_b)
+        } else {
+            (out_a, snap_a)
+        };
+        COUNTERS.restore(&baseline);
+        COUNTERS.add_snapshot(&snap);
+        out
+    }
+    #[cfg(not(feature = "anatomy-counters"))]
+    {
+        std::thread::scope(|s| {
+            let a = s.spawn(arm_a);
+            let b = s.spawn(arm_b);
+            let out_a = a.join().expect("pick-min arm a");
+            let out_b = b.join().expect("pick-min arm b");
+            if out_b.len() < out_a.len() {
+                out_b
+            } else {
+                out_a
+            }
+        })
+    }
+}
+
 /// Pick-min: baseline vs zlib knobs; the two encodes run in parallel so wall
 /// ≈ max(arm) instead of sum(arm) — measured ~2× → ~1.1× on dickens L6 T1.
 fn deflate_one_shot_t1_zlib_pick_min(
@@ -424,19 +466,7 @@ fn deflate_one_shot_t1_zlib_pick_min(
         bw.finish()
     };
 
-    let (base, zlib_out) = std::thread::scope(|s| {
-        let b = s.spawn(|| encode(&baseline));
-        let z = s.spawn(|| encode(&zlib));
-        (
-            b.join().expect("pick-min baseline"),
-            z.join().expect("pick-min zlib"),
-        )
-    });
-    if zlib_out.len() < base.len() {
-        zlib_out
-    } else {
-        base
-    }
+    pick_min_two_vecs(|| encode(&baseline), || encode(&zlib))
 }
 
 /// Raw DEFLATE bytes via the mmap-route two-pass resumable parser.
@@ -514,38 +544,20 @@ fn gzip_wrap_unpadded_deflate(data: &[u8], deflate: Vec<u8>) -> Vec<u8> {
 
 /// Pick-min: igzip vs gzip-primary L1 fast path (mmap + whole-buffer).
 fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
-    let (igzip, gzip) = std::thread::scope(|s| {
-        let igzip = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(1)));
-        let gzip = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
-        (
-            igzip.join().expect("pick-min L1 igzip"),
-            gzip.join().expect("pick-min L1 gzip"),
-        )
-    });
-    if gzip.len() < igzip.len() {
-        gzip
-    } else {
-        igzip
-    }
+    pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(1)),
+        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
+    )
 }
 
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
 fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
     let mut lazy_params = level::params(4);
     lazy_params.strategy = level::Strategy::Lazy;
-    let (greedy, lazy) = std::thread::scope(|s| {
-        let greedy = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(4)));
-        let lazy = s.spawn(|| encode_unpadded_deflate_bytes(data, lazy_params));
-        (
-            greedy.join().expect("pick-min L4 greedy"),
-            lazy.join().expect("pick-min L4 lazy"),
-        )
-    });
-    if lazy.len() < greedy.len() {
-        lazy
-    } else {
-        greedy
-    }
+    pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(4)),
+        || encode_unpadded_deflate_bytes(data, lazy_params),
+    )
 }
 
 fn deflate_into(

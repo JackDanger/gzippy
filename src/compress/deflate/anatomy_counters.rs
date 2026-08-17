@@ -234,6 +234,18 @@ macro_rules! define_counters {
                 $(self.$name.store(0, Relaxed);)+
             }
 
+            pub fn snapshot(&self) -> AnatomyCountersSnapshot {
+                AnatomyCountersSnapshot { $($name: self.$name.load(Relaxed),)+ }
+            }
+
+            pub fn restore(&self, snap: &AnatomyCountersSnapshot) {
+                $(self.$name.store(snap.$name, Relaxed);)+
+            }
+
+            pub fn add_snapshot(&self, snap: &AnatomyCountersSnapshot) {
+                $(self.$name.fetch_add(snap.$name, Relaxed);)+
+            }
+
             /// Render the current snapshot as one flat JSON object, field
             /// names matching this struct 1:1 (fulcrum anatomy's declared
             /// output shape).
@@ -247,6 +259,13 @@ macro_rules! define_counters {
 
         #[cfg(feature = "anatomy-counters")]
         pub static COUNTERS: AnatomyCounters = AnatomyCounters::zero();
+
+        /// Point-in-time counter values for pick-min winner attribution.
+        #[cfg(feature = "anatomy-counters")]
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct AnatomyCountersSnapshot {
+            $(pub $name: u64,)+
+        }
     };
 }
 
