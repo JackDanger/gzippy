@@ -163,27 +163,21 @@ pub fn encode_deflate_segment_to_sink(
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
         if !parallel
+            && level_uses_t1_ratchet(level)
+            && is_last
+            && bw.byte_len() == 0
+            && !data.is_empty()
+        {
+            *out = deflate_one_shot_t1_ratcheted(data, level);
+            return;
+        }
+        if !parallel
             && level_uses_t1_zlib_pick_min(level)
             && is_last
             && bw.byte_len() == 0
             && !data.is_empty()
         {
             *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
-            return;
-        }
-        if !parallel
-            && level_uses_t1_mmap_pick_min(level)
-            && is_last
-            && bw.byte_len() == 0
-            && !data.is_empty()
-        {
-            *out = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                3 => deflate_one_shot_t1_l3_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
             return;
         }
         deflate_into(
@@ -382,15 +376,24 @@ pub(crate) fn note_stored_block_emitted() {
 /// importantly, make the output depend on the chunk size — destroying
 /// byte-identity with the whole-buffer encoder.
 /// Levels where the T1 whole-buffer path runs zlib pick-min (L5-L7).
+/// L6-L7 only: L5 moved to [`level_uses_t1_ratchet`] (`deflate_one_shot_t1_l5_pick_min`
+/// wraps this same zlib pick-min, but every T1 whole-buffer entry point must reach L5
+/// through the ratchet, not this direct call, or the ladder monotonicity guarantee has
+/// a hole). Still used internally: `deflate_one_shot_t1_zlib_pick_min`'s own
+/// `debug_assert` accepts 5..=7 since the L5 wrapper calls it with level=5 directly.
 #[inline]
 fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
-    matches!(level, 5..=7)
+    matches!(level, 6..=7)
 }
 
-/// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
+/// Levels routed through [`deflate_one_shot_t1_ratcheted`] — ladder monotonicity by
+/// construction (levels 1-4's individual pick-min functions plus L5's wrapper, folded
+/// through the ratchet). Every T1 whole-buffer/mmap entry point must check this BEFORE
+/// `level_uses_t1_zlib_pick_min` so L5 is intercepted here rather than falling through
+/// to the direct zlib call.
 #[inline]
-fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
-    matches!(level, 1..=4)
+fn level_uses_t1_ratchet(level: u32) -> bool {
+    matches!(level, 1..=5)
 }
 
 /// Pick-min helper: parallel arms in release builds; sequential with winner-only
@@ -445,7 +448,9 @@ fn deflate_one_shot_t1_zlib_pick_min(
     is_last: bool,
     sync_flush: bool,
 ) -> Vec<u8> {
-    debug_assert!(level_uses_t1_zlib_pick_min(level));
+    // L5 reaches here via `deflate_one_shot_t1_l5_pick_min` (ratchet route);
+    // L6-L7 reach here directly via `level_uses_t1_zlib_pick_min` callers.
+    debug_assert!(matches!(level, 5..=7));
     let budget = encode_types::HeaderBudget::Lean;
     let baseline = level::params_baseline(level);
     let zlib = level::params_zlib_t1(level);
@@ -582,6 +587,15 @@ fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
 }
 
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
+///
+/// Does NOT carry its own gzip-`deflate_fast`-shaped arm: L3's pick-min
+/// gained one (`params_l3_gzip_deflate_fast`) and briefly let L3 leapfrog L4
+/// in size (`ladder_is_monotone_t1` regression, 2026-08-17). Mirroring the
+/// same arm onto L4 fixed L3->L4 but only pushed the identical violation to
+/// L4->L5 (proof by execution that arm-by-arm mirroring cannot terminate).
+/// The actual fix is [`deflate_one_shot_t1_ratcheted`], which caps every
+/// level's output at the level below's — L4 gets L3's winning arm for free
+/// through the ratchet instead of needing its own copy.
 fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
     let mut lazy_params = level::params(4);
     lazy_params.strategy = level::Strategy::Lazy;
@@ -589,6 +603,57 @@ fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
         || encode_unpadded_deflate_bytes(data, level::params(4)),
         || encode_unpadded_deflate_bytes(data, lazy_params),
     )
+}
+
+/// L5's zlib pick-min (`params_baseline(5)` vs `params_zlib_t1(5)`), wrapped
+/// to the `data: &[u8] -> Vec<u8>` calling convention the ratchet needs.
+/// `deflate_one_shot_t1_zlib_pick_min` requires its buffer to carry
+/// `parse::BUF_PAD` trailing bytes past the logical end (its two existing
+/// call sites already hold a padded caller buffer); this wrapper pads its
+/// own copy, the same way `encode_unpadded_deflate_bytes` does internally
+/// for the L1-L4 mmap pick-min functions.
+fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
+    let cap = data.len() + parse::BUF_PAD;
+    let mut buf = Vec::with_capacity(cap);
+    buf.extend_from_slice(data);
+    buf.resize(cap, 0);
+    deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), 5, true, true)
+}
+
+/// T1 whole-buffer/mmap output for levels 1..=5, with ladder monotonicity
+/// guaranteed BY CONSTRUCTION: level N's output size never exceeds level
+/// (N-1)'s, regardless of how many/which heterogeneous vendor-shaped arms
+/// each level's own pick-min tries. Needed because `params_inner`'s per-field
+/// depth monotonicity does NOT imply pick-min OUTPUT monotonicity — see the
+/// `L3->L4->L5` whack-a-mole receipt above (`deflate_one_shot_t1_l4_pick_min`
+/// doc) and `level.rs`'s own engine.wasm L8 receipt (a longer search can
+/// itself produce a LARGER output — parameter reasoning alone can never
+/// certify this, only a byte comparison can).
+///
+/// Scoped to 1..=5, not the full 1..=9 ladder: a full recursive ratchet
+/// through L9 was estimated by two independent reviews (2026-08-17, PLAN.md)
+/// at ~13-20x a single L9 encode — unmeasured and likely wall-prohibitive.
+/// L6-L9 keep today's `KNOWN_SAGS`-pinned behavior until that is measured
+/// (`fulcrum try --levels 1-9` on a ref that extends this range).
+fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
+    debug_assert!((1..=5).contains(&level));
+    let cur = match level {
+        1 => deflate_one_shot_t1_l1_pick_min(data),
+        2 => deflate_one_shot_t1_l2_pick_min(data),
+        3 => deflate_one_shot_t1_l3_pick_min(data),
+        4 => deflate_one_shot_t1_l4_pick_min(data),
+        5 => deflate_one_shot_t1_l5_pick_min(data),
+        _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
+    };
+    if level == 1 {
+        return cur;
+    }
+    let prev = deflate_one_shot_t1_ratcheted(data, level - 1);
+    if prev.len() < cur.len() {
+        prev
+    } else {
+        cur
+    }
 }
 
 fn deflate_into(
@@ -659,6 +724,11 @@ pub fn encode_deflate_slack_padded_to_sink(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
+    if level_uses_t1_ratchet(level) && logical_len > 0 {
+        let data = &buf[..logical_len];
+        out.extend_from_slice(&deflate_one_shot_t1_ratcheted(data, level));
+        return;
+    }
     if level_uses_t1_zlib_pick_min(level) && logical_len > 0 {
         out.extend_from_slice(&deflate_one_shot_t1_zlib_pick_min(
             buf,
@@ -668,18 +738,6 @@ pub fn encode_deflate_slack_padded_to_sink(
             true,
             true,
         ));
-        return;
-    }
-    if level_uses_t1_mmap_pick_min(level) && logical_len > 0 {
-        let data = &buf[..logical_len];
-        let deflate = match level {
-            1 => deflate_one_shot_t1_l1_pick_min(data),
-            2 => deflate_one_shot_t1_l2_pick_min(data),
-            3 => deflate_one_shot_t1_l3_pick_min(data),
-            4 => deflate_one_shot_t1_l4_pick_min(data),
-            _ => unreachable!(),
-        };
-        out.extend_from_slice(&deflate);
         return;
     }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
@@ -714,15 +772,8 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
         // OS=255 (unknown).
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        if level_uses_t1_mmap_pick_min(level) && !data.is_empty() {
-            let deflate = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                3 => deflate_one_shot_t1_l3_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
-            out.extend_from_slice(&deflate);
+        if level_uses_t1_ratchet(level) && !data.is_empty() {
+            out.extend_from_slice(&deflate_one_shot_t1_ratcheted(data, level));
         } else {
             encode_deflate_bytes_to_sink(data, &[], level, &mut out);
         }
@@ -1161,41 +1212,56 @@ fn encode_gzip_unpadded_l1_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l1_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 1));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
 
 /// T1 mmap L2: gzip `deflate_fast` class beats libdeflate Greedy on photo-like
-/// cells; Greedy wins libdeflate ties elsewhere. Pick-min three arms.
+/// cells; Greedy wins libdeflate ties elsewhere. Pick-min three arms, ratcheted
+/// against L1 (ladder monotonicity — see `deflate_one_shot_t1_ratcheted`).
 fn encode_gzip_unpadded_l2_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l2_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 2));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
 
 /// T1 mmap L3: gzip `deflate_fast` beats gzip on photo-like cells; libdeflate
-/// Greedy wins libdeflate ties. Pick-min three arms (L2 precedent).
+/// Greedy wins libdeflate ties. Pick-min three arms (L2 precedent), ratcheted
+/// against L2.
 fn encode_gzip_unpadded_l3_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l3_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 3));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
 
 /// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
 /// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
-/// precedent) without changing `params(4)` for streaming or T>1 routes.
+/// precedent) without changing `params(4)` for streaming or T>1 routes,
+/// ratcheted against L3.
 fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l4_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 4));
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
+/// T1 mmap L5: routes through [`deflate_one_shot_t1_ratcheted`] (not a direct
+/// zlib pick-min call) so this entry point stays consistent with the ladder
+/// monotonicity guarantee — see that function's doc.
+fn encode_gzip_unpadded_l5_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 5));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
@@ -1221,10 +1287,13 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     }
 
     let len = data.len();
-    // T1 mmap L5-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
+    // T1 mmap L6-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
     // `deflate_into`; route through the padded whole-buffer encoder so the
-    // streaming two-pass path does not need a second implementation.
-    if matches!(level, 5..=7) && len > 0 {
+    // streaming two-pass path does not need a second implementation. L5 is
+    // NOT included here — it routes through `encode_gzip_unpadded_l5_pickmin`
+    // below (the ratchet), or this entry point's ladder guarantee would have
+    // a hole relative to `encode_gzip_bytes_to_vec` / `encode_deflate_slack_padded_to_sink`.
+    if matches!(level, 6..=7) && len > 0 {
         let cap = len + INPLACE_TAIL_PAD;
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
@@ -1250,6 +1319,10 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
 
     if level == 4 && len > 0 {
         return encode_gzip_unpadded_l4_pickmin(data, writer);
+    }
+
+    if level == 5 && len > 0 {
+        return encode_gzip_unpadded_l5_pickmin(data, writer);
     }
 
     let out_cap = if level == 0 {

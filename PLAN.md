@@ -192,6 +192,232 @@ fulcrum why gzip:dd79_bin6:L3:T1:size --repo .
 
 Pick-min exhausted the obvious vendor arms (gzip deflate_fast + libdeflate greedy). Remaining gap is parse/block-boundary class. Do **not** ship global `hash3_chain_depth` or strategy changes without tie-guard + L6/L9 spot check (receipt: global hash3 flipped libdeflate L6/L9 ties).
 
+**Judgment call routed through Fable (2026-08-17), cross-check via cursor-agent in flight —
+this is a RECOMMENDATION for the next lever session, not yet built or measured:**
+
+`fulcrum why` on this cell: matches Δ1.81%, literals Δ4.59% — gzip covers 61,994 more
+positions using only 26,350 more matches (≈2.35 B/match ⇒ predominantly short/len-3-class
+matches we're missing). Algorithmic/parse gap, not Huffman.
+
+Fable rejected the two obvious zlib-ng candidates ([P14] early-exit-on-non-improving —
+wrong direction, can only produce equal-or-worse matches; [P10] deflate_medium — unmotivated
+midpoint of two arms that both already lose here) and instead named two composable defects
+inside the **existing** L3 gzip-deflate_fast arm:
+
+1. **Depth mismatch.** gzip L3 walks its 3-byte-keyed chain to depth 32
+   (`vendor/gzip/deflate.c` `configuration_table[3]`). Our `params_l3_gzip_deflate_fast()`
+   (`level.rs:370-381`) sets `max_search_depth=32` for the **hash4** chain only — the hash3
+   side-chain is pinned at `hash3_chain_depth = HC_HASH3_CHAIN_DEPTH = 8` (`hc.rs:91`), 4x
+   shallower than gzip at L3. (At L2, gzip's own chain depth is 8, which is offered as why L2
+   closed but L3 didn't — the existing depth-8 hash3 happened to be faithful there.)
+2. **Stale chain maintenance.** `HcMatchfinder::skip_bytes` (`hc.rs:643-702`), called on every
+   match interior, overwrites `hash3_tab[hash3]` heads but never writes `next3_tab` — interior
+   inserts leave dead/stale hash3 chain links, unlike gzip's uniformly-linked chain. Same class
+   of defect as the already-proven-causal L1 bucket-maintenance mechanism
+   ([[project_l1_bucket_maintenance_mechanism]]).
+
+Falsify-record check: `src/compress/ldx/ht_matchfinder.rs:21` cites a FALSIFY record at
+`src/compress/deflate/parse/mod.rs:540` that **no longer exists at that line** (current line
+540 is an unrelated struct field) — treated as non-binding/dangling per CLAUDE.md hard stop 2.
+Doc comment needs updating (hygiene only, not a gate).
+
+Proposed lever (NOT implemented): (A) one line — `hash3_chain_depth = 32` in
+`params_l3_gzip_deflate_fast()`, arm-gated so L2's arm is untouched. (B) thread
+`maintain_hash3_chain: bool` into `skip_bytes` to also write `next3_tab` when true, called
+from `greedy.rs` gated on `params.hash3_chain_depth > 0` — **this changes L2's gzip-arm bytes
+too** since `skip_bytes` is shared, so grading must cover L2+L3 together. (C) if A+B leave a
+residual: separate arm-gated block-flush-cadence lever (gzip flushes far more often, trading
+header bits for better local fit — rival spends 49,427 header bits vs our 16,760 on this
+file) — measured and gated independently, composed only if needed.
+
+**Do not start this lever until:** (1) the c8bbde67 size-only `make lever` verdict lands and,
+if SHIP, is merged (land the win first); (2) cursor-agent's independent cross-check of this
+recommendation completes — see next PLAN.md update.
+
+**cursor-agent cross-check (2026-08-17), CONCUR WITH CHANGES:** independently opened
+`ht_matchfinder.rs:21` (confirmed dangling — the cited line is a struct field, not a FALSIFY
+record) and `hc.rs`'s `longest_match`/`skip_bytes` (confirmed defect 2 is real: `skip_bytes`
+updates `hash3_tab` heads but never writes `next3_tab`, unlike `longest_match`). **Sequencing
+correction to Fable's plan: lead with defect (B) — the `skip_bytes`/`next3_tab` chain repair —
+not defect (A) — `hash3_chain_depth = 32`.** `hc.rs:76-90` already carries an in-file note that
+depth gains on `dd79_bin6` L3 saturate at depth 4 (d=8 is a wash or worse) — that measurement
+likely predates the chain-repair fix, so depth 32 alone is unlikely to close the gap and should
+be re-swept AFTER (B), not shipped as the headline change. Cheap first experiment once B lands:
+`hash3_chain_depth = max_search_depth` in the L3 gzip arm, then sweep. Also flagged: `lazy.rs`
+calls `skip_bytes` too — any future arm enabling `hash3_chain_depth` there needs the same gate.
+D3 (periodic cost-based flush, "front C" in Fable's plan) confirmed as the right independent
+residual lever if B(+A) underdeliver — different mechanism, compose don't conflate.
+
+**Revised proposed order for the next `dd79_bin6` L3 session: (B) chain-repair → re-sweep
+depth on the L3 gzip arm → (A) if still short → (C) block-cadence, each gated and measured
+separately, `tie-guard.sh` before every T1-output edit.**
+
+---
+
+## ⛔ BLOCKING — new regression found on `c8bbde67` (2026-08-17), confirmed by execution
+
+`cargo test --release --test size_invariants ladder_is_monotone_t1`:
+
+- **FAILS on this branch** (HEAD `2b5e860a`): `"text" level 4 produced a LARGER output than
+  level 3 (333536 > 324803 bytes, +8733 B, +2.7%)`.
+- **PASSES on `origin/main` (`e888ac9f`)** — verified directly in a side-by-side worktree build
+  (`~/www/gzippy/lever-c8bbde67-size-full/arm-e888ac9fd7fe`), not inferred.
+
+**This blocks merge regardless of the GATE promotion-board verdict** (a board SHIP with a
+failing size-invariant test is still NO-MERGE — CLAUDE.md non-negotiable 5).
+
+**Root mechanism (cursor-agent diagnosis, code-verified):** the branch widened L3's pick-min to
+three arms including `params_l3_gzip_deflate_fast()` (Greedy, chain **32**/nice **32**, forced
+len-3 acceptance) but left L4's pick-min untouched (two arms, Greedy/Lazy at libdeflate-table
+**16**/**30**, no len-3 forcing). On the `text` synthetic fixture (1 MiB prose, aozora/dickens
+class — not a toy edge case), L3's new deeper/more-aggressive arm now out-parses L4's capped
+arms, so L3 leapfrogs L4. Arm diversity is asymmetric, not a depth/strategy abutment already
+covered by `KNOWN_SAGS`.
+
+**Fix recommendation: widen L4, do NOT add `("text", 3)` to `KNOWN_SAGS`.** The sag is not
+coordinate-locked to a synthetic-only artifact (text models real prose shape) and `KNOWN_SAGS`
+documents accepted defects, not ones with an available fix. Mirror the L2→L3 precedent:
+
+1. **`level.rs`** — add `params_l4_gzip_deflate_fast()`: same envelope as
+   `params_l3_gzip_deflate_fast()` (chain 32/nice 32/forced len-3) but based on `params(4)` so
+   L4-specific fields stay intact. NOT a gzip-level-4 transliteration (gzip `-4` is actually
+   lazy/16/16) — purely to give L4 a third arm that can reproduce L3's winning candidate class.
+2. **`mod.rs`** — widen `deflate_one_shot_t1_l4_pick_min` to three arms (two parallel + one
+   sequential, mirroring L3's shape), picking min against the new gzip-class arm.
+3. Verify: `ladder_is_monotone_t1` passes (all fixtures, both directions); per-arm ablation on
+   `text` L3/L4 confirms which arm wins; `tie-guard.sh` shows L1/L2 untouched (only L4 pick-min
+   changes); re-run the branch's promotion measurement after the fix.
+
+**Scope:** L1/L2/L3/T>1/streaming untouched by this fix — only the L4 T1 mmap pick-min path
+widens. If 32/32 doesn't fully close the gap, escalate depth/nice above L3's values (L4 must at
+minimum reproduce L3's winning candidate).
+
+**Next agent: implement this fix BEFORE re-running any lever on `c8bbde67`.**
+
+**UPDATE (2026-08-17, same session): the L4 fix above was implemented and built — it
+correctly closed L3→L4 (L4 now ties L3 at 324,803 B) — but `ladder_is_monotone_t1` is
+STILL RED: the violation moved one level up.**
+
+```
+thread 'ladder_is_monotone_t1' panicked: on fixture 'text', level 5 produced a LARGER
+output than level 4 (333536 > 324803 bytes, +8733 bytes)
+```
+
+L5 uses a DIFFERENT code path (`deflate_one_shot_t1_zlib_pick_min`, `level_uses_t1_zlib_pick_min`
+= `5..=7`, 2 arms: baseline Lazy vs zlib-shaped Lazy at deeper chain) with no gzip-`deflate_fast`
+Greedy arm — same mechanism, next level up. **This is whack-a-mole, not a fix**, and both Fable
+and cursor-agent (independent architecture reviews, full reports below) converged on the same
+verdict before I could keep hand-mirroring arms: **stop mirroring arms level-by-level; the
+structural fix is a ratchet — level N's output is capped at level (N-1)'s bytes when N's own
+pick-min regresses.**
+
+**Both reviewers' key findings (independently reached, both from static code reading):**
+- Root cause: pick-min arm SETS are heterogeneous per level (different vendor-shaped candidates,
+  not a monotonically-deepening single parser), so `params_inner` depth monotonicity does NOT
+  imply pick-min output monotonicity. `level.rs`'s OWN existing receipt (engine.wasm L8: deeper
+  search made output LARGER — "a longer match at position i displaces a better match at i+k")
+  proves parameter reasoning alone can never certify monotonicity; only a byte comparison can.
+- A ratchet only ever REPLACES output with something STRICTLY SMALLER, so **tie-guard risk is
+  ~zero when the ratchet itself fires** (it's a no-op on any cell that's already monotone,
+  which includes all current libdeflate ties). Real tie-guard exposure is on the underlying
+  arm-mirroring edits (e.g. adding a new gzip-fast arm to a level), same as any T1 change —
+  run tie-guard regardless.
+- **Full L1–L9 ratchet is too expensive to ship unmeasured**: naive recursive re-derivation
+  costs ~13-20x a single encode at L9 (sum of every inherited level's arm count). A **scoped
+  ratchet over L1–L5** (or L1-L7, Fable's slightly larger scope) is cheap (single wrapper,
+  wall cost dominated by the deepest arm already run in parallel) but the wall bill is
+  UNMEASURED and must be gated by `fulcrum try` before landing, not assumed.
+- Disagreement only on immediate tactic: cursor-agent says mirror one more gzip-fast arm onto
+  L5 as a quick stopgap AND land the scoped ratchet as the structural follow-up; Fable says skip
+  the mirror and go straight to a "cumulative arm registry" (mathematically the same thing as a
+  ratchet, expressed as a static per-level superset of arms instead of a runtime byte-compare
+  recursion) for L1–L7 directly. **Recommendation: take Fable's registry framing (it's
+  statically testable — "each level's arm set is a superset of the level below's" — which is
+  exactly non-negotiable #5's "test the INVARIANT, not the value") but cursor-agent's SCOPE
+  (L1–L5 first, wall-measure before extending to L6/L7).**
+
+**Implementation sketch for next session (do this instead of any more manual arm-mirroring):**
+
+1. `level.rs`: add `LevelParams: PartialEq` (or an equivalent identity key) and
+   `pub fn t1_pick_min_arms(level: u32) -> Vec<LevelParams>` built as
+   `t1_pick_min_arms(level - 1)` extended with that level's OWN new arm(s), deduplicated. Delete
+   the now-redundant `params_l4_gzip_deflate_fast()` (L4 inherits L3's arm for free once the
+   registry exists) — do NOT add a `params_l5_gzip_deflate_fast()` by hand; let the registry
+   inherit it.
+2. `mod.rs`: replace the four separate `deflate_one_shot_t1_l{1..4}_pick_min` functions (and
+   fold in `deflate_one_shot_t1_zlib_pick_min` for L5) with one `deflate_one_shot_t1_pick_min(data,
+   level)` that runs the registry's arms (generalize `pick_min_two_vecs` to N arms — keep the
+   `anatomy-counters` winner-attribution branch), folding with strict `<` in native-arms-first
+   order (inherited arms must not swap in different bytes on an exact tie with the incumbent —
+   incumbent wins ties). Collapse the current 4 near-duplicate level-dispatch `match` blocks
+   (`encode_deflate_segment_to_sink`, `encode_deflate_slack_padded_to_sink`,
+   `encode_gzip_bytes_to_vec`, `encode_gzip_unpadded_slice_to_writer`) onto one predicate —
+   note `encode_gzip_bytes_to_vec` currently does NOT even route L5-L7 through the zlib pick-min
+   at all (falls through to single-arm `params(level)`), a **pre-existing entry-point
+   inconsistency** worth fixing in the same pass, flagged but not yet acted on.
+3. New unit test: `t1_arm_sets_are_cumulative` — asserts inclusion, not values, per
+   non-negotiable #5.
+4. Delist any `KNOWN_SAGS` pairs the registry heals in the SAME commit (test forces this).
+5. Adjudicate in cheapest-falsifier order: `ladder_is_monotone_t1` + `make holdout`/`make
+   surface` (deterministic, free) → `scripts/campaign/tie-guard.sh <ref>` (T1 bytes can change,
+   downward only, but arm-mirroring edits still need the cage) → `fulcrum try <ref> --threads
+   1,4 --levels 1-9` (or at minimum `3,5,6,9` per cursor-agent) for the actual wall number. **If
+   L5-L7 wall fails the budget, fall back to scoping the registry to L1–L5 only** and park L6/L7
+   inclusion with the measured wall number as the receipt — a decision the adjudicator makes,
+   not one pre-announced here.
+
+**Scope limits to state in the eventual commit:** T1 whole-buffer/mmap route only. The stdin
+streaming path (`encode_gzip_single_pass`, single-arm `params(level)`) and the T>1 path
+(`params_parallel`) are untouched and have their own (untested, for streaming) ladders — do not
+assume this fix reaches them.
+
+**Status: branch NOT mergeable.** `ladder_is_monotone_t1` is still red on the working tree
+(uncommitted L4 partial fix + unmodified L3 code). Do not add `("text", 4)` (or `("text", 5)`
+once the violation moves again) to `KNOWN_SAGS` to silence this — CLAUDE.md's "re-writing the
+rule to fit the result is not allowed," and the allowlist is explicitly for defects with no
+available fix, not ones a lever just created.
+
+---
+
+## GATE promotion verdict on `c8bbde67`, full 1-9 level size census (2026-08-17)
+
+The FIRST lever run (levels 2,6,9 only) returned a void NO-SHIP — confirmed by inspecting its
+`try.json`: `"levels": [2, 6, 9]`, zero L3 cells, so it could not see this L3-scoped change at
+all. Re-ran per the tool's own prescribed remedy:
+
+```bash
+CAMPAIGN_PROMOTE=1 CAMPAIGN_LEVELS=1-9 CAMPAIGN_OUT=lever-c8bbde67-size-full \
+  scripts/campaign/lever.sh c8bbde67 --size-only
+```
+
+```
+TRY — promotion evaluation over 792 cells (660 decidable on both arms; 132 not)
+  clause 1 OK: verify — zero roundtrip failures
+  clause 2 OK: arms differ
+  clause 3 OK: no pass->fail flips across 660 decidable cells
+  clause 4 OK: closed failing cell(s): gzip:photo.jpg:L3:T1:size
+  clause 5 OK: every passing cell inside its erosion budget
+  clause 6 OK: improvement 0.0033 vs residual harm 0.0000
+  clause 7 OK: all required arch(s) covered: aarch64
+VERDICT: SHIP
+```
+
+Matches the hand-measured expectation exactly: **closes `gzip:photo.jpg:L3:T1:size`** (the only
+cell the L3 pick-min lever was built for), zero regressions anywhere else on the corpus.
+Artifact: `~/www/gzippy/lever-c8bbde67-size-full/try.json`.
+
+**This SHIP verdict is scoped to the GATE promotion-board rubric only — it does NOT know about
+`ladder_is_monotone_t1`, a separate pinned invariant test outside the board's corpus.** A GATE
+SHIP with a failing size-invariant test is still NO-MERGE (CLAUDE.md non-negotiable 5). The
+commit `c8bbde67` ITSELF carries the ladder regression (confirmed: fails on `2b5e860a` which
+is `c8bbde67`'s code + doc commits, passes on `origin/main` `e888ac9f`) — it was not introduced
+by my later uncommitted L4 edit, the L4 edit only made the SYMPTOM move from L4 to L5.
+
+**Net next-session task: land the L1–L5 arm registry (see implementation sketch above), confirm
+`ladder_is_monotone_t1` passes clean, re-run `tie-guard.sh` + this same full-level `--size-only`
+lever (now against the registry-patched ref) to confirm `gzip:photo.jpg:L3:T1:size` still closes
+with zero new regressions, THEN merge. Do not merge `c8bbde67` as committed today.**
+
 ### 3. T4 cluster (after T1 L3 front moves)
 
 Open T4 cells (not fixed by mmap pick-min):

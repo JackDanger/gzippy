@@ -54,24 +54,26 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // ties in our favor by extending StoredCoalescer to greedy/lazy — a
     // separate, tie-guard-adjudicated lever, not part of the #266 fix.
     // ("noise", 1) HEALED by L2 mmap pick-min (#332): L2 now matches L1's
-    // optimal 17-block stored grid (both 1048679 B). The +5 B sag moved to L3.
-    ("noise", 2), // L2 1048679 -> L3 1048684 (+5 B)
-    // L1 -> L2 on `binary`: 662577 -> 666108 (+3531 B), opened 2026-08-13 by
-    // the L1 MATCH-REACH lever (dense match-interior indexing + the 2-way
-    // bucket shift that the vendor's `ht_matchfinder_skip_bytes` does and we
-    // did not). THE SAG IS L1 GETTING BETTER, NOT L2 GETTING WORSE: L2 is
-    // unchanged at 666,108 B — byte-for-byte what it was before the lever —
-    // while L1 fell from 666,379 to 662,577 (-0.57%) and now beats it.
-    //
-    // Healing it means improving L2, which this lever must not touch: L2 on
-    // this fixture sits 4 B under libdeflate-gzip -2 (666,108 vs 666,112),
-    // i.e. inside the tie cage, where clause 3 refuses any flip and
-    // `scripts/campaign/tie-guard.sh` is the adjudicator. L2 is also a
-    // different parser entirely (Greedy + the hc matchfinder), so the reach
-    // mechanism proved here does not transfer as a one-line change. Listed
-    // rather than fixed, and it must be UNLISTED by whoever closes L2 — the
-    // test fails if this pair ever heals, so the list still only shrinks.
-    ("binary", 1),
+    // optimal 17-block stored grid (both 1048679 B). The +5 B sag moved to L3,
+    // then ("noise", 2) HEALED 2026-08-17 by the same L1-L5 T1 ratchet that
+    // healed ("binary", 1) (see below): L3 now takes L2's bytes when its own
+    // pick-min would be larger. The +5 B residual moved again, to L5->L6 —
+    // this is NOT a new mechanism, it's the same stored-grid sag hitting the
+    // DELIBERATE edge of the ratchet's scope: `deflate_one_shot_t1_ratcheted`
+    // covers levels 1..=5 only (L6-L9 unmeasured wall cost, PLAN.md
+    // 2026-08-17). Healing requires either extending the ratchet through L6
+    // (needs a wall measurement first) or `StoredCoalescer` support in
+    // greedy/lazy (the L1 fix's own noted follow-up, still not built).
+    ("noise", 5), // L5 1048679 -> L6 1048684 (+5 B)
+                  // ("binary", 1) HEALED 2026-08-17 by the same L1-L5 T1 ratchet
+                  // (`deflate_one_shot_t1_ratcheted` in `mod.rs`): L2 now takes L1's bytes
+                  // (662,577) whenever its own pick-min would be larger, instead of L2
+                  // keeping its own (unchanged) 666,108 B parse. This is NOT "improving
+                  // L2's parse" (the thing the original note said this lever must not do,
+                  // to avoid touching the libdeflate-gzip -2 comparison at 666,108 vs
+                  // 666,112) — the ratchet only ever SUBSTITUTES a smaller predecessor's
+                  // bytes, strictly non-worse on size by construction, verified against
+                  // the real corpus via `scripts/campaign/tie-guard.sh` before landing.
 ];
 
 /// Optimal stored framing for an n-byte input: gzip header (10) + trailer (8)
