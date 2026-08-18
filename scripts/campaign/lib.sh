@@ -143,6 +143,75 @@ campaign_preflight() {
   [ "$CAMPAIGN_GZIPPY_DIRTY" = 0 ] || note "WARNING" "src is dirty — the artifact records a sha that does not describe the binary"
 }
 
+# --- G2: the full local test suite gates BOX TIME, not just doc advice --------------
+# Receipt (2026-08-17/18): PR `c8bbde67`'s PLAN.md handoff said "hand-measured, NOT a
+# verdict — run lever" and jumped straight to `make lever`. `ladder_is_monotone_t1`
+# (`tests/size_invariants.rs`) was red on that ref the whole time — a few seconds,
+# in-process, no box — but nothing forced anyone to run it, so the regression was found
+# only after two full-corpus size censuses AND a wall run interrupted by an unrelated box
+# reboot. A doc note saying "run cargo test first" is not an enforcement mechanism; the
+# next session skipped it too, because nothing reads doc notes before spending box time.
+# This function is the enforcement: it lives in the SAME MEDIUM as the box-spend it gates.
+#
+# Fast path: if $AFTER is the checked-out HEAD of a clean tree, test IN PLACE (reuses the
+# target/ cache — seconds after a warm build). Otherwise build a throwaway worktree of the
+# ref, exactly like `fulcrum try` does for its arms, so an unpushed/other-branch ref is
+# still gated and a stale target/ from a DIFFERENT ref can't produce a false pass.
+#
+# Escape hatch, named like `CAMPAIGN_ALLOW_MISSING_RIVAL`: CAMPAIGN_SKIP_TEST_GATE must
+# name a REASON, not just be set to 1 — "already ran it this session" is a valid reason;
+# silence is not.
+#
+# VERIFIED BOTH DIRECTIONS (2026-08-18): a deliberately failing committed test made this
+# refuse correctly; a clean HEAD passes it in seconds via the fast path. Also found and
+# fixed live: `ln -sf` does NOT replace an existing plain directory (it nests the symlink
+# inside it) — the worktree path must `rm -rf` the checkout's own vendor/ dir first, same
+# pattern tie-guard.sh already uses, or the build fails on a missing isal-sys Cargo.toml
+# and MISREPORTS AS a real test failure.
+campaign_test_gate() { # <after-ref>
+  local after="$1"
+  if [ -n "${CAMPAIGN_SKIP_TEST_GATE:-}" ]; then
+    note "test-gate" "SKIPPED — CAMPAIGN_SKIP_TEST_GATE=$CAMPAIGN_SKIP_TEST_GATE"
+    return 0
+  fi
+  local head_sha; head_sha="$(git -C "$CAMPAIGN_REPO" rev-parse HEAD 2>/dev/null || true)"
+  local after_sha; after_sha="$(git -C "$CAMPAIGN_REPO" rev-parse "$after" 2>/dev/null || true)"
+  local dirty=0
+  git -C "$CAMPAIGN_REPO" diff --quiet HEAD -- src Cargo.toml Cargo.lock tests 2>/dev/null || dirty=1
+
+  local test_dir
+  local cleanup_worktree=0
+  if [ "$after_sha" = "$head_sha" ] && [ "$dirty" = 0 ]; then
+    test_dir="$CAMPAIGN_REPO"
+    note "test-gate" "testing in place (after == clean HEAD): $CAMPAIGN_REPO"
+  else
+    test_dir="$(mktemp -d)/test-gate-$after_sha"
+    note "test-gate" "building throwaway worktree for $after ($after_sha) — after != HEAD or tree is dirty"
+    git -C "$CAMPAIGN_REPO" worktree add -q --detach "$test_dir" "$after" \
+      || die "test-gate: could not create worktree for '$after'"
+    # `ln -sf` does NOT replace an existing plain directory — it nests the symlink
+    # inside it (tie-guard.sh's own pattern, matched here after a session hit this
+    # exact bug: the checkout's real (submodule-pointer) vendor/ dir must be removed
+    # FIRST or the symlink silently lands at vendor/vendor and the build fails on a
+    # missing isal-sys Cargo.toml, misreported as a real test failure).
+    rm -rf "$test_dir/vendor" && ln -s "$CAMPAIGN_REPO/vendor" "$test_dir/vendor"
+    cleanup_worktree=1
+  fi
+
+  note "test-gate" "cargo test --release (full suite, no box) — this is what would have caught c8bbde67"
+  if ( cd "$test_dir" && cargo test --release 2>&1 | tail -60 ); then
+    note "test-gate" "PASS"
+  else
+    [ "$cleanup_worktree" = 1 ] && git -C "$CAMPAIGN_REPO" worktree remove --force "$test_dir" 2>/dev/null
+    die "cargo test --release FAILED on $after ($after_sha)" \
+      "This is what the box run would have discovered anyway, at 100x the cost." \
+      "Fix the test or explain why it's a known/expected failure before spending box time." \
+      "Override (must name a reason): CAMPAIGN_SKIP_TEST_GATE='<reason>' $0 ..."
+  fi
+  [ "$cleanup_worktree" = 1 ] && git -C "$CAMPAIGN_REPO" worktree remove --force "$test_dir" 2>/dev/null
+  return 0
+}
+
 # --- G3: GATE is promotion-only, and that is enforced, not remembered ---------------
 # corpus_split.json's own contract: "A promotion is judged on GATE. If a change was
 # fitted on GATE, the promotion is void regardless of the numbers." Exploration must

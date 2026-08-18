@@ -34,6 +34,10 @@ AFTER="$1"; shift
 git -C "$CAMPAIGN_REPO" rev-parse --verify "$AFTER" >/dev/null 2>&1 \
   || die "'$AFTER' is not a ref in $CAMPAIGN_REPO" "levers are judged from git refs, never from a dirty tree"
 
+# G2, before ANYTHING else spends box time: the full local test suite, seconds, no box.
+# See lib.sh campaign_test_gate's doc comment for the receipt (c8bbde67).
+campaign_test_gate "$AFTER"
+
 # Exploration runs on TUNE. A SHIP verdict is judged on GATE, and corpus_split.json is
 # explicit that fitting on GATE voids the promotion regardless of the numbers — so the set
 # is chosen by CAMPAIGN_PROMOTE, never silently.
