@@ -1868,6 +1868,15 @@ mod unpadded_slice_tests {
     /// consumes nothing); just above it (pass 1 emits its first block); and
     /// large enough that `max_shift` > 0 so pass 2 exercises the state
     /// rebase. L10-12 cover the padded-copy fallback arm.
+    ///
+    /// Levels 4, 5, 7 added 2026-08-18 (cursor-agent pre-merge review,
+    /// `deflate_one_shot_t1_ratcheted` / `b4b821c9`): the level list previously
+    /// read `[0,1,2,3,6,9]`, which happened to omit BOTH new ratchet-routed
+    /// levels (4, 5) this test's own mechanism (an entry-point routing gap)
+    /// caught mid-implementation — it caught the bug at L2 by luck, not by
+    /// coverage. A bug that only manifested at L4 or L5 specifically would
+    /// have shipped undetected. 7 added for symmetry with the L6 zlib
+    /// pick-min class this test already covered.
     #[test]
     fn unpadded_slice_is_byte_identical_to_whole_buffer() {
         let lookahead = parse::STREAM_BLOCK_LOOKAHEAD;
@@ -1885,7 +1894,7 @@ mod unpadded_slice_tests {
         for &len in &sizes {
             for period in [8u32, 96, 1 << 30] {
                 let data = corpus(len, period);
-                for level in [0u32, 1, 2, 3, 6, 9] {
+                for level in [0u32, 1, 2, 3, 4, 5, 6, 7, 9] {
                     assert_eq!(
                         unpadded(&data, level),
                         encode_gzip_bytes_to_vec(&data, level),
