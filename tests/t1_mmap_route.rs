@@ -151,6 +151,49 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     );
 }
 
+/// **KNOWN GAP, not yet fixed — 2026-08-18 (Codex pre-merge review of `b4b821c9`).**
+///
+/// The CLI-level counterpart of `size_invariants.rs::streaming_t1_is_ladder_monotone`:
+/// runs the actual `gzippy` binary (not an in-process call) piping the SAME bytes
+/// through stdin at every level 1-5 and asserts the pipe route's own output size
+/// never grows as the level rises. `deflate_one_shot_t1_ratcheted` (`b4b821c9`) only
+/// reaches the mmap FILE route (`t1_file_to_stdout_takes_the_mmap_route_and_matches_stdin_bytes`
+/// above, at L1/6/9 where mmap and stdin still happen to agree) — piped stdin input
+/// takes `PureT1` streaming, which this test proves is NOT currently monotone.
+///
+/// Deliberately no allowlist/xfail here (CLAUDE.md non-negotiable #5; user decision
+/// 2026-08-18: this invariant is required on every T1 route, not just the one already
+/// fixed). Fix streaming to make this pass; do not weaken the assertion.
+#[test]
+fn t1_pipe_stdin_is_ladder_monotone_l1_to_l5() {
+    let data = corpus(1024 * 1024);
+    let mut sizes = Vec::new();
+    for level in 1u32..=5 {
+        let run = gzippy()
+            .args([&format!("-{level}"), "-p1", "-c"])
+            .write_stdin(data.clone())
+            .assert()
+            .success();
+        let gz = run.get_output().stdout.clone();
+        assert_eq!(roundtrip(&gz), data, "L{level}: pipe-stdin roundtrip");
+        sizes.push(gz.len());
+    }
+    for n in 0..sizes.len() - 1 {
+        let (lo, hi) = (sizes[n], sizes[n + 1]);
+        assert!(
+            hi <= lo,
+            "STREAMING (pipe stdin) ladder monotonicity violated: level {} produced a \
+             LARGER output than level {} ({hi} > {lo} bytes, +{} bytes) via `gzippy -N -p1 -c` \
+             with piped stdin. The mmap FILE route is already fixed for the same input \
+             (deflate_one_shot_t1_ratcheted, b4b821c9) — the pipe route needs the same \
+             guarantee, by a mechanism compatible with single-pass streaming.",
+            n + 2,
+            n + 1,
+            hi - lo,
+        );
+    }
+}
+
 /// Files at or below the 128 KiB threshold keep the streaming route — the
 /// threshold is shared with the T>1 mmap gate, and this pins which side of it
 /// each route owns.
