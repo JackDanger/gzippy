@@ -6,6 +6,44 @@
 
 ---
 
+## Wall census attempted on solvency, 2026-08-19: UNDECIDED (not NO-SHIP), box noise CONFIRMED
+## by direct measurement, not inferred
+
+`fulcrum try origin/lever/l3-gzip-deflate-fast-pickmin --threads 1 --levels 1-6` (`CAMPAIGN_
+PROMOTE=1`, full 22-file corpus, x86_64 solvency box, commit `254a6dc1`). The box's `mpstat`
+snapshot right before launch showed 99.78% system-wide idle (the vLLM tenant seen earlier via
+`ps aux`'s cumulative-average CPU is GPU-bound with a bursty, not-continuous, CPU footprint) —
+looked usable, so the run was launched rather than deferred again.
+
+**Result: VERDICT UNDECIDED.** 528 wall cells: 281 VOID/VOID (both arms), 173 VOID(after)/OK
+(base), 66 ABSENT/ABSENT (igzip — found via `/usr/bin/igzip`, a system package not the pinned
+vendor build, `rival_bin()` doesn't reach it), only 6 OK/OK and 2 OK/VOID. The VOID reason on
+inspected cells is `aa_bias` — an A-A self-consistency check (the SAME binary timed against
+itself) failing, meaning the box's bursty tenant activity IS corrupting wall timing during the
+run's actual multi-minute duration even though the single pre-launch snapshot looked clean.
+**This directly confirms, by execution rather than inference, that this box is not currently
+usable for a trustworthy wall verdict** — the earlier `ps aux`-based deferral this session was
+right for the right reason, just under-evidenced; now it's evidenced. `fulcrum` self-protected
+correctly (UNDECIDED + a re-run list, not a guessed SHIP or NO-SHIP) — the measurement
+discipline did its job.
+
+**The SIZE axis of this SAME run came back fully clean, independently confirming and EXTENDING
+the earlier size-only verdict to a second architecture:** clause 3 "no pass->fail flips across
+468 decidable cells," clause 4 "closed failing cell(s): gzip:photo.jpg:L3:T1:size," clause 6
+"improvement 0.0263 vs harm 0.0000," **clause 7 "all required arch(s) covered: x86_64"** — the
+earlier local size-only SHIP (commit `14fce138`) was aarch64-only (this laptop); this is the
+first x86_64 confirmation of the same result. Artifact:
+`/root/www/gzippy-bench/campaign/lever-origin-lever-l3-gzip-deflate-fast-pickmin/try.json`
+(solvency box; not yet pulled to a synced location).
+
+**Next action for whoever continues: re-run the SAME command once the box is verified quiet by
+a FULL-DURATION check (not a single `mpstat` snapshot — this session's own miss), or once the
+vLLM tenant is gone.** The local hyperfine numbers (3.1-3.4x wall reduction, PLAN.md above) are
+still the best available signal of DIRECTION and MAGNITUDE; they are not, and were never
+claimed to be, a substitute for this adjudicator.
+
+---
+
 ## Fresh SIZE board, 2026-08-19, commit `86c19fc5`
 
 `CAMPAIGN_LEVELS=1-9 make board-size-promote` (built igzip locally first — `make
