@@ -4,6 +4,11 @@
 **Done when:** **0 / 1320** failing GATE promotion-board cells (size AND wall, per-label, T1 and T>1).  
 **Not done when:** a session summary, a partial lever, or a hand measurement without `make lever`.
 
+**Fresh board, commit `06b2e231`, this branch: 11 of 1320 failing** (was 13 at `86c19fc5`
+earlier the same day, was a stale 36 on main). dd79_bin6 L3 T1 closed this session. Residual:
+dd79_bin6 L3 T4 (separate lever, same bug on the untouched T>1 path), photo.jpg L1/2/3 T4 (real
+fix found, PARKED — see below, not merged), weights.safetensors L4/L7-9 (untouched, tiny).
+
 ---
 
 ## ⛔ PARKED, NOT MERGED, 2026-08-19 — T4 seam fix (`agent/cursor-t4-seam` @ `ebd7f556`): real
