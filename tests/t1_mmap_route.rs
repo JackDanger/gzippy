@@ -151,19 +151,27 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     );
 }
 
-/// **KNOWN GAP, not yet fixed — 2026-08-18 (Codex pre-merge review of `b4b821c9`).**
+/// **PARTIALLY FIXED — 2026-08-18/19.** Originally a KNOWN GAP from Codex's pre-merge
+/// review of `b4b821c9` (streaming had no ratchet at all); the streaming-route fix
+/// (`encode_gzip_single_pass`, same date) makes this PASS for this test's 1 MiB input,
+/// because that fits under the ~4.56 MiB first-refill threshold and now routes through
+/// the whole-buffer ratchet too. **The gap is NOT closed in general** — inputs LARGER
+/// than that threshold still take true single-pass streaming with no monotonicity
+/// guarantee (reproduced directly on a 5 MiB pipe input, 2026-08-19: real violations
+/// at L2→L3 and L4→L5). See `PLAN.md`'s "CRITICAL" section for why that fix (and the
+/// original mmap ratchet) are both currently blocked on an even bigger, separately
+/// measured wall-cost problem before either can promote — passing THIS test is not
+/// sufficient evidence the branch is ready.
 ///
 /// The CLI-level counterpart of `size_invariants.rs::streaming_t1_is_ladder_monotone`:
 /// runs the actual `gzippy` binary (not an in-process call) piping the SAME bytes
 /// through stdin at every level 1-5 and asserts the pipe route's own output size
-/// never grows as the level rises. `deflate_one_shot_t1_ratcheted` (`b4b821c9`) only
-/// reaches the mmap FILE route (`t1_file_to_stdout_takes_the_mmap_route_and_matches_stdin_bytes`
-/// above, at L1/6/9 where mmap and stdin still happen to agree) — piped stdin input
-/// takes `PureT1` streaming, which this test proves is NOT currently monotone.
+/// never grows as the level rises.
 ///
 /// Deliberately no allowlist/xfail here (CLAUDE.md non-negotiable #5; user decision
 /// 2026-08-18: this invariant is required on every T1 route, not just the one already
-/// fixed). Fix streaming to make this pass; do not weaken the assertion.
+/// fixed). This test passing is necessary, not sufficient — see the large-input
+/// residual above.
 #[test]
 fn t1_pipe_stdin_is_ladder_monotone_l1_to_l5() {
     let data = corpus(1024 * 1024);

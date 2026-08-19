@@ -642,8 +642,16 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
 /// stack frame before any comparison could drop a loser — up to 5 near-input-sized
 /// buffers at once on incompressible data (an 83 MiB input could peak near 400+ MiB
 /// of ratchet-owned Vec<u8> alone, on top of what the underlying encoders allocate).
-/// This form holds at most two buffers at any moment: `best` and the level just
-/// computed; the loser is dropped immediately every iteration.
+/// This form holds at most THREE buffers at any moment, not two (correction,
+/// 2026-08-19 review): the outer `best` stays alive across the whole
+/// computation of `cur`, and computing `cur` itself has its own transient
+/// 2-buffer peak inside the level's own pick-min (either its two parallel
+/// arms, or an already-reduced best-of-those-2 plus a third sequential arm —
+/// see `deflate_one_shot_t1_l2_pick_min` for the shape). So peak = outer
+/// `best` + that level's own 2-buffer internal peak = 3, not 2. Still a large
+/// improvement over the prior recursive form's up-to-5, and the loser at
+/// each OUTER fold step is still dropped immediately every iteration — the
+/// correction is to the exact count, not the direction of the fix.
 fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
     debug_assert!((1..=5).contains(&level));
     let mut best = deflate_one_shot_t1_l1_pick_min(data);

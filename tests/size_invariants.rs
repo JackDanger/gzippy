@@ -202,9 +202,10 @@ fn compress_t1_streaming(data: &[u8], level: u32) -> Vec<u8> {
 /// coincidental (same bytes, same code path, below the refill threshold).
 const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] = &[("text", 7), ("text", 8), ("noise", 5)];
 
-/// **MOSTLY FIXED 2026-08-18** (was a known gap from Codex's `b4b821c9` pre-merge
-/// review; fixed same day per Fable + cursor-agent's independent streaming-route
-/// design reviews — see `PLAN.md` "PROMOTION PAUSED" section for the full history).
+/// **PARTIALLY FIXED 2026-08-18/19** (was a known gap from Codex's `b4b821c9` pre-merge
+/// review; partially fixed same day per Fable + cursor-agent's independent streaming-route
+/// design reviews — see `PLAN.md`'s CRITICAL section, then "PROMOTION PAUSED", for the
+/// full history — status is more complicated than either heading alone suggests).
 ///
 /// `ladder_is_monotone_t1` proves the T1 WHOLE-BUFFER/MMAP route
 /// (`encode_gzip_bytes_to_vec`) is ladder-monotone via `deflate_one_shot_t1_ratcheted`.
@@ -215,17 +216,30 @@ const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] = &[("text", 7), ("text", 8), 
 /// `encode_gzip_single_pass` (`mod.rs`): the function already buffers the ENTIRE
 /// input before parsing anything whenever it fits in the first ~4.56 MiB refill
 /// (Fable's finding) — for that case (all four `fixtures::NAMES`, 1 MiB each, and
-/// the overwhelming majority of real files/pipes), it now routes through
-/// `encode_gzip_slack_padded_to_vec` directly, at zero extra memory or latency,
-/// making streaming byte-identical to the mmap route including the ratchet.
+/// the overwhelming majority of real files/pipes BY COUNT), it now routes through
+/// `encode_gzip_slack_padded_to_vec` directly, making streaming byte-identical to
+/// the mmap route including the ratchet.
+///
+/// **⚠ CORRECTION 2026-08-19: "zero extra memory or latency" (the original wording
+/// here and in the `12cd8094` commit message) was FALSE — measured, not just
+/// imprecise.** Hyperfine, paired, 3 MiB incompressible pipe at `-5`: 295ms on this
+/// branch vs 40ms on the prior code and 34ms on libdeflate — 7.3x and 8.7x slower,
+/// 11x more instructions, 3x peak RSS. The input READ buffer genuinely doesn't grow
+/// (that part was correct), but the RATCHET the whole-buffer branch now runs does
+/// real, uncosted extra work (up to ~10-12 cumulative arms by L5) — the exact same
+/// cost this session then found on the ORIGINAL mmap-route ratchet too, via the
+/// wall census that had been running the whole time. See `PLAN.md`'s CRITICAL
+/// section: this is now the dominant open question for the whole branch, on BOTH
+/// routes, not a streaming-specific residual.
 ///
 /// **Residual, NOT fixed — inputs LARGER than the ~4.56 MiB refill boundary still
-/// take the single-arm streaming path with no monotonicity guarantee.** This is a
-/// real, named, open scope boundary (see `PLAN.md` "Phase 2"), not silently
-/// dropped — it needs either an explicit accepted-tradeoff decision or Fable's
-/// segmented cumulative-arm + bit-splice construction (direction (d) in the design
-/// review) to close for good. This test's fixtures are all 1 MiB and so cannot
-/// exercise that residual; it is intentionally out of this test's reach.
+/// take the single-arm streaming path with no monotonicity guarantee.** Reproduced
+/// directly on a 5 MiB pipe input (2026-08-19): real violations at L2→L3 and L4→L5.
+/// This test's fixtures are all 1 MiB and so cannot exercise that residual — it is
+/// intentionally out of this test's reach, and has ZERO test coverage anywhere in
+/// this suite as of this comment; adding that coverage is next, but is secondary to
+/// the wall-cost question above, which affects whether the below-threshold "fix"
+/// should even ship as currently built.
 #[test]
 fn streaming_t1_is_ladder_monotone() {
     for &name in fixtures::NAMES {
