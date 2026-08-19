@@ -1,8 +1,56 @@
 # gzippy encoder campaign — handoff
 
-**Date:** 2026-08-17 (updated 2026-08-18)  
+**Date:** 2026-08-17 (updated 2026-08-19)  
 **Done when:** **0 / 1320** failing GATE promotion-board cells (size AND wall, per-label, T1 and T>1).  
 **Not done when:** a session summary, a partial lever, or a hand measurement without `make lever`.
+
+---
+
+## Fresh SIZE board, 2026-08-19, commit `86c19fc5`
+
+`CAMPAIGN_LEVELS=1-9 make board-size-promote` (built igzip locally first — `make
+vendor/isa-l/build/igzip`, missing on this laptop worktree until now — so all four rivals are
+covered, not declared-absent): **13 of 1320 measured cells failing** (down from the stale
+"36 failing" MEMORY.md board note). Artifact:
+`/Users/jackdanger/www/gzippy-bench/campaign/size-all-86c19fc5/census.json`. Worst offenders:
+
+    vs gzip: dd79_bin6 L3 T4 +0.35%, L3 T1 +0.27%, photo.jpg L1-3 T4 +0.04%, dd79_bin6 L2 T4 +0.03%,
+             weights.safetensors L7-9 T1/T4 +0.00-0.02%
+    vs pigz: dd79_bin6 L3 T4 +0.23%, L3 T1 +0.15%
+    vs libdeflate: weights.safetensors L4 T4 +0.04%
+    vs igzip: none (0 of 132)
+
+**`dd79_bin6` L3 — insert-density hypothesis BUILT AND FALSIFIED, same session.** `fulcrum why
+gzip:dd79_bin6:L3:T1` (structure layer only — lines/counters/params layers skipped, no
+valgrind/Linux/anatomy-counters build on this host): gzip finds 1.85% MORE matches and 4.4%
+FEWER literals than us. Memory (`project_len3_guard_dd79_mechanism.md`, PR #299, 2026-08-09)
+named the L3 residual's cause as "unmeasured... plausibly insert-all vs skip_bytes." Read
+`vendor/gzip/deflate.c`'s actual `deflate_fast` (confirmed the correct analog: gzip L1-3 all
+dispatch to it, `deflate.c:686`): it is NOT dense — `max_insert_length` (`= max_lazy_match`,
+`configuration_table[3].max_lazy = 6`) caps the interior-insert loop; matches longer than 6
+bytes insert NOTHING for their interior, only resync the rolling hash. Our `HcMatchfinder::
+skip_bytes` is unconditionally dense (a faithful libdeflate port) for every match length — the
+OPPOSITE direction from every prior insert-density lever in this file (L1's `fast_hash_update_
+inserts`/`fast_dense_interior_insert` family all went DENSER to match libdeflate, never sparser
+to match gzip).
+
+Built it exactly as scoped (new `LevelParams::hc_max_insert_length` field, default 0 = current
+dense behavior everywhere; set to 6 ONLY on `params_l3_gzip_deflate_fast()`; new `HcMatchfinder::
+resync_hashes` — `skip_bytes` minus its three table writes, same window-slide handling) —
+**measured WORSE, not better**: `dd79_bin6` -3 standalone `gzip_deflate_fast` arm size rose from
+4,448,442 B to 4,449,262 B (+820 B), and its corpus-wide win rate (`pickmin_arm_audit`) dropped
+from 6/23 to 2/23. **REVERTED** (`git checkout`, back to `bc75535e`'s clean state — build/test
+reconfirmed identical). This CLOSES the "insert-all vs skip_bytes, unmeasured" question from
+memory with a definitive, scoped, measured NO: copying gzip's sparser insertion does not make
+our matchfinder behave more like gzip's, because our OTHER heuristics (chain=32, nice=32,
+Greedy strategy — all libdeflate-style, not gzip's) were apparently relying on the dense
+insertion to find matches gzip's own compensating mechanism finds some other way. The
+match-count gap's real cause is still open; this rules out ONE specific, previously-plausible
+mechanism, not the whole class. `fulcrum candidates gzip:dd79_bin6:L3:T1` has 23 other
+un-falsified techniques listed if this is picked up again — [P14] (zlib-ng's early-exit on
+first non-improving candidate at levels <5) and [P10] (`deflate_medium`'s overlap-fixup search)
+are the two that most directly touch match ACCEPTANCE rather than insertion and were not tried
+this session.
 
 ---
 
