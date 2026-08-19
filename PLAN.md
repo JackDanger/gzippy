@@ -86,8 +86,14 @@ execution before trusting them, reframe this away from "revert vs redesign":**
    is not obviously sufficient to restore wall solvency on its own.
 
 Given (1), paying 7.3x wall for an "unconditional" guarantee that main doesn't even uphold
-beyond synthetic fixtures today is a bad trade. **Adopted: Fable's "rung + nested bonus"
-construction** — split each level's arms into `rung(N)` (the level's own native, homogeneous
+beyond synthetic fixtures today is a bad trade. ~~**Adopted: Fable's "rung + nested bonus"
+construction**~~ — **RETRACTED, same session, 2026-08-19: built, and the proof's own stated
+premise (`rung(N) <= rung(N-1)`) was FALSE on the first real fixture checked — `binary` L2
+(663,410) > L1 (662,577), reproduced 3x on a freshly-verified binary. See "IMPLEMENTED THEN
+FALSIFIED AND REVERTED" below for the numbers and why there is no cheap patch inside this
+fold shape. Left the description below intact — quote-and-strike, not delete — because it's
+still the correct record of what was tried and why it looked sound going in.** — split each
+level's arms into `rung(N)` (the level's own native, homogeneous
 arm(s): Fast/Greedy/Lazy/zlib-depth family — the class that has never been observed to sag
 below L6) and `bonus(N)` (the "gzip-shaped forced-min-match-3" vendor arms that are the ONLY
 class ever observed to cause a sag — `gzip_primary`, `gzip_deflate_fast` at L2/L3,
@@ -121,6 +127,67 @@ size-only lever re-run are required, not assumed safe by construction alone.
 numbers) once the census finishes** — the tallies above are this session's own log-reading,
 useful for orientation but not the adjudicator. Do not decide among the three options above
 without it.
+
+**IMPLEMENTED THEN FALSIFIED AND REVERTED, same session, 2026-08-19.** `t1_rung_arms` +
+`t1_bonus_arms` were built and wired in (kept the name `deflate_one_shot_t1_ratcheted`, no
+call-site changes). Build was clean. Test suite immediately caught the problem before it went
+anywhere near a box: `block_pins`/`fingerprint_suite` both failed on `binary:L2:T1` — expected
+per the design's own "this DOES change output bytes" warning, so the pins were regenerated —
+but the NEW value, `binary L2 T1 = 663,410`, is LARGER than `binary L1 T1 = 662,577`
+(+833 B, +0.13%). **This is a ladder-monotonicity violation, not a pin-format artifact.**
+
+Verified directly, not inferred from the pin diff: fresh `cargo build --release`, ran
+`target/release/gzippy -1 -p1 -c` and `-2 -p1 -c` against the exact `fixtures::generate("binary")`
+bytes (sha256 `5471319620839130044196dec14ef6c5ec49fefe57a5bbe69aec86f9f9e0d0e`), 3x each,
+byte-identical every run: L1 = 662,577, L2 = 663,410. Deterministic, reproducible, on the
+binary that was actually measured.
+
+**Root cause: the proof's own stated premise — `rung(N) <= rung(N-1)`, which Fable's proof
+sketch explicitly flagged as "not proven, but true everywhere ever measured below L6" — is
+FALSE on this exact fixture at N=2.** `rung(2)` (`params(2)`'s own native parse) plus
+`bonus(2)`'s two vendor arms all came in above `f(1) = 662,577`. This is CLAUDE.md's own
+standing warning (`level.rs`'s engine.wasm L8 receipt: "a longer search can itself produce a
+LARGER output") landing on the exact premise the whole construction rested on, on the very
+first fixture checked. Not a coding bug — `cargo build` was clean, the arm lists matched the
+design exactly — the DESIGN's mathematical premise was wrong, and "true everywhere ever
+measured" turned out to mean "measured nowhere below L6," because nobody had actually run
+`ladder_is_monotone_t1` against this construction before this check (the test suite runs
+alphabetically by target name and stopped at `fingerprint_suite`, before reaching
+`size_invariants.rs` — the pin-diff investigation caught this ahead of that test, not because
+of it).
+
+**Why there is no cheap fix inside this construction:** making `bonus(N)` also absorb
+`rung(N-1)` (so a future level's bonus set structurally dominates a past level's rung choice
+too) sounds like a small extension, but tracing it through shows `bonus(N)` would then have to
+equal the full union of every arm — rung AND vendor — ever tried at any level `< N`. That IS
+the old cumulative ratchet's exact cost shape (its per-level own-arm counts, 2/3/3/2/2 summed
+level-by-level to reach L5 = 12 total encodes to compute `f(5)`), not a cheaper one. The
+`t1_rung_arms`/`t1_bonus_arms` split's real (and only) saving was skipping that cumulative
+walk — computing `f(N)` standalone from just that level's own rung+bonus, independent of any
+other level. That standalone-ness is exactly what makes `rung(N) <= rung(N-1)` load-bearing,
+and exactly what a falsified premise there breaks with no partial-credit fallback: any fix that
+restores the guarantee by folding in predecessor arms un-does the saving that was the entire
+point.
+
+**Reverted to the known-correct cumulative ratchet** (`git checkout -- src/compress/deflate/mod.rs
+src/compress/deflate/parse/mod.rs tests/fingerprints/ours_blocks.tsv`) — CLAUDE.md: "a change
+that makes things worse gets reverted." Re-verified post-revert on the same fixture, same
+binary-rebuild discipline: L1=662,577, L2=662,577, L3=661,068, L4=657,593, L5=657,593 — monotone
+non-increasing, confirming the revert actually restored the safe baseline and this wasn't a
+build-staleness illusion in either direction.
+
+**Where this leaves the wall-cost problem: still open, but the fix has to live INSIDE the
+proven-correct cumulative fold, not in a cheaper fold shape.** The one direction from the
+original two-reviewer design brief that this finding does NOT invalidate is **1a — thin the
+per-level ARM SET, not the fold structure**: the cumulative ratchet's cost is a sum over levels
+of each level's own arm count (2/3/3/2/2 = 12 total by L5); cutting that per-level count (e.g.
+dropping `libdeflate_greedy` or unifying the chain8/chain32 `gzip_deflate_fast` variants) cuts
+the SAME total proportionally, with zero change to the correctness argument, because the fold
+shape (`if cur.len() < best.len() { best = cur }` walking every level) is untouched — only
+which arms feed `cur` changes. This needs the win-rate measurement Fable named
+(`PICKMIN_ARM` attribution under `anatomy-counters`) before dropping anything, not a guess.
+**Next action: run that attribution, on the GATE corpus, per level** — which arms ever win,
+and how often — before proposing which to drop.
 
 ---
 
