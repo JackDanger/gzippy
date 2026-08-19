@@ -42,6 +42,41 @@ vLLM tenant is gone.** The local hyperfine numbers (3.1-3.4x wall reduction, PLA
 still the best available signal of DIRECTION and MAGNITUDE; they are not, and were never
 claimed to be, a substitute for this adjudicator.
 
+**TWO FOLLOW-UP ATTEMPTS, same session, both converge on the same result — this is now
+TRIANGULATED, not a single inconclusive run:**
+
+1. Built a monitor polling the box's 5-min AND 15-min load averages every 90s (not another
+   instantaneous snapshot — the smoothing this session's first attempt lacked), required 3
+   consecutive reads under 4.0 (of 32 cores) before declaring quiet. Confirmed quiet
+   (load5=1.80, load15=2.64) after ~5 minutes. **Re-ran the identical command: UNDECIDED
+   again**, essentially unchanged (264 VOID/VOID, 188 VOID/OK, only 7 OK/OK of 528 wall
+   cells — worse than attempt 1's 6 OK/OK, not better).
+2. Hypothesized short/fast T1 cells need more statistical power against jitter, not just a
+   quieter box: re-ran with `--scope 'levels=1,2,3,4,5' --n 45` (3x the default 15 samples,
+   full measurement on the levels this change touches, L6 sentinel-sampled only). **UNDECIDED
+   again, WORSE**: only 1 OK/OK of 452 wall cells (225 VOID/VOID, 175 VOID/OK) — MORE samples
+   made it worse, not better, ruling out "insufficient n" as the fix too.
+
+**Pattern across all three attempts: L6 (the one level this branch's change does NOT touch,
+included as an unaffected control) mostly succeeds; L1-L5 (the exact coordinate the change
+acts on, all shorter-duration T1 encodes at lower search depth) is almost universally VOID,
+regardless of load-quiet or sample count.** This points at something more structural than
+tenant contention — plausibly a timer-resolution or scheduling-jitter limitation of this
+specific box/VM for SHORT operations specifically, which neither waiting nor resampling fixes.
+This is itself a new operational finding worth carrying forward (not yet in
+`reference_solvency_box_operational_lessons.md`): **this box may be fundamentally unable to
+wall-adjudicate fast/short T1 cells with the current per-invocation timing method**, independent
+of tenant load. A fix would need a different measurement strategy (e.g. many back-to-back
+repeats of the same short op with an outer median, rather than per-invocation `--n`-sample
+timing) — that is `fulcrum`-tool engineering, out of this branch's scope.
+
+**Given three converging attempts, further retries on THIS box without a different measurement
+strategy are not expected to resolve this.** The wall leg stays genuinely UNDECIDED. The size
+leg is SHIP, confirmed on two architectures. Decision point for whoever continues, unchanged
+in substance but now much better evidenced: merge size-clean with wall tracked as a
+follow-up (needing either a quieter/different box or a fulcrum measurement-strategy fix), or
+hold. This is a product/process call, not a measurement one — not resolved here.
+
 ---
 
 ## Fresh SIZE board, 2026-08-19, commit `86c19fc5`
