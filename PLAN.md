@@ -6,6 +6,51 @@
 
 ---
 
+## ⛔ PARKED, NOT MERGED, 2026-08-19 — T4 seam fix (`agent/cursor-t4-seam` @ `ebd7f556`): real
+## mechanism, real size win, CONFIRMED DISQUALIFYING wall regression against the actual rival
+
+cursor-agent (driven as an implementation task, see the "LANDED" section below for the pattern)
+correctly diagnosed the `photo.jpg`/`data.csv` T4 seam: T4's `params_parallel` path is missing
+the gzip-shaped pick-min arm T1 already uses, so chunked encodes lose match discovery on
+near-incompressible/low-ratio content. Built a per-chunk 2-way pick-min (`params_parallel` vs
+`params_l{2,3}_gzip_deflate_fast`), then — after I measured a 1.63-2.02x wall regression against
+its OWN PARENT and sent it back — added a size-ratio dead-zone gate (skip the extra arm when
+the cheap arm's own output ratio is 20-50%, i.e. prose-shaped) that fixed `dickens`'s wall cost
+back to noise-level.
+
+**But `dickens`'s fix worked by giving up its size win entirely (independently confirmed: `wc -c`
+shows dickens L2/L3 T4 output is BYTE-IDENTICAL to parent, delta=0 — the dead zone excludes it
+from the extra arm, so it gets none of the benefit). The cells that DO keep their real size win
+(`photo.jpg`, `data.csv` — both outside the 20-50% dead zone since one is ~99% and the other
+~14%) still pay the full 2x-per-chunk cost, unresolved.**
+
+**And critically — my own first wall check only compared the fix against its own PARENT (our
+prior code), never against the actual RIVAL. Checked separately, directly:**
+
+    L2 photo.jpg T4: parent 26.2ms BEATS pigz -p4 39.1ms (1.50x faster) -- PASSING today
+                      fixed  53.7ms LOSES to pigz -p4 39.4ms (1.36x slower) -- WOULD FAIL
+    L2 data.csv T4:  parent 30.5ms BEATS pigz -p4 37.7ms (1.23x faster) -- PASSING today
+                      fixed  52.1ms LOSES to pigz -p4 37.7ms (1.38x slower) -- WOULD FAIL
+
+**This is not "fails to help an already-failing wall cell" — it is a CONFIRMED pass→fail flip
+on two cells that currently WIN against pigz at T4, exactly what CLAUDE.md's clause 3 treats as
+absolute regardless of any size improvement elsewhere. NOT MERGED into the main lever branch.**
+`agent/cursor-t4-seam` worktree/branch left as-is (not deleted, not pushed) for revival — per
+CLAUDE.md "PARK monotone work; never DELETE it," the mechanism finding and the size-side numbers
+are real and valuable even though this implementation can't ship. Revival needs a genuinely
+cheaper way to decide "try the gzip arm" than running a full trial encode (already tried and
+rejected by the agent: nested `thread::scope` inside T>1 — oversubscribes; gzip-first probe;
+file-level classification) — or accepting the cost only where a wall census proves real T>1
+slack absorbs it, which these two specific cells (already winning, thin margin) evidently do not.
+
+**Process note:** the discipline of independently re-verifying a delegated agent's numbers (not
+just its own report) caught this — the agent's OWN wall check was honest and correctly scoped
+to what I'd asked for (before/after its own change), but I hadn't asked it to check against the
+rival, which is the actual bar. My prompt's gap, not the agent's error — logged so the next
+delegated wall-cost check asks for the rival comparison explicitly, not just parent-vs-after.
+
+---
+
 ## ✅ LANDED, 2026-08-19, commit `804fdbb0` — dd79_bin6 L3 hash3-chain-repair, driven through
 ## cursor-agent (real implementation work, not review), independently re-verified before merge
 
