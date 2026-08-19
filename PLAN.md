@@ -156,6 +156,26 @@ alphabetically by target name and stopped at `fingerprint_suite`, before reachin
 `size_invariants.rs` — the pin-diff investigation caught this ahead of that test, not because
 of it).
 
+**SHARPER, 2026-08-19 (cursor-agent adversarial re-review of this exact section — codex
+independently confirmed the audit methodology but hit its own usage limit before reaching a
+verdict on this claim): the proof sketch was broken even INDEPENDENT of the falsified premise.**
+Bonus nesting only gives `min(bonus(N)) <= min(bonus(N-1))` — it says nothing about `f(N-1)`
+when `f(N-1)` was won by the RUNG side, not bonus, which is exactly what happened here:
+`f(1) = 662,559` came from `rung(1)` (`l1_native`), while every `bonus(2)` arm sat at
+663,392+ (`l2_gzip_primary`, the best bonus arm at L2, is barely below `l3_gzip_deflate_fast`
+and still above `f(1)`). So even a hypothetically-true `rung(N) <= rung(N-1)` would not have
+saved this case on its own — the full statement needed was `min(rung(N), min(bonus(N))) <=
+min(rung(N-1), min(bonos(N-1)))`, and nesting alone never implies the RHS's rung term is
+covered. Mechanistically: `rung(2)` (`params(2)`, `Strategy::Greedy`, depth 6, nice 10,
+`far_len3_gate`, `greedy_len3_shadow`) parses the len-3-rich, ELF-record-like `binary` fixture
+WORSE than `rung(1)` (`params(1)`, `Strategy::Fast`, depth 1, chainless one-pass) — confirming
+CLAUDE.md's own standing warning in mechanistic, not just statistical, terms. Independently
+reproduced per-arm sizes (unpadded, same fixture): `l1_native` 662,559, `l2_gzip_primary`
+(L2's own best bonus arm) 663,392 — so `f(2) >= 663,392 > f(1) = 662,559` regardless of exactly
+which bonus arms are nested in. **Same verdict (revert was correct, no cheap fix exists), a
+strictly weaker and more defensible reason than "one inequality happened to be false" — the
+construction's proof had a gap a correct premise couldn't have closed either.**
+
 **Why there is no cheap fix inside this construction:** making `bonus(N)` also absorb
 `rung(N-1)` (so a future level's bonus set structurally dominates a past level's rung choice
 too) sounds like a small extension, but tracing it through shows `bonus(N)` would then have to
