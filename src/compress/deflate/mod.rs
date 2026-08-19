@@ -557,21 +557,6 @@ fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
-/// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
-fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    let best = pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(2)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    );
-    let gzip_greedy = encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast());
-    if gzip_greedy.len() < best.len() {
-        gzip_greedy
-    } else {
-        best
-    }
-}
-
 /// Pick-min: Lazy vs gzip `deflate_fast` at L3.
 ///
 /// THINNED 2026-08-19 (`pickmin_arm_audit::win_rate_report`, the real 23-file
@@ -627,6 +612,64 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
     deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), 5, true, true)
 }
 
+/// Combined L1+L2 arm dispatch, all 5 arms (L1's 2, L2's 3) spawned
+/// CONCURRENTLY via `std::thread::scope` instead of L1 fully resolving (its
+/// own internal 2-way parallel pick-min) before L2 starts.
+///
+/// SCOPED NARROWLY, not a return of full L1-L5 parallelization: a prior
+/// version of this branch (`bc75535e`) parallelized every arm across every
+/// level up to L5 (~11 threads at L5) and was shipped as a "3.1-3.4x wall
+/// win" off ONLY this laptop's (M1/aarch64) numbers. A direct `hyperfine`
+/// check on the x86_64 solvency box (the project's wall authority) — run
+/// against the exact binaries `fulcrum try` had already built there — found
+/// it net negative at 3 of 5 levels: L1 tie, L2 1.59-1.83x FASTER (every
+/// file tested), L3 1.19x SLOWER, L5 1.04-1.08x SLOWER. `bc75535e` was
+/// REVERTED (`0edecd3`); see PLAN.md's top-of-file retraction and
+/// `project_t1_ratchet_parallel_dispatch_level_dependent.md` for the full
+/// account. **L2 is the one coordinate measured safe on BOTH architectures**
+/// (this laptop and x86_64 solvency) — this function is scoped to exactly
+/// that, not extrapolated further without the same dual-arch check.
+///
+/// PROOF OF BYTE-IDENTITY: same canonical-order argument the reverted full
+/// version used (see its history), scoped to `[L1's 2 arms] ++ [L2's 3
+/// arms]` — the first arm in that fixed order achieving the group's minimum
+/// wins any tie, exactly reproducing `deflate_one_shot_t1_l1_pick_min`
+/// followed by the OLD `deflate_one_shot_t1_l2_pick_min` (removed — its
+/// pair-then-third-sequential-arm shape is now folded directly into this
+/// function instead of a separate helper). `cargo test` after this change
+/// must show ZERO pin/fingerprint regeneration — verify this empirically,
+/// not just from the proof, per the same discipline that
+/// caught the reverted version's ARCH problem (which was a real regression
+/// the proof never claimed to rule out — the proof is about BYTES, not wall
+/// time).
+fn deflate_one_shot_t1_l1_l2_parallel(data: &[u8]) -> Vec<u8> {
+    std::thread::scope(|s| {
+        let l1a = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(1)));
+        let l1b = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
+        let l2a = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(2)));
+        let l2b = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
+        let l2c =
+            s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()));
+
+        let ordered = [
+            l1a.join().expect("ratchet arm l1a panicked"),
+            l1b.join().expect("ratchet arm l1b panicked"),
+            l2a.join().expect("ratchet arm l2a panicked"),
+            l2b.join().expect("ratchet arm l2b panicked"),
+            l2c.join().expect("ratchet arm l2c panicked"),
+        ];
+        let mut best: Option<Vec<u8>> = None;
+        for cur in ordered {
+            best = Some(match best {
+                None => cur,
+                Some(b) if cur.len() < b.len() => cur,
+                Some(b) => b,
+            });
+        }
+        best.expect("l1a always runs")
+    })
+}
+
 /// T1 whole-buffer/mmap output for levels 1..=5, with ladder monotonicity
 /// guaranteed BY CONSTRUCTION: level N's output size never exceeds level
 /// (N-1)'s, regardless of how many/which heterogeneous vendor-shaped arms
@@ -649,22 +692,37 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
 /// stack frame before any comparison could drop a loser — up to 5 near-input-sized
 /// buffers at once on incompressible data (an 83 MiB input could peak near 400+ MiB
 /// of ratchet-owned Vec<u8> alone, on top of what the underlying encoders allocate).
-/// This form holds at most THREE buffers at any moment, not two (correction,
-/// 2026-08-19 review): the outer `best` stays alive across the whole
-/// computation of `cur`, and computing `cur` itself has its own transient
-/// 2-buffer peak inside the level's own pick-min (either its two parallel
-/// arms, or an already-reduced best-of-those-2 plus a third sequential arm —
-/// see `deflate_one_shot_t1_l2_pick_min` for the shape). So peak = outer
-/// `best` + that level's own 2-buffer internal peak = 3, not 2. Still a large
-/// improvement over the prior recursive form's up-to-5, and the loser at
-/// each OUTER fold step is still dropped immediately every iteration — the
-/// correction is to the exact count, not the direction of the fix.
+/// This form holds at most THREE buffers at any moment during the L3-L5
+/// loop portion (correction, 2026-08-19 review): the outer `best` stays
+/// alive across the whole computation of `cur`, and computing `cur` itself
+/// has its own transient 2-buffer peak inside that level's own pick-min.
+/// So peak DURING THE LOOP = outer `best` + that level's own 2-buffer
+/// internal peak = 3. Still a large improvement over the prior recursive
+/// form's up-to-5, and the loser at each OUTER fold step is still dropped
+/// immediately every iteration — the correction is to the exact count, not
+/// the direction of the fix.
+///
+/// **UPDATED PEAK, 2026-08-19 (`deflate_one_shot_t1_l1_l2_parallel`):** for
+/// `level >= 2`, the FIRST step (computing L1+L2 combined) now spawns all 5
+/// arms concurrently, so its own transient peak is 5 buffers (every arm's
+/// output alive until the fold collapses them), not the 2 the old serial
+/// L1-then-L2 form held at any one moment. Overall peak across the whole
+/// call = max(5, 3) = 5, up from 3 — traded deliberately for wall time, at
+/// the SAME kind of tradeoff the removed full-L1-L5 parallel version made
+/// (peak 11) before being reverted for an unrelated (wall-time) reason; the
+/// memory tradeoff itself was never in question. L3-L5 stay the ORIGINAL
+/// serial per-level fold — see `deflate_one_shot_t1_l1_l2_parallel`'s doc
+/// comment for why the line is drawn exactly at L2.
 fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
     debug_assert!((1..=5).contains(&level));
-    let mut best = deflate_one_shot_t1_l1_pick_min(data);
-    for lv in 2..=level {
+    let mut best = if level == 1 {
+        deflate_one_shot_t1_l1_pick_min(data)
+    } else {
+        deflate_one_shot_t1_l1_l2_parallel(data)
+    };
+    let start = if level == 1 { 2 } else { 3 };
+    for lv in start..=level {
         let cur = match lv {
-            2 => deflate_one_shot_t1_l2_pick_min(data),
             3 => deflate_one_shot_t1_l3_pick_min(data),
             4 => deflate_one_shot_t1_l4_pick_min(data),
             5 => deflate_one_shot_t1_l5_pick_min(data),
