@@ -6,8 +6,50 @@
 
 ---
 
-## ⛔ RETRACTED AND REVERTED, 2026-08-19: the parallel-dispatch "wall fix" was NOT a universal
-## win — it is LEVEL-DEPENDENT, and net negative at 3 of 5 levels on the wall-authority box
+## ✅ L2-ONLY PARALLEL DISPATCH, 2026-08-19, commit `848b8924` — DUAL-ARCH VERIFIED before
+## claiming anything, the discipline the section below was reverted for skipping
+
+Built the narrower successor named in the retraction below: `deflate_one_shot_t1_l1_l2_parallel`
+spawns L1's 2 arms + L2's 3 arms concurrently (5 threads), L3-L5 unchanged (original serial
+fold). Byte-identity verified empirically (`cargo test --release`, zero pin/fingerprint
+regeneration) before any wall measurement, same as always.
+
+**Measured on BOTH architectures BEFORE writing this section, not after:**
+
+    M1/aarch64 (this laptop), hyperfine paired:
+      L2, 3 MiB incompressible: 96.5ms -> 52.2ms (1.85x)
+      L2, dickens (12 MB):      185.8ms -> 103.9ms (1.79x)
+      L1, 3 MiB (untouched code path, expect a tie): 51.8ms -> 52.0ms (1.00x, confirmed no
+        regression from the unrelated code motion)
+
+    x86_64 solvency (wall authority), hyperfine paired, run directly on the box against the
+    exact arm binaries (not fulcrum's per-invocation timing, which has the jitter problem named
+    below — hyperfine's own outlier detection handled the box's variable load fine, flagging
+    "statistical outliers detected" on 2 of 4 runs but still reporting a clear, consistent
+    signal each time):
+      L2, dd79_bin6:  206.2ms -> 133.4ms (1.55x)
+      L2, access.log: 250.5ms -> 146.8ms (1.71x)
+      L2, dickens:    288.3ms -> 169.6ms (1.70x)
+      L1, dd79_bin6 (untouched, expect a tie): 131.2ms -> 134.5ms (1.02x, within noise)
+
+**Consistent, real win on both architectures, three different files each, L1 confirmed
+unchanged on both.** This is the properly-scoped, properly-verified successor to the reverted
+full-L1-L5 parallelization below — L2 alone, not extrapolated to L3-L5 without repeating this
+exact dual-arch check first (that is precisely the corner the reverted version cut).
+
+**Still not a `fulcrum try` adjudicated SHIP** — these are paired hyperfine numbers on two
+machines, not the promotion-rule adjudicator. Given the box's own wall-census tooling has a
+demonstrated jitter problem at short/fast T1 cells (documented below), getting an actual
+`fulcrum try` wall verdict for this scoped version is the honest next step, not assumed from
+these numbers alone — but the numbers are real, precise (tight enough for hyperfine's own
+outlier detector to still call a clear winner), and now properly dual-arch, which the
+FIRST version never was before being shipped.
+
+---
+
+## ⛔ RETRACTED AND REVERTED, 2026-08-19: the FULL parallel-dispatch "wall fix" was NOT a
+## universal win — it is LEVEL-DEPENDENT, and net negative at 3 of 5 levels on the wall-authority
+## box (superseded above by the properly-scoped, dual-arch-verified L2-only version)
 
 Every section below celebrating commit `bc75535e` ("parallelize the T1 L1-L5 ratchet's arm
 dispatch") as a 3.1-3.4x wall win is **WRONG AS STATED — read this section first, they are
