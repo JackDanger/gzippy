@@ -635,25 +635,31 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
 /// at ~13-20x a single L9 encode — unmeasured and likely wall-prohibitive.
 /// L6-L9 keep today's `KNOWN_SAGS`-pinned behavior until that is measured
 /// (`fulcrum try --levels 1-9` on a ref that extends this range).
+///
+/// ASCENDING ITERATIVE FOLD, not recursion (cursor-agent/Codex pre-merge review,
+/// 2026-08-18): the first version recursed level-down-to-1, so completing a level-5
+/// call held cur5, cur4, cur3, cur2 AND cur1 alive SIMULTANEOUSLY at the deepest
+/// stack frame before any comparison could drop a loser — up to 5 near-input-sized
+/// buffers at once on incompressible data (an 83 MiB input could peak near 400+ MiB
+/// of ratchet-owned Vec<u8> alone, on top of what the underlying encoders allocate).
+/// This form holds at most two buffers at any moment: `best` and the level just
+/// computed; the loser is dropped immediately every iteration.
 fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
     debug_assert!((1..=5).contains(&level));
-    let cur = match level {
-        1 => deflate_one_shot_t1_l1_pick_min(data),
-        2 => deflate_one_shot_t1_l2_pick_min(data),
-        3 => deflate_one_shot_t1_l3_pick_min(data),
-        4 => deflate_one_shot_t1_l4_pick_min(data),
-        5 => deflate_one_shot_t1_l5_pick_min(data),
-        _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
-    };
-    if level == 1 {
-        return cur;
+    let mut best = deflate_one_shot_t1_l1_pick_min(data);
+    for lv in 2..=level {
+        let cur = match lv {
+            2 => deflate_one_shot_t1_l2_pick_min(data),
+            3 => deflate_one_shot_t1_l3_pick_min(data),
+            4 => deflate_one_shot_t1_l4_pick_min(data),
+            5 => deflate_one_shot_t1_l5_pick_min(data),
+            _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
+        };
+        if cur.len() < best.len() {
+            best = cur;
+        }
     }
-    let prev = deflate_one_shot_t1_ratcheted(data, level - 1);
-    if prev.len() < cur.len() {
-        prev
-    } else {
-        cur
-    }
+    best
 }
 
 fn deflate_into(
