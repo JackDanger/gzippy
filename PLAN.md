@@ -52,6 +52,17 @@ first non-improving candidate at levels <5) and [P10] (`deflate_medium`'s overla
 are the two that most directly touch match ACCEPTANCE rather than insertion and were not tried
 this session.
 
+**`photo.jpg` L1-3 T4 vs gzip (+0.04% each) — NAMED, not investigated: a real T4-only seam
+residual, out of this branch's T1-scoped charter.** Direct check: our OWN T4 output is larger
+than our OWN T1 output on this file by 3,604 B (L1), 11,257 B (L2), 10,229 B (L3) — and T1 is
+already SMALLER than gzip on L2/L3 (the `#332`/`c8bbde67` closed cells), so the T4 seam cost is
+large enough to erase that win and flip the T4 cell to a loss. MEMORY.md's board summary says
+"the seam class is CLOSED (bit-splice merged in the Cursor wave)" — this file's T4 residual
+contradicts that as stated, or names an exception the merged fix doesn't cover; not
+reconciled. This is a T>1 mechanism (CLAUDE.md STEP 2, a separate code path from this branch's
+T1 ratchet work, needing the causation/starvation tooling, not `fulcrum why`/`candidates`) —
+named here as the next board-visible item, not pursued.
+
 ---
 
 ## 🛑 CRITICAL, MEASURED 2026-08-18 — the whole ratchet mechanism has a severe, likely-disqualifying wall cost, on BOTH routes
