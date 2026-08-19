@@ -6,6 +6,48 @@
 
 ---
 
+## ✅ LANDED, 2026-08-19, commit `804fdbb0` — dd79_bin6 L3 hash3-chain-repair, driven through
+## cursor-agent (real implementation work, not review), independently re-verified before merge
+
+Per the user's directive to drive expansive implementation work through `codex exec` and
+`cursor-agent` (not just review), redirected the dd79_bin6 L3 residual investigation to
+cursor-agent in an isolated worktree (codex itself hit its usage quota and did no real work —
+see below). Result, in full:
+
+**Real bug found, not a parameter tweak:** `HcMatchfinder::skip_bytes` overwrote `hash3_tab`
+heads during match interiors WITHOUT linking `next3_tab` — leaving stale length-3 chain links
+that `longest_match`'s own chain walk expected to be able to traverse. gzip links every inserted
+position (vendor-precedented). Fixed as a new, purely-additive pick-min arm
+(`params_l3_gzip_hash3_chain_repair`: `maintain_hash3_chain: true` + gzip's L3 chain depth 32),
+gated by a new `LevelParams` field defaulting `false` everywhere else — cannot touch any other
+level's or arm's output.
+
+**Numbers (independently re-verified by me, not just trusted from the agent's report):**
+`gzip:dd79_bin6:L3:T1` — 4,448,460 B (+0.271% vs gzip, FAILING) → 4,431,260 B (−0.116% vs gzip,
+**PASSING**), −17,200 B. Corpus-wide L3 win rate (`pickmin_arm_audit`): 3/23 (wins dd79_bin6
+specifically; `l3_native` still dominant at 17/23, `l3_libdeflate_greedy` still 0/23 dead
+weight).
+
+**Verification chain, every step re-run independently on the merged branch, not just taken from
+the agent's report:** `cargo build --release` clean zero warnings; `cargo test --release` full
+suite green, zero pin regeneration; direct `wc -c` size check matched the agent's number
+exactly; `tie-guard.sh --levels 1,2,3,4,5,6,9` PASS (161 probed, 33 tied, 0 flipped) — run twice,
+once in the agent's worktree, once again after cherry-picking onto the main lever branch.
+Cherry-picked cleanly (`a3010bf6` → `804fdbb0`), pushed.
+
+**Candidates correctly rejected, with reasoning, before landing on this one** (from `fulcrum
+candidates gzip:dd79_bin6:L3:T1`, 24 applicable techniques read in full): [P14] early-exit on
+non-improving candidates moves the WRONG direction for a match-COUNT deficit (can only find
+equal-or-shorter matches, never more); insert-density/sparse `skip_bytes` was already falsified
+earlier this session (see the retraction further down); [P10] `deflate_medium` overlap-fixup not
+tried, lower priority since chain-repair already closed the named cell.
+
+**Codex status: still exhausted (usage quota, resets ~Sep 17), did zero real work on its
+assigned task before erroring out.** cursor-agent is now the sole practical driver for delegated
+implementation work this session, per the user's explicit direction.
+
+---
+
 ## ✅ L2-ONLY PARALLEL DISPATCH, 2026-08-19, commit `848b8924` — DUAL-ARCH VERIFIED before
 ## claiming anything, the discipline the section below was reverted for skipping
 
