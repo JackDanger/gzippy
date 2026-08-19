@@ -6,6 +6,63 @@
 
 ---
 
+## ⛔ RETRACTED AND REVERTED, 2026-08-19: the parallel-dispatch "wall fix" was NOT a universal
+## win — it is LEVEL-DEPENDENT, and net negative at 3 of 5 levels on the wall-authority box
+
+Every section below celebrating commit `bc75535e` ("parallelize the T1 L1-L5 ratchet's arm
+dispatch") as a 3.1-3.4x wall win is **WRONG AS STATED — read this section first, they are
+left in place (quote-and-strike) as the record of what was believed and why it was wrong, not
+as current fact.**
+
+**What happened:** the 3.1-3.4x numbers were measured ONLY on this M1 laptop (aarch64). The
+wall-census UNDECIDED investigation below (three attempts, all inconclusive from box noise)
+prompted a DIFFERENT, more direct check: running `hyperfine` — a statistically rigorous tool,
+NOT fulcrum's per-invocation timing — directly on the x86_64 solvency box (the project's
+designated wall authority) against the exact two binaries `fulcrum try` had already built
+there. That measurement is precise (tight std devs, no jitter, unlike fulcrum's VOIDs) and
+reveals the fix is **LEVEL-DEPENDENT, not a universal win**, consistent across three different
+files (dd79_bin6, access.log, dickens):
+
+    L1: tie (1.00x)
+    L2: BIG WIN, 1.59-1.83x FASTER, every file tested
+    L3: LOSS, 1.19x SLOWER
+    L5: LOSS, 1.04-1.08x SLOWER
+
+This is net negative at 3 of 5 tested levels on the authoritative box — the opposite of the
+"universal win" every earlier section claims. **REVERTED** (`git revert bc75535e`, commit
+`0edecd3`) — CLAUDE.md: "a change that makes things worse gets reverted." Full test suite green
+after the revert.
+
+**Mechanistic read, not yet independently confirmed:** `User` time in every hyperfine run rose
+sharply for the parallel form (e.g. dickens L5: 443ms serial vs 1845ms parallel, ~4.2x more
+total CPU work) while wall time barely moved or regressed — the parallelism IS spreading work
+across cores, but on this x86_64/Linux box the marginal thread-spawn/scheduling cost of L3's and
+L5's ADDED arms (more concurrent OS threads) apparently outweighs their parallel savings, while
+L2's smaller thread count (5 arms) stays a clear net win everywhere. Plausible but UNCONFIRMED:
+whether this is pure thread-count overhead, cache/NUMA contention, or turbo-clock throttling
+under higher concurrency — not measured, would need `fulcrum profile counters` on this box.
+
+**What this does NOT retract:** the wall-cost MECHANISM this fix targeted is still real and
+still open (the CRITICAL section further down: ~11 serial arm-encodes, 7.3x/8.7x slower than
+libdeflate on the M1). The FOLD-SHAPE analysis (byte-identical equivalence proof for running
+arms concurrently vs serially) is still correct and reusable. **The real, much narrower,
+promising lead this session's correction surfaces: L2's parallel dispatch alone is a clear,
+consistent win on the one architecture that matters for wall grading.** A future lever should
+parallelize ONLY through L2's arm set (5 arms: L1's 2 + L2's 3) and keep L3-L5 serial as before
+— NOT built here, this session ran out of room to design and re-measure it properly after
+finding the problem. Any such lever needs BOTH architectures measured before being trusted,
+which is exactly the discipline this correction is paying the cost of having skipped once.
+
+**Process lesson, banked to memory:** a wall claim measured on only ONE architecture, however
+carefully paired/locally rigorous, is not a wall claim — CLAUDE.md's own "SIZE IS ARCH-
+INVARIANT; WALL IS ARCH-EXPOSED" was sitting right there and got skipped for the fast path
+(believe the laptop, defer the box for adjudication) instead of the slow path (get a second
+architecture's number before calling it a fix). The fulcrum UNDECIDED investigation below is
+what indirectly forced the second-architecture check that caught this — a genuinely lucky save,
+not a designed one.
+
+---
+
 ## Wall census attempted on solvency, 2026-08-19: UNDECIDED (not NO-SHIP), box noise CONFIRMED
 ## by direct measurement, not inferred
 
@@ -36,11 +93,16 @@ first x86_64 confirmation of the same result. Artifact:
 `/root/www/gzippy-bench/campaign/lever-origin-lever-l3-gzip-deflate-fast-pickmin/try.json`
 (solvency box; not yet pulled to a synced location).
 
-**Next action for whoever continues: re-run the SAME command once the box is verified quiet by
-a FULL-DURATION check (not a single `mpstat` snapshot — this session's own miss), or once the
-vLLM tenant is gone.** The local hyperfine numbers (3.1-3.4x wall reduction, PLAN.md above) are
-still the best available signal of DIRECTION and MAGNITUDE; they are not, and were never
-claimed to be, a substitute for this adjudicator.
+**Superseded — see the retraction at the top of this file.** ~~Next action for whoever
+continues: re-run the SAME command once the box is verified quiet by a FULL-DURATION check (not
+a single `mpstat` snapshot — this session's own miss), or once the vLLM tenant is gone. The
+local hyperfine numbers (3.1-3.4x wall reduction, PLAN.md above) are still the best available
+signal of DIRECTION and MAGNITUDE; they are not, and were never claimed to be, a substitute for
+this adjudicator.~~ The M1-only numbers were WRONG (not just unadjudicated) — a direct x86_64
+hyperfine check found the fix net negative at 3 of 5 levels, and `bc75535e` was reverted. The
+UNDECIDED wall census below was for a commit that no longer exists on this branch; re-running it
+against the reverted state would presumably resolve cleanly, but the branch has moved on from
+needing that specific verdict.
 
 **TWO FOLLOW-UP ATTEMPTS, same session, both converge on the same result — this is now
 TRIANGULATED, not a single inconclusive run:**
@@ -414,8 +476,11 @@ the still-open wall question — but merge-readiness needs the wall leg resolved
 named decision to ship size-only with wall tracked as a follow-up, which is a call for the next
 session or the user, not something to resolve by continuing to add levers unchecked.
 
-**WALL LEG: MECHANISM FOUND AND FIXED, 2026-08-19 (commit `bc75535e`), pending box
-adjudication.** Diffed what the ratchet's own code was doing against what it NEEDED to do (the
+**⚠ WALL LEG, 2026-08-19 (commit `bc75535e`) — SEE THE RETRACTION AT THE VERY TOP OF THIS FILE.
+The "MECHANISM FOUND AND FIXED" framing below was PREMATURE: `bc75535e` was REVERTED (commit
+`0edecd3`) after a second-architecture check found it net negative at 3 of 5 levels. Left
+in place as the record of the reasoning, not as current fact.** Diffed what the ratchet's own
+code was doing against what it NEEDED to do (the
 `/goal` directive's own framing): every prior version computed each level's own arms then
 folded the FINISHED result before starting the next level's arms — a purely SERIAL chain of
 ~11 independent O(n) parses to reach L5, on a 10-core laptop. Nothing about correctness ever
