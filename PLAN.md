@@ -1,8 +1,72 @@
 # gzippy encoder campaign — handoff
 
-**Date:** 2026-08-17  
+**Date:** 2026-08-17 (updated 2026-08-18)  
 **Done when:** **0 / 1320** failing GATE promotion-board cells (size AND wall, per-label, T1 and T>1).  
 **Not done when:** a session summary, a partial lever, or a hand measurement without `make lever`.
+
+---
+
+## ⛔ PROMOTION PAUSED 2026-08-18 — Codex pre-merge review found a real, confirmed gap
+
+The `lever/l3-gzip-deflate-fast-pickmin` branch (now at `8b0a21b0`, worktree
+`~/www/gzippy-lever-l3-pickmin` — the primary `~/www/gzippy` worktree is back on
+`main`, see "LOCAL LAYOUT" note in memory `feedback_repo_discipline.md`) is a three-agent-reviewed
+(Fable, cursor-agent x2, Codex) ratchet fix for a ladder-monotonicity regression the L3
+pick-min lever introduced. Codex's review found what all three prior reviews missed:
+
+**`deflate_one_shot_t1_ratcheted` only reaches the T1 whole-buffer/mmap route.** The
+STREAMING route — what the CLI actually uses for stdin/pipe input
+(`gzippy -N -c - < file`) and what every library caller of `compress_bytes`/
+`compress_with_pipeline` gets regardless of input source — dispatches to entirely
+separate code (`encode_gzip_reader_to_writer_sized`) never wired into the ratchet, and
+is NOT ladder-monotone in production. **Confirmed by direct CLI execution** (not just
+trusted): `binary` fixture, T1, `-p1`, real binary — L1=662,577 → L2=666,107 (up) →
+L3=661,353 (down) → L4=663,583 (up again) → L5=657,593 (down).
+
+**This is NOT a regression this branch introduced** — verified via a throwaway probe
+that `origin/main` (before c8bbde67/b4b821c9 ever existed) shows the IDENTICAL sag set
+on the streaming route today. It was simply never covered by `ladder_is_monotone_t1`
+(which only ever tested `encode_gzip_bytes_to_vec`), so nothing caught it until now.
+
+**User decision (2026-08-18): the ladder invariant is REQUIRED on the streaming route
+too — not a vendor-fidelity nicety.** CLAUDE.md non-negotiable #5 applies. Fixing this
+is now part of finishing this branch, not a follow-up.
+
+**Done so far (commits `22f8042a`, `8b0a21b0`):**
+1. Fixed a second, independent Codex finding: `deflate_one_shot_t1_ratcheted` was
+   recursive, holding up to 5 near-input-sized buffers alive simultaneously at peak
+   (an 83 MiB input could peak ~400+ MiB of ratchet-owned `Vec<u8>` alone). Rewritten
+   as an ascending iterative fold — same computation, byte-identical output, only 2
+   buffers alive at any moment.
+2. Added two RED tests pinning the streaming gap as the fix's acceptance criteria
+   (deliberately not silenced with an allowlist): `size_invariants.rs::streaming_t1_is_ladder_monotone`
+   (in-process, `compress_bytes`, all fixtures) and
+   `t1_mmap_route.rs::t1_pipe_stdin_is_ladder_monotone_l1_to_l5` (real CLI binary,
+   piped stdin, L1-5). Both correctly exclude ONLY the two pre-existing `("text",7)`/
+   `("text",8)` sags already shared with (and accepted for) the mmap route — confirmed
+   present on `origin/main` too, unrelated to any pick-min/ratchet lever. Full measured
+   streaming sag set: `("text",7)` +567 B, `("text",8)` +413 B (both excluded, shared),
+   `("tabular",3)` +15,770 B, `("binary",1)` +3,530 B, `("binary",3)` +2,230 B,
+   `("noise",1)` +5 B (these four are the real gap, currently failing).
+
+**NOT yet done — this is the next work:** design and implement a fix that makes the
+streaming route ladder-monotone WITHOUT losing its point (bounded memory for large
+piped input — true single-pass streaming architecturally cannot re-read input to try
+multiple candidate encodings and pick the smallest, so "just add pick-min to
+streaming" does not work as a design; ANY hard-guarantee mechanism trades some of
+that memory-boundedness away, at least past some size threshold). This is a real
+architecture question, not a bug-fix — being routed through Fable and cursor-agent
+for a design pass before implementation, per this session's established practice for
+judgment calls of this weight.
+
+**The remote wall census** (`--threads 1 --levels 1,2,3,4,5,6`, PID 975533 on solvency,
+`CAMPAIGN_OUT=/root/lever-b4b821c9-wall-3`) was left running through this — it
+measures the mmap-route ratchet's wall cost, which the iterative-vs-recursive rewrite
+does not change (same computation). Its result remains informative for that question
+but is NOT the final gating measurement — a fresh lever run against the truly final
+commit (once streaming is fixed) is still required before promotion.
+
+---
 
 ---
 
