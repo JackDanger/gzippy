@@ -244,11 +244,43 @@ question, not a counting exercise, and deserves its own pass rather than being r
 cuts the cumulative-to-L5 total from 12 to 11 (~8%) — nowhere near enough. The wall-cost
 question (this file's "CRITICAL" section at top) remains genuinely open; this is one small,
 zero-risk piece of the "thin inside the correct fold" direction, not a resolution of it. Full
-`cargo test --release` re-run in progress to confirm this change is byte-identical everywhere
-it should be (0 wins ⇒ removing the arm should regenerate ZERO pins, unlike the falsified
-redesign above); tie-guard and a size-only lever check are next, then an honest reassessment of
-whether arm-thinning alone can ever close the wall gap or whether this needs to go back to
-option 2 (size-gating) or back to the user given how large the remaining gap looks.
+`cargo test --release` re-run: green, ZERO pins regenerated, confirming byte-identity as 0/23
+predicts. `tie-guard.sh HEAD --levels 1,2,3,4,5,6,9`: **PASS** — 161 cells probed, 33 tied, 0
+flipped.
+
+**Adversarially reviewed 2026-08-19** (codex exec + cursor-agent, parallel, per standing
+instruction — extended to codex this round at the user's request): codex hit its own usage
+limit mid-run (no verdict, but confirmed the audit's L3 arm list matches the pre-removal
+shipped function before cutting off). cursor-agent completed both claims as **VERIFIED WITH
+CAVEAT**: independently reproduced the `binary` fixture numbers and the 0/23 count, confirmed
+the audit is methodologically equivalent to the pre-removal shipped pick-min, confirmed full
+suite + zero pin regen — and found a SHARPER root-cause for the falsified redesign than this
+file's own first framing (see "IMPLEMENTED THEN FALSIFIED AND REVERTED" above, now corrected
+in place). Honest limit named on Claim 2: 0/23 closes a counting question on 23 files, not a
+universal theorem — accepted, the kept `#[allow(dead_code)]` audit arm is the sentinel for a
+future corpus shift.
+
+**`fulcrum try HEAD --size-only`, `CAMPAIGN_LEVELS=1-9`, full 22-file corpus, 594 decidable
+cells (gzip+pigz+libdeflate; igzip declared absent — not built on this laptop worktree, and
+this change is a proven byte-identical no-op so it cannot possibly show anything igzip-specific
+new): VERDICT SHIP.** Every clause passes: clause 2 (arms differ), clause 1 (zero roundtrip
+failures), clause 3 (**zero pass→fail flips across 594 cells**), clause 4 (**closes
+`gzip:photo.jpg:L3:T1:size`** — one of the three cells this branch's earlier L3 work was
+supposed to hold, confirmed still closed against the `origin/main` baseline), clause 5 (every
+passing cell inside its erosion budget), clause 6 (improvement 0.0033 vs 0.0000 confirmed-real
+harm), clause 7 (aarch64 covered), clause 8 (paired-method, n fixed before the run). Artifact:
+`/Users/jackdanger/www/gzippy-bench/campaign/lever-HEAD/try.json`.
+
+**This is a real, adjudicated, banked SIZE-leg result for the whole branch (`e888ac9f` ..
+`217438d5`), not just today's thinning.** It is NOT a full promotion verdict — CLAUDE.md's bar
+is size AND wall together, `--size-only` explicitly does not grade wall, and the wall leg (the
+7.3x/8.7x regression named in this file's own CRITICAL section) remains genuinely unresolved:
+today's one arm cut is ~8% of the cumulative arm cost, nowhere near enough on its own. **Per
+CLAUDE.md ("land cleared work before starting a new lever"), the size leg being SHIP-clean is
+itself worth banking now** (PR opened / updated with this verdict) rather than held hostage to
+the still-open wall question — but merge-readiness needs the wall leg resolved or an explicit,
+named decision to ship size-only with wall tracked as a follow-up, which is a call for the next
+session or the user, not something to resolve by continuing to add levers unchecked.
 
 ---
 
