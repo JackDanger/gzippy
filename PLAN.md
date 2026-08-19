@@ -6,6 +6,73 @@
 
 ---
 
+## 🛑 CRITICAL, MEASURED 2026-08-18 — the whole ratchet mechanism has a severe, likely-disqualifying wall cost, on BOTH routes
+
+Discovered while responding to a fourth review's demand for real wall/RSS measurement of the
+streaming fix (see "PROMOTION PAUSED" section below for that review's four findings — all
+confirmed correct, but this is bigger than any of them). **This is not scoped to streaming.**
+The mmap/file route from `b4b821c9` — reviewed clean by Fable, cursor-agent, and a prior
+Codex pass — has the SAME problem, because it's the SAME mechanism (cumulative multi-arm
+pick-min via `deflate_one_shot_t1_ratcheted`).
+
+**Two independent measurements, both executed, neither noise:**
+
+1. **Streaming route, directly measured (hyperfine, 15+ paired runs):** 3 MiB incompressible
+   pipe input, `-5`. Branch: 295ms. Old code (main): 40ms. libdeflate: 34ms. gzip: 66ms. pigz:
+   61ms. **The branch is 7.3x slower than our own prior code and 8.7x slower than libdeflate**
+   — on an ordinary, common-shape request. 11x more instructions retired, 3x peak RSS.
+
+2. **Mmap/file route, from the in-flight wall census** (`CAMPAIGN_OUT=/root/lever-b4b821c9-wall-3`,
+   `--threads 1 --levels 1,2,3,4,5,6`, launched to validate the ORIGINAL ratchet from `b4b821c9`,
+   not the streaming fix): **319 confirmed wall losses vs 75 confirmed wins** (81% loss rate)
+   among `RESOLVED` (non-noise, non-VOID) cells so far, still running. Confirmed via the
+   per-cell JSON artifacts (`a` = our gzippy, `b` = rival; `RESOLVED-a-slower` = we lost,
+   re-verified against a `wall_class: WIN` example to be certain of the field semantics before
+   concluding anything). Worst confirmed ratios: up to 29x slower than a rival. Multiple cells
+   show the box's own 3x-n re-confirmation mechanism OVERRIDING an initial win into a confirmed
+   loss (e.g. `gzip:weights.safetensors:L3:T1`: first pass 0.42x [win] → confirmed 2.43x
+   [loss]) — this is exactly what CLAUDE.md's flip-confirmation exists to catch, and it is
+   catching a real regression, not noise.
+
+**Root cause (reasoned, not yet independently re-verified against a profiler — name this
+before trusting it further):** `deflate_one_shot_t1_ratcheted` computes the CUMULATIVE union
+of every level 1..N's own multi-arm pick-min to guarantee monotonicity. At L2 this is
+~4-5 arms (L1's 2 + L2's 2-3); by L5 it's ~10-12 arms. Each arm is a FULL independent parse of
+the input. On files small enough that a single rival pass is already fast (sub-100ms), running
+10+ of our own passes to save a few hundred bytes is a wall-losing trade — the SIZE win the
+ratchet buys is real and was correctly SHIP-verdicted, but nothing in this campaign's earlier
+review chain (mine, Fable's, cursor-agent's, an earlier Codex pass) priced this cost before
+now, because no one had run a real wall census against this exact ref until this session.
+
+**What this means for the branch:** size-only promotion (the `--size-only` SHIP verdict from
+earlier this session) is NOT sufficient on its own — CLAUDE.md's own bar is size AND wall, and
+this looks headed for a wall NO-SHIP. Do not merge on the size verdict alone. Do not spend
+further effort polishing streaming test coverage (the fourth review's findings #1/#3/#4) until
+this is resolved — if the ratchet mechanism gets redesigned to cut arm count, those tests may
+need to change again anyway.
+
+**Options, not yet decided:**
+1. **Cap the arm count / narrow the ratchet's cumulative scope** — e.g., each level compares
+   against only level N-1's WINNING arm (not the full re-derivation this session's recursive
+   and iterative implementations both do), which is a fundamentally different, cheaper
+   construction than "compute everyone's own arms and fold." Needs its own design pass.
+2. **Gate the ratchet on file size** — only pay the multi-arm cost above some threshold where
+   the absolute wall cost stops mattering relative to rivals (small files are exactly where
+   the RATIO looks worst even though the ABSOLUTE time is small). Same class of routing CLAUDE.md
+   already permits (input-size, not content) but changes what "closes a size cell" means for
+   small files.
+3. **Revert to before `c8bbde67`** and re-approach the original L3 lever with wall priced in
+   from the start, per the CLAUDE.md rule this session already learned the hard way once
+   (run `cargo test` first) and is now learning again at a larger scale (measure wall before
+   declaring a multi-arm mechanism safe, not after it's spread across two routes).
+
+**Next action: get the actual `fulcrum try` verdict (SHIP/NO-SHIP/UNDECIDED with clause
+numbers) once the census finishes** — the tallies above are this session's own log-reading,
+useful for orientation but not the adjudicator. Do not decide among the three options above
+without it.
+
+---
+
 ## ⛔ PROMOTION PAUSED 2026-08-18 — Codex pre-merge review found a real, confirmed gap
 
 The `lever/l3-gzip-deflate-fast-pickmin` branch (now at `8b0a21b0`, worktree
