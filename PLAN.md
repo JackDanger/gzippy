@@ -282,6 +282,49 @@ the still-open wall question — but merge-readiness needs the wall leg resolved
 named decision to ship size-only with wall tracked as a follow-up, which is a call for the next
 session or the user, not something to resolve by continuing to add levers unchecked.
 
+**WALL LEG: MECHANISM FOUND AND FIXED, 2026-08-19 (commit `bc75535e`), pending box
+adjudication.** Diffed what the ratchet's own code was doing against what it NEEDED to do (the
+`/goal` directive's own framing): every prior version computed each level's own arms then
+folded the FINISHED result before starting the next level's arms — a purely SERIAL chain of
+~11 independent O(n) parses to reach L5, on a 10-core laptop. Nothing about correctness ever
+required that seriality (every arm is independent; none reads another's output) — it was an
+artifact of the code's shape, not the algorithm. Rewrote `deflate_one_shot_t1_ratcheted` to
+spawn every needed arm as its own thread via `std::thread::scope` and fold the results with the
+IDENTICAL strict-`<` tie-break composition the serial form used (proof in the function's own
+doc comment: three strict-`<`-ties-to-earlier-operand folds compose into "first element in a
+fixed canonical order to hit the global minimum wins," and parallel execution changes WHEN each
+arm is computed, never WHAT the fold compares).
+
+**Verified, not assumed:** `cargo build --release` clean; `cargo test --release` full suite
+green with **ZERO pin/fingerprint regeneration** — confirms the equivalence proof empirically.
+`tie-guard.sh HEAD --levels 1,2,3,4,5,6,9`: PASS, 161 probed / 33 tied / 0 flipped.
+
+**Measured locally (hyperfine, paired, this machine, before any box time — cheapest falsifier
+first):**
+
+    3 MiB incompressible, -5, T1: 259ms (serial) -> 76ms (parallel), 3.4x faster.
+                                   libdeflate gap: 8.22x -> 2.42x.
+    dickens (12 MB real text), -5, T1: 678ms -> 219ms, 3.1x faster.
+                                   libdeflate gap: 5.25x -> 1.70x.
+    4 KB incompressible, -5, T1: 3.5ms -> 3.0ms, no regression (noise-level either way).
+
+Consistent, large win across synthetic incompressible, real compressible content, and small
+files (no thread-spawn-overhead regression found at any size tested). **Does NOT fully close
+the gap to libdeflate** — still 1.7-2.4x slower, down from 5.25-8.22x. This is a SCHEDULING fix,
+not a reduction in total CPU work: `User` time in the 3 MiB case rose slightly (433ms -> 483ms,
+thread overhead), while `Wall` time fell 3.4x. Peak memory rises from ~3 buffers to up to 11.
+
+**BLOCKED on box adjudication, not on more work here:** the solvency box
+(`root@10.0.2.240` via `-o ProxyJump=neurotic`) is reachable but NOT frozen right now — `ps aux`
+shows a 4-worker vLLM inference job (`VLLM::Worker_TP0-3`) at ~400% combined CPU, load average
+5.7-7.0. Per CLAUDE.md's own repeated wall-measurement discipline (paired, frozen box, "a
+freshly rebooted/contended box is not a frozen box"), a wall census run against this contention
+would produce numbers the campaign's own rules already know not to trust. **Next action for
+whoever continues: check box load, and once quiet, run `fulcrum try HEAD --threads 1 --levels
+1-6` for the adjudicated wall verdict** — the local numbers above are strong directional
+evidence (3.1-3.4x wall reduction, reproduced on 3 different input shapes) but are NOT the
+adjudicator CLAUDE.md requires for a final wall claim.
+
 ---
 
 ## ⛔ PROMOTION PAUSED 2026-08-18 — Codex pre-merge review found a real, confirmed gap
