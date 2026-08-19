@@ -549,76 +549,22 @@ fn gzip_wrap_unpadded_deflate(data: &[u8], deflate: Vec<u8>) -> Vec<u8> {
     gz
 }
 
-/// Pick-min: igzip vs gzip-primary L1 fast path (mmap + whole-buffer).
-fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(1)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    )
-}
-
-/// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
-/// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
-fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    let best = pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(2)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    );
-    let gzip_greedy = encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast());
-    if gzip_greedy.len() < best.len() {
-        gzip_greedy
-    } else {
-        best
-    }
-}
-
-/// Pick-min: Lazy vs gzip `deflate_fast` at L3.
-///
-/// THINNED 2026-08-19 (`pickmin_arm_audit::win_rate_report`, the real 23-file
-/// GATE corpus, T1): the third arm this function used to try,
-/// `params_l3_libdeflate_greedy`, won ZERO of 23 L3 cells — every single file
-/// had a strictly smaller (or tied-and-thus-redundant) result from one of the
-/// other two arms. An arm that never wins cannot be the reason any current
-/// cell is closed, so dropping it cannot reopen one; it only cuts L3's own
-/// arm count from 3 to 2 (part of the wall-cost thinning direction PLAN.md
-/// names after the "rung + nested bonus" fold-shape redesign was built and
-/// falsified same day — see PLAN.md's CRITICAL section). `params_l3_
-/// libdeflate_greedy` itself is kept (still `pub`, still exercised by the
-/// audit) so a future corpus/content shift that makes it start winning again
-/// shows up as a nonzero count next run, not silently.
-fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(3)),
-        || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()),
-    )
-}
-
-/// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
-///
-/// Does NOT carry its own gzip-`deflate_fast`-shaped arm: L3's pick-min
-/// gained one (`params_l3_gzip_deflate_fast`) and briefly let L3 leapfrog L4
-/// in size (`ladder_is_monotone_t1` regression, 2026-08-17). Mirroring the
-/// same arm onto L4 fixed L3->L4 but only pushed the identical violation to
-/// L4->L5 (proof by execution that arm-by-arm mirroring cannot terminate).
-/// The actual fix is [`deflate_one_shot_t1_ratcheted`], which caps every
-/// level's output at the level below's — L4 gets L3's winning arm for free
-/// through the ratchet instead of needing its own copy.
-fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
-    let mut lazy_params = level::params(4);
-    lazy_params.strategy = level::Strategy::Lazy;
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(4)),
-        || encode_unpadded_deflate_bytes(data, lazy_params),
-    )
-}
-
 /// L5's zlib pick-min (`params_baseline(5)` vs `params_zlib_t1(5)`), wrapped
 /// to the `data: &[u8] -> Vec<u8>` calling convention the ratchet needs.
 /// `deflate_one_shot_t1_zlib_pick_min` requires its buffer to carry
 /// `parse::BUF_PAD` trailing bytes past the logical end (its two existing
 /// call sites already hold a padded caller buffer); this wrapper pads its
 /// own copy, the same way `encode_unpadded_deflate_bytes` does internally
-/// for the L1-L4 mmap pick-min functions.
+/// for the rest of the ratchet's arms.
+///
+/// The L1-L4 siblings this function used to have (`deflate_one_shot_t1_l1
+/// _pick_min` through `_l4_pick_min`) were REMOVED 2026-08-19: the ratchet
+/// now spawns every arm directly inline (see `deflate_one_shot_t1_ratcheted`'s
+/// "FULLY PARALLEL ARM DISPATCH" doc) instead of calling per-level helper
+/// functions one at a time. L5 alone keeps its wrapper because its own
+/// internal pick-min (`deflate_one_shot_t1_zlib_pick_min`) is shared with the
+/// L6/L7 direct-dispatch routes — duplicating its buffer-padding/header-
+/// budget/sync-flush logic inline would risk the two copies drifting.
 fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
     let cap = data.len() + parse::BUF_PAD;
     let mut buf = Vec::with_capacity(cap);
@@ -632,8 +578,12 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
 /// (N-1)'s, regardless of how many/which heterogeneous vendor-shaped arms
 /// each level's own pick-min tries. Needed because `params_inner`'s per-field
 /// depth monotonicity does NOT imply pick-min OUTPUT monotonicity — see the
-/// `L3->L4->L5` whack-a-mole receipt above (`deflate_one_shot_t1_l4_pick_min`
-/// doc) and `level.rs`'s own engine.wasm L8 receipt (a longer search can
+/// `L3->L4->L5` whack-a-mole receipt (mirroring a gzip-shaped arm onto one
+/// level to fix a sag only pushed the identical violation to the next level —
+/// proof by execution that arm-by-arm mirroring cannot terminate; git history
+/// around 2026-08-17 for the full account, since the per-level helper
+/// functions that carried this doc comment were removed 2026-08-19) and
+/// `level.rs`'s own engine.wasm L8 receipt (a longer search can
 /// itself produce a LARGER output — parameter reasoning alone can never
 /// certify this, only a byte comparison can).
 ///
@@ -643,38 +593,136 @@ fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
 /// L6-L9 keep today's `KNOWN_SAGS`-pinned behavior until that is measured
 /// (`fulcrum try --levels 1-9` on a ref that extends this range).
 ///
-/// ASCENDING ITERATIVE FOLD, not recursion (cursor-agent/Codex pre-merge review,
-/// 2026-08-18): the first version recursed level-down-to-1, so completing a level-5
-/// call held cur5, cur4, cur3, cur2 AND cur1 alive SIMULTANEOUSLY at the deepest
-/// stack frame before any comparison could drop a loser — up to 5 near-input-sized
-/// buffers at once on incompressible data (an 83 MiB input could peak near 400+ MiB
-/// of ratchet-owned Vec<u8> alone, on top of what the underlying encoders allocate).
-/// This form holds at most THREE buffers at any moment, not two (correction,
-/// 2026-08-19 review): the outer `best` stays alive across the whole
-/// computation of `cur`, and computing `cur` itself has its own transient
-/// 2-buffer peak inside the level's own pick-min (either its two parallel
-/// arms, or an already-reduced best-of-those-2 plus a third sequential arm —
-/// see `deflate_one_shot_t1_l2_pick_min` for the shape). So peak = outer
-/// `best` + that level's own 2-buffer internal peak = 3, not 2. Still a large
-/// improvement over the prior recursive form's up-to-5, and the loser at
-/// each OUTER fold step is still dropped immediately every iteration — the
-/// correction is to the exact count, not the direction of the fix.
+/// FULLY PARALLEL ARM DISPATCH, not a serial level-by-level walk (2026-08-19,
+/// wall-cost fix): every prior version of this function computed each level's
+/// own arms, then folded the FINISHED result against the running `best`
+/// before starting the next level's arms — a purely SERIAL chain of up to 10
+/// independent O(n) parses (2/3/2/2/2 = ~11 arm-encodes to reach L5, PLAN.md's
+/// CRITICAL section: measured 7.3x slower than prior code, 8.7x slower than
+/// libdeflate on a 3 MiB incompressible pipe at `-5`). Every one of those
+/// parses is INDEPENDENT of every other — none reads another's output — so
+/// nothing about correctness required serial execution; it was purely an
+/// artifact of the code's shape (each level's helper function calling the
+/// next only after the previous returned).
+///
+/// This spawns EVERY needed arm across EVERY level up to `level` as its own
+/// thread via `std::thread::scope` (this laptop: 10 cores; L5 needs 10
+/// top-level threads plus 2 more nested one level deeper inside its own
+/// slot, 12 total OS threads at peak for 11 arm-encodes) — the SAME pattern
+/// `pick_min_two_vecs` already uses for 2 arms at a time, just not
+/// artificially capped at 2 or serialized across levels. The comparison
+/// logic that follows is IDENTICAL to the old nested fold, not a new
+/// tie-break rule — see the equivalence proof below.
+///
+/// PROOF THIS IS BYTE-IDENTICAL TO THE OLD SERIAL FORM: `pick_min_two_vecs`
+/// picks `b` only if STRICTLY smaller than `a` (ties keep `a`); each level's
+/// optional third sequential arm is folded in with the same strict `<` (ties
+/// keep the pair's already-resolved winner); the outer level-by-level loop
+/// folds with the same strict `<` (ties keep the earlier level's `best`).
+/// Composing three strict-`<`-with-ties-to-the-earlier-operand folds is
+/// exactly "the first element, in a fixed canonical order, that achieves the
+/// global minimum wins" — by induction: if the global min lives in an
+/// earlier group, that group's own fold already produced it and every later
+/// strict-`<` comparison leaves it untouched; if it lives only in a later
+/// group, the earlier group's (necessarily larger) value loses to it. The
+/// canonical order below is exactly [L1's 2 arms] ++ [L2's 3] ++ [L3's 2] ++
+/// [L4's 2] ++ [L5's 1 slot, itself `deflate_one_shot_t1_l5_pick_min`'s own
+/// `pick_min_two_vecs` pair over baseline vs zlib — reused as-is rather than
+/// duplicated inline, so it opens its own nested `thread::scope` for those
+/// two, one level deeper than this wave's other 9 arms] — the exact order
+/// the old code visited them in. Running them concurrently changes
+/// WHEN each byte vector is computed, never WHAT the fold compares, so the
+/// linear "first strict-min wins" scan below reproduces the serial form's
+/// output bit-for-bit — verify this against `cargo test --release` (expect
+/// ZERO pin/fingerprint regeneration; any regeneration here means the proof
+/// above has a bug, not that a lever intentionally changed output).
+///
+/// Peak memory rises from the old form's ~3 buffers to up to 11 (every arm's
+/// output alive at once until the fold runs) — an ~83 MiB input could hold
+/// ~830 MiB across all L5 arms simultaneously. Traded deliberately for wall
+/// time; PARK this construction if a memory-constrained caller ever needs T1
+/// L5 on very large inputs under tight RSS (not measured as a problem yet —
+/// no failing cell has named it).
 fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
     debug_assert!((1..=5).contains(&level));
-    let mut best = deflate_one_shot_t1_l1_pick_min(data);
-    for lv in 2..=level {
-        let cur = match lv {
-            2 => deflate_one_shot_t1_l2_pick_min(data),
-            3 => deflate_one_shot_t1_l3_pick_min(data),
-            4 => deflate_one_shot_t1_l4_pick_min(data),
-            5 => deflate_one_shot_t1_l5_pick_min(data),
-            _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
-        };
-        if cur.len() < best.len() {
-            best = cur;
+    std::thread::scope(|s| {
+        let l1a = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(1)));
+        let l1b = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
+
+        let l2 = (level >= 2).then(|| {
+            (
+                s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(2))),
+                s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary())),
+                s.spawn(|| {
+                    encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast())
+                }),
+            )
+        });
+        let l3 = (level >= 3).then(|| {
+            (
+                s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(3))),
+                s.spawn(|| {
+                    encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast())
+                }),
+            )
+        });
+        let l4 = (level >= 4).then(|| {
+            (
+                s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(4))),
+                s.spawn(|| {
+                    let mut lazy_params = level::params(4);
+                    lazy_params.strategy = level::Strategy::Lazy;
+                    encode_unpadded_deflate_bytes(data, lazy_params)
+                }),
+            )
+        });
+        // L5's own pick-min (baseline vs zlib) stays behind the existing
+        // shared helper rather than duplicating its body here — it opens its
+        // OWN nested `thread::scope` for those two arms when built without
+        // `anatomy-counters`, so this wave's L5 slot and L1-L4's 9 other arms
+        // still all overlap on the core count; only L5's own two sub-arms
+        // are one level of nesting deeper instead of flattened into this
+        // wave. Traded for not duplicating `deflate_one_shot_t1_zlib_pick_min`'s
+        // logic (buffer padding, `HeaderBudget`, sync-flush framing) a second
+        // time where it could silently drift from the shared function.
+        let l5 = (level >= 5).then(|| s.spawn(|| deflate_one_shot_t1_l5_pick_min(data)));
+
+        // Join in the EXACT canonical order the old serial fold visited —
+        // see the doc comment's equivalence proof. `fold` keeps the FIRST
+        // strict-minimum, matching every fold this replaces (none of them
+        // use `Iterator::min_by_key`, which keeps the LAST tie, not the
+        // first — that would silently change output on any tied cell).
+        let mut ordered = vec![
+            l1a.join().expect("ratchet arm l1a panicked"),
+            l1b.join().expect("ratchet arm l1b panicked"),
+        ];
+        if let Some((a, b, c)) = l2 {
+            ordered.push(a.join().expect("ratchet arm l2a panicked"));
+            ordered.push(b.join().expect("ratchet arm l2b panicked"));
+            ordered.push(c.join().expect("ratchet arm l2c panicked"));
         }
-    }
-    best
+        if let Some((a, b)) = l3 {
+            ordered.push(a.join().expect("ratchet arm l3a panicked"));
+            ordered.push(b.join().expect("ratchet arm l3b panicked"));
+        }
+        if let Some((a, b)) = l4 {
+            ordered.push(a.join().expect("ratchet arm l4a panicked"));
+            ordered.push(b.join().expect("ratchet arm l4b panicked"));
+        }
+        if let Some(h) = l5 {
+            ordered.push(h.join().expect("ratchet arm l5 panicked"));
+        }
+
+        let mut best: Option<Vec<u8>> = None;
+        for cur in ordered {
+            best = Some(match best {
+                None => cur,
+                Some(b) if cur.len() < b.len() => cur,
+                Some(b) => b,
+            });
+        }
+        best.expect("L1's two arms always run")
+    })
 }
 
 fn deflate_into(

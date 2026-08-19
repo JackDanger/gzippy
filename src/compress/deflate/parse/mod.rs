@@ -795,10 +795,10 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
         return true;
     }
     // `Strategy::Fast` (L1) streams via `fast::run_resumable` in tune builds
-    // only. Shipped L1 runs mmap pick-min (`deflate_one_shot_t1_l1_pick_min`),
-    // which is whole-buffer only — the resumable fast path would diverge from
-    // `encode_gzip_slack_padded_to_vec` and mmap pick-min
-    // (`tests/streaming_identity.rs`).
+    // only. Shipped L1 runs `deflate_one_shot_t1_ratcheted`'s inline mmap
+    // arm dispatch (`deflate/mod.rs`), which is whole-buffer only — the
+    // resumable fast path would diverge from `encode_gzip_slack_padded_to_vec`
+    // and the ratchet (`tests/streaming_identity.rs`).
     #[cfg(not(feature = "l1-tune"))]
     if matches!(strategy, Strategy::Fast) {
         return false;
