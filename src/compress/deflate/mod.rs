@@ -888,8 +888,56 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     let mut in_next = 0usize; // parse position, in buffer coordinates
     let mut avail = 0usize; // valid bytes in buf
     let mut eof = false;
-    let mut crc = crc32fast::Hasher::new();
     let mut total: u64 = 0;
+    let fill_to = cap - INPLACE_TAIL_PAD;
+
+    // FIRST refill, done unconditionally, BEFORE committing to streaming (no
+    // header written, no BitWriter created yet). Ladder monotonicity fix
+    // (2026-08-18, Fable + cursor-agent design review of the streaming-route
+    // gap Codex found in b4b821c9's pre-merge review): if the whole input
+    // fits in this one refill — i.e. EOF arrives before `avail` reaches
+    // `fill_to` — the buffer already holds every byte of the input with
+    // `INPLACE_TAIL_PAD` zeroed behind it: EXACTLY the precondition
+    // `encode_gzip_slack_padded_to_vec` needs, at ZERO extra memory or
+    // latency cost (this buffer and this read were always going to happen;
+    // `fill_to` is ~4.56 MiB, so this covers the overwhelming majority of
+    // real files/pipes for free). Route through it instead of the
+    // single-arm streaming loop below, for byte-identity with the file/mmap
+    // route at every level: the whole-buffer path already carries the L1-5
+    // ratchet (`deflate_one_shot_t1_ratcheted`), the L6-7 zlib pick-min, and
+    // the L8-12 fallback — this closes the streaming gap for ALL of them,
+    // not just 1-5. Only inputs LARGER than `fill_to` fall through to true
+    // single-pass streaming below, where the ladder invariant is not
+    // currently guaranteed (see `PLAN.md`, "PROMOTION PAUSED" section, for
+    // the Phase 2 tradeoff this leaves open).
+    while !eof && avail < fill_to {
+        let r = reader.read(&mut buf[avail..fill_to]);
+        match r {
+            Ok(0) => eof = true,
+            Ok(k) => {
+                total += k as u64;
+                avail += k;
+                state.input_total_len = state.input_total_len.max(total as usize);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf[avail..avail + INPLACE_TAIL_PAD].fill(0);
+
+    if eof {
+        let gz = encode_gzip_slack_padded_to_vec(&buf[..avail + INPLACE_TAIL_PAD], avail, level);
+        writer.write_all(&gz)?;
+        return Ok(avail as u64);
+    }
+
+    // Streaming continues past this point: the CRC hasher restarts here and
+    // now folds every chunk (including the one already read above) as the
+    // main loop below drains it — the loop's own refill-while at the top of
+    // its first iteration is a no-op (`avail` is already `fill_to`), so
+    // nothing below needs to change for this case.
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&buf[..avail]);
 
     let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);

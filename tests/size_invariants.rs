@@ -168,9 +168,16 @@ fn ladder_is_monotone_t1() {
 /// `threads=1`, the same `compress_with_pipeline_sized` -> `encode_gzip_reader_to_writer_sized`
 /// path the CLI takes for stdin/pipe input and every library caller takes
 /// regardless of input source. Deliberately NOT `compress_t1`
-/// (`encode_gzip_bytes_to_vec`, the whole-buffer/mmap entry point `ladder_is_monotone_t1`
-/// already covers) — this is a DIFFERENT production code path with its own
-/// dispatch, and `deflate_one_shot_t1_ratcheted` (`b4b821c9`) is not wired into it.
+/// (`encode_gzip_bytes_to_vec`, the whole-buffer/mmap entry point) directly —
+/// this test exercises a DIFFERENT production entry point with its own dispatch.
+///
+/// UPDATED 2026-08-18 (streaming-route ladder fix, `encode_gzip_single_pass`):
+/// for any input that fits in the first ~4.56 MiB refill (all fixtures here
+/// do — 1 MiB), this route now calls `encode_gzip_slack_padded_to_vec`
+/// directly and so IS byte-identical to `compress_t1`/the mmap route,
+/// including `deflate_one_shot_t1_ratcheted` for L1-5. Only genuinely large
+/// (>~4.56 MiB) streamed input still takes the un-ratcheted single-arm path —
+/// see `PLAN.md` "PROMOTION PAUSED" for that residual scope.
 fn compress_t1_streaming(data: &[u8], level: u32) -> Vec<u8> {
     let mut out = Vec::new();
     gzippy::compress::compress_bytes(data, &mut out, level as u8, 1)
@@ -178,48 +185,47 @@ fn compress_t1_streaming(data: &[u8], level: u32) -> Vec<u8> {
     out
 }
 
-/// Pre-existing sags SHARED with the mmap route's own `KNOWN_SAGS` — the high-level
-/// "L7 beats L8/L9 on prose" characteristic is a property of `params(level)`'s own
-/// table at high levels (outside the L1-5 ratchet's scope on EITHER route), not
-/// something any pick-min/ratchet lever has ever touched. Confirmed by measurement
-/// (2026-08-18) that `origin/main` — before c8bbde67/b4b821c9 existed — shows the
-/// IDENTICAL two entries on the streaming route, so this is not a regression to
-/// chase, it is the same accepted defect `KNOWN_SAGS` already documents for mmap.
-/// A THIRD list, not literally `KNOWN_SAGS` (that one is scoped to the mmap-route
-/// test by name), because the two routes' accepted-defect sets are not required to
-/// be identical in general — only these two currently happen to coincide.
-const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] = &[("text", 7), ("text", 8)];
+/// Sags SHARED with the mmap route's own `KNOWN_SAGS` — now including
+/// `("noise", 5)`, because the streaming fix below (2026-08-18) makes small
+/// inputs byte-IDENTICAL to the mmap route (both call
+/// `encode_gzip_slack_padded_to_vec`), so streaming naturally inherits the
+/// mmap route's one remaining documented boundary sag too (the ratchet's
+/// deliberate L5/L6 scope cutoff — see `KNOWN_SAGS` in this file). `("text",7)`/
+/// `("text",8)` are a DIFFERENT, older-and-deeper shared sag: the "L7 beats
+/// L8/L9 on prose" characteristic is a property of `params(level)`'s own table
+/// at high levels, outside the ratchet's scope on EITHER route, confirmed
+/// present on `origin/main` before c8bbde67/b4b821c9 ever existed. A THIRD
+/// list, not literally `KNOWN_SAGS` (that one is scoped to the mmap-route test
+/// by name), because the two routes' accepted-defect sets are not required to
+/// be identical in general — these three currently happen to coincide, and
+/// the streaming-route fix below made that coincidence exact rather than
+/// coincidental (same bytes, same code path, below the refill threshold).
+const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] = &[("text", 7), ("text", 8), ("noise", 5)];
 
-/// **KNOWN GAP, not yet fixed — 2026-08-18 (Codex pre-merge review of `b4b821c9`).**
+/// **MOSTLY FIXED 2026-08-18** (was a known gap from Codex's `b4b821c9` pre-merge
+/// review; fixed same day per Fable + cursor-agent's independent streaming-route
+/// design reviews — see `PLAN.md` "PROMOTION PAUSED" section for the full history).
 ///
 /// `ladder_is_monotone_t1` proves the T1 WHOLE-BUFFER/MMAP route
 /// (`encode_gzip_bytes_to_vec`) is ladder-monotone via `deflate_one_shot_t1_ratcheted`.
-/// It says NOTHING about the STREAMING route, which is what the CLI actually uses
-/// for stdin/pipe input (`gzippy -N -c - < file`) and what every library caller of
-/// `compress_bytes`/`compress_with_pipeline` gets regardless of input source. That
-/// route dispatches to `encode_gzip_reader_to_writer_sized`, entirely separate code,
-/// not wired into the ratchet.
+/// The STREAMING route — CLI stdin/pipe input and every `compress_bytes`/
+/// `compress_with_pipeline` library caller regardless of input source — used to
+/// dispatch unconditionally to `encode_gzip_reader_to_writer_sized`'s single-arm
+/// per-chunk parse, entirely bypassing the ratchet. Fixed in
+/// `encode_gzip_single_pass` (`mod.rs`): the function already buffers the ENTIRE
+/// input before parsing anything whenever it fits in the first ~4.56 MiB refill
+/// (Fable's finding) — for that case (all four `fixtures::NAMES`, 1 MiB each, and
+/// the overwhelming majority of real files/pipes), it now routes through
+/// `encode_gzip_slack_padded_to_vec` directly, at zero extra memory or latency,
+/// making streaming byte-identical to the mmap route including the ratchet.
 ///
-/// Full measured sag set on this route (2026-08-18, ALL confirmed present on
-/// `origin/main` already — this branch did not introduce them, it simply never
-/// reached this route):
-///   ("text", 7)    +567 B    <- in STREAMING_SHARED_KNOWN_SAGS, excluded below
-///   ("text", 8)    +413 B    <- in STREAMING_SHARED_KNOWN_SAGS, excluded below
-///   ("tabular", 3) +15,770 B <- REAL GAP, not excluded — same L3-vs-L4 class as
-///                                the whole-buffer bug this branch fixed, just
-///                                unfixed here
-///   ("binary", 1)  +3,530 B  <- REAL GAP (Codex's reported numbers)
-///   ("binary", 3)  +2,230 B  <- REAL GAP
-///   ("noise", 1)   +5 B      <- REAL GAP (streaming's own stored-grid sag,
-///                                never healed by any pick-min lever since none
-///                                ever touched this route)
-///
-/// This test intentionally excludes ONLY `STREAMING_SHARED_KNOWN_SAGS`: per
-/// CLAUDE.md non-negotiable #5 ("test the INVARIANT, not the value") and explicit
-/// user decision (2026-08-18) that the ladder invariant is REQUIRED on this route
-/// too, not a vendor-fidelity nicety — the remaining four must be FIXED, not
-/// silently downgraded to accepted defects. Do not widen the exclusion list to
-/// cover them; make the assertion pass by making streaming ladder-monotone.
+/// **Residual, NOT fixed — inputs LARGER than the ~4.56 MiB refill boundary still
+/// take the single-arm streaming path with no monotonicity guarantee.** This is a
+/// real, named, open scope boundary (see `PLAN.md` "Phase 2"), not silently
+/// dropped — it needs either an explicit accepted-tradeoff decision or Fable's
+/// segmented cumulative-arm + bit-splice construction (direction (d) in the design
+/// review) to close for good. This test's fixtures are all 1 MiB and so cannot
+/// exercise that residual; it is intentionally out of this test's reach.
 #[test]
 fn streaming_t1_is_ladder_monotone() {
     for &name in fixtures::NAMES {
