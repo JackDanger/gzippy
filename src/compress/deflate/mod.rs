@@ -574,7 +574,12 @@ fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
 fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
     pick_min_two_vecs(
         || encode_unpadded_deflate_bytes(data, level::params(3)),
-        || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()),
+        || {
+            pick_min_two_vecs(
+                || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()),
+                || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_hash3_chain_repair()),
+            )
+        },
     )
 }
 
@@ -1915,7 +1920,12 @@ mod pickmin_arm_audit {
         match level {
             1 => &["l1_native", "l1_gzip_primary"],
             2 => &["l2_native", "l2_gzip_primary", "l2_gzip_deflate_fast"],
-            3 => &["l3_native", "l3_libdeflate_greedy", "l3_gzip_deflate_fast"],
+            3 => &[
+                "l3_native",
+                "l3_libdeflate_greedy",
+                "l3_gzip_deflate_fast",
+                "l3_gzip_hash3_chain_repair",
+            ],
             4 => &["l4_native_greedy", "l4_lazy"],
             5 => &["l5_baseline", "l5_zlib"],
             _ => unreachable!("pickmin_arm_audit is scoped to levels 1..=5"),
@@ -1964,6 +1974,11 @@ mod pickmin_arm_audit {
                 (
                     "l3_gzip_deflate_fast",
                     encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()).len(),
+                ),
+                (
+                    "l3_gzip_hash3_chain_repair",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_gzip_hash3_chain_repair())
+                        .len(),
                 ),
             ],
             4 => {

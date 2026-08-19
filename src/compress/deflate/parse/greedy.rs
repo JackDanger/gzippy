@@ -37,7 +37,16 @@ pub(super) fn run(
             next_hashes,
             ..
         } = &mut state;
-        mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
+        mf.skip_bytes(
+            buf,
+            in_base,
+            0,
+            in_end,
+            data_start,
+            params.hash3_chain_depth,
+            params.maintain_hash3_chain,
+            next_hashes,
+        );
     }
     run_resumable(
         buf,
@@ -251,6 +260,8 @@ pub(super) fn run_block(
                 in_next + 1,
                 in_end,
                 (length - 1) as usize,
+                params.hash3_chain_depth,
+                params.maintain_hash3_chain,
                 next_hashes,
             );
             in_next += length as usize;
@@ -291,6 +302,8 @@ pub(super) fn run_block(
                     in_next + 2,
                     in_end,
                     (next_len - 1) as usize,
+                    params.hash3_chain_depth,
+                    params.maintain_hash3_chain,
                     next_hashes,
                 );
                 in_next += 1 + next_len as usize;
@@ -301,7 +314,16 @@ pub(super) fn run_block(
                 buf[in_next + 2],
             ) {
                 sink.push_match(DEFLATE_MIN_MATCH_LEN, offset);
-                mf.skip_bytes(buf, in_base, in_next + 2, in_end, 1, next_hashes);
+                mf.skip_bytes(
+                    buf,
+                    in_base,
+                    in_next + 2,
+                    in_end,
+                    1,
+                    params.hash3_chain_depth,
+                    params.maintain_hash3_chain,
+                    next_hashes,
+                );
                 in_next += DEFLATE_MIN_MATCH_LEN as usize;
             } else {
                 sink.push_literal(buf[in_next]);
@@ -340,6 +362,8 @@ pub(super) fn run_block(
                     in_next + 2,
                     in_end,
                     (next_len - 1) as usize,
+                    params.hash3_chain_depth,
+                    params.maintain_hash3_chain,
                     next_hashes,
                 );
                 in_next += 1 + next_len as usize;
@@ -347,7 +371,16 @@ pub(super) fn run_block(
                 // Nothing longer behind it: take the far len-3. Position +1
                 // is already inserted by the probe; only +2 remains.
                 sink.push_match(DEFLATE_MIN_MATCH_LEN, offset);
-                mf.skip_bytes(buf, in_base, in_next + 2, in_end, 1, next_hashes);
+                mf.skip_bytes(
+                    buf,
+                    in_base,
+                    in_next + 2,
+                    in_end,
+                    1,
+                    params.hash3_chain_depth,
+                    params.maintain_hash3_chain,
+                    next_hashes,
+                );
                 in_next += DEFLATE_MIN_MATCH_LEN as usize;
             }
         } else {
