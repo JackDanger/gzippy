@@ -189,6 +189,47 @@ which arms feed `cur` changes. This needs the win-rate measurement Fable named
 **Next action: run that attribution, on the GATE corpus, per level** — which arms ever win,
 and how often — before proposing which to drop.
 
+**DONE 2026-08-19: built `pickmin_arm_audit` (`src/compress/deflate/mod.rs`, `#[cfg(test)]`,
+`#[ignore]`d — `cargo test --release --lib pickmin_arm_audit -- --ignored --nocapture`) and ran
+it against the real 23-file GATE corpus, T1, levels 1-5.** Calls the exact same private encode
+functions the shipped pick-min functions call (can't drift from what ships), so this is COUNTED
+not inferred, per CLAUDE.md. Win-rate table (N/23 files where that arm produced the level's
+minimum; ties count for both):
+
+    L1  l1_native 21/23 (91.3%)          l1_gzip_primary 2/23 (8.7%)
+    L2  l2_native 11/23 (47.8%)          l2_gzip_primary 2/23 (8.7%)   l2_gzip_deflate_fast 10/23 (43.5%)
+    L3  l3_native 17/23 (73.9%)          l3_libdeflate_greedy 0/23 (0.0%)   l3_gzip_deflate_fast 6/23 (26.1%)
+    L4  l4_native_greedy 1/23 (4.3%)     l4_lazy 22/23 (95.7%)
+    L5  l5_baseline 3/23 (13.0%)         l5_zlib 21/23 (91.3%)
+
+**One clean, zero-risk cut: `l3_libdeflate_greedy` — 0/23, never once the reason an L3 cell is
+closed.** Removed from `deflate_one_shot_t1_l3_pick_min` (L3 now 2 arms, not 3; cumulative cost
+to reach L5 now 2+3+2+2+2=11, was 12). Kept the function itself (`level.rs`, `#[allow(dead_code)]`,
+still `pub`) so the audit keeps exercising it — a future nonzero count is the signal to
+reconsider, not a hand-argument. `l3_libdeflate_greedy` having never won is itself informative:
+it is L3's ONLY arm with no matching "native gzip-shaped forced-min-match-3" characterization —
+`l3_gzip_deflate_fast` already covers that vendor-shape class at L3 with a cheaper/differently-
+tuned config, and 0/23 says libdeflate's specific greedy-depth-12 shape adds nothing L3's other
+two arms don't already reach on this corpus.
+
+**Every other arm has a nonzero, sometimes-substantial win rate — none of the rest are safe to
+drop outright on this data.** `l4_native_greedy` (1/23, `weights.safetensors` only) and
+`l5_baseline` (3/23) are the next-thinnest margins but are NOT zero — dropping them needs either
+a margin-size check (how many bytes would those cells actually lose, CLAUDE.md's margin-floor
+precedent) or acceptance that this is a genuine size/wall tradeoff, not a free cut. Not pursued
+further this session — the one unambiguous, zero-risk cut is banked; the rest is a real tradeoff
+question, not a counting exercise, and deserves its own pass rather than being rushed here.
+
+**Honest scale check: this alone does not solve the 7.3x/8.7x wall problem.** One arm off L3
+cuts the cumulative-to-L5 total from 12 to 11 (~8%) — nowhere near enough. The wall-cost
+question (this file's "CRITICAL" section at top) remains genuinely open; this is one small,
+zero-risk piece of the "thin inside the correct fold" direction, not a resolution of it. Full
+`cargo test --release` re-run in progress to confirm this change is byte-identical everywhere
+it should be (0 wins ⇒ removing the arm should regenerate ZERO pins, unlike the falsified
+redesign above); tie-guard and a size-only lever check are next, then an honest reassessment of
+whether arm-thinning alone can ever close the wall gap or whether this needs to go back to
+option 2 (size-gating) or back to the user given how large the remaining gap looks.
+
 ---
 
 ## ⛔ PROMOTION PAUSED 2026-08-18 — Codex pre-merge review found a real, confirmed gap

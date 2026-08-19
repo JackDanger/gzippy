@@ -572,18 +572,25 @@ fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Pick-min: Lazy vs libdeflate Greedy vs gzip `deflate_fast` at L3.
+/// Pick-min: Lazy vs gzip `deflate_fast` at L3.
+///
+/// THINNED 2026-08-19 (`pickmin_arm_audit::win_rate_report`, the real 23-file
+/// GATE corpus, T1): the third arm this function used to try,
+/// `params_l3_libdeflate_greedy`, won ZERO of 23 L3 cells — every single file
+/// had a strictly smaller (or tied-and-thus-redundant) result from one of the
+/// other two arms. An arm that never wins cannot be the reason any current
+/// cell is closed, so dropping it cannot reopen one; it only cuts L3's own
+/// arm count from 3 to 2 (part of the wall-cost thinning direction PLAN.md
+/// names after the "rung + nested bonus" fold-shape redesign was built and
+/// falsified same day — see PLAN.md's CRITICAL section). `params_l3_
+/// libdeflate_greedy` itself is kept (still `pub`, still exercised by the
+/// audit) so a future corpus/content shift that makes it start winning again
+/// shows up as a nonzero count next run, not silently.
 fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
-    let best = pick_min_two_vecs(
+    pick_min_two_vecs(
         || encode_unpadded_deflate_bytes(data, level::params(3)),
-        || encode_unpadded_deflate_bytes(data, level::params_l3_libdeflate_greedy()),
-    );
-    let gzip_fast = encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast());
-    if gzip_fast.len() < best.len() {
-        gzip_fast
-    } else {
-        best
-    }
+        || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()),
+    )
 }
 
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
@@ -1781,6 +1788,209 @@ mod streaming_tests {
                     block,
                     "streaming(is_last=true) diverged from encode_deflate_bytes_to_sink at L{level}, len={}",
                     data.len()
+                );
+            }
+        }
+    }
+}
+
+/// Per-arm win-rate audit for the L1-L5 T1 ratchet's pick-min functions.
+///
+/// NAMED BLOCKING QUESTION (CLAUDE.md's bar for building a measurement tool):
+/// PLAN.md's "rung + nested bonus" wall-cost fix was built and FALSIFIED same-day
+/// (2026-08-19, see PLAN.md) — the cheaper fold shape cannot preserve monotonicity
+/// without effectively re-absorbing the old ratchet's full cumulative cost. The
+/// remaining viable direction (CLAUDE.md option 1a from the original design brief)
+/// is thinning the ARM SET inside the existing, PROVEN-correct cumulative fold —
+/// but "which arms are safe to drop" cannot be guessed (CLAUDE.md: "COUNT it,
+/// never INFER it"). This module counts it: for every corpus file, at every
+/// level 1-5, which of that level's own candidate arms actually produces the
+/// winning (smallest) bytes. An arm with ZERO wins across the whole corpus is a
+/// candidate to drop with NO change to the fold's correctness (removing an arm
+/// that never wins cannot make any cell's output larger).
+///
+/// Deliberately NOT gated behind `anatomy-counters` or any new feature: this
+/// runs in-process against the real corpus, calls the exact same private encode
+/// functions the shipped pick-min functions call (so it can never drift from
+/// what actually ships the way an external/black-box measurement could), and is
+/// `#[ignore]`d so it costs nothing in a normal `cargo test` run.
+///
+///     cargo test --release --lib pickmin_arm_audit -- --ignored --nocapture
+#[cfg(test)]
+mod pickmin_arm_audit {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn corpus_roots() -> Vec<std::path::PathBuf> {
+        let mut v = vec![];
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(std::path::PathBuf::from(&h).join("www/gzippy-bench/corpus"));
+        }
+        v.push(std::path::PathBuf::from("/root/gzippy-bench/corpus"));
+        v
+    }
+
+    fn corpus_files() -> Vec<std::path::PathBuf> {
+        for root in corpus_roots() {
+            if root.is_dir() {
+                let mut files: Vec<_> = std::fs::read_dir(&root)
+                    .expect("read corpus dir")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file())
+                    .collect();
+                files.sort();
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+        vec![]
+    }
+
+    /// Arm labels at `level`, with NO encoding performed — must list exactly
+    /// the labels `arms_at_level` returns, in any order (report enumeration
+    /// only; win tallying itself never uses this, only `arms_at_level`'s own
+    /// output, so a drift here could only ever hide a 0-win arm from the
+    /// printed summary, not corrupt a count).
+    fn arm_labels_at_level(level: u32) -> &'static [&'static str] {
+        match level {
+            1 => &["l1_native", "l1_gzip_primary"],
+            2 => &["l2_native", "l2_gzip_primary", "l2_gzip_deflate_fast"],
+            3 => &["l3_native", "l3_libdeflate_greedy", "l3_gzip_deflate_fast"],
+            4 => &["l4_native_greedy", "l4_lazy"],
+            5 => &["l5_baseline", "l5_zlib"],
+            _ => unreachable!("pickmin_arm_audit is scoped to levels 1..=5"),
+        }
+    }
+
+    /// (arm label, encoded length) for every candidate arm at `level`, in the
+    /// EXACT composition the shipped `deflate_one_shot_t1_l{level}_pick_min`
+    /// functions use — kept in lockstep with those functions by hand; if they
+    /// drift, this audit is measuring a mechanism that no longer ships.
+    fn arms_at_level(data: &[u8], level: u32) -> Vec<(&'static str, usize)> {
+        match level {
+            1 => vec![
+                (
+                    "l1_native",
+                    encode_unpadded_deflate_bytes(data, level::params(1)).len(),
+                ),
+                (
+                    "l1_gzip_primary",
+                    encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()).len(),
+                ),
+            ],
+            2 => vec![
+                (
+                    "l2_native",
+                    encode_unpadded_deflate_bytes(data, level::params(2)).len(),
+                ),
+                (
+                    "l2_gzip_primary",
+                    encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()).len(),
+                ),
+                (
+                    "l2_gzip_deflate_fast",
+                    encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()).len(),
+                ),
+            ],
+            3 => vec![
+                (
+                    "l3_native",
+                    encode_unpadded_deflate_bytes(data, level::params(3)).len(),
+                ),
+                (
+                    "l3_libdeflate_greedy",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_libdeflate_greedy()).len(),
+                ),
+                (
+                    "l3_gzip_deflate_fast",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()).len(),
+                ),
+            ],
+            4 => {
+                let mut lazy_params = level::params(4);
+                lazy_params.strategy = level::Strategy::Lazy;
+                vec![
+                    (
+                        "l4_native_greedy",
+                        encode_unpadded_deflate_bytes(data, level::params(4)).len(),
+                    ),
+                    (
+                        "l4_lazy",
+                        encode_unpadded_deflate_bytes(data, lazy_params).len(),
+                    ),
+                ]
+            }
+            5 => {
+                let cap = data.len() + parse::BUF_PAD;
+                let mut buf = Vec::with_capacity(cap);
+                buf.extend_from_slice(data);
+                buf.resize(cap, 0);
+                let in_end = data.len();
+                let budget = encode_types::HeaderBudget::Lean;
+                let encode = |params: &level::LevelParams| -> usize {
+                    let mut bw = BitWriter::from_vec(Vec::new());
+                    parse::compress(&buf, 0, in_end, in_end, params, true, budget, &mut bw);
+                    bw.finish().len()
+                };
+                vec![
+                    ("l5_baseline", encode(&level::params_baseline(5))),
+                    ("l5_zlib", encode(&level::params_zlib_t1(5))),
+                ]
+            }
+            _ => unreachable!("pickmin_arm_audit is scoped to levels 1..=5"),
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly: needs the real corpus, prints a report, isn't a pass/fail gate"]
+    fn win_rate_report() {
+        let files = corpus_files();
+        assert!(
+            !files.is_empty(),
+            "pickmin_arm_audit: no corpus found under ~/www/gzippy-bench/corpus or \
+             /root/gzippy-bench/corpus — this audit needs the real corpus, not synthetic fixtures"
+        );
+        // (level, arm_label) -> win count. BTreeMap for stable, sorted output.
+        let mut wins: BTreeMap<(u32, &'static str), u32> = BTreeMap::new();
+        let mut cells: BTreeMap<u32, u32> = BTreeMap::new();
+
+        for path in &files {
+            let data = std::fs::read(path).expect("read corpus file");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for level in 1..=5u32 {
+                let arms = arms_at_level(&data, level);
+                let min_len = arms.iter().map(|(_, l)| *l).min().unwrap();
+                // A tie (two arms hit the exact same min) counts as a win for
+                // BOTH — dropping either one alone still leaves a winner at
+                // that size, so a tie is not evidence either arm is safe to
+                // drop unilaterally.
+                for (label, len) in &arms {
+                    if *len == min_len {
+                        *wins.entry((level, label)).or_insert(0) += 1;
+                    }
+                }
+                *cells.entry(level).or_insert(0) += 1;
+                println!(
+                    "{name}\tL{level}\twinner(s)={}\tmin_len={min_len}",
+                    arms.iter()
+                        .filter(|(_, l)| *l == min_len)
+                        .map(|(label, _)| *label)
+                        .collect::<Vec<_>>()
+                        .join("+")
+                );
+            }
+        }
+
+        println!("\n=== WIN-RATE SUMMARY ({} corpus files) ===", files.len());
+        for level in 1..=5u32 {
+            let total = *cells.get(&level).unwrap_or(&0);
+            for &label in arm_labels_at_level(level) {
+                let w = *wins.get(&(level, label)).unwrap_or(&0);
+                println!(
+                    "L{level}\t{label}\t{w}/{total} wins ({:.1}%)",
+                    100.0 * w as f64 / total as f64
                 );
             }
         }

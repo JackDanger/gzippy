@@ -358,6 +358,13 @@ pub fn params_l2_gzip_deflate_fast() -> LevelParams {
 }
 
 /// libdeflate L3 is `deflate_compress_greedy` at depth 12 / nice 14 (we ship Lazy).
+///
+/// THINNED OUT of L3's shipped pick-min 2026-08-19 (`pickmin_arm_audit::win_rate_report`,
+/// `deflate/mod.rs`): 0/23 wins on the real GATE corpus, T1 — never the reason any L3
+/// cell is closed. Kept `pub` and defined (not deleted) so the audit test keeps
+/// exercising it every run; a future nonzero win count there is the signal to
+/// reconsider, not a hand-argument.
+#[allow(dead_code)]
 pub fn params_l3_libdeflate_greedy() -> LevelParams {
     let mut p = params(3);
     p.strategy = Strategy::Greedy;
