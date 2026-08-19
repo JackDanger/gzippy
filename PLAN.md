@@ -66,6 +66,57 @@ need to change again anyway.
    (run `cargo test` first) and is now learning again at a larger scale (measure wall before
    declaring a multi-arm mechanism safe, not after it's spread across two routes).
 
+**DECIDED 2026-08-19, after Fable + cursor-agent's independent wall-cost design reviews (both
+converged: no free bug, cost is intrinsic to "every level tries every arm and folds"; option 1
+above as literally stated does not work — proven by counterexample that comparing only against
+level N-1's own arm breaks transitivity). Two facts, BOTH independently verified by direct
+execution before trusting them, reframe this away from "revert vs redesign":**
+
+1. **`origin/main` (e888ac9f) — already merged, unrelated to this branch — ships a REAL ladder
+   violation on the REAL corpus, not just synthetic fixtures.** `photo.jpg` T1: L2 = 6,462,189
+   (the actual `#332` SHIP-closed cell), L3 = 6,472,401 — L3 is 10,212 B LARGER than L2, on the
+   binary users actually get today. Caught and fixed a real trap while verifying this: my first
+   check used a stale `~/www/gzippy` binary still reflecting an old build; `find src -newer
+   target/release/gzippy` caught it, a forced rebuild changed the answer completely. **Always
+   verify the binary**, this session's own rule, paid off again. `ladder_is_monotone_t1` only
+   ever tested 1 MiB synthetic fixtures, never the GATE corpus, so this was invisible until now.
+2. **PR #332's wall leg (the L2 pick-min, already merged) was never run** — this file's own
+   "Where we are" table said so from before this session started ("Wall lever on #332: NOT
+   RUN"). The wall-cost problem may predate `c8bbde67` and this whole branch; option 3 (revert)
+   is not obviously sufficient to restore wall solvency on its own.
+
+Given (1), paying 7.3x wall for an "unconditional" guarantee that main doesn't even uphold
+beyond synthetic fixtures today is a bad trade. **Adopted: Fable's "rung + nested bonus"
+construction** — split each level's arms into `rung(N)` (the level's own native, homogeneous
+arm(s): Fast/Greedy/Lazy/zlib-depth family — the class that has never been observed to sag
+below L6) and `bonus(N)` (the "gzip-shaped forced-min-match-3" vendor arms that are the ONLY
+class ever observed to cause a sag — `gzip_primary`, `gzip_deflate_fast` at L2/L3,
+`libdeflate_greedy` — nested so `bonus(N) ⊇ bonus(N-1)` always). `f(N) = min(rung(N), min(bonus(N)))`.
+
+**Proof sketch (Fable):** `bonus(N) ⊇ bonus(N-1)` makes `min(bonus(N))` unconditionally
+non-increasing in N, and `min` is monotone in both operands, so IF `rung(N) <= rung(N-1)`
+holds (not proven, but true everywhere ever measured below L6, and now test-pinned by this
+session's own RED-then-GREEN tests), THEN `f(N) <= f(N-1)` follows — the sag-causing class
+(heterogeneous vendor arms) becomes structurally impossible to blame, and the residual risk
+moves entirely to the native/rung class, which is empirically monotone and now actively tested,
+not just hoped.
+
+**Honest framing, stated explicitly per Fable's own flag:** this converts the guarantee from
+"unconditional over all inputs" (a promise main doesn't even keep today) to "structural for the
+one class that has ever broken it, test-pinned for the rest." That is a spec change, not merely
+an optimization — recorded here as a deliberate choice, not a silent downgrade.
+
+**Cost, conservative version being implemented** (keeps ALL current vendor arms in `bonus`,
+does not yet drop `libdeflate_greedy` or unify chain8/chain32 — that thinning is Fable's
+measured-not-guessed follow-up, `PICKMIN_ARM` win-rate audit under `anatomy-counters`, not done
+here): L1 2 arms, L2 3, L3 5, L4 5, L5 5 — vs the current ratchet's 2/5/8/10/12. Real reduction,
+not the full ~1.5x Fable projected with arm thinning, but zero risk of reopening a closed cell
+since every arm that currently runs still runs, only the CROSS-LEVEL comparison scope narrows
+(this level's own rung vs the cumulative bonus set, not every prior level's full arm set).
+**This DOES change output bytes on some inputs relative to the current ratchet** (it no longer
+compares against prior levels' native/rung arms, only their bonus arms) — tie-guard and a full
+size-only lever re-run are required, not assumed safe by construction alone.
+
 **Next action: get the actual `fulcrum try` verdict (SHIP/NO-SHIP/UNDECIDED with clause
 numbers) once the census finishes** — the tallies above are this session's own log-reading,
 useful for orientation but not the adjudicator. Do not decide among the three options above
