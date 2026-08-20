@@ -36,44 +36,52 @@ const LEVELS: std::ops::RangeInclusive<u32> = 0..=9;
 /// fixtures at the commit that introduced this test (T1, in-process).
 /// A pair listed here that STOPS sagging fails the test with instructions to
 /// delete it, so this list is honest and can only shrink.
+// ⚠ REBASELINED 2026-08-20 — the T1 CUMULATIVE RATCHET WAS REMOVED, and several
+// entries below were healed BY that ratchet rather than by any parse improvement.
+// See `deflate_one_shot_t1_ratcheted`'s doc comment for the full reasoning; the
+// short version is CLAUDE.md hard stop 10 (a test is not a goal): the ratchet
+// bought unconditional ladder monotonicity for a MEASURED 7.3x/8.7x wall cost,
+// and a full-corpus one-directional check (23 files x L1-L5 x gzip/pigz/libdeflate,
+// 345 cells, every stream sha256-roundtripped) found its entire size benefit was
+// margin ABOVE what any rival requires: **0 pass->fail cell flips**, 340 passing
+// before and after. It closed nothing; it only made us slower. Removing it costs
+// 1.73x-4.50x LESS wall (paired hyperfine, aarch64) and re-exposes the sags below,
+// which are therefore honest pre-existing defects, not new regressions.
 const KNOWN_SAGS: &[(&str, u32)] = &[
-    // The L3->L4 sags on synthetic tabular/binary HEALED by mmap pick-min entry-point
-    // wiring (#330 L4 + #331 encode_gzip_bytes_to_vec / slack-padded paths).
-    // High-level sag on prose: L7 is the best level on `text`.
-    ("text", 7), // L7 305775 -> L8 306342 (+567 B)
+    // ("noise", 0) and ("noise", 1) HEALED for real (not by the ratchet) —
+    // the issue #266 fix (stored-span coalescing in `parse::StoredCoalescer`)
+    // gave L0/L1 the optimal 17-block stored grid, and L2 mmap pick-min (#332)
+    // matched it at L2 (all 1048679 B). Both stay healed without the ratchet.
+    //
+    // The residual +5 B stored-grid sag is real and predates the ratchet: L3-L9's
+    // greedy/lazy paths parse on the SOFT_MAX_BLOCK (300,000 B) grid and emit each
+    // block's stored payload uncoalesced (65535x4 + 37860 runt per parse block),
+    // costing one extra block header vs L1/L2's coalesced 17-block grid. That grid
+    // is byte-identical to libdeflate's own (tie-cage cells), so healing it means
+    // deliberately breaking those ties in our favour by extending StoredCoalescer
+    // to greedy/lazy — a separate, tie-guard-adjudicated lever, still not built.
+    // The ratchet formerly hid this at L3/L4/L5 by substituting L2's bytes, which
+    // pushed the identical +5 B to the edge of its scope, ("noise", 5). With the
+    // ratchet gone it returns to its true origin at L2->L3.
+    ("noise", 2), // L2 1048679 -> L3 1048684 (+5 B)
+    // The "level ladder sags at L4" defect family — the SAME defect memory records
+    // on the real corpus (`-4` larger than `-3` on 10/11 TUNE files;
+    // project_the_level_ladder_sags_at_L4.md). L4 widens the search
+    // (`max_search_depth`) and the longer search produces a genuinely larger parse
+    // on this fixture — `level.rs`'s own engine.wasm L8 receipt, recurring. The
+    // ratchet masked it by handing L4 L3's bytes; it never fixed it. Real fix is a
+    // better L4 parse, not a fold.
+    ("text", 3), // L3 324800 -> L4 333536 (+8736 B)
+    // High-level sag on prose, outside the (former) ratchet's 1..=5 scope entirely
+    // and so unaffected by its removal: L7 is simply the best level on `text`.
+    ("text", 7), // L7 303038 -> L8 306342 (+3304 B)
     ("text", 8), // L8 306342 -> L9 306755 (+413 B)
-    // ("noise", 0) HEALED by the issue #266 fix (stored-span coalescing in
-    // `parse::StoredCoalescer`): L1 now emits the same optimal 17-block
-    // stored grid as L0 (both 1048679 B). That fix exposed the successor
-    // sag below.
-    // L1's now-optimal 17-block stored grid beats L2-L9's 18 blocks: the
-    // greedy/lazy paths parse on the SOFT_MAX_BLOCK (300,000 B) grid and
-    // emit each block's stored payload uncoalesced (65535x4 + 37860 runt
-    // per parse block) — byte-identical to libdeflate's own L2-L9 grid
-    // (tie-cage cells), so healing it means deliberately breaking those
-    // ties in our favor by extending StoredCoalescer to greedy/lazy — a
-    // separate, tie-guard-adjudicated lever, not part of the #266 fix.
-    // ("noise", 1) HEALED by L2 mmap pick-min (#332): L2 now matches L1's
-    // optimal 17-block stored grid (both 1048679 B). The +5 B sag moved to L3,
-    // then ("noise", 2) HEALED 2026-08-17 by the same L1-L5 T1 ratchet that
-    // healed ("binary", 1) (see below): L3 now takes L2's bytes when its own
-    // pick-min would be larger. The +5 B residual moved again, to L5->L6 —
-    // this is NOT a new mechanism, it's the same stored-grid sag hitting the
-    // DELIBERATE edge of the ratchet's scope: `deflate_one_shot_t1_ratcheted`
-    // covers levels 1..=5 only (L6-L9 unmeasured wall cost, PLAN.md
-    // 2026-08-17). Healing requires either extending the ratchet through L6
-    // (needs a wall measurement first) or `StoredCoalescer` support in
-    // greedy/lazy (the L1 fix's own noted follow-up, still not built).
-    ("noise", 5), // L5 1048679 -> L6 1048684 (+5 B)
-                  // ("binary", 1) HEALED 2026-08-17 by the same L1-L5 T1 ratchet
-                  // (`deflate_one_shot_t1_ratcheted` in `mod.rs`): L2 now takes L1's bytes
-                  // (662,577) whenever its own pick-min would be larger, instead of L2
-                  // keeping its own (unchanged) 666,108 B parse. This is NOT "improving
-                  // L2's parse" (the thing the original note said this lever must not do,
-                  // to avoid touching the libdeflate-gzip -2 comparison at 666,108 vs
-                  // 666,112) — the ratchet only ever SUBSTITUTES a smaller predecessor's
-                  // bytes, strictly non-worse on size by construction, verified against
-                  // the real corpus via `scripts/campaign/tie-guard.sh` before landing.
+                 // ("binary", 1) was listed as HEALED-BY-RATCHET (L2 taking L1's 662,577
+                 // instead of its own 666,108). With the ratchet removed L2 returns to
+                 // 666,108 — which STILL BEATS libdeflate-gzip -2's 666,112, so the cell
+                 // this entry was worried about stays won either way, and no sag appears
+                 // here because L1 and L2 both land on the same side of the comparison.
+                 // Verified in the 345-cell sweep above, not inferred.
 ];
 
 /// Optimal stored framing for an n-byte input: gzip header (10) + trailer (8)
@@ -185,22 +193,30 @@ fn compress_t1_streaming(data: &[u8], level: u32) -> Vec<u8> {
     out
 }
 
-/// Sags SHARED with the mmap route's own `KNOWN_SAGS` — now including
-/// `("noise", 5)`, because the streaming fix below (2026-08-18) makes small
-/// inputs byte-IDENTICAL to the mmap route (both call
-/// `encode_gzip_slack_padded_to_vec`), so streaming naturally inherits the
-/// mmap route's one remaining documented boundary sag too (the ratchet's
-/// deliberate L5/L6 scope cutoff — see `KNOWN_SAGS` in this file). `("text",7)`/
-/// `("text",8)` are a DIFFERENT, older-and-deeper shared sag: the "L7 beats
-/// L8/L9 on prose" characteristic is a property of `params(level)`'s own table
-/// at high levels, outside the ratchet's scope on EITHER route, confirmed
-/// present on `origin/main` before c8bbde67/b4b821c9 ever existed. A THIRD
-/// list, not literally `KNOWN_SAGS` (that one is scoped to the mmap-route test
-/// by name), because the two routes' accepted-defect sets are not required to
-/// be identical in general — these three currently happen to coincide, and
-/// the streaming-route fix below made that coincidence exact rather than
-/// coincidental (same bytes, same code path, below the refill threshold).
-const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] = &[("text", 7), ("text", 8), ("noise", 5)];
+/// Sags SHARED with the mmap route's own [`KNOWN_SAGS`]. Below the ~4.56 MiB
+/// refill threshold the streaming route calls `encode_gzip_slack_padded_to_vec`
+/// and is therefore byte-IDENTICAL to the mmap route, so for these 1 MiB
+/// fixtures the two lists must agree entry-for-entry — they are kept as separate
+/// consts because the two routes' accepted-defect sets are not required to
+/// coincide in general (above the threshold they genuinely do not).
+///
+/// ⚠ REBASELINED 2026-08-20 alongside [`KNOWN_SAGS`] when the T1 cumulative
+/// ratchet was removed (measured: 0 pass->fail rival cell flips across 345
+/// cells, 1.73x-4.50x less wall — see that const's comment and
+/// `deflate_one_shot_t1_ratcheted`). `("noise", 5)` was an artefact of the
+/// ratchet's own L5/L6 scope cutoff and is GONE; the true stored-grid sag it
+/// displaced is back at its origin, `("noise", 2)`. `("text", 3)` is the
+/// "ladder sags at L4" defect family the ratchet masked rather than fixed.
+/// `("text", 7)`/`("text", 8)` are the older, deeper "L7 is the best level on
+/// prose" property of `params(level)`'s high-level table — outside the former
+/// ratchet's 1..=5 scope on EITHER route, and confirmed present on
+/// `origin/main` before `c8bbde67`/`b4b821c9` ever existed.
+///
+/// NOTE this list is a weaker guard than [`KNOWN_SAGS`]: the loop below only
+/// SKIPS a listed pair, so a listed sag that heals passes silently here,
+/// whereas `KNOWN_SAGS` fails closed in both directions and can only shrink.
+const STREAMING_SHARED_KNOWN_SAGS: &[(&str, u32)] =
+    &[("noise", 2), ("text", 3), ("text", 7), ("text", 8)];
 
 /// **PARTIALLY FIXED 2026-08-18/19** (was a known gap from Codex's `b4b821c9` pre-merge
 /// review; partially fixed same day per Fable + cursor-agent's independent streaming-route

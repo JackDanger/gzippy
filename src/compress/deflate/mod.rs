@@ -675,69 +675,45 @@ fn deflate_one_shot_t1_l1_l2_parallel(data: &[u8]) -> Vec<u8> {
     })
 }
 
-/// T1 whole-buffer/mmap output for levels 1..=5, with ladder monotonicity
-/// guaranteed BY CONSTRUCTION: level N's output size never exceeds level
-/// (N-1)'s, regardless of how many/which heterogeneous vendor-shaped arms
-/// each level's own pick-min tries. Needed because `params_inner`'s per-field
-/// depth monotonicity does NOT imply pick-min OUTPUT monotonicity — see the
-/// `L3->L4->L5` whack-a-mole receipt above (`deflate_one_shot_t1_l4_pick_min`
-/// doc) and `level.rs`'s own engine.wasm L8 receipt (a longer search can
-/// itself produce a LARGER output — parameter reasoning alone can never
-/// certify this, only a byte comparison can).
+/// T1 whole-buffer/mmap output for levels 1..=5.
 ///
-/// Scoped to 1..=5, not the full 1..=9 ladder: a full recursive ratchet
-/// through L9 was estimated by two independent reviews (2026-08-17, PLAN.md)
-/// at ~13-20x a single L9 encode — unmeasured and likely wall-prohibitive.
-/// L6-L9 keep today's `KNOWN_SAGS`-pinned behavior until that is measured
-/// (`fulcrum try --levels 1-9` on a ref that extends this range).
+/// **REVERTED FROM A CUMULATIVE RATCHET, 2026-08-20 (CLAUDE.md hard stop 10).**
+/// This function previously folded every level's own multi-arm pick-min into
+/// a running minimum across ALL of 1..=level, to guarantee `size(N) <=
+/// size(N-1)` unconditionally — at L5 that meant ~12 full independent parses
+/// per call, a MEASURED 7.3x (vs this branch's own prior code) / 8.7x (vs
+/// libdeflate) wall regression, still open when the decision below was made.
 ///
-/// ASCENDING ITERATIVE FOLD, not recursion (cursor-agent/Codex pre-merge review,
-/// 2026-08-18): the first version recursed level-down-to-1, so completing a level-5
-/// call held cur5, cur4, cur3, cur2 AND cur1 alive SIMULTANEOUSLY at the deepest
-/// stack frame before any comparison could drop a loser — up to 5 near-input-sized
-/// buffers at once on incompressible data (an 83 MiB input could peak near 400+ MiB
-/// of ratchet-owned Vec<u8> alone, on top of what the underlying encoders allocate).
-/// This form holds at most THREE buffers at any moment during the L3-L5
-/// loop portion (correction, 2026-08-19 review): the outer `best` stays
-/// alive across the whole computation of `cur`, and computing `cur` itself
-/// has its own transient 2-buffer peak inside that level's own pick-min.
-/// So peak DURING THE LOOP = outer `best` + that level's own 2-buffer
-/// internal peak = 3. Still a large improvement over the prior recursive
-/// form's up-to-5, and the loser at each OUTER fold step is still dropped
-/// immediately every iteration — the correction is to the exact count, not
-/// the direction of the fix.
+/// That guarantee maps to no promotion-rule clause and no CLAUDE.md goal
+/// sentence — `ladder_is_monotone_t1` (`tests/size_invariants.rs`) is a local
+/// test convention, not a chartered bar, and it was independently confirmed
+/// (2026-08-19, direct execution) that `origin/main` — merged, unrelated to
+/// this branch — ALREADY violates it on the real corpus (`photo.jpg` T1: L3 =
+/// 6,472,401 > L2 = 6,462,189, +10,212 B) with zero promotion-cell
+/// consequence, because promotion compares us to a RIVAL at a given level,
+/// never to our own adjacent level. Paying 7.3x/8.7x wall for a guarantee the
+/// shipped binary doesn't itself uphold, with no rival-facing benefit, fails
+/// the charter's actual bar (size AND wall, per label, vs every rival) rather
+/// than serving it.
 ///
-/// **UPDATED PEAK, 2026-08-19 (`deflate_one_shot_t1_l1_l2_parallel`):** for
-/// `level >= 2`, the FIRST step (computing L1+L2 combined) now spawns all 5
-/// arms concurrently, so its own transient peak is 5 buffers (every arm's
-/// output alive until the fold collapses them), not the 2 the old serial
-/// L1-then-L2 form held at any one moment. Overall peak across the whole
-/// call = max(5, 3) = 5, up from 3 — traded deliberately for wall time, at
-/// the SAME kind of tradeoff the removed full-L1-L5 parallel version made
-/// (peak 11) before being reverted for an unrelated (wall-time) reason; the
-/// memory tradeoff itself was never in question. L3-L5 stay the ORIGINAL
-/// serial per-level fold — see `deflate_one_shot_t1_l1_l2_parallel`'s doc
-/// comment for why the line is drawn exactly at L2.
+/// What's kept: `deflate_one_shot_t1_l1_l2_parallel`'s L1+L2 fold, which IS
+/// independently, dual-arch measured CHEAPER than the prior serial form
+/// (1.5-1.85x faster, `848b8924`) — folding L1 into L2 there is a side effect
+/// of a real wall win, not a cost paid for monotonicity, so it stays. L3, L4,
+/// L5 go back to their OWN independent pick-min, no cross-level folding —
+/// whatever ladder sags that exposes on the synthetic fixtures are receipted
+/// into `KNOWN_SAGS` (same escape valve the test already had) rather than
+/// bought back with another full-cascade fold.
 fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
     debug_assert!((1..=5).contains(&level));
-    let mut best = if level == 1 {
-        deflate_one_shot_t1_l1_pick_min(data)
-    } else {
-        deflate_one_shot_t1_l1_l2_parallel(data)
-    };
-    let start = if level == 1 { 2 } else { 3 };
-    for lv in start..=level {
-        let cur = match lv {
-            3 => deflate_one_shot_t1_l3_pick_min(data),
-            4 => deflate_one_shot_t1_l4_pick_min(data),
-            5 => deflate_one_shot_t1_l5_pick_min(data),
-            _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
-        };
-        if cur.len() < best.len() {
-            best = cur;
-        }
+    match level {
+        1 => deflate_one_shot_t1_l1_pick_min(data),
+        2 => deflate_one_shot_t1_l1_l2_parallel(data),
+        3 => deflate_one_shot_t1_l3_pick_min(data),
+        4 => deflate_one_shot_t1_l4_pick_min(data),
+        5 => deflate_one_shot_t1_l5_pick_min(data),
+        _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
     }
-    best
 }
 
 fn deflate_into(
