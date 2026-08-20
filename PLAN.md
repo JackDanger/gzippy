@@ -4,6 +4,74 @@
 **Done when:** **0 / 1320** failing GATE promotion-board cells (size AND wall, per-label, T1 and T>1).  
 **Not done when:** a session summary, a partial lever, or a hand measurement without `make lever`.
 
+---
+
+## 🎯 FABLE DESIGN, 2026-08-19 — the structural reason BOTH T4 attempts above failed, and the
+## real fix shape: stop choosing between whole parses, cost-gate individual decisions instead
+
+Routed through Fable (per the user's directive — cursor-agent was out of budget, "do tricky
+work via Fable") after two independent T4 attempts (the seam fix and the dd79 hash3-chain
+generalization) both hit a wall-cost or size-regression wall from the SAME root cause. Full
+report: `codex-dd79-l3-implement-prompt.txt`-style delegation, output archived in this session's
+scratchpad. Key findings, each backed by an actual code citation, not inference:
+
+1. **T4 has ZERO idle-core slack — confirmed structurally, not measured indirectly.**
+   `src/infra/scheduler.rs`'s `compress_parallel` spawns exactly `num_threads` chunk workers
+   plus a SPIN-WAITING writer thread (`wait_for_slot_ready`) — so `-p4` already burns 5 cores'
+   worth of activity. `pipelined.rs`'s grid targets `CHUNKS_PER_THREAD = 2`, so every
+   GATE-corpus file produces ≥2×T chunks and all T workers stay saturated until the tail wave.
+   **Any extra per-chunk work steals sibling-chunk cycles ~1:1** — exactly why the seam fix
+   measured ~2x wall (26.2→53.7ms), not ~max(arms). This is why T1's L1+L2 parallelization
+   worked (genuinely idle cores at `-p1`) and NEITHER T4 attempt could ever have worked as "run
+   a second candidate."
+
+2. **The hash3-chain LINK fix is a provable NO-OP without the WALK.** `next3_tab` is read in
+   exactly one place (`longest_match`'s chain loop, `hc.rs` ~392-424), gated on
+   `hash3_chain_depth > 0`; with depth 0 (every shipped `params_parallel` level) the loop
+   breaks before ever touching `next3_tab`. So "link correctly, don't walk deeper" changes
+   nothing — the dd79 win REQUIRES the deeper walk, meaning the weights.safetensors regression
+   is necessarily in the WALK's newly-accepted matches, not the linking. Decoupling them (my
+   own first idea after the discard above) would not have helped even if tried.
+
+3. **Any "choose between whole-parse arms per chunk" design is structurally dead for these
+   cells, not just the two variants already tried.** The seam agent's own size-ratio dead-zone
+   gate is degenerate (dickens keeps wall by forfeiting its ENTIRE size win — verified
+   byte-identical to parent; photo.jpg/data.csv keep the win and still pay full 2x, because the
+   gzip arm WINS BROADLY on exactly those files, so a cheaper "try the cheap arm first, bail
+   early if it's not going to help" selector still can't avoid paying for the arm that wins).
+
+**Recommended direction: this codebase already solved this exact SHAPE of problem once —
+`far_len3_gate` / PR #299 (`src/compress/deflate/parse/far_len3.rs`).** Instead of running a
+second whole parse, price INDIVIDUAL match-accept decisions against the block's own running
+literal-cost frequencies, inside the ONE parse T>1 already does. Concretely:
+
+- **dd79_bin6 L3 T4:** enable `maintain_hash3_chain=true`/`hash3_chain_depth=32` on
+  `params_parallel(3)` (as tried) AND gate the resulting len-3 accepts through a CONTRACTING
+  version of the existing `far_len3` cost table (reject a within-8192 len-3 accept when the
+  running frequencies price 3 literals cheaper, fail-open to today's bytes when there's no
+  evidence yet) — the same per-file-adapts-itself resolution that closed the L2 guard class.
+- **photo.jpg/data.csv L1-3 T4:** UNATTRIBUTED — the gzip arm differs from `params_parallel`
+  in several knobs at once (depth, nice, forced-min-match, hash3 depth, and at L3 strategy
+  itself). Needs a knob-isolation sweep BEFORE designing a gate (which single knob or
+  combination actually carries the win).
+
+**Named as the cheapest falsifier, not yet run: attribute the weights.safetensors regression.**
+Does it concentrate in gateable "we-match/they'd-be-cheaper-literal" len-3 decisions (design is
+live), or is it parse DISPLACEMENT (same accepts, worse downstream structure — a per-decision
+gate is blind to that, design is dead for this file)? Use `fulcrum why
+libdeflate:weights.safetensors:L3:T4:size` / `examples/divergence_accounting` /
+anatomy-counters on shipped-vs-repaired. **This must run before building anything** — see
+below for the result.
+
+**Full verification gate Fable named for whatever gets built** (the exact checks that caught
+both prior failures): full-corpus `wc -c` sweep against ALL FOUR rivals (not just the target
+file — tie-guard alone misses close-win flips like weights.safetensors was); `hyperfine` paired
+against the ACTUAL rival (pigz -p4), not our own parent; `tie-guard.sh`; `cargo test` zero pin
+regen; `make holdout` + `make surface` for generalization; `make lever REF=<ref> ARGS="--threads
+1,4"` scoped to the levels actually touched (2,3 — not the 2,6,9 default).
+
+---
+
 **Fresh board, commit `06b2e231`, this branch: 11 of 1320 failing** (was 13 at `86c19fc5`
 earlier the same day, was a stale 36 on main). dd79_bin6 L3 T1 closed this session. Residual:
 dd79_bin6 L3 T4 (tried, REGRESSES elsewhere — see below), photo.jpg L1/2/3 T4 (real fix found,
