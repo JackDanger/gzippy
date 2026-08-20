@@ -63,6 +63,31 @@ libdeflate:weights.safetensors:L3:T4:size` / `examples/divergence_accounting` /
 anatomy-counters on shipped-vs-repaired. **This must run before building anything** — see
 below for the result.
 
+**RUN, 2026-08-19/20 — clean, decisive: the regression IS the gateable class. Design A is
+LIVE.** `--features anatomy-counters`, shipped vs the discarded hash3-chain-repair patch
+(re-applied locally, uncommitted, throwaway worktree), same file, same T4 invocation:
+
+    literals_emitted:        87,304,414 -> 87,150,880   (-153,534)
+    matches_emitted:            921,030 ->    972,605   (+51,575)
+    match_length_bytes_total: 3,563,962 -> 3,717,496   (+153,534 -- EXACTLY offsets the
+                                                          literal delta: the LZ77 partition
+                                                          identity, confirms no bytes
+                                                          double-counted or lost)
+    new match avg length: 153,534 / 51,575 = 2.977 ≈ 3.0  -- ESSENTIALLY EVERY new match
+                                                              is length-3
+    emit_body_bits delta: +47,934 bits = +5,991.75 B ≈ the measured +5,926 B whole-file
+                                                        regression (accounts for effectively
+                                                        all of it)
+
+**Every byte of the regression is carried by ~51,575 newly-accepted length-3 matches that are,
+on average, individually MORE EXPENSIVE (Huffman-coded) than the 3 literals they replaced** —
+not parse displacement, not a diffuse structural effect. This is EXACTLY `far_len3_gate`'s
+existing cost table's native question ("does this specific len-3 accept beat 3 literals under
+this block's own running frequencies") applied to a different accept site (the hash3-chain
+walk's own len-3 finds, `lazy.rs`'s accept path, vs `far_len3_gate`'s current scope of
+far-offset-only accepts). **Design A (contracting len-3 gate on the hash3-chain-repair walk)
+should be built next** — the falsifier that would have killed it came back clean.
+
 **Full verification gate Fable named for whatever gets built** (the exact checks that caught
 both prior failures): full-corpus `wc -c` sweep against ALL FOUR rivals (not just the target
 file — tie-guard alone misses close-win flips like weights.safetensors was); `hyperfine` paired
