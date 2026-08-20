@@ -6,8 +6,47 @@
 
 **Fresh board, commit `06b2e231`, this branch: 11 of 1320 failing** (was 13 at `86c19fc5`
 earlier the same day, was a stale 36 on main). dd79_bin6 L3 T1 closed this session. Residual:
-dd79_bin6 L3 T4 (separate lever, same bug on the untouched T>1 path), photo.jpg L1/2/3 T4 (real
-fix found, PARKED — see below, not merged), weights.safetensors L4/L7-9 (untouched, tiny).
+dd79_bin6 L3 T4 (tried, REGRESSES elsewhere — see below), photo.jpg L1/2/3 T4 (real fix found,
+PARKED — see below, not merged), weights.safetensors L4/L7-9 (untouched, tiny).
+
+---
+
+## ⛔ TRIED AND DISCARDED, 2026-08-19 (never committed) — dd79_bin6 L3 T4 hash3-chain-repair
+## does NOT safely generalize from T1 to `params_parallel`; confirmed pass→fail elsewhere
+
+Applying the SAME fix that closed `gzip:dd79_bin6:L3:T1:size` (T1's hash3-chain-repair pick-min
+arm, landed `804fdbb0`) directly to `params_parallel(3)` (the T>1 path, unconditional parameter
+change, not a pick-min arm) looked genuinely promising going in: unlike the T4-seam fix, this is
+an IN-PLACE matchfinder change inside the ONE parse T>1 already does, not a redundant second
+encode — so no comparable wall-cost class was expected, and that held (dd79_bin6 L3 T4: 17%
+slower than parent but still 1.27x FASTER than pigz, no wall regression; dickens L3 T4 exactly
+unaffected). Closed the target cell cleanly: 4,452,034 → 4,426,383 B, now beats both gzip
+(-10,039) and pigz (-15,531).
+
+**But a full-corpus check (all 22 files, not just the target) found 5 files regress at L3 T4:**
+dd79_text6 +5 B, engine.wasm +55 B, markup.xml +2 B, monorepo.tar +620 B,
+**weights.safetensors +5,926 B**. Checked each against all three rivals for a pass→fail flip
+(tie-guard does NOT catch this — it only checks EXACT libdeflate ties, and this was a close win
+with a 2,252 B margin, not a tie): **`libdeflate:weights.safetensors:L3:T4:size` flips PASS
+(83,080,006 ≤ 83,082,258) → FAIL (83,085,932 > 83,082,258).** A real, disqualifying regression
+on a currently-passing cell — clause 3 is absolute regardless of the dd79_bin6 win.
+
+**Tried a quick depth sweep (4/8/16/24 vs the shipped 32) hoping this was a magnitude problem,
+not a direction problem — it is NOT rescued by any depth:** at `hash3_chain_depth=4`, dd79_bin6
+still wins comfortably (4,426,504) but weights.safetensors is STILL worse than both libdeflate
+and its own parent (83,086,176), barely different from depth 32's regression. This is CLAUDE.md's
+own documented lesson recurring on a NEW mechanism (the `level.rs` engine.wasm L8 depth-scaling
+receipt: "a deeper chain changes the PARSE, not merely the quality of one match... no multiplier
+rescues it") — the regression is about LINKING the chain at all, not how deep it's walked.
+
+**Discarded (never committed — this was an uncommitted local edit in a throwaway worktree, `git
+checkout` cleanly reverted it, nothing to revert-commit).** Making this an ADDITIVE pick-min arm
+(matching T1's safe pattern, instead of an unconditional parameter change) would restore the
+"never worse" guarantee, but reintroduces the exact redundant-second-encode wall-cost class that
+already sank the T4-seam fix above — not attempted, likely the same trap. Revival needs either a
+cost-aware per-chunk decision that doesn't require a full trial encode, or accepting
+weights.safetensors' loss is bounded and outside this specific promotion cell's scope (it is
+not — L3 T4 vs libdeflate on that exact file is the flip). `dd79_bin6:L3:T4` stays open.
 
 ---
 
