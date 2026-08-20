@@ -163,26 +163,21 @@ pub fn encode_deflate_segment_to_sink(
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
         if !parallel
+            && level_uses_t1_ratchet(level)
+            && is_last
+            && bw.byte_len() == 0
+            && !data.is_empty()
+        {
+            *out = deflate_one_shot_t1_ratcheted(data, level);
+            return;
+        }
+        if !parallel
             && level_uses_t1_zlib_pick_min(level)
             && is_last
             && bw.byte_len() == 0
             && !data.is_empty()
         {
             *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
-            return;
-        }
-        if !parallel
-            && level_uses_t1_mmap_pick_min(level)
-            && is_last
-            && bw.byte_len() == 0
-            && !data.is_empty()
-        {
-            *out = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
             return;
         }
         deflate_into(
@@ -381,15 +376,24 @@ pub(crate) fn note_stored_block_emitted() {
 /// importantly, make the output depend on the chunk size — destroying
 /// byte-identity with the whole-buffer encoder.
 /// Levels where the T1 whole-buffer path runs zlib pick-min (L5-L7).
+/// L6-L7 only: L5 moved to [`level_uses_t1_ratchet`] (`deflate_one_shot_t1_l5_pick_min`
+/// wraps this same zlib pick-min, but every T1 whole-buffer entry point must reach L5
+/// through the ratchet, not this direct call, or the ladder monotonicity guarantee has
+/// a hole). Still used internally: `deflate_one_shot_t1_zlib_pick_min`'s own
+/// `debug_assert` accepts 5..=7 since the L5 wrapper calls it with level=5 directly.
 #[inline]
 fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
-    matches!(level, 5..=7)
+    matches!(level, 6..=7)
 }
 
-/// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
+/// Levels routed through [`deflate_one_shot_t1_ratcheted`] — ladder monotonicity by
+/// construction (levels 1-4's individual pick-min functions plus L5's wrapper, folded
+/// through the ratchet). Every T1 whole-buffer/mmap entry point must check this BEFORE
+/// `level_uses_t1_zlib_pick_min` so L5 is intercepted here rather than falling through
+/// to the direct zlib call.
 #[inline]
-fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
-    matches!(level, 1 | 2 | 4)
+fn level_uses_t1_ratchet(level: u32) -> bool {
+    matches!(level, 1..=5)
 }
 
 /// Pick-min helper: parallel arms in release builds; sequential with winner-only
@@ -444,7 +448,9 @@ fn deflate_one_shot_t1_zlib_pick_min(
     is_last: bool,
     sync_flush: bool,
 ) -> Vec<u8> {
-    debug_assert!(level_uses_t1_zlib_pick_min(level));
+    // L5 reaches here via `deflate_one_shot_t1_l5_pick_min` (ratchet route);
+    // L6-L7 reach here directly via `level_uses_t1_zlib_pick_min` callers.
+    debug_assert!(matches!(level, 5..=7));
     let budget = encode_types::HeaderBudget::Lean;
     let baseline = level::params_baseline(level);
     let zlib = level::params_zlib_t1(level);
@@ -551,22 +557,42 @@ fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
-/// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
-fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    let best = pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(2)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    );
-    let gzip_greedy = encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast());
-    if gzip_greedy.len() < best.len() {
-        gzip_greedy
-    } else {
-        best
-    }
+/// Pick-min: Lazy vs gzip `deflate_fast` at L3.
+///
+/// THINNED 2026-08-19 (`pickmin_arm_audit::win_rate_report`, the real 23-file
+/// GATE corpus, T1): the third arm this function used to try,
+/// `params_l3_libdeflate_greedy`, won ZERO of 23 L3 cells — every single file
+/// had a strictly smaller (or tied-and-thus-redundant) result from one of the
+/// other two arms. An arm that never wins cannot be the reason any current
+/// cell is closed, so dropping it cannot reopen one; it only cuts L3's own
+/// arm count from 3 to 2 (part of the wall-cost thinning direction PLAN.md
+/// names after the "rung + nested bonus" fold-shape redesign was built and
+/// falsified same day — see PLAN.md's CRITICAL section). `params_l3_
+/// libdeflate_greedy` itself is kept (still `pub`, still exercised by the
+/// audit) so a future corpus/content shift that makes it start winning again
+/// shows up as a nonzero count next run, not silently.
+fn deflate_one_shot_t1_l3_pick_min(data: &[u8]) -> Vec<u8> {
+    pick_min_two_vecs(
+        || encode_unpadded_deflate_bytes(data, level::params(3)),
+        || {
+            pick_min_two_vecs(
+                || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()),
+                || encode_unpadded_deflate_bytes(data, level::params_l3_gzip_hash3_chain_repair()),
+            )
+        },
+    )
 }
 
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
+///
+/// Does NOT carry its own gzip-`deflate_fast`-shaped arm: L3's pick-min
+/// gained one (`params_l3_gzip_deflate_fast`) and briefly let L3 leapfrog L4
+/// in size (`ladder_is_monotone_t1` regression, 2026-08-17). Mirroring the
+/// same arm onto L4 fixed L3->L4 but only pushed the identical violation to
+/// L4->L5 (proof by execution that arm-by-arm mirroring cannot terminate).
+/// The actual fix is [`deflate_one_shot_t1_ratcheted`], which caps every
+/// level's output at the level below's — L4 gets L3's winning arm for free
+/// through the ratchet instead of needing its own copy.
 fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
     let mut lazy_params = level::params(4);
     lazy_params.strategy = level::Strategy::Lazy;
@@ -574,6 +600,120 @@ fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
         || encode_unpadded_deflate_bytes(data, level::params(4)),
         || encode_unpadded_deflate_bytes(data, lazy_params),
     )
+}
+
+/// L5's zlib pick-min (`params_baseline(5)` vs `params_zlib_t1(5)`), wrapped
+/// to the `data: &[u8] -> Vec<u8>` calling convention the ratchet needs.
+/// `deflate_one_shot_t1_zlib_pick_min` requires its buffer to carry
+/// `parse::BUF_PAD` trailing bytes past the logical end (its two existing
+/// call sites already hold a padded caller buffer); this wrapper pads its
+/// own copy, the same way `encode_unpadded_deflate_bytes` does internally
+/// for the L1-L4 mmap pick-min functions.
+fn deflate_one_shot_t1_l5_pick_min(data: &[u8]) -> Vec<u8> {
+    let cap = data.len() + parse::BUF_PAD;
+    let mut buf = Vec::with_capacity(cap);
+    buf.extend_from_slice(data);
+    buf.resize(cap, 0);
+    deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), 5, true, true)
+}
+
+/// Combined L1+L2 arm dispatch, all 5 arms (L1's 2, L2's 3) spawned
+/// CONCURRENTLY via `std::thread::scope` instead of L1 fully resolving (its
+/// own internal 2-way parallel pick-min) before L2 starts.
+///
+/// SCOPED NARROWLY, not a return of full L1-L5 parallelization: a prior
+/// version of this branch (`bc75535e`) parallelized every arm across every
+/// level up to L5 (~11 threads at L5) and was shipped as a "3.1-3.4x wall
+/// win" off ONLY this laptop's (M1/aarch64) numbers. A direct `hyperfine`
+/// check on the x86_64 solvency box (the project's wall authority) — run
+/// against the exact binaries `fulcrum try` had already built there — found
+/// it net negative at 3 of 5 levels: L1 tie, L2 1.59-1.83x FASTER (every
+/// file tested), L3 1.19x SLOWER, L5 1.04-1.08x SLOWER. `bc75535e` was
+/// REVERTED (`0edecd3`); see PLAN.md's top-of-file retraction and
+/// `project_t1_ratchet_parallel_dispatch_level_dependent.md` for the full
+/// account. **L2 is the one coordinate measured safe on BOTH architectures**
+/// (this laptop and x86_64 solvency) — this function is scoped to exactly
+/// that, not extrapolated further without the same dual-arch check.
+///
+/// PROOF OF BYTE-IDENTITY: same canonical-order argument the reverted full
+/// version used (see its history), scoped to `[L1's 2 arms] ++ [L2's 3
+/// arms]` — the first arm in that fixed order achieving the group's minimum
+/// wins any tie, exactly reproducing `deflate_one_shot_t1_l1_pick_min`
+/// followed by the OLD `deflate_one_shot_t1_l2_pick_min` (removed — its
+/// pair-then-third-sequential-arm shape is now folded directly into this
+/// function instead of a separate helper). `cargo test` after this change
+/// must show ZERO pin/fingerprint regeneration — verify this empirically,
+/// not just from the proof, per the same discipline that
+/// caught the reverted version's ARCH problem (which was a real regression
+/// the proof never claimed to rule out — the proof is about BYTES, not wall
+/// time).
+fn deflate_one_shot_t1_l1_l2_parallel(data: &[u8]) -> Vec<u8> {
+    std::thread::scope(|s| {
+        let l1a = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(1)));
+        let l1b = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
+        let l2a = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params(2)));
+        let l2b = s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()));
+        let l2c =
+            s.spawn(|| encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()));
+
+        let ordered = [
+            l1a.join().expect("ratchet arm l1a panicked"),
+            l1b.join().expect("ratchet arm l1b panicked"),
+            l2a.join().expect("ratchet arm l2a panicked"),
+            l2b.join().expect("ratchet arm l2b panicked"),
+            l2c.join().expect("ratchet arm l2c panicked"),
+        ];
+        let mut best: Option<Vec<u8>> = None;
+        for cur in ordered {
+            best = Some(match best {
+                None => cur,
+                Some(b) if cur.len() < b.len() => cur,
+                Some(b) => b,
+            });
+        }
+        best.expect("l1a always runs")
+    })
+}
+
+/// T1 whole-buffer/mmap output for levels 1..=5.
+///
+/// **REVERTED FROM A CUMULATIVE RATCHET, 2026-08-20 (CLAUDE.md hard stop 10).**
+/// This function previously folded every level's own multi-arm pick-min into
+/// a running minimum across ALL of 1..=level, to guarantee `size(N) <=
+/// size(N-1)` unconditionally — at L5 that meant ~12 full independent parses
+/// per call, a MEASURED 7.3x (vs this branch's own prior code) / 8.7x (vs
+/// libdeflate) wall regression, still open when the decision below was made.
+///
+/// That guarantee maps to no promotion-rule clause and no CLAUDE.md goal
+/// sentence — `ladder_is_monotone_t1` (`tests/size_invariants.rs`) is a local
+/// test convention, not a chartered bar, and it was independently confirmed
+/// (2026-08-19, direct execution) that `origin/main` — merged, unrelated to
+/// this branch — ALREADY violates it on the real corpus (`photo.jpg` T1: L3 =
+/// 6,472,401 > L2 = 6,462,189, +10,212 B) with zero promotion-cell
+/// consequence, because promotion compares us to a RIVAL at a given level,
+/// never to our own adjacent level. Paying 7.3x/8.7x wall for a guarantee the
+/// shipped binary doesn't itself uphold, with no rival-facing benefit, fails
+/// the charter's actual bar (size AND wall, per label, vs every rival) rather
+/// than serving it.
+///
+/// What's kept: `deflate_one_shot_t1_l1_l2_parallel`'s L1+L2 fold, which IS
+/// independently, dual-arch measured CHEAPER than the prior serial form
+/// (1.5-1.85x faster, `848b8924`) — folding L1 into L2 there is a side effect
+/// of a real wall win, not a cost paid for monotonicity, so it stays. L3, L4,
+/// L5 go back to their OWN independent pick-min, no cross-level folding —
+/// whatever ladder sags that exposes on the synthetic fixtures are receipted
+/// into `KNOWN_SAGS` (same escape valve the test already had) rather than
+/// bought back with another full-cascade fold.
+fn deflate_one_shot_t1_ratcheted(data: &[u8], level: u32) -> Vec<u8> {
+    debug_assert!((1..=5).contains(&level));
+    match level {
+        1 => deflate_one_shot_t1_l1_pick_min(data),
+        2 => deflate_one_shot_t1_l1_l2_parallel(data),
+        3 => deflate_one_shot_t1_l3_pick_min(data),
+        4 => deflate_one_shot_t1_l4_pick_min(data),
+        5 => deflate_one_shot_t1_l5_pick_min(data),
+        _ => unreachable!("deflate_one_shot_t1_ratcheted is scoped to levels 1..=5"),
+    }
 }
 
 fn deflate_into(
@@ -644,6 +784,11 @@ pub fn encode_deflate_slack_padded_to_sink(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
+    if level_uses_t1_ratchet(level) && logical_len > 0 {
+        let data = &buf[..logical_len];
+        out.extend_from_slice(&deflate_one_shot_t1_ratcheted(data, level));
+        return;
+    }
     if level_uses_t1_zlib_pick_min(level) && logical_len > 0 {
         out.extend_from_slice(&deflate_one_shot_t1_zlib_pick_min(
             buf,
@@ -653,17 +798,6 @@ pub fn encode_deflate_slack_padded_to_sink(
             true,
             true,
         ));
-        return;
-    }
-    if level_uses_t1_mmap_pick_min(level) && logical_len > 0 {
-        let data = &buf[..logical_len];
-        let deflate = match level {
-            1 => deflate_one_shot_t1_l1_pick_min(data),
-            2 => deflate_one_shot_t1_l2_pick_min(data),
-            4 => deflate_one_shot_t1_l4_pick_min(data),
-            _ => unreachable!(),
-        };
-        out.extend_from_slice(&deflate);
         return;
     }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
@@ -698,14 +832,8 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
         // OS=255 (unknown).
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        if level_uses_t1_mmap_pick_min(level) && !data.is_empty() {
-            let deflate = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
-            out.extend_from_slice(&deflate);
+        if level_uses_t1_ratchet(level) && !data.is_empty() {
+            out.extend_from_slice(&deflate_one_shot_t1_ratcheted(data, level));
         } else {
             encode_deflate_bytes_to_sink(data, &[], level, &mut out);
         }
@@ -814,8 +942,56 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     let mut in_next = 0usize; // parse position, in buffer coordinates
     let mut avail = 0usize; // valid bytes in buf
     let mut eof = false;
-    let mut crc = crc32fast::Hasher::new();
     let mut total: u64 = 0;
+    let fill_to = cap - INPLACE_TAIL_PAD;
+
+    // FIRST refill, done unconditionally, BEFORE committing to streaming (no
+    // header written, no BitWriter created yet). Ladder monotonicity fix
+    // (2026-08-18, Fable + cursor-agent design review of the streaming-route
+    // gap Codex found in b4b821c9's pre-merge review): if the whole input
+    // fits in this one refill — i.e. EOF arrives before `avail` reaches
+    // `fill_to` — the buffer already holds every byte of the input with
+    // `INPLACE_TAIL_PAD` zeroed behind it: EXACTLY the precondition
+    // `encode_gzip_slack_padded_to_vec` needs, at ZERO extra memory or
+    // latency cost (this buffer and this read were always going to happen;
+    // `fill_to` is ~4.56 MiB, so this covers the overwhelming majority of
+    // real files/pipes for free). Route through it instead of the
+    // single-arm streaming loop below, for byte-identity with the file/mmap
+    // route at every level: the whole-buffer path already carries the L1-5
+    // ratchet (`deflate_one_shot_t1_ratcheted`), the L6-7 zlib pick-min, and
+    // the L8-12 fallback — this closes the streaming gap for ALL of them,
+    // not just 1-5. Only inputs LARGER than `fill_to` fall through to true
+    // single-pass streaming below, where the ladder invariant is not
+    // currently guaranteed (see `PLAN.md`, "PROMOTION PAUSED" section, for
+    // the Phase 2 tradeoff this leaves open).
+    while !eof && avail < fill_to {
+        let r = reader.read(&mut buf[avail..fill_to]);
+        match r {
+            Ok(0) => eof = true,
+            Ok(k) => {
+                total += k as u64;
+                avail += k;
+                state.input_total_len = state.input_total_len.max(total as usize);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf[avail..avail + INPLACE_TAIL_PAD].fill(0);
+
+    if eof {
+        let gz = encode_gzip_slack_padded_to_vec(&buf[..avail + INPLACE_TAIL_PAD], avail, level);
+        writer.write_all(&gz)?;
+        return Ok(avail as u64);
+    }
+
+    // Streaming continues past this point: the CRC hasher restarts here and
+    // now folds every chunk (including the one already read above) as the
+    // main loop below drains it — the loop's own refill-while at the top of
+    // its first iteration is a no-op (`avail` is already `fill_to`), so
+    // nothing below needs to change for this case.
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&buf[..avail]);
 
     let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
@@ -1144,30 +1320,56 @@ fn encode_gzip_unpadded_l1_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l1_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 1));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
 
 /// T1 mmap L2: gzip `deflate_fast` class beats libdeflate Greedy on photo-like
-/// cells; Greedy wins libdeflate ties elsewhere. Pick-min three arms.
+/// cells; Greedy wins libdeflate ties elsewhere. Pick-min three arms, ratcheted
+/// against L1 (ladder monotonicity — see `deflate_one_shot_t1_ratcheted`).
 fn encode_gzip_unpadded_l2_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l2_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 2));
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
+/// T1 mmap L3: gzip `deflate_fast` beats gzip on photo-like cells; libdeflate
+/// Greedy wins libdeflate ties. Pick-min three arms (L2 precedent), ratcheted
+/// against L2.
+fn encode_gzip_unpadded_l3_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 3));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
 
 /// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
 /// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
-/// precedent) without changing `params(4)` for streaming or T>1 routes.
+/// precedent) without changing `params(4)` for streaming or T>1 routes,
+/// ratcheted against L3.
 fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
     data: &[u8],
     writer: &mut W,
 ) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l4_pick_min(data));
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 4));
+    writer.write_all(&best)?;
+    Ok(data.len() as u64)
+}
+
+/// T1 mmap L5: routes through [`deflate_one_shot_t1_ratcheted`] (not a direct
+/// zlib pick-min call) so this entry point stays consistent with the ladder
+/// monotonicity guarantee — see that function's doc.
+fn encode_gzip_unpadded_l5_pickmin<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> std::io::Result<u64> {
+    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_ratcheted(data, 5));
     writer.write_all(&best)?;
     Ok(data.len() as u64)
 }
@@ -1193,10 +1395,13 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     }
 
     let len = data.len();
-    // T1 mmap L5-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
+    // T1 mmap L6-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
     // `deflate_into`; route through the padded whole-buffer encoder so the
-    // streaming two-pass path does not need a second implementation.
-    if matches!(level, 5..=7) && len > 0 {
+    // streaming two-pass path does not need a second implementation. L5 is
+    // NOT included here — it routes through `encode_gzip_unpadded_l5_pickmin`
+    // below (the ratchet), or this entry point's ladder guarantee would have
+    // a hole relative to `encode_gzip_bytes_to_vec` / `encode_deflate_slack_padded_to_sink`.
+    if matches!(level, 6..=7) && len > 0 {
         let cap = len + INPLACE_TAIL_PAD;
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
@@ -1216,8 +1421,16 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         return encode_gzip_unpadded_l2_pickmin(data, writer);
     }
 
+    if level == 3 && len > 0 {
+        return encode_gzip_unpadded_l3_pickmin(data, writer);
+    }
+
     if level == 4 && len > 0 {
         return encode_gzip_unpadded_l4_pickmin(data, writer);
+    }
+
+    if level == 5 && len > 0 {
+        return encode_gzip_unpadded_l5_pickmin(data, writer);
     }
 
     let out_cap = if level == 0 {
@@ -1620,6 +1833,219 @@ mod streaming_tests {
     }
 }
 
+/// Per-arm win-rate audit for the L1-L5 T1 ratchet's pick-min functions.
+///
+/// NAMED BLOCKING QUESTION (CLAUDE.md's bar for building a measurement tool):
+/// PLAN.md's "rung + nested bonus" wall-cost fix was built and FALSIFIED same-day
+/// (2026-08-19, see PLAN.md) — the cheaper fold shape cannot preserve monotonicity
+/// without effectively re-absorbing the old ratchet's full cumulative cost. The
+/// remaining viable direction (CLAUDE.md option 1a from the original design brief)
+/// is thinning the ARM SET inside the existing, PROVEN-correct cumulative fold —
+/// but "which arms are safe to drop" cannot be guessed (CLAUDE.md: "COUNT it,
+/// never INFER it"). This module counts it: for every corpus file, at every
+/// level 1-5, which of that level's own candidate arms actually produces the
+/// winning (smallest) bytes. An arm with ZERO wins across the whole corpus is a
+/// candidate to drop with NO change to the fold's correctness (removing an arm
+/// that never wins cannot make any cell's output larger).
+///
+/// Deliberately NOT gated behind `anatomy-counters` or any new feature: this
+/// runs in-process against the real corpus, calls the exact same private encode
+/// functions the shipped pick-min functions call (so it can never drift from
+/// what actually ships the way an external/black-box measurement could), and is
+/// `#[ignore]`d so it costs nothing in a normal `cargo test` run.
+///
+///     cargo test --release --lib pickmin_arm_audit -- --ignored --nocapture
+#[cfg(test)]
+mod pickmin_arm_audit {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn corpus_roots() -> Vec<std::path::PathBuf> {
+        let mut v = vec![];
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(std::path::PathBuf::from(&h).join("www/gzippy-bench/corpus"));
+        }
+        v.push(std::path::PathBuf::from("/root/gzippy-bench/corpus"));
+        v
+    }
+
+    fn corpus_files() -> Vec<std::path::PathBuf> {
+        for root in corpus_roots() {
+            if root.is_dir() {
+                let mut files: Vec<_> = std::fs::read_dir(&root)
+                    .expect("read corpus dir")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file())
+                    .collect();
+                files.sort();
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+        vec![]
+    }
+
+    /// Arm labels at `level`, with NO encoding performed — must list exactly
+    /// the labels `arms_at_level` returns, in any order (report enumeration
+    /// only; win tallying itself never uses this, only `arms_at_level`'s own
+    /// output, so a drift here could only ever hide a 0-win arm from the
+    /// printed summary, not corrupt a count).
+    fn arm_labels_at_level(level: u32) -> &'static [&'static str] {
+        match level {
+            1 => &["l1_native", "l1_gzip_primary"],
+            2 => &["l2_native", "l2_gzip_primary", "l2_gzip_deflate_fast"],
+            3 => &[
+                "l3_native",
+                "l3_libdeflate_greedy",
+                "l3_gzip_deflate_fast",
+                "l3_gzip_hash3_chain_repair",
+            ],
+            4 => &["l4_native_greedy", "l4_lazy"],
+            5 => &["l5_baseline", "l5_zlib"],
+            _ => unreachable!("pickmin_arm_audit is scoped to levels 1..=5"),
+        }
+    }
+
+    /// (arm label, encoded length) for every candidate arm at `level`, in the
+    /// EXACT composition the shipped `deflate_one_shot_t1_l{level}_pick_min`
+    /// functions use — kept in lockstep with those functions by hand; if they
+    /// drift, this audit is measuring a mechanism that no longer ships.
+    fn arms_at_level(data: &[u8], level: u32) -> Vec<(&'static str, usize)> {
+        match level {
+            1 => vec![
+                (
+                    "l1_native",
+                    encode_unpadded_deflate_bytes(data, level::params(1)).len(),
+                ),
+                (
+                    "l1_gzip_primary",
+                    encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()).len(),
+                ),
+            ],
+            2 => vec![
+                (
+                    "l2_native",
+                    encode_unpadded_deflate_bytes(data, level::params(2)).len(),
+                ),
+                (
+                    "l2_gzip_primary",
+                    encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()).len(),
+                ),
+                (
+                    "l2_gzip_deflate_fast",
+                    encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()).len(),
+                ),
+            ],
+            3 => vec![
+                (
+                    "l3_native",
+                    encode_unpadded_deflate_bytes(data, level::params(3)).len(),
+                ),
+                (
+                    "l3_libdeflate_greedy",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_libdeflate_greedy()).len(),
+                ),
+                (
+                    "l3_gzip_deflate_fast",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_gzip_deflate_fast()).len(),
+                ),
+                (
+                    "l3_gzip_hash3_chain_repair",
+                    encode_unpadded_deflate_bytes(data, level::params_l3_gzip_hash3_chain_repair())
+                        .len(),
+                ),
+            ],
+            4 => {
+                let mut lazy_params = level::params(4);
+                lazy_params.strategy = level::Strategy::Lazy;
+                vec![
+                    (
+                        "l4_native_greedy",
+                        encode_unpadded_deflate_bytes(data, level::params(4)).len(),
+                    ),
+                    (
+                        "l4_lazy",
+                        encode_unpadded_deflate_bytes(data, lazy_params).len(),
+                    ),
+                ]
+            }
+            5 => {
+                let cap = data.len() + parse::BUF_PAD;
+                let mut buf = Vec::with_capacity(cap);
+                buf.extend_from_slice(data);
+                buf.resize(cap, 0);
+                let in_end = data.len();
+                let budget = encode_types::HeaderBudget::Lean;
+                let encode = |params: &level::LevelParams| -> usize {
+                    let mut bw = BitWriter::from_vec(Vec::new());
+                    parse::compress(&buf, 0, in_end, in_end, params, true, budget, &mut bw);
+                    bw.finish().len()
+                };
+                vec![
+                    ("l5_baseline", encode(&level::params_baseline(5))),
+                    ("l5_zlib", encode(&level::params_zlib_t1(5))),
+                ]
+            }
+            _ => unreachable!("pickmin_arm_audit is scoped to levels 1..=5"),
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly: needs the real corpus, prints a report, isn't a pass/fail gate"]
+    fn win_rate_report() {
+        let files = corpus_files();
+        assert!(
+            !files.is_empty(),
+            "pickmin_arm_audit: no corpus found under ~/www/gzippy-bench/corpus or \
+             /root/gzippy-bench/corpus — this audit needs the real corpus, not synthetic fixtures"
+        );
+        // (level, arm_label) -> win count. BTreeMap for stable, sorted output.
+        let mut wins: BTreeMap<(u32, &'static str), u32> = BTreeMap::new();
+        let mut cells: BTreeMap<u32, u32> = BTreeMap::new();
+
+        for path in &files {
+            let data = std::fs::read(path).expect("read corpus file");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for level in 1..=5u32 {
+                let arms = arms_at_level(&data, level);
+                let min_len = arms.iter().map(|(_, l)| *l).min().unwrap();
+                // A tie (two arms hit the exact same min) counts as a win for
+                // BOTH — dropping either one alone still leaves a winner at
+                // that size, so a tie is not evidence either arm is safe to
+                // drop unilaterally.
+                for (label, len) in &arms {
+                    if *len == min_len {
+                        *wins.entry((level, label)).or_insert(0) += 1;
+                    }
+                }
+                *cells.entry(level).or_insert(0) += 1;
+                println!(
+                    "{name}\tL{level}\twinner(s)={}\tmin_len={min_len}",
+                    arms.iter()
+                        .filter(|(_, l)| *l == min_len)
+                        .map(|(label, _)| *label)
+                        .collect::<Vec<_>>()
+                        .join("+")
+                );
+            }
+        }
+
+        println!("\n=== WIN-RATE SUMMARY ({} corpus files) ===", files.len());
+        for level in 1..=5u32 {
+            let total = *cells.get(&level).unwrap_or(&0);
+            for &label in arm_labels_at_level(level) {
+                let w = *wins.get(&(level, label)).unwrap_or(&0);
+                println!(
+                    "L{level}\t{label}\t{w}/{total} wins ({:.1}%)",
+                    100.0 * w as f64 / total as f64
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod inplace_tests {
     use super::*;
@@ -1763,6 +2189,15 @@ mod unpadded_slice_tests {
     /// consumes nothing); just above it (pass 1 emits its first block); and
     /// large enough that `max_shift` > 0 so pass 2 exercises the state
     /// rebase. L10-12 cover the padded-copy fallback arm.
+    ///
+    /// Levels 4, 5, 7 added 2026-08-18 (cursor-agent pre-merge review,
+    /// `deflate_one_shot_t1_ratcheted` / `b4b821c9`): the level list previously
+    /// read `[0,1,2,3,6,9]`, which happened to omit BOTH new ratchet-routed
+    /// levels (4, 5) this test's own mechanism (an entry-point routing gap)
+    /// caught mid-implementation — it caught the bug at L2 by luck, not by
+    /// coverage. A bug that only manifested at L4 or L5 specifically would
+    /// have shipped undetected. 7 added for symmetry with the L6 zlib
+    /// pick-min class this test already covered.
     #[test]
     fn unpadded_slice_is_byte_identical_to_whole_buffer() {
         let lookahead = parse::STREAM_BLOCK_LOOKAHEAD;
@@ -1780,7 +2215,7 @@ mod unpadded_slice_tests {
         for &len in &sizes {
             for period in [8u32, 96, 1 << 30] {
                 let data = corpus(len, period);
-                for level in [0u32, 1, 2, 3, 6, 9] {
+                for level in [0u32, 1, 2, 3, 4, 5, 6, 7, 9] {
                     assert_eq!(
                         unpadded(&data, level),
                         encode_gzip_bytes_to_vec(&data, level),

@@ -212,6 +212,52 @@ fn levels_1_through_12_never_get_larger_when_streamed() {
     eprintln!("streamed==whole-buffer on {identical}/{compared} level-1..12 cases");
 }
 
+/// Pins the NEW seam the streaming ladder-monotonicity fix introduced
+/// (2026-08-18, `encode_gzip_single_pass`): below the ~4.56 MiB first-refill
+/// threshold (`2*WINDOW_SIZE + STREAM_BLOCK_LOOKAHEAD + STREAM_CHUNK`, not
+/// re-derived here to avoid drifting out of sync with the production
+/// constants — see that function for the exact formula), streaming now
+/// routes through `encode_gzip_slack_padded_to_vec` directly and so must be
+/// BYTE-IDENTICAL to the whole-buffer encoder at every level that fixes,
+/// same bar as `level_1_is_byte_identical_to_the_whole_buffer_encoder`
+/// already holds L1 to (L1 was ALREADY whole-buffer on this route before the
+/// fix; this test is what proves L2, L4, L5, L6, L7 joined it). Level 3
+/// excluded for the same documented reason
+/// `levels_1_through_12_never_get_larger_when_streamed` excludes it (chunk-
+/// sensitive content detector, not applicable to a whole-buffer path anyway).
+///
+/// All `cases()` used here are `<= CHUNK + 1` (~4.19 MiB), comfortably under
+/// the ~4.56 MiB threshold, so every one of them takes the whole-buffer
+/// branch. Sizes AT OR ABOVE the threshold are deliberately NOT asserted
+/// byte-identical here — that residual (true single-pass streaming, no
+/// monotonicity guarantee) is the open "Phase 2" scope named in `PLAN.md`;
+/// `streamed_output_roundtrips_through_an_independent_decoder` already
+/// covers correctness (not byte-identity) for those larger cases via
+/// `cases()`'s multi-chunk entries.
+#[test]
+fn levels_below_the_refill_threshold_are_byte_identical_to_the_whole_buffer_encoder() {
+    let below_threshold: Vec<(&'static str, Vec<u8>)> = cases()
+        .into_iter()
+        .filter(|(_, data)| data.len() <= CHUNK + 1)
+        .collect();
+    assert!(
+        !below_threshold.is_empty(),
+        "test setup: no cases() fall below the refill threshold — cases() must have drifted"
+    );
+    for level in [2u32, 4, 5, 6, 7] {
+        for (name, data) in &below_threshold {
+            assert_eq!(
+                streamed(data, level),
+                whole_buffer(data, level),
+                "L{level} {name} ({} bytes, below the refill threshold): streamed and \
+                 whole-buffer output differ — the streaming ladder-monotonicity fix \
+                 (encode_gzip_single_pass) should make these identical below ~4.56 MiB",
+                data.len()
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adversarial readers.
 //

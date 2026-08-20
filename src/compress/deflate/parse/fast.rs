@@ -1110,6 +1110,8 @@ fn chain_block(
                 pos + 1,
                 in_end,
                 (length - 1) as usize,
+                0,
+                false,
                 next_hashes,
             );
             pos += length as usize;
@@ -1155,7 +1157,7 @@ fn hc_catchup(
     if count == 0 {
         return;
     }
-    mf.skip_bytes(buf, in_base, from, in_end, count, next_hashes);
+    mf.skip_bytes(buf, in_base, from, in_end, count, 0, false, next_hashes);
 }
 
 /// L1 gets one step denser than L0 (matches igzip's own "~3"): measured
