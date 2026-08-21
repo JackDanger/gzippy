@@ -713,37 +713,36 @@ pub fn encode_deflate_slack_padded_to_sink(
 /// Compress `data` into a gzip-framed stream (gzip header + DEFLATE + CRC32 +
 /// ISIZE). This is the variant the roundtrip oracles consume.
 ///
-/// Wrapped in [`crate::anatomy_wall_root!`] (the `anatomy-wall` feature's
-/// root span, see `anatomy_wall` module docs): this is one of the two
-/// production T1 entry points (the other being [`encode_gzip_slack_padded_to_vec`]) the
-/// wall-clock phase timers measure against.
+/// ⚠ THIS IS A CONVENIENCE WRAPPER, NOT A SECOND ENGINE. It pads a copy of
+/// `data` and delegates to [`encode_gzip_slack_padded_to_vec`], so its bytes
+/// are IDENTICAL to the shipped CLI path at every level, by construction.
+///
+/// It used to be a second engine, and that was a silent defect. It carried its
+/// own pick-min dispatch that handled only the mmap levels (1/2/4) and had no
+/// zlib branch, so at L5-L7 the zlib pick-min never ran: by the time the shared
+/// dispatcher was reached, the 10-byte gzip header made its `bw.byte_len() == 0`
+/// guard false. Nothing announced this. Measured on 2026-08-21 before the fix:
+/// dickens L5 4,582,861 here vs 4,544,452 shipped (+38,409 B); access.log L6
+/// +43,787 B; never smaller.
+///
+/// That mattered because FIVE test suites call this function — `size_invariants`
+/// (which walks L0-L9 and owns ladder monotonicity), `anatomy_pins`,
+/// `perf_shape`, `startup_cost`, `anatomy_wall` — and `anatomy_pins` described
+/// it as "the production T1 entry point", which it was not. Those suites agreed
+/// with production only by the accident of their fixtures. Delegation makes the
+/// agreement structural instead of lucky.
+///
+/// Cost, MEASURED not assumed: for LARGE inputs this adds one copy of the input
+/// plus the pad. For SMALL ones it is cheaper than what it replaced — the
+/// startup pins moved DOWN, alloc_events 3 -> 2 and alloc_bytes 308 -> 291 on a
+/// 1-byte input at L6 and L9, because the old path allocated three times. Either
+/// way this is a convenience API with no CLI caller: the CLI reaches
+/// `encode_gzip_slack_padded_to_vec` directly.
 pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
-    crate::anatomy_wall_root!({
-        let cap = estimate_output_cap(data.len(), level, 32);
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, cap);
-        let mut out = Vec::with_capacity(cap);
-        // Minimal gzip header: magic, CM=8 (deflate), FLG=0, MTIME=0, XFL=0,
-        // OS=255 (unknown).
-        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-
-        if level_uses_t1_mmap_pick_min(level) && !data.is_empty() {
-            let deflate = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
-            out.extend_from_slice(&deflate);
-        } else {
-            encode_deflate_bytes_to_sink(data, &[], level, &mut out);
-        }
-
-        let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out
-    })
+    let mut buf = Vec::with_capacity(data.len() + INPLACE_TAIL_PAD);
+    buf.extend_from_slice(data);
+    buf.resize(data.len() + INPLACE_TAIL_PAD, 0);
+    encode_gzip_slack_padded_to_vec(&buf, data.len(), level)
 }
 
 /// Gzip-framed compression that parses IN PLACE over a caller-padded buffer.
