@@ -392,9 +392,36 @@ fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
     matches!(level, 1 | 2 | 4)
 }
 
-/// Pick-min helper: parallel arms in release builds; sequential with winner-only
-/// counter attribution when `anatomy-counters` is on (both arms would otherwise
-/// double-count into the global snapshot).
+/// Pick-min helper: the arms run SEQUENTIALLY.
+///
+/// ⚠ THEY USED TO RUN IN PARALLEL, AND THAT WAS A CONTRACT VIOLATION. Every
+/// caller of this function is a `_t1_` path — i.e. the user asked for ONE
+/// thread. Spawning two arms made `-p1` consume ~1.8 cores. Measured on
+/// dickens (median of 7, cpu% via getrusage):
+///
+/// ```text
+/// gzippy -6 -p1   173.3%      pigz -6 -p1     99.6%
+/// gzippy -1 -p1   186.5%      gzip -6         99.5%
+///                             libdeflate -6   99.0%
+/// ```
+///
+/// Every rival uses exactly one core when asked for one thread. Three
+/// consequences, ascending: (1) least-surprise violation (non-negotiable 4);
+/// (2) it VOIDs our own wall cells — fulcrum's pin gate requires cpu% in
+/// [threads*50, threads*160] and correctly refused to certify 148-153%, which
+/// is what NO-SHIPped PR #333 on one undecidable cell; (3) **every T1 wall
+/// comparison we have ever published was taken with ~1.8x the CPU the rival
+/// was allowed.** The pin gate was never the obstacle — it was a working
+/// detector for this, and it had been refusing to certify inflated numbers the
+/// whole time.
+///
+/// OUTPUT IS BYTE-IDENTICAL: both orders pick the same winner by the same
+/// `min` over the same two candidates. Only cpu% and wall move. Verified over
+/// the 23-file corpus x L1-L9 (0 differing cells).
+///
+/// The `anatomy-counters` branch additionally does winner-only counter
+/// attribution (both arms would otherwise double-count into the global
+/// snapshot); that behaviour is unchanged.
 fn pick_min_two_vecs(
     arm_a: impl FnOnce() -> Vec<u8> + Send,
     arm_b: impl FnOnce() -> Vec<u8> + Send,
@@ -420,17 +447,13 @@ fn pick_min_two_vecs(
     }
     #[cfg(not(feature = "anatomy-counters"))]
     {
-        std::thread::scope(|s| {
-            let a = s.spawn(arm_a);
-            let b = s.spawn(arm_b);
-            let out_a = a.join().expect("pick-min arm a");
-            let out_b = b.join().expect("pick-min arm b");
-            if out_b.len() < out_a.len() {
-                out_b
-            } else {
-                out_a
-            }
-        })
+        let out_a = arm_a();
+        let out_b = arm_b();
+        if out_b.len() < out_a.len() {
+            out_b
+        } else {
+            out_a
+        }
     }
 }
 
