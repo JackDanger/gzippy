@@ -368,6 +368,7 @@ fn hot_symbol_sizes_within_band() {
     // why the twin, and why its sizes are trustworthy despite `strip`
     // reseeding exact layout.
     let syms: Vec<(u64, String)>;
+    #[allow(unknown_lints, clippy::needless_late_init)] // clippy 1.98
     let graded: PathBuf;
     if shipped.parent().and_then(Path::file_name) == Some("release-syms".as_ref()) {
         syms = read_text_symbols(&shipped);

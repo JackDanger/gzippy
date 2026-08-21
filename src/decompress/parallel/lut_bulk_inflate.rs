@@ -551,6 +551,9 @@ fn build_dynamic_huffman(
     const CL_ORDER: [usize; 19] = [
         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
     ];
+    // clippy 1.98 `manual_slice_fill`. NOT rewritten: CLAUDE.md — "DECOMPRESSION
+    // IS DONE AND WON... Do not revisit it, re-measure it, or optimise it."
+    #[allow(unknown_lints, clippy::manual_slice_fill)]
     for v in &mut scratch.cl_lens {
         *v = 0;
     }
@@ -645,6 +648,9 @@ fn build_dynamic_huffman(
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
     let dist_lens_slice = &scratch.all_lens[hlit..hlit + hdist];
+    // clippy 1.98 `manual_slice_fill`. NOT rewritten: CLAUDE.md — "DECOMPRESSION
+    // IS DONE AND WON... Do not revisit it, re-measure it, or optimise it."
+    #[allow(unknown_lints, clippy::manual_slice_fill)]
     for v in &mut scratch.dist_lens {
         *v = 0;
     }

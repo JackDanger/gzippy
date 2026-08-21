@@ -627,6 +627,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
     let mut w = [0u32; 64];
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)] // clippy 1.98; see bitstream.rs
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)] // clippy 1.98
     for chunk in msg.chunks_exact(64) {
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
