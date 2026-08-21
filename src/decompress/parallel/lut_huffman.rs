@@ -1449,6 +1449,9 @@ impl LutDistCode {
         let next_bits = bits.peek();
         let next_10 = (next_bits & ((1u64 << ISAL_DECODE_SHORT_BITS) - 1)) as usize;
         let mut next_sym = self.table.short_code_lookup[next_10] as u32;
+        // clippy 1.98 `needless_late_init`. NOT rewritten: decompression is
+        // DONE AND WON per CLAUDE.md; this is a style lint, not a defect.
+        #[allow(unknown_lints, clippy::needless_late_init)]
         let bit_count;
         if (next_sym & SMALL_FLAG_BIT) == 0 {
             bit_count = next_sym >> SMALL_SHORT_CODE_LEN_OFFSET;

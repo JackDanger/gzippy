@@ -433,6 +433,20 @@ impl BitSplicer {
         // Little-endian u64 keeps DEFLATE's LSB-first order: within the lane,
         // byte k's low bits receive byte k-1's high bits, exactly as the
         // byte loop did; the lane's top `inv` bits carry into the next lane.
+        // clippy 1.98 `chunks_exact_to_as_chunks` suggests `as_chunks::<8>()`.
+        // NOT taken here: this is the adjudicated bit-writer hot path (see the
+        // wall-flip receipt above), `as_chunks` returns a different shape
+        // (`(&[[u8;8]], &[u8])`) so the carry/remainder handling is not a
+        // mechanical swap, and CLAUDE.md hard stop 4 says a hot-loop rewrite must
+        // show the counter moving. Convert it as a MEASURED change or not at all.
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+        // clippy 1.98 `chunks_exact_to_as_chunks` suggests `as_chunks::<8>()`.
+        // NOT taken: this is the adjudicated bit-writer hot path (wall-flip
+        // receipt above); `as_chunks` returns `(&[[u8;8]], &[u8])`, a different
+        // shape, so the carry/remainder handling is not a mechanical swap, and
+        // CLAUDE.md hard stop 4 wants a counter before a hot-loop rewrite.
+        // `unknown_lints` is required for toolchains older than 1.98.
+        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let mut chunks = data.chunks_exact(8);
         for ch in &mut chunks {
             let lane = u64::from_le_bytes(ch.try_into().unwrap());
