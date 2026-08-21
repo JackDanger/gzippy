@@ -577,16 +577,22 @@ fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
 /// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
 /// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
 fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    let best = pick_min_two_vecs(
+    // TWO arms, not three. The `params_l1_gzip_primary` arm was DELETED
+    // 2026-08-21: measured over the full 22-file corpus against gzip, pigz and
+    // libdeflate, it protects ZERO cells. Its only min-win was data.sqlite,
+    // which passes all three rivals by >= 73 KB without it, and it changed the
+    // output on no other file — so tie-cage exposure is nil. Cost removed:
+    // ~36% of L2's T1 encode wall (three arms 10,510 ms -> two arms 6,704 ms,
+    // corpus total).
+    //
+    // NOTE the data.sqlite min-win it used to score was a symptom, not a
+    // service: L2's greedy parse emits 14.8 MB there where the L1 fast path
+    // emits 12.9 MB — the ladder-sag class, reproduced at L2. This arm was
+    // papering over it silently. Fix the sag, do not restore the arm.
+    pick_min_two_vecs(
         || encode_unpadded_deflate_bytes(data, level::params(2)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    );
-    let gzip_greedy = encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast());
-    if gzip_greedy.len() < best.len() {
-        gzip_greedy
-    } else {
-        best
-    }
+        || encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()),
+    )
 }
 
 /// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).

@@ -8,11 +8,11 @@
 #   (or: cargo run --release --example fingerprint_tool -- pin-t4)
 fixture	level	size_t1	size_t4	tax_bytes	members_t1	members_t4	blocks_t1	blocks_t4
 binary	1	662577	662654	77	1	1	16	18
-binary	2	663410	665361	1951	1	1	16	4
+binary	2	665503	665361	-142	1	1	4	4
 binary	6	649312	640687	-8625	1	1	4	4
 binary	9	637081	635324	-1757	1	1	4	4
 noise	1	1048679	1048684	5	1	1	17	18
-noise	2	1048679	1048684	5	1	1	17	18
+noise	2	1048684	1048684	0	1	1	18	18
 noise	6	1048684	1048684	0	1	1	18	18
 noise	9	1048684	1048684	0	1	1	18	18
 tabular	1	285078	287060	1982	1	1	16	18
