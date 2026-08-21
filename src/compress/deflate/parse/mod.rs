@@ -787,6 +787,24 @@ pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLO
 /// same level — the T>1 == T1 invariant. It does NOT mean identical to
 /// libdeflate's, and must never be read that way.
 pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
+    // A level that runs WHOLE-BUFFER PICK-MIN cannot stream. The streaming
+    // parse is ONE arm; the whole-buffer path runs two and keeps the smaller,
+    // so streaming such a level does not merely reorder blocks — it emits a
+    // DIFFERENT, LARGER stream than the same input passed as a file. That
+    // violates this module's own rule ("a level streams only when its output
+    // is PROVABLY unaffected by streaming") and the contract it cites
+    // ("being at-least-as-small at the level the user typed").
+    //
+    // This is the SAME reasoning that already excludes L1 below; it was simply
+    // never generalised to the other pick-min levels when they landed.
+    //
+    // MEASURED on main e888ac9f, 23-file corpus x L4-L7, T1, size only:
+    // piping cost 5,429,807 B = 0.6377% larger, up to 2.535% at L4
+    // (minjs.min.js). Per-level on engine.wasm: L4 +9,528 B, L5 +1,085,
+    // L6 +754, L7 +70; L3/L8/L9 byte-identical (they run no pick-min).
+    if super::level_uses_t1_zlib_pick_min(level) || super::level_uses_t1_mmap_pick_min(level) {
+        return false;
+    }
     let strategy = super::level::params(level).strategy;
     if matches!(
         strategy,
