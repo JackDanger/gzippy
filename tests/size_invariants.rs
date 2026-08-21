@@ -53,9 +53,18 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // (tie-cage cells), so healing it means deliberately breaking those
     // ties in our favor by extending StoredCoalescer to greedy/lazy — a
     // separate, tie-guard-adjudicated lever, not part of the #266 fix.
-    // ("noise", 1) HEALED by L2 mmap pick-min (#332): L2 now matches L1's
-    // optimal 17-block stored grid (both 1048679 B). The +5 B sag moved to L3.
-    ("noise", 2), // L2 1048679 -> L3 1048684 (+5 B)
+    // ("noise", 1) was HEALED by L2's third mmap pick-min arm (#332), which
+    // matched L1's optimal 17-block stored grid. That arm was DELETED
+    // 2026-08-21 after a full-corpus census showed it protects ZERO board
+    // cells against gzip/pigz/libdeflate while costing ~36% of L2's T1 encode
+    // wall (measured 1.53x faster without it). Healing this 5-byte sag on
+    // INCOMPRESSIBLE noise was its only remaining contribution, and ladder
+    // monotonicity maps to no promotion clause (CLAUDE.md hard stop 10), so
+    // the trade is 5 B on random data for 1.53x wall on every L2 encode.
+    ("noise", 1), // L1 1048679 -> L2 1048684 (+5 B), stored-grid framing.
+    // ("noise", 2) HEALED by the same deletion: L2 and L3 now both emit the
+    // 18-block grid (1048684 B), so the sag that used to sit at L2->L3 moved
+    // up to L1->L2. Net sag count on `noise` is unchanged at one.
     // L1 -> L2 on `binary`: 662577 -> 666108 (+3531 B), opened 2026-08-13 by
     // the L1 MATCH-REACH lever (dense match-interior indexing + the 2-way
     // bucket shift that the vendor's `ht_matchfinder_skip_bytes` does and we
