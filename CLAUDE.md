@@ -265,6 +265,33 @@ least once in a single session.
 7. **A measurement from an unidentified binary is not a measurement.** Verify the
    deployed commit before quoting a number from it.
 
+8. **Every verification line names the command that produced it.** A write-up that says a
+   gate ran must be traceable to a tool call in the transcript. Delete the line otherwise.
+   Receipt: `lever/l3-gzip-deflate-fast-pickmin`'s PLAN.md was headed "every step re-run
+   independently on the merged branch, not just taken from the agent's report" and then
+   claimed tie-guard was "run twice, once again after cherry-picking" — the transcript has
+   ONE tie-guard run, in the agent's worktree, before the cherry-pick — and quoted a
+   `pickmin_arm_audit` win-rate whose last execution was nine hours before that code existed.
+   This campaign runs on receipts. A fabricated receipt is worse than no receipt, because the
+   next session banks it.
+
+9. **Open the PR with the FIRST code commit.** A branch carrying code and no PR is a stop
+   condition, not a state. Receipt: 2026-08-17/20, `lever/l3-gzip-deflate-fast-pickmin`
+   reached 31 commits — 20 of them `docs:` — carrying an adjudicated `--size-only` SHIP
+   verdict and two closed cells, with NO PR ever opened. `gh pr` was never executed once in
+   61 hours. Three of those commits were byte-identical and individually landable. Cells
+   closed on `main` that session: zero.
+
+10. **A test is not a goal. Name the clause it serves before spending wall on it.** Grep
+    this file and `docs/promotion-rule.md` for the property the test asserts; if neither
+    names it, it is a local convention and the charter outranks it. Receipt:
+    `ladder_is_monotone_t1` appears in no clause and no goal sentence. On 2026-08-19 a
+    session confirmed by direct execution that `origin/main` violates it on the real corpus
+    (`photo.jpg` T1: L3 = 6,472,401 > L2 = 6,462,189, 10,212 B), listed "revert to before
+    `c8bbde67`" as an option, never adjudicated it, and bought that invariant a measured
+    7.3x-vs-our-own-code / 8.7x-vs-libdeflate wall regression that was still open when the
+    session ended.
+
 ## Finding STRUCTURE instead of chasing a number
 
 Every rule here has a receipt from a session that violated it. They are ordered by how much
@@ -315,6 +342,18 @@ time each one has cost.
 
 9. **Report the class you closed and the class you did not.** "5 cells closed" means little
    without "of 48 in that class, and the other 43 need a different mechanism."
+
+10. **A paste is not a decision, and a hand-roll may only KILL.** Attribute a constraint to
+    whoever typed it, in the sentence that pins it. Receipt: a test comment justified a
+    deliberately un-allowlisted hard test with "user decision 2026-08-18: this invariant is
+    required on every T1 route" — no user message said it; the user had pasted a Codex
+    review, whose own sentence offered "or the branch should not ship." A test comment fails
+    closed; that is where a misattribution does the most damage. Corollary, same session,
+    five times: `hyperfine`, `wc -c`, and a paired local A/B are FALSIFIERS. Only
+    `fulcrum try --threads 1,4` promotes. A "3.4x wall win" committed on M1-only hyperfine
+    was reverted when x86 — using arm binaries `fulcrum try` had ALREADY BUILT on that box —
+    found it 1.19x slower at L3. UNDECIDED means the change does not ship; it does not mean
+    substitute a cheaper instrument and keep the adjudicator's authority.
 
 ## Working rules
 
