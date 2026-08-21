@@ -491,17 +491,34 @@ fn main() {
                     "LOSE {f}:L{l}:T{t} vs {rival}  +{gap} B ({:+.3}%)\n",
                     gap as f64 * 100.0 / rfp.file_bytes as f64
                 );
-                for (axis, o, r) in ofp.diff(rfp).into_iter().take(6) {
-                    if axis == "file_bytes" {
-                        continue;
-                    }
+                // RANK BY ABSOLUTE DELTA, and print it next to the relative one.
+                // CLAUDE.md: "State the absolute next to the relative. 87% of a 0.01%
+                // penalty is 0.01%." `StreamFingerprint::diff` orders axes by RELATIVE
+                // change (|x-y| / max(x,y)), which scores an axis that is merely OFF
+                // (ours 0, rival 179 -> 1.00, the maximum) above the axis carrying the
+                // actual mass. Receipt, gzip:text:L9:T1 (2026-08-20): `len3` printed
+                // first at -100.0% on a 179-token gap while `len4_7` sat below it with a
+                // 9,026-token gap -- 50x the mass, 4.5x the lower rank. Three probes were
+                // spent on len3; all three came back byte-identical, because 179 tokens
+                // cannot account for a 2,518 B loss. The relative column stays: an axis
+                // that is fully OFF is real structural information (it proved we never
+                // FIND those matches). It just is not, by itself, a direction.
+                let mut axes: Vec<(&str, u64, u64)> = ofp
+                    .diff(rfp)
+                    .into_iter()
+                    .filter(|(axis, _, _)| *axis != "file_bytes")
+                    .collect();
+                axes.sort_by_key(|(_, o, r)| std::cmp::Reverse(o.abs_diff(*r)));
+                for (axis, o, r) in axes.into_iter().take(6) {
                     let rel = if r == 0 {
                         f64::INFINITY
                     } else {
                         (o as f64 - r as f64) * 100.0 / r as f64
                     };
+                    let abs = o.abs_diff(r);
+                    let sign = if o >= r { '+' } else { '-' };
                     msg.push_str(&format!(
-                        "    {axis:<14} ours {o:>12}  rival {r:>12}  ({rel:+.1}%)\n"
+                        "    {axis:<14} ours {o:>12}  rival {r:>12}  ({sign}{abs}, {rel:+.1}%)\n"
                     ));
                     axis_classes
                         .entry(axis)
