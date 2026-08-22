@@ -47,6 +47,7 @@
 pub mod anatomy_counters;
 pub mod anatomy_wall;
 pub mod bitstream;
+pub mod block_cost_probe;
 pub mod block_split;
 pub mod costs;
 pub mod encode_types;
