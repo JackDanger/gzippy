@@ -847,6 +847,27 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
     if super::level_uses_t1_zlib_pick_min(level) || super::level_uses_t1_mmap_pick_min(level) {
         return false;
     }
+    // A level that RE-CUTS its blocks over a 1,000,000-byte span cannot stream
+    // either, for the same reason and with a sharper failure mode. The span
+    // holds tokens whose literals are read back out of the input buffer at
+    // emit time, so it must be flushed before either (a) a resumable call
+    // returns, which cuts the span at a seam the whole-buffer encoder does not
+    // have, or (b) the streaming buffer slides, which would drop the literal
+    // bytes the span still needs.
+    //
+    // (a) is not hypothetical: the mmap two-pass route
+    // (`encode_gzip_unpadded_slice_to_writer`) calls the resumable parser
+    // twice, and with the span flushed at the pass-1 return
+    // `unpadded_slice_is_byte_identical_to_whole_buffer` FAILED at L9,
+    // len=305,017 — one forced boundary the whole-buffer encoder never emits.
+    //
+    // Excluding these levels routes both the pipe and the mmap paths to the
+    // whole-buffer encoder, which is byte-identical by construction. It costs
+    // the in-place mmap parse and the streaming RSS bound at L8/L9; see this
+    // branch's verdict commit, which prices that.
+    if super::level::level_uses_postsplit(level) {
+        return false;
+    }
     let strategy = super::level::params(level).strategy;
     if matches!(
         strategy,
@@ -2300,7 +2321,7 @@ mod emit_tests {
                 &mut fast,
                 &buf,
                 0,
-                &sink,
+                &sink.view(),
                 &statics.litcode,
                 &statics.offcode,
             );
@@ -2332,7 +2353,7 @@ mod emit_tests {
             &mut fast,
             &buf,
             0,
-            &sink,
+            &sink.view(),
             &statics.litcode,
             &statics.offcode,
         );
@@ -2366,7 +2387,7 @@ mod emit_tests {
         let (sink, buf) = sink_and_buf(&tokens);
 
         let mut fast = BitWriter::new();
-        emit_sequences(&mut fast, &buf, 0, &sink, &litcode, &offcode);
+        emit_sequences(&mut fast, &buf, 0, &sink.view(), &litcode, &offcode);
         let fast_bytes = fast.finish();
 
         let mut refr = BitWriter::new();
@@ -2388,13 +2409,13 @@ mod emit_tests {
         shifted.extend_from_slice(&buf);
 
         let mut a = BitWriter::new();
-        emit_sequences(&mut a, &buf, 0, &sink, &statics.litcode, &statics.offcode);
+        emit_sequences(&mut a, &buf, 0, &sink.view(), &statics.litcode, &statics.offcode);
         let mut b = BitWriter::new();
         emit_sequences(
             &mut b,
             &shifted,
             37,
-            &sink,
+            &sink.view(),
             &statics.litcode,
             &statics.offcode,
         );

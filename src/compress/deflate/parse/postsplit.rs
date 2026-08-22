@@ -94,7 +94,7 @@ pub(crate) const SPAN_BYTES: usize = 1_000_000;
 /// `data.parquet` (722 blocks on `main`, 331 under the cap = 15/span x 21
 /// spans) and that cell is the ONLY size regression of the whole lever
 /// (L9 +634 B, breaking a byte-exact tie with libdeflate).
-const MAX_BLOCKS_PER_SPAN: usize = 0;
+const MAX_BLOCKS_PER_SPAN: Option<usize> = None;
 
 /// `NUM` in `FindMinimum` (`blocksplitter.c:60`, "Good value: 9").
 const FIND_MINIMUM_NUM: usize = 9;
@@ -530,7 +530,7 @@ impl SpanSplitter {
         let mut numblocks = 1usize;
 
         loop {
-            if MAX_BLOCKS_PER_SPAN > 0 && numblocks >= MAX_BLOCKS_PER_SPAN {
+            if MAX_BLOCKS_PER_SPAN.is_some_and(|m| numblocks >= m) {
                 break;
             }
             // `FindLargestSplittableBlock` (:195).
