@@ -54,6 +54,11 @@ pub use fast::tune;
 // forbidden work is not inert documentation; it is an instruction.
 mod far_len3;
 mod greedy;
+/// PROPOSER-RECALL instrument for the block-split heuristic. OFF by default;
+/// with the `split-recall` feature off, both hooks below compile to nothing and
+/// this module does not exist. See its module doc for the blocked question.
+#[cfg(feature = "split-recall")]
+pub mod split_recall;
 use far_len3::FarLen3Gate;
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
@@ -1052,6 +1057,15 @@ fn continue_block(
 ) -> bool {
     let bytes_in_block = in_next - block_begin;
     let guard_mul = sink.sparse_split_guard_mul;
+    // PROPOSER-RECALL hook (feature `split-recall`, OFF by default — compiles to
+    // nothing otherwise). `ready_to_check_block` takes `&self` and mutates
+    // nothing, so evaluating it here cannot perturb the split decision; it only
+    // tells the recorder whether the SAD test below was actually consulted.
+    #[cfg(feature = "split-recall")]
+    let consulted = (guard_mul == 0 || sparse_split_active(sink, bytes_in_block, guard_mul))
+        && sink
+            .stats
+            .ready_to_check_block(bytes_in_block, in_end - in_next);
     let end_block = if guard_mul > 0 {
         sparse_split_active(sink, bytes_in_block, guard_mul)
             && sink
@@ -1061,6 +1075,10 @@ fn continue_block(
         sink.stats
             .should_end_block(bytes_in_block, in_end - in_next)
     };
+    #[cfg(feature = "split-recall")]
+    if consulted {
+        split_recall::record_check(sink, end_block);
+    }
     in_next < in_max_block_end && sink.nseqs < SEQ_STORE_LENGTH && !end_block
 }
 
@@ -1285,6 +1303,10 @@ fn emit_block(
     try_exact: bool,
     pending_stored: Option<&mut StoredCoalescer>,
 ) {
+    // PROPOSER-RECALL hook (feature `split-recall`, OFF by default). Snapshots
+    // the finished block's sequences before `sink.begin()` clears them.
+    #[cfg(feature = "split-recall")]
+    split_recall::record_block(block_start, sink);
     // `anatomy-wall` region: `huffman_table` — the code-BUILDING phase for
     // this block, before any bit is written: both candidate Huffman codes,
     // the dynamic header, and the three-way stored/static/dynamic cost
