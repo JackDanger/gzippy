@@ -93,6 +93,18 @@ pub struct LevelParams {
     /// closed, turn this on at T1 and take the size — do not preserve identity for its own
     /// sake.
     pub try_exact_huffman: bool,
+    /// Post-parse block splitting span, in input bytes (0 = off).
+    ///
+    /// When non-zero the lazy/lazy2 parser stops emitting each parsed block
+    /// immediately; it concatenates the parsed token streams until this many
+    /// bytes have accumulated and then re-cuts the span with zopfli's searched
+    /// splitter (`parse::postsplit`). The PARSE is unchanged — only where the
+    /// block boundaries land.
+    ///
+    /// This is a level->config knob, not a content decision: it is read from
+    /// `LevelParams` and never from the data. `CLAUDE.md` declares the
+    /// level->config map free to change.
+    pub postsplit_span: usize,
     /// T>1-only: libdeflate's 2-way hash bucket (second candidate on short-match
     /// acceptance). Set only by `params_parallel`; T1 stays single-probe.
     pub fast_bucket2: bool,
@@ -374,9 +386,27 @@ pub fn params(level: u32) -> LevelParams {
 }
 
 /// libdeflate-table knobs (streaming / segmented / pick-min baseline).
+/// Levels that re-cut their blocks with the searched post-parse splitter
+/// (`parse::postsplit`).
+///
+/// SCOPED TO THE TWO DEEPEST LADDER LEVELS, deliberately. The splitter's cost
+/// is a search over exact block costs, paid per input byte; L8/L9 already spend
+/// `max_search_depth = 600` chain probes per position, so it is the coordinate
+/// where a per-byte boundary search is cheapest RELATIVE to the parse. They are
+/// also the only Lazy/Lazy2 levels that run ONE encode — L1/L2/L4 run mmap
+/// pick-min and L5-L7 run zlib pick-min (`level_uses_t1_*_pick_min`), so a
+/// change there would be paid twice and measured through a `min()`.
+#[inline]
+pub(crate) fn level_uses_postsplit(level: u32) -> bool {
+    matches!(level, 8 | 9)
+}
+
 pub(crate) fn params_baseline(level: u32) -> LevelParams {
     #[allow(unused_mut)]
     let mut p = params_inner(level);
+    if level_uses_postsplit(level) {
+        p.postsplit_span = super::parse::postsplit::SPAN_BYTES;
+    }
     #[cfg(feature = "ladder-tune")]
     ladder_tune::apply(&mut p);
     if level == 1 {
@@ -714,6 +744,7 @@ fn params_inner(level: u32) -> LevelParams {
     match level {
         0 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -744,6 +775,7 @@ fn params_inner(level: u32) -> LevelParams {
         // values only so the struct is populated.
         1 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -769,6 +801,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         2 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -847,6 +880,7 @@ fn params_inner(level: u32) -> LevelParams {
         //     out of this change's causal reach.
         3 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -884,6 +918,7 @@ fn params_inner(level: u32) -> LevelParams {
         // faster at T4 (wall ratio 0.9519).
         4 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -909,6 +944,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         5 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -934,6 +970,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         6 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -959,6 +996,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         7 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -984,6 +1022,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         8 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -1009,6 +1048,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         9 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -1036,6 +1076,7 @@ fn params_inner(level: u32) -> LevelParams {
         // deflate_compress.c:3974-4004).
         10 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -1066,6 +1107,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         11 => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,
@@ -1096,6 +1138,7 @@ fn params_inner(level: u32) -> LevelParams {
         },
         _ => LevelParams {
             try_exact_huffman: false,
+            postsplit_span: 0,
             fast_bucket2: BUCKET2_OFF.0,
             fast_bucket2_gate_max_len: BUCKET2_OFF.1,
             fast_bucket2_probe_on_miss: false,

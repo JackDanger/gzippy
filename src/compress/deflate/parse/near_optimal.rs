@@ -455,7 +455,7 @@ impl Optimizer {
             bw,
             buf,
             block_begin,
-            &self.sink,
+            &self.sink.view(),
             statics,
             is_final,
             &mut self.header_scratch,
