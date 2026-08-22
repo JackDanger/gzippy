@@ -1,0 +1,110 @@
+[
+ {
+  "rival": "pigz",
+  "scenario": "refuse_overwrite_without_force",
+  "fixture": "dickens",
+  "reason": "pigz exits 1 and prints 'skipping:', gzip exits 2 and prints 'already exists; not overwritten'. Hand-verified: our exit code and message match gzip byte-for-byte; pigz is the outlier."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "directory_input",
+  "fixture": "dickens",
+  "reason": "pigz exits 1 on a directory argument, gzip exits 2; we match gzip. Charter non-negotiable 4 cites gzip's CLI as the contract and forbids following a vendor's habit."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "mode000_input",
+  "fixture": "dickens",
+  "reason": "pigz reports 13 (or 0) on a mode-000 input; gzip reports 1. We match gzip. pigz's code is its own errno-derived convention and is not part of any published contract."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "hardlink_input",
+  "fixture": "dickens",
+  "reason": "pigz exits 1 refusing a multiply-linked file, gzip exits 2; we match gzip's exit code and refusal semantics. Following pigz here would break the gzip contract we are graded against."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "refuse_overwrite_without_force",
+  "fixture": "engine.wasm",
+  "reason": "pigz exits 1 and prints 'skipping:', gzip exits 2 and prints 'already exists; not overwritten'. Hand-verified: our exit code and message match gzip byte-for-byte; pigz is the outlier."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "directory_input",
+  "fixture": "engine.wasm",
+  "reason": "pigz exits 1 on a directory argument, gzip exits 2; we match gzip. Charter non-negotiable 4 cites gzip's CLI as the contract and forbids following a vendor's habit."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "mode000_input",
+  "fixture": "engine.wasm",
+  "reason": "pigz reports 13 (or 0) on a mode-000 input; gzip reports 1. We match gzip. pigz's code is its own errno-derived convention and is not part of any published contract."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "hardlink_input",
+  "fixture": "engine.wasm",
+  "reason": "pigz exits 1 refusing a multiply-linked file, gzip exits 2; we match gzip's exit code and refusal semantics. Following pigz here would break the gzip contract we are graded against."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "refuse_overwrite_without_force",
+  "fixture": "dropin naive file \u540d\u524d with spaces.txt",
+  "reason": "pigz exits 1 and prints 'skipping:', gzip exits 2 and prints 'already exists; not overwritten'. Hand-verified: our exit code and message match gzip byte-for-byte; pigz is the outlier."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "directory_input",
+  "fixture": "dropin naive file \u540d\u524d with spaces.txt",
+  "reason": "pigz exits 1 on a directory argument, gzip exits 2; we match gzip. Charter non-negotiable 4 cites gzip's CLI as the contract and forbids following a vendor's habit."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "mode000_input",
+  "fixture": "dropin naive file \u540d\u524d with spaces.txt",
+  "reason": "pigz reports 13 (or 0) on a mode-000 input; gzip reports 1. We match gzip. pigz's code is its own errno-derived convention and is not part of any published contract."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "hardlink_input",
+  "fixture": "dropin naive file \u540d\u524d with spaces.txt",
+  "reason": "pigz exits 1 refusing a multiply-linked file, gzip exits 2; we match gzip's exit code and refusal semantics. Following pigz here would break the gzip contract we are graded against."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "compress_stdout",
+  "fixture": "already-named.gz",
+  "reason": "pigz refuses to compress a file already ending in .gz and prints 'skipping'; gzip and we both compress it and exit 0. Hand-verified against gzip directly. pigz is the outlier."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "compress_level1",
+  "fixture": "already-named.gz",
+  "reason": "Same as compress_stdout: pigz skips .gz-suffixed input, gzip and we compress it. Verified by running gzip -c on the same fixture; exit 0, output produced."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "compress_level9",
+  "fixture": "already-named.gz",
+  "reason": "Same as compress_stdout: pigz skips .gz-suffixed input, gzip and we compress it. Verified by running gzip -c on the same fixture; exit 0, output produced."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "directory_input",
+  "fixture": "already-named.gz",
+  "reason": "pigz exits 1 on a directory argument, gzip exits 2; we match gzip. Charter non-negotiable 4 cites gzip's CLI as the contract and forbids following a vendor's habit."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "mode000_input",
+  "fixture": "already-named.gz",
+  "reason": "pigz reports 13 (or 0) on a mode-000 input; gzip reports 1. We match gzip. pigz's code is its own errno-derived convention and is not part of any published contract."
+ },
+ {
+  "rival": "pigz",
+  "scenario": "hardlink_input",
+  "fixture": "already-named.gz",
+  "reason": "pigz exits 1 refusing a multiply-linked file, gzip exits 2; we match gzip's exit code and refusal semantics. Following pigz here would break the gzip contract we are graded against."
+ }
+]
