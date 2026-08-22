@@ -62,6 +62,8 @@ use far_len3::FarLen3Gate;
 mod ht_fast;
 mod lazy;
 mod near_optimal;
+/// Post-parse block splitter (zopfli `blocksplitter.c`). See its module doc.
+pub(super) mod postsplit;
 /// The crown engine (zopfli port + LzFind/squeeze/recursive-splitter Pareto
 /// tier). Reached only via `-F`/`-I`/`-J`. See
 /// `docs/compressor-architecture.md` for the full module map.
@@ -199,6 +201,22 @@ pub(crate) struct Sink {
     sparse_split_hold: bool,
 }
 
+/// Everything [`emit_block`] needs to render ONE DEFLATE block: a contiguous
+/// run of sequences, the trailing literal count, the matching symbol
+/// histograms, and the input byte span they cover.
+///
+/// A [`Sink`] is exactly one of these ([`Sink::view`]), which is how every
+/// parser reaches the emitter. It is a separate type so the post-parse block
+/// splitter ([`postsplit`]) can hand the SAME emitter a SUB-RANGE of a longer
+/// token buffer without copying the sequences.
+pub(crate) struct BlockView<'a> {
+    seqs: &'a [Seq],
+    litrun: u32,
+    litlen_freqs: &'a [u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &'a [u32; DEFLATE_NUM_OFFSET_SYMS],
+    block_length: usize,
+}
+
 thread_local! {
     /// One recycled [`Sink`] per thread — the exact shape already used for
     /// `HcMatchfinder` (`matchfinder/hc.rs`'s `HC_POOL`), for the same reason.
@@ -283,6 +301,30 @@ impl Sink {
             nseqs: 0,
             sparse_split_guard_mul: 0,
             sparse_split_hold: false,
+        }
+    }
+
+    /// The sequences written so far.
+    ///
+    /// SAFETY-carrying accessor: `seqs` deliberately keeps `Vec::len == 0` and
+    /// is written through spare capacity by [`Sink::push_seq`], so the slice
+    /// must be built by hand. Exactly `nseqs` slots are initialised.
+    #[inline]
+    fn seq_slice(&self) -> &[Seq] {
+        // SAFETY: `push_seq` has initialised exactly `nseqs` slots inside the
+        // reserved capacity (see its own SAFETY note for the bound).
+        unsafe { std::slice::from_raw_parts(self.seqs.as_ptr(), self.nseqs) }
+    }
+
+    /// This sink as one whole block, for [`emit_block`].
+    #[inline]
+    fn view(&self) -> BlockView<'_> {
+        BlockView {
+            seqs: self.seq_slice(),
+            litrun: self.litrun,
+            litlen_freqs: &self.litlen_freqs,
+            offset_freqs: &self.offset_freqs,
+            block_length: self.block_length,
         }
     }
 
@@ -805,6 +847,27 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
     if super::level_uses_t1_zlib_pick_min(level) || super::level_uses_t1_mmap_pick_min(level) {
         return false;
     }
+    // A level that RE-CUTS its blocks over a 1,000,000-byte span cannot stream
+    // either, for the same reason and with a sharper failure mode. The span
+    // holds tokens whose literals are read back out of the input buffer at
+    // emit time, so it must be flushed before either (a) a resumable call
+    // returns, which cuts the span at a seam the whole-buffer encoder does not
+    // have, or (b) the streaming buffer slides, which would drop the literal
+    // bytes the span still needs.
+    //
+    // (a) is not hypothetical: the mmap two-pass route
+    // (`encode_gzip_unpadded_slice_to_writer`) calls the resumable parser
+    // twice, and with the span flushed at the pass-1 return
+    // `unpadded_slice_is_byte_identical_to_whole_buffer` FAILED at L9,
+    // len=305,017 — one forced boundary the whole-buffer encoder never emits.
+    //
+    // Excluding these levels routes both the pipe and the mmap paths to the
+    // whole-buffer encoder, which is byte-identical by construction. It costs
+    // the in-place mmap parse and the streaming RSS bound at L8/L9; see this
+    // branch's verdict commit, which prices that.
+    if super::level::level_uses_postsplit(level) {
+        return false;
+    }
     let strategy = super::level::params(level).strategy;
     if matches!(
         strategy,
@@ -1271,7 +1334,7 @@ fn emit_block(
     bw: &mut BitWriter,
     buf: &[u8],
     block_start: usize,
-    sink: &Sink,
+    blk: &BlockView,
     statics: &StaticCodes,
     is_final: bool,
     header_scratch: &mut HeaderScratch,
@@ -1301,17 +1364,17 @@ fn emit_block(
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
             // Add the end-of-block symbol to the litlen frequencies (as the
             // vendor does in deflate_flush_block).
-            let mut litlen_freqs = sink.litlen_freqs;
+            let mut litlen_freqs = *blk.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
             let shaped = if budget.may_shape() {
-                shaped_freqs_if_smaller(&litlen_freqs, &sink.offset_freqs, shape)
+                shaped_freqs_if_smaller(&litlen_freqs, blk.offset_freqs, shape)
             } else {
                 None
             };
             let (build_lit, build_off): (&[u32], &[u32]) = match shaped {
                 Some((ref l, ref o)) => (l, o),
-                None => (&litlen_freqs, &sink.offset_freqs),
+                None => (&litlen_freqs, blk.offset_freqs),
             };
 
             make_huffman_code_into(
@@ -1352,14 +1415,14 @@ fn emit_block(
                     alt_offcode,
                     DEFLATE_NUM_OFFSET_SYMS,
                     MAX_OFFSET_CODEWORD_LEN,
-                    &sink.offset_freqs,
+                    blk.offset_freqs,
                 );
             }
 
             let heur_header = build_dynamic_header(&litcode.lens, &offcode.lens, header_scratch);
             let heur_bits = 3
                 + heur_header.header_bits()
-                + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, litcode, offcode);
+                + cost_from_freqs(&litlen_freqs, blk.offset_freqs, litcode, offcode);
 
             // The exact candidate is costed ONLY when enabled. Building its header
             // unconditionally would both pay for work T1 must not pay for and read
@@ -1375,7 +1438,7 @@ fn emit_block(
                     build_dynamic_header(&alt_litcode.lens, &alt_offcode.lens, alt_header);
                 let exact_bits_true = 3
                     + exact_header_true.header_bits()
-                    + cost_from_freqs(&litlen_freqs, &sink.offset_freqs, alt_litcode, alt_offcode);
+                    + cost_from_freqs(&litlen_freqs, blk.offset_freqs, alt_litcode, alt_offcode);
 
                 enum Pick<'a> {
                     Heuristic(DynamicHeader<'a>, u64),
@@ -1412,7 +1475,7 @@ fn emit_block(
                         + exact_header_shaped.header_bits()
                         + cost_from_freqs(
                             &litlen_freqs,
-                            &sink.offset_freqs,
+                            blk.offset_freqs,
                             &shape.cand_litcode,
                             &shape.cand_offcode,
                         );
@@ -1451,11 +1514,11 @@ fn emit_block(
             };
             let static_bits = 3 + cost_from_freqs(
                 &litlen_freqs,
-                &sink.offset_freqs,
+                blk.offset_freqs,
                 &statics.litcode,
                 &statics.offcode,
             );
-            let stored_bits = stored_block_bits(sink.block_length);
+            let stored_bits = stored_block_bits(blk.block_length);
             (header, dynamic_bits, static_bits, stored_bits)
         });
     let (litcode, offcode) = (&*litcode, &*offcode);
@@ -1488,14 +1551,14 @@ fn emit_block(
             // Coalescing caller: defer, so an adjacent stored block can share
             // a maximal sub-block grid (see `StoredCoalescer`).
             Some(pending) => {
-                pending.push(bw, buf, block_start, sink.block_length);
+                pending.push(bw, buf, block_start, blk.block_length);
                 if is_final {
                     pending.flush(bw, buf, true);
                 }
             }
             None => super::emit_stored_block(
                 bw,
-                &buf[block_start..block_start + sink.block_length],
+                &buf[block_start..block_start + blk.block_length],
                 is_final,
             ),
         }
@@ -1519,7 +1582,7 @@ fn emit_block(
                 bw,
                 buf,
                 block_start,
-                sink,
+                blk,
                 &statics.litcode,
                 &statics.offcode,
             );
@@ -1535,7 +1598,7 @@ fn emit_block(
         bw.add_bits(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN as u64, 2);
         header.emit(bw);
         crate::anatomy_wall_time!(huffman_encode_ns, huffman_encode_calls, {
-            emit_sequences(bw, buf, block_start, sink, litcode, offcode);
+            emit_sequences(bw, buf, block_start, blk, litcode, offcode);
         });
     }
 }
@@ -1555,23 +1618,23 @@ fn emit_block_static_or_stored(
     bw: &mut BitWriter,
     buf: &[u8],
     block_start: usize,
-    sink: &Sink,
+    blk: &BlockView,
     statics: &StaticCodes,
     is_final: bool,
     pending_stored: Option<&mut StoredCoalescer>,
 ) {
     let (static_bits, stored_bits) =
         crate::anatomy_wall_time!(huffman_table_ns, huffman_table_calls, {
-            let mut litlen_freqs = sink.litlen_freqs;
+            let mut litlen_freqs = *blk.litlen_freqs;
             litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
             let static_bits = 3 + cost_from_freqs(
                 &litlen_freqs,
-                &sink.offset_freqs,
+                blk.offset_freqs,
                 &statics.litcode,
                 &statics.offcode,
             );
-            let stored_bits = stored_block_bits(sink.block_length);
+            let stored_bits = stored_block_bits(blk.block_length);
             (static_bits, stored_bits)
         });
 
@@ -1591,14 +1654,14 @@ fn emit_block_static_or_stored(
             // Coalescing caller: defer for a maximal sub-block grid (see
             // `StoredCoalescer`).
             Some(pending) => {
-                pending.push(bw, buf, block_start, sink.block_length);
+                pending.push(bw, buf, block_start, blk.block_length);
                 if is_final {
                     pending.flush(bw, buf, true);
                 }
             }
             None => super::emit_stored_block(
                 bw,
-                &buf[block_start..block_start + sink.block_length],
+                &buf[block_start..block_start + blk.block_length],
                 is_final,
             ),
         }
@@ -1616,7 +1679,7 @@ fn emit_block_static_or_stored(
                 bw,
                 buf,
                 block_start,
-                sink,
+                blk,
                 &statics.litcode,
                 &statics.offcode,
             );
@@ -1926,7 +1989,7 @@ fn emit_sequences(
     bw: &mut BitWriter,
     buf: &[u8],
     block_start: usize,
-    sink: &Sink,
+    blk: &BlockView,
     litcode: &HuffmanCode,
     offcode: &HuffmanCode,
 ) {
@@ -1946,18 +2009,16 @@ fn emit_sequences(
     // codes to <= 14 bits (< 2 bytes) and a match to <= 47 bits (< 6 bytes)
     // while covering >= 3 input bytes, so 2 output bytes per covered input byte
     // bounds both; + slack for the EOB and the flushes' 8-byte headroom.
-    bw.reserve(sink.block_length * 2 + 16);
+    bw.reserve(blk.block_length * 2 + 16);
 
     // `p` walks the input: each Seq's literals are exactly the input bytes
     // between the previous match's end and this match's start.
     let mut p = block_start;
-    // SAFETY: `push_seq` has initialised exactly `nseqs` slots in the reserved
-    // capacity; `Vec::len` is deliberately 0, so the slice is built by hand.
-    let written = unsafe { std::slice::from_raw_parts(sink.seqs.as_ptr(), sink.nseqs) };
+    let written = blk.seqs;
     for seq in written {
         // SAFETY: every Seq was pushed with its literals + match inside the
         // block, so [p, p + litrunlen + length) stays within
-        // `block_start + sink.block_length <= buf.len()`; reserve() above
+        // `block_start + blk.block_length <= buf.len()`; reserve() above
         // covers every flush in the run and the match flush below.
         unsafe {
             p = emit_literal_run(bw, buf, p, seq.litrunlen as usize, &tabs.lit);
@@ -1987,10 +2048,10 @@ fn emit_sequences(
 
     // Trailing literals after the last match, then the end-of-block symbol.
     // SAFETY: the trailing run is the block's final `litrun` input bytes, ending
-    // exactly at `block_start + sink.block_length <= buf.len()`; reserve()'s 16
+    // exactly at `block_start + blk.block_length <= buf.len()`; reserve()'s 16
     // slack bytes cover the EOB flush.
     unsafe {
-        emit_literal_run(bw, buf, p, sink.litrun as usize, &tabs.lit);
+        emit_literal_run(bw, buf, p, blk.litrun as usize, &tabs.lit);
         add_entry(bw, tabs.eob);
         bw.flush_word_unchecked();
     }
@@ -2284,7 +2345,7 @@ mod emit_tests {
                 &mut fast,
                 &buf,
                 0,
-                &sink,
+                &sink.view(),
                 &statics.litcode,
                 &statics.offcode,
             );
@@ -2316,7 +2377,7 @@ mod emit_tests {
             &mut fast,
             &buf,
             0,
-            &sink,
+            &sink.view(),
             &statics.litcode,
             &statics.offcode,
         );
@@ -2350,7 +2411,7 @@ mod emit_tests {
         let (sink, buf) = sink_and_buf(&tokens);
 
         let mut fast = BitWriter::new();
-        emit_sequences(&mut fast, &buf, 0, &sink, &litcode, &offcode);
+        emit_sequences(&mut fast, &buf, 0, &sink.view(), &litcode, &offcode);
         let fast_bytes = fast.finish();
 
         let mut refr = BitWriter::new();
@@ -2372,13 +2433,13 @@ mod emit_tests {
         shifted.extend_from_slice(&buf);
 
         let mut a = BitWriter::new();
-        emit_sequences(&mut a, &buf, 0, &sink, &statics.litcode, &statics.offcode);
+        emit_sequences(&mut a, &buf, 0, &sink.view(), &statics.litcode, &statics.offcode);
         let mut b = BitWriter::new();
         emit_sequences(
             &mut b,
             &shifted,
             37,
-            &sink,
+            &sink.view(),
             &statics.litcode,
             &statics.offcode,
         );

@@ -109,9 +109,30 @@ pub(super) fn run_resumable(
     let mut blocks_completed = 0u32;
     let mut split_hold_latched = false;
     let mut split_hold_decided = false;
+    // Post-parse block splitter (`postsplit`), levels that declare a span only.
+    // `None` everywhere else, so the emit path below is unchanged for them.
+    let mut splitter = if params.postsplit_span > 0 {
+        Some(super::postsplit::SpanSplitter::new())
+    } else {
+        None
+    };
 
     loop {
         if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
+            // The span holds only COMPLETE blocks, so cutting it here is safe;
+            // it is one forced boundary at a chunk seam, exactly as the
+            // per-block emit already produces there.
+            if let Some(sp) = splitter.as_mut() {
+                sp.flush(
+                    bw,
+                    buf,
+                    statics,
+                    false,
+                    &mut header_scratch,
+                    &mut code_scratch,
+                    params.try_exact_huffman,
+                );
+            }
             return in_next;
         }
         // Start a new DEFLATE block.
@@ -154,18 +175,47 @@ pub(super) fn run_resumable(
             )
         });
 
-        emit_block(
-            bw,
-            buf,
-            block_begin,
-            &sink,
-            statics,
-            role.is_final() && in_next == in_end,
-            &mut header_scratch,
-            &mut code_scratch,
-            params.try_exact_huffman,
-            None,
-        );
+        match splitter.as_mut() {
+            // Post-parse splitting: hold this block's tokens instead of
+            // emitting them, and re-cut the span once it is full.
+            Some(sp) => {
+                if sp.is_full_for(sink.block_length) {
+                    sp.flush(
+                        bw,
+                        buf,
+                        statics,
+                        false,
+                        &mut header_scratch,
+                        &mut code_scratch,
+                        params.try_exact_huffman,
+                    );
+                }
+                sp.append(&sink, block_begin);
+                if in_next == in_end {
+                    sp.flush(
+                        bw,
+                        buf,
+                        statics,
+                        role.is_final(),
+                        &mut header_scratch,
+                        &mut code_scratch,
+                        params.try_exact_huffman,
+                    );
+                }
+            }
+            None => emit_block(
+                bw,
+                buf,
+                block_begin,
+                &sink.view(),
+                statics,
+                role.is_final() && in_next == in_end,
+                &mut header_scratch,
+                &mut code_scratch,
+                params.try_exact_huffman,
+                None,
+            ),
+        }
         blocks_completed += 1;
         if in_next == in_end {
             return in_next;
