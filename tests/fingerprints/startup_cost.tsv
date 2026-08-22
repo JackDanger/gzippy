@@ -122,8 +122,8 @@ level	threads	counter	value
 1	4	match_length_bytes_total	0
 1	4	matches_emitted	0
 1	4	matches_emitted_fast	0
-6	1	alloc_bytes	308
-6	1	alloc_events	3
+6	1	alloc_bytes	291
+6	1	alloc_events	2
 6	1	bitstream_flush_word_calls	2
 6	1	block_split_observations	1
 6	1	blocks_emitted_dynamic	0
@@ -224,8 +224,8 @@ level	threads	counter	value
 6	4	match_length_bytes_total	0
 6	4	matches_emitted	0
 6	4	matches_emitted_fast	0
-9	1	alloc_bytes	308
-9	1	alloc_events	3
+9	1	alloc_bytes	291
+9	1	alloc_events	2
 9	1	bitstream_flush_word_calls	2
 9	1	block_split_observations	1
 9	1	blocks_emitted_dynamic	0
