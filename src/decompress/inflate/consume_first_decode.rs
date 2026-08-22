@@ -2148,11 +2148,36 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
             .copy_from_slice(&bits.data[bits.pos..bits.pos + remaining]);
         bits.pos += remaining;
         out_pos += remaining;
-    }
 
-    // Reset bit buffer state for next block
-    bits.bitbuf = 0;
-    bits.bitsleft = 0;
+        // Moving `pos` past bytes that never went through the bit buffer
+        // invalidates the refill invariant, so the buffer must be reset — but
+        // ONLY here. The drain loop above ran until `available() < 8`, and the
+        // payload is byte-aligned, so reaching this branch means `available()`
+        // is exactly 0 and nothing valid is discarded.
+        //
+        // ⚠ THE RESET USED TO BE UNCONDITIONAL, AND THAT WAS A DESYNC BUG.
+        // `bitbuf` holds bits loaded from bytes BEFORE `bits.pos` (see
+        // `Bits::refill`: it ORs an 8-byte word in and advances `pos`). When a
+        // stored payload ends while whole bytes are still buffered — the drain
+        // loop exits on `remaining == 0`, not on an empty buffer — zeroing
+        // `bitbuf`/`bitsleft` without rewinding `pos` throws those bytes away
+        // and the next block starts `available()/8` bytes too far into the
+        // stream. `marker_inflate::read_stored_bytes_aligned` (the parallel-SM
+        // sibling, which cites these lines) already scoped its reset this way;
+        // this site did not.
+        //
+        // RECEIPT (2026-08-22, `probe/stored-blocks`): our own `-1` output for
+        // `movie.mp4` and `tool.bin` — the only 2 of 115 corpus streams that
+        // contain BTYPE=00 blocks — failed `decompress_raw_bytes` with
+        // "Invalid repeat" / "Invalid distance" while `gzip -dc`,
+        // `libdeflate-gzip -dc` and `gzippy -dc` all decoded them byte-exactly.
+        // The trigger is our stored grid: a 65,536-byte stored block emits
+        // sub-blocks of 65,535 + 1, and the 1-byte sub-block leaves several
+        // bytes buffered. This silently blinded `examples/blockcensus` to every
+        // stored block we emit.
+        bits.bitbuf = 0;
+        bits.bitsleft = 0;
+    }
 
     Ok(out_pos)
 }
@@ -2915,6 +2940,44 @@ mod tests {
     /// handles arbitrary overlap. Covers the OVERLAPPING danger zone
     /// (`dist < len`) across every branch (dist==1 RLE, dist 2..=7 small-stride,
     /// dist>=8 word) and every loop-trip count.
+    /// A stored block whose payload ENDS while whole bytes are still sitting in
+    /// the bit buffer must not lose them. `decode_stored` used to zero
+    /// `bitbuf`/`bitsleft` unconditionally after the payload, while `pos` had
+    /// already been advanced past those bytes by `refill` — so the next block
+    /// was read `available()/8` bytes too far into the stream.
+    ///
+    /// This fixture is the minimum that reproduces it: a non-final stored block
+    /// with LEN=1 followed by a final stored block. After the 1-byte payload the
+    /// buffer still holds the SECOND block's header byte, which the old code
+    /// discarded. It is not hypothetical — our own `-1` output for `movie.mp4`
+    /// and `tool.bin` emits 65,536-byte stored blocks as 65,535 + 1 sub-blocks
+    /// and hit exactly this (2026-08-22, `probe/stored-blocks`); those streams
+    /// decoded byte-exactly through `gzip`, `libdeflate-gzip` and `gzippy -dc`
+    /// but NOT through `decompress_raw_bytes`, which silently blinded
+    /// `examples/blockcensus` to every stored block we emit.
+    #[test]
+    fn stored_block_ending_mid_buffer_keeps_the_next_block_header() {
+        // Block 1: BFINAL=0 BTYPE=00, LEN=1, NLEN=!1, payload "A".
+        // Block 2: BFINAL=1 BTYPE=00, LEN=4, NLEN=!4, payload "BCDE".
+        let mut raw: Vec<u8> = Vec::new();
+        raw.push(0b0000_0000); // bfinal=0, btype=00, 5 pad bits
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.extend_from_slice(&(!1u16).to_le_bytes());
+        raw.push(b'A');
+        raw.push(0b0000_0001); // bfinal=1, btype=00, 5 pad bits
+        raw.extend_from_slice(&4u16.to_le_bytes());
+        raw.extend_from_slice(&(!4u16).to_le_bytes());
+        raw.extend_from_slice(b"BCDE");
+
+        let mut out = vec![0u8; 64];
+        let n = inflate_consume_first(&raw, &mut out).expect("stored chain must decode");
+        assert_eq!(
+            &out[..n],
+            b"ABCDE",
+            "stored payload ending with bytes still buffered desynced the next block"
+        );
+    }
+
     #[test]
     fn copy_match_fast_matches_naive_reference_all_dist_len() {
         // Generous tail so the fast path's <40-byte overwrite never runs off
