@@ -553,20 +553,6 @@ fn encode_unpadded_deflate_bytes(data: &[u8], params: level::LevelParams) -> Vec
     bw.finish()
 }
 
-fn gzip_wrap_unpadded_deflate(data: &[u8], deflate: Vec<u8>) -> Vec<u8> {
-    let len = data.len();
-    let out_cap = 10 + deflate.len() + 8;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, out_cap);
-    let mut gz = Vec::with_capacity(out_cap);
-    gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    gz.extend_from_slice(&deflate);
-    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
-    gz.extend_from_slice(&crc.to_le_bytes());
-    gz.extend_from_slice(&(len as u32).to_le_bytes());
-    gz
-}
-
 /// Pick-min: igzip vs gzip-primary L1 fast path (mmap + whole-buffer).
 fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
     pick_min_two_vecs(
@@ -1131,76 +1117,6 @@ fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Writ
     encode_gzip_single_pass(reader, writer, level, stream_chunk, size_hint)
 }
 
-/// Gzip-compress `data` — a borrowed slice that CANNOT carry trailing pad
-/// bytes — into `writer`, byte-identical to the whole-buffer encoder
-/// ([`encode_gzip_bytes_to_vec`]) at every level.
-///
-/// The intended caller is the T1 FILE route in `compress/io.rs`, where `data`
-/// is a read-only mmap of the input file. The vendor's answer to input-side
-/// page-fault cost is exactly this — libdeflate-gzip maps its input
-/// (`vendor/libdeflate/programs/gzip.c`) — while our first streaming L1
-/// (`encode_gzip_single_pass`) paid for its fixed window with per-byte
-/// copy-through-window traffic that a solvency bisect measured at +3-7% wall
-/// on L1 file cells (PR #256). An mmap cannot take the whole-buffer entry
-/// points directly because they demand [`INPLACE_TAIL_PAD`] readable bytes
-/// past the logical end, and reading past an mmap's final page is SIGBUS
-/// territory. This function closes that gap without copying the bulk:
-///
-/// * **Levels with a resumable parser** ([`level_streams`], L1-L9): PASS 1
-///   parses `data[..len - INPLACE_TAIL_PAD]` IN PLACE over the mmap in
-///   `InputMode::Bounded` — the parser stops at the last block boundary that
-///   still has [`parse::STREAM_BLOCK_LOOKAHEAD`] bytes of lookahead, so every
-///   boundary and match decision is identical to a whole-buffer parse (the
-///   same argument `encode_gzip_single_pass` streams on), and no read ever
-///   reaches the unpadded final bytes. PASS 2 copies the small remainder —
-///   at most ~2 windows of history plus the lookahead margin, a bounded
-///   constant regardless of input size — into a padded scratch buffer and
-///   drains it with the SAME [`parse::ParseState`] and the SAME continuous
-///   [`BitWriter`], exactly one slide of the streaming loop. No sync-flush,
-///   no seam, no boundary moved: byte-identity is inherited, not re-argued.
-/// * **Level 0**: stored blocks are emitted straight off the mmap (no pad
-///   requirement), drained every [`STREAM_CHUNK`] bytes — a multiple of
-///   [`MAX_STORED_SUBBLOCK`], so sub-block boundaries land exactly where the
-///   whole-buffer encoder puts them.
-/// * **Levels without a resumable parser** (L10-12, NearOptimal): the one
-///   copy the pad problem genuinely forces. The input is copied once into a
-///   padded buffer — the identical allocation the Read-based fallback in
-///   [`encode_gzip_reader_to_writer_chunked_sized`] makes today, with the
-///   copy sourced from the page cache instead of a `read(2)` loop.
-/// T1 mmap L1: gzip `MIN_MATCH` 3-byte primary hash wins `photo.jpg` T1; igzip
-/// 4-byte wins libdeflate ties elsewhere. Pick-min both (L4/L8/L9 precedent).
-fn encode_gzip_unpadded_l1_pickmin<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l1_pick_min(data));
-    writer.write_all(&best)?;
-    Ok(data.len() as u64)
-}
-
-/// T1 mmap L2: gzip `deflate_fast` class beats libdeflate Greedy on photo-like
-/// cells; Greedy wins libdeflate ties elsewhere. Pick-min three arms.
-fn encode_gzip_unpadded_l2_pickmin<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l2_pick_min(data));
-    writer.write_all(&best)?;
-    Ok(data.len() as u64)
-}
-
-/// T1 mmap L4: Greedy loses `data.sqlite` to gzip header tax; Lazy alone flips
-/// the `weights.safetensors` libdeflate tie. Pick-min both parsers (L8/L9
-/// precedent) without changing `params(4)` for streaming or T>1 routes.
-fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> std::io::Result<u64> {
-    let best = gzip_wrap_unpadded_deflate(data, deflate_one_shot_t1_l4_pick_min(data));
-    writer.write_all(&best)?;
-    Ok(data.len() as u64)
-}
-
 /// Compress `data[..logical_len]` as one gzip stream, written to `writer`.
 ///
 /// `data` MAY carry trailing slack past `logical_len` — if it carries at least
@@ -1265,32 +1181,32 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     // whole-`data` CRC over the pad is a corrupt trailer, not a size delta.
     let data = &data[..logical_len];
     let len = logical_len;
-    // T1 mmap L5-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
-    // `deflate_into`; route through the padded whole-buffer encoder so the
-    // streaming two-pass path does not need a second implementation.
-    if matches!(level, 5..=7) && len > 0 {
-        let cap = len + INPLACE_TAIL_PAD;
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, cap);
-        let mut input = Vec::with_capacity(cap);
-        input.extend_from_slice(data);
-        input.resize(cap, 0);
-        let gz = encode_gzip_slack_padded_to_vec(&input, len, level);
-        writer.write_all(&gz)?;
-        return Ok(len as u64);
-    }
-
-    if level == 1 && len > 0 {
-        return encode_gzip_unpadded_l1_pickmin(data, writer);
-    }
-
-    if level == 2 && len > 0 {
-        return encode_gzip_unpadded_l2_pickmin(data, writer);
-    }
-
-    if level == 4 && len > 0 {
-        return encode_gzip_unpadded_l4_pickmin(data, writer);
-    }
+    // INVARIANT: reaching here proves `level_streams(level)`, because the
+    // `!level_streams(level)` block above returns on every path. And
+    // `level_has_resumable_parser` returns false for any level that runs
+    // whole-buffer pick-min — that is the module's stated rule, "a level that
+    // runs WHOLE-BUFFER PICK-MIN cannot stream". So a streaming level NEVER
+    // picks min, and the four dispatches that used to sit here (L5-L7 via the
+    // padded encoder, and L1/L2/L4 via their pick-min wrappers) described a
+    // state the invariant forbids.
+    //
+    // They were not harmless. `level_streams` is DEFINED in terms of the
+    // pick-min predicates, so forcing a predicate false to ablate pick-min
+    // flips those levels to "streaming" and lands them right here — where a
+    // second, unguarded copy of the pick-min dispatch ran it anyway. An
+    // ablation on 2026-08-22 read "L2/L4 pick-min is free and buys nothing"
+    // from exactly that reroute; deleting the arms for real then cost
+    // +612,340 B at L2 and +4,166,271 B at L4 and broke three cells.
+    //
+    // One dispatch site, guarded by the predicate, above. This asserts the
+    // contradiction can no longer be reached silently.
+    debug_assert!(
+        level_streams(level)
+            && !level_uses_t1_zlib_pick_min(level)
+            && !level_uses_t1_mmap_pick_min(level),
+        "streaming tail reached for a pick-min level {level} — the whole-buffer \
+         branch above must have returned"
+    );
 
     let out_cap = if level == 0 {
         // Drained per STREAM_CHUNK stored slice below — the output buffer
