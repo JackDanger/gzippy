@@ -1460,6 +1460,21 @@ fn emit_block(
         });
     let (litcode, offcode) = (&*litcode, &*offcode);
 
+    crate::block_cost_probe!(
+        sink.block_length,
+        stored_bits,
+        static_bits,
+        dynamic_bits as i64,
+        if stored_bits <= dynamic_bits && stored_bits <= static_bits {
+            's'
+        } else if static_bits <= dynamic_bits {
+            'f'
+        } else {
+            'd'
+        },
+        'e'
+    );
+
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
         // blocks_emitted_stored is counted in `write_stored_subblock`
         // (deflate/mod.rs) — the single physical-BTYPE=00-block emission
@@ -1559,6 +1574,15 @@ fn emit_block_static_or_stored(
             let stored_bits = stored_block_bits(sink.block_length);
             (static_bits, stored_bits)
         });
+
+    crate::block_cost_probe!(
+        sink.block_length,
+        stored_bits,
+        static_bits,
+        -1i64,
+        if stored_bits <= static_bits { 's' } else { 'f' },
+        's'
+    );
 
     if stored_bits <= static_bits {
         // See the sibling `emit_block`'s comment: counted in

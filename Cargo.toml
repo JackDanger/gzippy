@@ -133,6 +133,11 @@ anatomy-counters = []
 # `ANATOMY_WALL={json}`. No env var gates behavior, consistent with "NO env
 # vars in the production path".
 anatomy-wall = []
+# Per-block block-TYPE cost lines for the stored-block probe (see
+# src/compress/deflate/block_cost_probe.rs). DEFAULT OFF; with the feature off the
+# call sites compile to nothing. Prints one `BLOCKCOST ...` line per emitted block
+# to stderr. Measurement-output only — no env var, no behaviour change.
+block-cost-probe = []
 # ── Bucket-split-oracle session (2026-07-26) ────────────────────────────────
 # The `parse_match` anatomy-wall bucket is FUSED (probe + accept/defer +
 # `Sink::push_*` emission + histogram/stats all inlined in one per-position
