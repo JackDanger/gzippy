@@ -147,8 +147,12 @@ note "out" "$OUT"
 # including signals — see feedback_llama_pause_no_orphan. Opt out only for a smoke run.
 FREEZE=()
 if [ "${CAMPAIGN_NO_FREEZE:-0}" != "1" ]; then
-  FREEZE=("$CAMPAIGN_FULCRUM" freeze run --ttl-s 7200 --procs "llama-swap,llama-server" --)
-  note "freeze" "llama-swap,llama-server paused for the run (SIGCONT on every exit path)"
+  # TTL must outlast the grid: a full L1-9 x T1,T4 x 22-file wall board projects ~9.5h and
+  # was KILLED at 7200s twice (2026-08-13/14, EXIT:124 at 250/230 rows). Override per run;
+  # the default stays 2h so a stray run cannot pin the box's llama processes indefinitely.
+  FREEZE_TTL_S="${CAMPAIGN_FREEZE_TTL_S:-7200}"
+  FREEZE=("$CAMPAIGN_FULCRUM" freeze run --ttl-s "$FREEZE_TTL_S" --procs "llama-swap,llama-server" --)
+  note "freeze" "llama-swap,llama-server paused for the run, ttl=${FREEZE_TTL_S}s (SIGCONT on every exit path)"
 else
   # `note` uses a %s conversion, so an escape written here would print literally.
   printf '\033[1;33mfreeze DISABLED\033[0m (CAMPAIGN_NO_FREEZE=1) — smoke only, NOT quotable\n'
