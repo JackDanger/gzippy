@@ -471,8 +471,31 @@ jobs:
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
-      - name: Ir budgets + ours-vs-ldx margins
-        run: cargo test --release --test ir_budget --test ir_vs_ldx -- --nocapture
+      # TWO STEPS, NOT ONE, AND THIS IS THE POINT.
+      #
+      # These ran as `cargo test --test ir_budget --test ir_vs_ldx`, which runs
+      # the binaries in sequence and ABORTS after the first failing one. The
+      # absolute-pin leg has been red on shared runners for weeks (it is pinned
+      # to trainer and its own header says to re-calibrate before porting), so
+      # `ir_vs_ldx` NEVER EXECUTED HERE AT ALL — verified in the job log for
+      # main @ b560d984: one "Running tests/ir_budget.rs" line and no
+      # ir_vs_ldx line.
+      #
+      # The non-portable check was masking the portable one. Per the block
+      # comment above, leg 1 of `ir_vs_ldx` is a SAME-HOST SAME-BUILD RATIO in
+      # which runner drift cancels — it is the leg that can legitimately gate a
+      # shared runner, and it is the one nobody could see.
+      #
+      # Both stay informational for now because this job is
+      # `continue-on-error`. The criterion for promoting the ratio leg to
+      # required is the one already stated above — observed stably green across
+      # runner generations — and that observation was impossible until now.
+      - name: Ir absolute budgets (trainer-pinned; NOT portable, informational)
+        continue-on-error: true
+        run: cargo test --release --test ir_budget -- --nocapture
+
+      - name: Ir ratio vs ldx (same-host, drift-cancelling — the promotable leg)
+        run: cargo test --release --test ir_vs_ldx -- --nocapture
 
   lint:
     name: Lint
