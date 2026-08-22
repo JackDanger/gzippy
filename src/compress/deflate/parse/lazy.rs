@@ -57,7 +57,16 @@ pub(super) fn run(
             next_hashes,
             ..
         } = &mut state;
-        mf.skip_bytes(buf, in_base, 0, in_end, data_start, next_hashes);
+        mf.skip_bytes(
+            buf,
+            in_base,
+            0,
+            in_end,
+            data_start,
+            params.hash3_chain_depth,
+            params.maintain_hash3_chain,
+            next_hashes,
+        );
     }
     run_resumable(
         buf,
@@ -282,6 +291,8 @@ pub(super) fn run_block(
                         in_next,
                         in_end,
                         (cur_len - 1) as usize,
+                        params.hash3_chain_depth,
+                        params.maintain_hash3_chain,
                         next_hashes,
                     );
                     in_next += (cur_len - 1) as usize;
@@ -342,6 +353,8 @@ pub(super) fn run_block(
                             in_next,
                             in_end,
                             (cur_len - 3) as usize,
+                            params.hash3_chain_depth,
+                            params.maintain_hash3_chain,
                             next_hashes,
                         );
                         in_next += (cur_len - 3) as usize;
@@ -355,6 +368,8 @@ pub(super) fn run_block(
                         in_next,
                         in_end,
                         (cur_len - 2) as usize,
+                        params.hash3_chain_depth,
+                        params.maintain_hash3_chain,
                         next_hashes,
                     );
                     in_next += (cur_len - 2) as usize;

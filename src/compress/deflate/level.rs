@@ -194,6 +194,11 @@ pub struct LevelParams {
     /// Length-3 hash chain walk depth in `HcMatchfinder` (0 = singleton head
     /// only, shipped everywhere; gzip `deflate_fast` uses 8 at L2 pick-min).
     pub hash3_chain_depth: u32,
+    /// Also link `next3_tab` in `HcMatchfinder::skip_bytes` during match
+    /// interiors (gzip chains every inserted position; our port overwrote
+    /// hash3 heads without writing `next3_tab`, leaving stale len-3 links).
+    /// Pick-min arms only — shipped paths keep false.
+    pub maintain_hash3_chain: bool,
     /// Near-optimal-only knobs (meaningful iff `strategy == NearOptimal`).
     pub near_optimal: NearOptimalParams,
 }
@@ -354,6 +359,58 @@ pub fn params_l2_gzip_deflate_fast() -> LevelParams {
     p.forced_min_match_len = 3;
     p.greedy_accept_far_len3 = true;
     p.hash3_chain_depth = super::matchfinder::hc::HC_HASH3_CHAIN_DEPTH;
+    p
+}
+
+/// libdeflate L3 is `deflate_compress_greedy` at depth 12 / nice 14 (we ship Lazy).
+///
+/// THINNED OUT of L3's shipped pick-min 2026-08-19 (`pickmin_arm_audit::win_rate_report`,
+/// `deflate/mod.rs`): 0/23 wins on the real GATE corpus, T1 — never the reason any L3
+/// cell is closed. Kept `pub` and defined (not deleted) so the audit test keeps
+/// exercising it every run; a future nonzero win count there is the signal to
+/// reconsider, not a hand-argument.
+#[allow(dead_code)]
+pub fn params_l3_libdeflate_greedy() -> LevelParams {
+    let mut p = params(3);
+    p.strategy = Strategy::Greedy;
+    p.far_len3_gate = false;
+    p.greedy_len3_shadow = false;
+    p
+}
+
+/// UNUSED on `main`: L3 no longer runs pick-min (it streams, one parse), so no
+/// arm calls this. Kept `pub` and defined rather than deleted because it is the
+/// exact configuration the recorded L3 measurements were taken with — deleting it
+/// would lose the reproduction for a finding that is still open. Same reason as
+/// `params_l3_libdeflate_greedy` above.
+#[allow(dead_code)]
+/// Gzip `deflate_fast` L3 (`vendor/gzip/deflate.c` configuration_table[3]: chain 32, nice 32).
+pub fn params_l3_gzip_deflate_fast() -> LevelParams {
+    let mut p = params(3);
+    p.strategy = Strategy::Greedy;
+    p.max_search_depth = 32;
+    p.nice_match_length = 32;
+    p.far_len3_gate = false;
+    p.greedy_len3_shadow = false;
+    p.forced_min_match_len = 3;
+    p.greedy_accept_far_len3 = true;
+    p.hash3_chain_depth = super::matchfinder::hc::HC_HASH3_CHAIN_DEPTH;
+    p
+}
+
+/// UNUSED on `main` for the same reason as the function above. This is the config
+/// behind the commit message's measured result: as a knob on the single parse it is
+/// -51,009 B at L3 and closes `dd79_bin6`, but it breaks `weights.safetensors`, so
+/// it does not ship. Kept so that result stays reproducible.
+#[allow(dead_code)]
+/// L3 gzip arm: repair hash3 chain maintenance in `skip_bytes` during match
+/// interiors and walk hash3 chains to gzip L3 depth 32. Vendor diff on
+/// `gzip:dd79_bin6:L3:T1`: gzip finds more len-3-class matches; our
+/// `skip_bytes` left stale `next3_tab` links while `longest_match` linked them.
+pub fn params_l3_gzip_hash3_chain_repair() -> LevelParams {
+    let mut p = params_l3_gzip_deflate_fast();
+    p.maintain_hash3_chain = true;
+    p.hash3_chain_depth = 32;
     p
 }
 
@@ -735,6 +792,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         // Native L1 is the igzip-class one-pass FAST path (Increment 4):
@@ -765,6 +823,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         2 => LevelParams {
@@ -790,6 +849,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
@@ -868,6 +928,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
@@ -905,6 +966,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         5 => LevelParams {
@@ -930,6 +992,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         6 => LevelParams {
@@ -955,6 +1018,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         7 => LevelParams {
@@ -980,6 +1044,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         8 => LevelParams {
@@ -1005,6 +1070,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         9 => LevelParams {
@@ -1030,6 +1096,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NONE_NO,
         },
         // Native near-optimal parser (`deflate_compress_near_optimal`,
@@ -1057,6 +1124,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 2,
                 min_improvement_to_continue: 32,
@@ -1087,6 +1155,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 4,
                 min_improvement_to_continue: 16,
@@ -1117,6 +1186,7 @@ fn params_inner(level: u32) -> LevelParams {
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
+            maintain_hash3_chain: false,
             near_optimal: NearOptimalParams {
                 max_optim_passes: 10,
                 min_improvement_to_continue: 1,

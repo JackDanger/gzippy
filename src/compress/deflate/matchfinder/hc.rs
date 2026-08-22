@@ -647,6 +647,8 @@ impl HcMatchfinder {
         in_next: usize,
         in_end: usize,
         count: usize,
+        hash3_chain_depth: u32,
+        maintain_hash3_chain: bool,
         next_hashes: &mut [u32; 2],
     ) {
         if count + 5 > in_end - in_next {
@@ -670,7 +672,11 @@ impl HcMatchfinder {
             // and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()` (reset above).
             unsafe {
                 debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
+                let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
                 *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
+                if maintain_hash3_chain && hash3_chain_depth > 0 {
+                    *self.next3_tab.get_unchecked_mut(cur_pos) = cur_node3;
+                }
                 *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
                 *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
             }
@@ -905,6 +911,8 @@ mod tests {
             in_next: usize,
             in_end: usize,
             count: usize,
+            _hash3_chain_depth: u32,
+            _maintain_hash3_chain: bool,
             next_hashes: &mut [u32; 2],
         ) {
             if count + 5 > in_end - in_next {
@@ -961,8 +969,8 @@ mod tests {
         // then the greedy walk over the rest.
         let seed = (in_end / 4).min(37);
         if seed > 0 {
-            mf_new.skip_bytes(&buf, &mut base_new, 0, in_end, seed, &mut nh_new);
-            mf_ref.skip_bytes(&buf, &mut base_ref, 0, in_end, seed, &mut nh_ref);
+            mf_new.skip_bytes(&buf, &mut base_new, 0, in_end, seed, 0, false, &mut nh_new);
+            mf_ref.skip_bytes(&buf, &mut base_ref, 0, in_end, seed, 0, false, &mut nh_ref);
             assert_state_eq(
                 &mf_new,
                 &mf_ref,
@@ -1034,6 +1042,8 @@ mod tests {
                     in_next + 1,
                     in_end,
                     len - 1,
+                    0,
+                    false,
                     &mut nh_new,
                 );
                 mf_ref.skip_bytes(
@@ -1042,6 +1052,8 @@ mod tests {
                     in_next + 1,
                     in_end,
                     len - 1,
+                    0,
+                    false,
                     &mut nh_ref,
                 );
                 assert_state_eq(
@@ -1185,7 +1197,16 @@ mod tests {
 
         // Seed positions 0..12 so the chains are populated (1..11 hashed
         // correctly; next_hashes ends pointing at position 12).
-        mf.skip_bytes(&buf, &mut in_base, 0, in_end, 12, &mut next_hashes);
+        mf.skip_bytes(
+            &buf,
+            &mut in_base,
+            0,
+            in_end,
+            12,
+            0,
+            false,
+            &mut next_hashes,
+        );
 
         let (len, off) = mf.longest_match(
             &buf,
