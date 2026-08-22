@@ -672,11 +672,17 @@ impl HcMatchfinder {
             // and `cur_pos ∈ 0..WINDOW_SIZE == next_tab.len()` (reset above).
             unsafe {
                 debug_assert!(hash3 < HASH3_SIZE && hash4 < HASH4_SIZE && cur_pos < WINDOW_SIZE);
-                let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
-                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
+                // Load the old head ONLY when it is going to be used. Reading it
+                // unconditionally cost 1.1-3.2% Ir at L6 on every corpus class
+                // even with the knob OFF — an extra load per skipped position in
+                // the matchfinder's hottest loop. Caught by diffing the Ir
+                // ratchet's VALUES against main (the check that hid #331's
+                // regression when it compared job status instead).
                 if maintain_hash3_chain && hash3_chain_depth > 0 {
+                    let cur_node3 = *self.hash3_tab.get_unchecked(hash3);
                     *self.next3_tab.get_unchecked_mut(cur_pos) = cur_node3;
                 }
+                *self.hash3_tab.get_unchecked_mut(hash3) = cur_pos as i16;
                 *self.next_tab.get_unchecked_mut(cur_pos) = *self.hash4_tab.get_unchecked(hash4);
                 *self.hash4_tab.get_unchecked_mut(hash4) = cur_pos as i16;
             }
