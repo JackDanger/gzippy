@@ -40,6 +40,17 @@
 //! WHAT THIS IS NOT: the true optimum. Greedy recursive bisection is a LOWER BOUND
 //! on the achievable gain. `--dp` runs an exact O(C^2) dynamic program over a coarse
 //! candidate grid on one file to bound how far the greedy search sits from optimal.
+//! MEASURED, engine.wasm, grid refined 512 -> 256 -> 128 -> 64 tokens
+//! (`--levels 3,9 --dp {512,256,128,64}`), gain over our partition in bytes:
+//!
+//!     grid   512    256    128     64   | greedy (free cut positions)
+//!     L3    1649   1813   1965   2121   | 2069
+//!     L9    1613   1807   2005   2161   | 2114
+//!
+//! The DP is still RISING at grid 64 and has already passed greedy by 51 B (L3) and
+//! 46 B (L9) — so on this file the greedy number under-reports the optimum by at
+//! least 2.5% / 2.2%, and the true free-position optimum is above even the grid-64
+//! DP. Read every headroom figure this tool prints as a floor, not a ceiling.
 //!
 //!   cargo run --release --features split-probe --example split_headroom -- \
 //!       --levels 3,9 CORPUS/dickens CORPUS/engine.wasm ...
@@ -435,7 +446,7 @@ fn main() {
     }
 
     println!(
-        "{:<22} {:>2} {:>11} {:>7} {:>14} {:>14} {:>7} {:>7} {:>12} {:>8} {:>7} {:>7}",
+        "{:<22} {:>2} {:>11} {:>7} {:>14} {:>14} {:>7} {:>7} {:>12} {:>8} {:>8} {:>7} {:>7}",
         "file",
         "L",
         "in_bytes",
@@ -446,6 +457,7 @@ fn main() {
         "best_bl",
         "gain_bytes",
         "gain_%",
+        "arm",
         "valid",
         "evals"
     );
@@ -549,16 +561,19 @@ fn main() {
             }
             let seeded_bits = coster.total(&seeded, n);
 
-            let (best_bits, best_blocks) = if greedy_bits <= seeded_bits {
-                (greedy_bits, greedy.len() + 1)
+            // WHICH arm won matters more than the margin: "scratch" means throwing our
+            // cut set away and re-searching beats keeping it, i.e. our boundaries are
+            // not merely incomplete but actively in the wrong places.
+            let (best_bits, best_blocks, arm) = if greedy_bits <= seeded_bits {
+                (greedy_bits, greedy.len() + 1, "scratch")
             } else {
-                (seeded_bits, seeded.len() + 1)
+                (seeded_bits, seeded.len() + 1, "seeded")
             };
             let gain_bytes = (ours_bits as i64 - best_bits as i64) / 8;
             let gain_pct = (ours_bits as f64 - best_bits as f64) / ours_bits as f64 * 100.0;
 
             println!(
-                "{:<22} {:>2} {:>11} {:>7} {:>14} {:>14} {:>7} {:>7} {:>12} {:>7.4}% {:>7} {:>7}",
+                "{:<22} {:>2} {:>11} {:>7} {:>14} {:>14} {:>7} {:>7} {:>12} {:>7.4}% {:>8} {:>7} {:>7}",
                 name,
                 level,
                 data.len(),
@@ -569,6 +584,7 @@ fn main() {
                 best_blocks,
                 gain_bytes,
                 gain_pct,
+                arm,
                 if valid && self_ok {
                     "VALID".to_string()
                 } else {
