@@ -67,6 +67,12 @@ mod near_optimal;
 /// `docs/compressor-architecture.md` for the full module map.
 pub mod ultra;
 
+/// Block-PLACEMENT denominator probe. OFF by default; `--features split-probe`
+/// only. See `probe.rs` — it exists to answer "how many bytes does better block
+/// placement buy with the parse held fixed?", which nothing else in the tree can.
+#[cfg(feature = "split-probe")]
+pub mod probe;
+
 /// Number of trailing pad bytes appended to the matchfinder's working buffer so
 /// its speculative 4-byte / 8-byte loads never read out of bounds.
 pub(super) const BUF_PAD: usize = 16;
@@ -1475,6 +1481,20 @@ fn emit_block(
         'e'
     );
 
+    // Placement-denominator probe (off by default; see `probe.rs`). Placed here
+    // because all three candidate costs are live and nothing has been written
+    // yet, so the record is exactly what the emitter is about to decide on.
+    #[cfg(feature = "split-probe")]
+    probe::record(
+        block_start,
+        sink,
+        is_final,
+        try_exact,
+        dynamic_bits,
+        static_bits,
+        stored_bits,
+    );
+
     if stored_bits <= dynamic_bits && stored_bits <= static_bits {
         // blocks_emitted_stored is counted in `write_stored_subblock`
         // (deflate/mod.rs) — the single physical-BTYPE=00-block emission
@@ -2061,6 +2081,136 @@ mod seq_store_bound_tests {
             0,
             "len stays 0; slots are written via spare capacity"
         );
+    }
+}
+
+/// The placement probe's cost model must BE the emitter's, not resemble it.
+///
+/// `probe::cost_span` re-states `emit_block`'s three-way stored/static/dynamic
+/// decision for an arbitrary span, and `examples/split_headroom.rs` prices BOTH
+/// our partition and a searched partition with it. If the two arithmetics ever
+/// diverge, the "headroom" it reports is the difference between two cost models
+/// rather than between two partitions — the exact failure mode that makes a
+/// denominator measurement worthless. Re-pinned here rather than left to the
+/// example's runtime check, because only a test fails closed.
+#[cfg(all(test, feature = "split-probe"))]
+mod probe_tests {
+    use super::*;
+
+    /// Compress real fixtures and assert that re-pricing each emitted block's own
+    /// frequencies through `probe::cost_span` reproduces, bit for bit and btype for
+    /// btype, what `emit_block` decided on the live histogram.
+    ///
+    /// Runs on the COVERING run only — the arm whose bytes shipped — because that is
+    /// the only thing `examples/split_headroom.rs` ever prices. `probe::covering_run`
+    /// documents (with its measurement) why L1/L2/L4 have none.
+    #[test]
+    fn probe_cost_span_reprices_emit_block() {
+        probe_refuses_the_levels_whose_block_base_it_cannot_see();
+        for level in [3u32, 5, 6, 7, 8, 9] {
+            for name in crate::fixtures::NAMES {
+                let data = crate::fixtures::generate(name);
+                probe::enable();
+                let _ = crate::compress::deflate::encode_gzip_bytes_to_vec(&data, level);
+                let rec = probe::take();
+                assert!(!rec.is_empty(), "{name} L{level}: probe recorded nothing");
+                if std::env::var("PROBE_DUMP").is_ok() {
+                    for b in &rec {
+                        println!(
+                            "{name} L{level} run={} start={} len={} nseqs={} trail={} final={}",
+                            b.run,
+                            b.start,
+                            b.len,
+                            b.seqs.len(),
+                            b.trailing_lits,
+                            b.is_final
+                        );
+                    }
+                }
+                let blocks = probe::covering_run(rec, data.len())
+                    .unwrap_or_else(|| panic!("{name} L{level}: no covering run recorded"));
+                for b in &blocks {
+                    // Rebuild the block's frequencies from its recorded tokens alone.
+                    let mut lit = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+                    let mut off = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+                    let mut p = b.start;
+                    for s in &b.seqs {
+                        for _ in 0..s.litrunlen {
+                            lit[data[p] as usize] += 1;
+                            p += 1;
+                        }
+                        let l = s.length();
+                        lit[DEFLATE_FIRST_LEN_SYM + length_slot(l) as usize] += 1;
+                        off[offset_slot(s.offset as u32) as usize] += 1;
+                        p += l as usize;
+                    }
+                    let end = b.start + b.len;
+                    assert_eq!((end - p) as u32, b.trailing_lits);
+                    while p < end {
+                        lit[data[p] as usize] += 1;
+                        p += 1;
+                    }
+                    // Step 1: the tokens must BE the histogram the encoder priced.
+                    let dl: Vec<(usize, u32, u32)> = (0..DEFLATE_NUM_LITLEN_SYMS)
+                        .filter(|&i| lit[i] != b.litlen_freqs[i])
+                        .map(|i| (i, lit[i], b.litlen_freqs[i]))
+                        .collect();
+                    let dof: Vec<(usize, u32, u32)> = (0..DEFLATE_NUM_OFFSET_SYMS)
+                        .filter(|&i| off[i] != b.offset_freqs[i])
+                        .map(|i| (i, off[i], b.offset_freqs[i]))
+                        .collect();
+                    if !(dl.is_empty() && dof.is_empty()) {
+                        panic!(
+                            "{name} L{level} block@{} len={} nseqs={} trail={} run={} \
+                             final={}: rebuilt tokens != priced histogram \
+                             (sym, rebuilt, priced): litlen {dl:?} offset {dof:?}",
+                            b.start,
+                            b.len,
+                            b.seqs.len(),
+                            b.trailing_lits,
+                            b.run,
+                            b.is_final
+                        );
+                    }
+                    // Step 2: same histogram, same arithmetic, same answer.
+                    let (bits, btype) = probe::cost_span(&lit, &off, b.len, b.try_exact);
+                    assert_eq!(
+                        (bits, btype),
+                        (b.bits, b.btype),
+                        "{name} L{level} block@{}: cost_span disagrees with emit_block",
+                        b.start
+                    );
+                }
+            }
+        }
+    }
+
+    /// The probe must FAIL CLOSED where it cannot see the whole input.
+    ///
+    /// L1/L2/L4 are the mmap pick-min levels and at least one of their arms reports
+    /// `block_start` in a base that is not an offset into the whole input, so no run
+    /// tiles `[0, len)`. That must stay a REFUSAL, never a partial answer — a probe
+    /// that silently prices the wrong bytes is how a denominator measurement becomes
+    /// a phantom finding. If a future change gives these levels a covering run, this
+    /// test fails and the L1/L2/L4 rows become measurable — a good failure, but it
+    /// must be noticed rather than assumed.
+    ///
+    /// Folded into the cost-model test rather than standing alone because the
+    /// recorder is PROCESS-GLOBAL: `cargo test` runs test fns concurrently, and two
+    /// tests calling `probe::take()` drain each other's records (this test failed
+    /// with "probe recorded nothing" when it was separate).
+    fn probe_refuses_the_levels_whose_block_base_it_cannot_see() {
+        let data = crate::fixtures::generate("text");
+        for level in [1u32, 2, 4] {
+            probe::enable();
+            let _ = crate::compress::deflate::encode_gzip_bytes_to_vec(&data, level);
+            let rec = probe::take();
+            assert!(!rec.is_empty(), "L{level}: probe recorded nothing");
+            assert!(
+                probe::covering_run(rec, data.len()).is_none(),
+                "L{level} now HAS a covering run — re-open the L1/L2/L4 placement rows"
+            );
+        }
     }
 }
 
