@@ -197,6 +197,56 @@ pub(crate) struct Sink {
     /// When true, non-ultra-sparse blocks need [`L3_NON_ULTRA_SPLIT_MIN_BYTES`]
     /// before an entropy split (high block-rate inputs only).
     sparse_split_hold: bool,
+    /// Scratch for the EXACT block-boundary cost test. Boxed and allocated on
+    /// first proposal so a parse that never reaches one pays nothing, and so
+    /// the hot `Sink` fields stay in the cache lines they already occupy.
+    split_cost: Option<Box<SplitCost>>,
+}
+
+/// State for the exact block-boundary decision.
+///
+/// The emit path already computes a block's EXACT size in bits as
+/// `header_bits(code) + cost_from_freqs(freqs, code)` — seven call sites use
+/// that expression to choose the block TYPE. This carries the little bit of
+/// state needed to ask the same question about the block BOUNDARY.
+struct SplitCost {
+    /// Token histogram as of the last point the content looked STABLE. This is
+    /// `A` in `exact_bits(A) + exact_bits(B) < exact_bits(A u B)`; `B` is
+    /// everything the block has accumulated since, derived by subtraction.
+    ///
+    /// It is a SNAPSHOT of `Sink::litlen_freqs`, not a second histogram
+    /// incremented in the hot loop: the per-symbol cost of this whole mechanism
+    /// is zero added operations.
+    snap_lit: [u32; DEFLATE_NUM_LITLEN_SYMS],
+    snap_off: [u32; DEFLATE_NUM_OFFSET_SYMS],
+    /// Difference buffers, refilled per test.
+    tmp_lit: [u32; DEFLATE_NUM_LITLEN_SYMS],
+    tmp_off: [u32; DEFLATE_NUM_OFFSET_SYMS],
+    litcode: HuffmanCode,
+    offcode: HuffmanCode,
+    header: HeaderScratch,
+}
+
+impl SplitCost {
+    fn new() -> Self {
+        SplitCost {
+            snap_lit: [0; DEFLATE_NUM_LITLEN_SYMS],
+            snap_off: [0; DEFLATE_NUM_OFFSET_SYMS],
+            tmp_lit: [0; DEFLATE_NUM_LITLEN_SYMS],
+            tmp_off: [0; DEFLATE_NUM_OFFSET_SYMS],
+            // `make_huffman_code_into` sizes both vectors on first use, the
+            // same contract every other caller-owned code in this file relies on.
+            litcode: HuffmanCode {
+                lens: Vec::new(),
+                codewords: Vec::new(),
+            },
+            offcode: HuffmanCode {
+                lens: Vec::new(),
+                codewords: Vec::new(),
+            },
+            header: HeaderScratch::new(),
+        }
+    }
 }
 
 thread_local! {
@@ -283,6 +333,7 @@ impl Sink {
             nseqs: 0,
             sparse_split_guard_mul: 0,
             sparse_split_hold: false,
+            split_cost: None,
         }
     }
 
@@ -296,6 +347,12 @@ impl Sink {
         self.stats.reset();
         self.sparse_split_guard_mul = 0;
         self.sparse_split_hold = false;
+        // A new block starts with an empty history, so the stable-point
+        // snapshot must match the (zeroed) frequency arrays.
+        if let Some(sc) = self.split_cost.as_mut() {
+            sc.snap_lit = [0; DEFLATE_NUM_LITLEN_SYMS];
+            sc.snap_off = [0; DEFLATE_NUM_OFFSET_SYMS];
+        }
     }
 
     /// `deflate_choose_literal` (with split-stat gathering always on, as greedy
@@ -1035,6 +1092,113 @@ fn sparse_split_active(sink: &Sink, bytes_in_block: usize, sparse_split_guard_mu
         || bytes_in_block >= L3_NON_ULTRA_SPLIT_MIN_BYTES
 }
 
+/// EXACT size in bits of a dynamic DEFLATE block with this token histogram.
+///
+/// This is the same expression the emit path uses seven times to choose the
+/// block TYPE (`3 + header_bits() + cost_from_freqs()`), which is why the
+/// boundary decision needs no constant of its own: whatever a header costs,
+/// `header_bits()` returns it for the actual code that would be written.
+fn exact_dynamic_block_bits(
+    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+    litcode: &mut HuffmanCode,
+    offcode: &mut HuffmanCode,
+    header: &mut HeaderScratch,
+) -> u64 {
+    make_huffman_code_into(
+        litcode,
+        DEFLATE_NUM_LITLEN_SYMS,
+        MAX_LITLEN_CODEWORD_LEN,
+        litlen_freqs,
+    );
+    make_huffman_code_into(
+        offcode,
+        DEFLATE_NUM_OFFSET_SYMS,
+        MAX_OFFSET_CODEWORD_LEN,
+        offset_freqs,
+    );
+    let h = build_dynamic_header(&litcode.lens, &offcode.lens, header);
+    3 + h.header_bits() + cost_from_freqs(litlen_freqs, offset_freqs, litcode, offcode)
+}
+
+/// Does ending the block here actually PAY for the extra header it costs?
+///
+/// The drift check (`BlockSplitStats::do_end_block_check`) compares 10 coarse
+/// buckets against a `200/512` cutoff and never computes a bit, so it cannot
+/// answer this. It is kept as a cheap PROPOSER — it fires rarely — and this
+/// function adjudicates, in the same units the encoder actually writes.
+///
+/// `A` is the block up to the last point the content looked stable; `B` is
+/// everything since. Each candidate block pays for its own end-of-block symbol,
+/// which is why `[256]` is bumped on all three histograms rather than only on
+/// the two halves.
+fn split_pays(sink: &mut Sink) -> bool {
+    let sc = sink
+        .split_cost
+        .get_or_insert_with(|| Box::new(SplitCost::new()));
+
+    // `A` empty means no stable point has been recorded yet (the first check in
+    // this block). Splitting would emit an empty leading block.
+    let a_tokens: u32 = sc.snap_lit.iter().sum();
+    if a_tokens == 0 {
+        return false;
+    }
+
+    // exact_bits(A u B) — the block as it stands.
+    sc.tmp_lit = sink.litlen_freqs;
+    sc.tmp_off = sink.offset_freqs;
+    sc.tmp_lit[DEFLATE_END_OF_BLOCK] += 1;
+    let merged = exact_dynamic_block_bits(
+        &sc.tmp_lit,
+        &sc.tmp_off,
+        &mut sc.litcode,
+        &mut sc.offcode,
+        &mut sc.header,
+    );
+
+    // exact_bits(A) — the stable head.
+    sc.tmp_lit = sc.snap_lit;
+    sc.tmp_off = sc.snap_off;
+    sc.tmp_lit[DEFLATE_END_OF_BLOCK] += 1;
+    let head = exact_dynamic_block_bits(
+        &sc.tmp_lit,
+        &sc.tmp_off,
+        &mut sc.litcode,
+        &mut sc.offcode,
+        &mut sc.header,
+    );
+
+    // exact_bits(B) — everything since, by subtraction. No second histogram is
+    // maintained in the hot loop; this is the whole reason a snapshot is taken
+    // instead of accumulated.
+    for i in 0..DEFLATE_NUM_LITLEN_SYMS {
+        sc.tmp_lit[i] = sink.litlen_freqs[i] - sc.snap_lit[i];
+    }
+    for i in 0..DEFLATE_NUM_OFFSET_SYMS {
+        sc.tmp_off[i] = sink.offset_freqs[i] - sc.snap_off[i];
+    }
+    sc.tmp_lit[DEFLATE_END_OF_BLOCK] += 1;
+    let tail = exact_dynamic_block_bits(
+        &sc.tmp_lit,
+        &sc.tmp_off,
+        &mut sc.litcode,
+        &mut sc.offcode,
+        &mut sc.header,
+    );
+
+    head + tail < merged
+}
+
+/// Record "the content looks stable as of here", so the next proposal measures
+/// its tail against this point.
+#[inline]
+fn mark_stable_point(sink: &mut Sink) {
+    if let Some(sc) = sink.split_cost.as_mut() {
+        sc.snap_lit = sink.litlen_freqs;
+        sc.snap_off = sink.offset_freqs;
+    }
+}
+
 /// Whether the block loop should continue after emitting a token.
 #[inline]
 fn continue_block(
@@ -1046,7 +1210,10 @@ fn continue_block(
 ) -> bool {
     let bytes_in_block = in_next - block_begin;
     let guard_mul = sink.sparse_split_guard_mul;
-    let end_block = if guard_mul > 0 {
+    let ready = sink
+        .stats
+        .ready_to_check_block(bytes_in_block, in_end - in_next);
+    let proposed = if guard_mul > 0 {
         sparse_split_active(sink, bytes_in_block, guard_mul)
             && sink
                 .stats
@@ -1054,6 +1221,27 @@ fn continue_block(
     } else {
         sink.stats
             .should_end_block(bytes_in_block, in_end - in_next)
+    };
+
+    // The drift check PROPOSES; exact bits DECIDE.
+    let end_block = if proposed {
+        if split_pays(sink) {
+            true
+        } else {
+            // Declined. Merge the recent window into the running distribution so
+            // the proposer needs a fresh 512 observations before asking again —
+            // without this the confirm would re-run on every token — but leave
+            // the stable point FROZEN, so the tail being measured keeps growing
+            // until it is big enough to pay for its own header.
+            sink.stats.merge_new_observations();
+            false
+        }
+    } else {
+        if ready {
+            // Checked and no drift: this is the new stable point.
+            mark_stable_point(sink);
+        }
+        false
     };
     in_next < in_max_block_end && sink.nseqs < SEQ_STORE_LENGTH && !end_block
 }
