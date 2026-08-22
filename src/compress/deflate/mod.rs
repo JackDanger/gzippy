@@ -1200,15 +1200,51 @@ fn encode_gzip_unpadded_l4_pickmin<W: std::io::Write>(
     Ok(data.len() as u64)
 }
 
+/// Compress `data[..logical_len]` as one gzip stream, written to `writer`.
+///
+/// `data` MAY carry trailing slack past `logical_len` — if it carries at least
+/// [`INPLACE_TAIL_PAD`] readable zero bytes there, the parse runs IN PLACE with
+/// no copy of the input. The mmap route arranges exactly that (see
+/// `io.rs::map_with_tail_pad`). Callers with no slack pass
+/// `logical_len == data.len()` and get a single copy instead.
 pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     data: &[u8],
+    logical_len: usize,
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
     use encode_types::{BlockRole, HeaderBudget, InputMode};
+    debug_assert!(logical_len <= data.len());
 
     if !level_streams(level) {
-        let logical_len = data.len();
+        // FAST PATH: the caller already gave us the pad, so parse IN PLACE.
+        //
+        // `data` is usually an mmap of the whole input. Copying it just to
+        // append INPLACE_TAIL_PAD zero bytes costs a full memcpy of the file —
+        // 51 MB on monorepo.tar to add 16 bytes. Measured 2026-08-21: our
+        // explicit allocations ran at EXACTLY 1.50x the input on every corpus
+        // file regardless of compressibility (1.0x this copy + 0.5x the output
+        // reservation), and peak RSS at 2.5-2.7x the input.
+        //
+        // When the mapping already carries >= INPLACE_TAIL_PAD readable bytes
+        // past `logical_len` — which `map_with_tail_pad` arranges by mapping
+        // into the final partial page, where the kernel zero-fills past EOF —
+        // those bytes ARE the pad the padded encoder requires, and the copy is
+        // pure waste. `debug_assert` the zero-fill rather than trust it.
+        if data.len() >= logical_len + INPLACE_TAIL_PAD {
+            debug_assert!(
+                data[logical_len..logical_len + INPLACE_TAIL_PAD]
+                    .iter()
+                    .all(|&b| b == 0),
+                "slack bytes past logical_len must read as zero"
+            );
+            let gz = encode_gzip_slack_padded_to_vec(data, logical_len, level);
+            writer.write_all(&gz)?;
+            return Ok(logical_len as u64);
+        }
+
+        // SLOW PATH: no slack available (e.g. the input ends exactly on a page
+        // boundary, so mapping further would fault). Copy once.
         let cap = logical_len + INPLACE_TAIL_PAD;
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
@@ -1220,7 +1256,14 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         return Ok(logical_len as u64);
     }
 
-    let len = data.len();
+    // Past this point NOTHING knows about slack: the streaming encoders below
+    // were written when `data.len()` WAS the logical length and they still
+    // assume it (`crc32fast::hash(data)`, the two-pass tail copy). Re-establish
+    // that contract here, once, instead of threading `logical_len` through
+    // them. Caught by the 22 L9 cells that changed bytes on first build — a
+    // whole-`data` CRC over the pad is a corrupt trailer, not a size delta.
+    let data = &data[..logical_len];
+    let len = logical_len;
     // T1 mmap L5-L7: zlib knobs live in `encode_gzip_slack_padded_to_vec` /
     // `deflate_into`; route through the padded whole-buffer encoder so the
     // streaming two-pass path does not need a second implementation.
@@ -1778,7 +1821,7 @@ mod unpadded_slice_tests {
 
     fn unpadded(data: &[u8], level: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        let n = encode_gzip_unpadded_slice_to_writer(data, &mut out, level)
+        let n = encode_gzip_unpadded_slice_to_writer(data, data.len(), &mut out, level)
             .expect("unpadded-slice encode");
         assert_eq!(n, data.len() as u64, "reported input length");
         out

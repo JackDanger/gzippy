@@ -101,6 +101,67 @@ impl<W: Write> Write for HeaderSpliceWriter<W> {
     }
 }
 
+/// Map `input_file`, asking for [`TAIL_PAD`] bytes of readable slack past EOF so
+/// the encoder can parse IN PLACE instead of copying the whole input.
+///
+/// Returns `(mapping, logical_len)`. The mapping is `logical_len + TAIL_PAD`
+/// bytes when the slack was obtainable and exactly `logical_len` otherwise.
+///
+/// WHY. The padded encoder requires TAIL_PAD trailing bytes so the matchfinder's
+/// speculative 4/8-byte loads stay in bounds. Without slack, the only way to
+/// supply them is to copy the entire input — a 51 MB memcpy on monorepo.tar to
+/// append 16 bytes. Measured 2026-08-21: explicit allocations ran at exactly
+/// 1.50x the input on every corpus file regardless of compressibility, and peak
+/// RSS at 2.5-2.7x, against pigz's flat ~2 MB.
+///
+/// HOW IT IS SAFE. A file's last page is partial whenever `len % page != 0`, and
+/// the kernel zero-fills the remainder of that page; reading it is defined, and
+/// mapping into it does not fault. Mapping into a page BEYOND the last one is
+/// what raises SIGBUS, so we only ask for slack that fits inside the final
+/// partial page, and fall back to the plain map (and the copy) otherwise —
+/// including the exact-multiple-of-page case, where there is no partial page at
+/// all.
+fn map_with_tail_pad(file: &File, len: usize) -> std::io::Result<(memmap2::Mmap, usize)> {
+    const TAIL_PAD: usize = crate::compress::deflate::INPLACE_TAIL_PAD;
+    let page = page_size();
+    let slack_in_last_page = if page == 0 { 0 } else { page - (len % page) };
+    // `len % page == 0` gives slack_in_last_page == page, but there is no
+    // partial page then — the next byte is in a page the file does not own.
+    let can_extend = page != 0 && !len.is_multiple_of(page) && slack_in_last_page >= TAIL_PAD;
+    if can_extend {
+        // SAFETY: same contract as the plain `Mmap::map` below — the file is
+        // opened read-only and not mutated concurrently by gzippy. The extra
+        // TAIL_PAD bytes lie inside the file's final partial page, which the
+        // kernel zero-fills, so they are readable and read as zero.
+        let m = unsafe { memmap2::MmapOptions::new().len(len + TAIL_PAD).map(file) };
+        if let Ok(m) = m {
+            return Ok((m, len));
+        }
+        // Fall through to the plain map if the kernel refused the longer
+        // mapping for any reason; correctness never depends on the fast path.
+    }
+    // SAFETY: as above.
+    let m = unsafe { memmap2::Mmap::map(file)? };
+    Ok((m, len))
+}
+
+#[cfg(unix)]
+fn page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name is always safe; a negative return
+    // means "no limit", which we treat as "no slack available".
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn page_size() -> usize {
+    0
+}
+
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return compress_stdin(args);
@@ -388,7 +449,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // SAFETY: the input file is opened read-only and mapped for the
         // duration of this compression; it is not mutated concurrently by
         // gzippy, matching every other mmap read path in this module.
-        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
+        let (mmap, logical_len) = map_with_tail_pad(&input_file, file_size as usize)?;
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         // Gate-4 route assertion at the call site of the encoder about to run
@@ -402,6 +463,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let bytes = crate::anatomy_wall_cli!({
                 crate::compress::deflate::encode_gzip_unpadded_slice_to_writer(
                     &mmap,
+                    logical_len,
                     &mut w,
                     args.compression_level as u32,
                 )?
@@ -755,5 +817,75 @@ fn human_size(bytes: u64) -> (f64, &'static str) {
         (bytes as f64 / KB as f64, "KB")
     } else {
         (bytes as f64, "B")
+    }
+}
+
+#[cfg(test)]
+mod map_with_tail_pad_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The fast path in `encode_gzip_unpadded_slice_to_writer` is only correct
+    /// if the bytes past EOF in the final partial page are readable AND ZERO.
+    /// That is a kernel guarantee, not a gzippy one, so pin it: a release build
+    /// compiles the `debug_assert` away, and a non-zero pad would silently
+    /// corrupt the tail of every compressed file.
+    #[test]
+    fn extended_map_slack_is_readable_and_zero() {
+        let page = page_size();
+        assert!(page > 0, "test needs a real page size");
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Sizes chosen around the page boundary, where the branch decides.
+        for &len in &[
+            1usize,
+            17,
+            page - 17,
+            page - 16,
+            page - 15,
+            page - 1,
+            page,
+            page + 1,
+            3 * page - 16,
+            3 * page,
+            3 * page + 7,
+        ] {
+            let path = dir.path().join(format!("f{len}"));
+            let mut f = std::fs::File::create(&path).expect("create");
+            // Non-zero content, so a pad read as zero cannot be content bleed.
+            f.write_all(&vec![0xABu8; len]).expect("write");
+            f.sync_all().expect("sync");
+            drop(f);
+
+            let f = std::fs::File::open(&path).expect("open");
+            let (m, logical) = map_with_tail_pad(&f, len).expect("map");
+            assert_eq!(logical, len, "logical_len must be the true file length");
+            assert_eq!(
+                &m[..len],
+                &vec![0xABu8; len][..],
+                "content changed, len={len}"
+            );
+
+            let extended = m.len() > len;
+            assert!(
+                m.len() == len || m.len() == len + crate::compress::deflate::INPLACE_TAIL_PAD,
+                "mapping is either exact or exactly padded, got {} for len={len}",
+                m.len()
+            );
+            if extended {
+                assert!(
+                    m[len..].iter().all(|&b| b == 0),
+                    "slack past EOF must read as zero, len={len}"
+                );
+            }
+            // A file ending exactly on a page boundary has no partial page to
+            // borrow from, so it MUST fall back rather than map a page it does
+            // not own.
+            if len.is_multiple_of(page) {
+                assert!(
+                    !extended,
+                    "must not extend past a full final page, len={len}"
+                );
+            }
+        }
     }
 }
