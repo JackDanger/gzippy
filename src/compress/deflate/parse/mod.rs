@@ -2433,7 +2433,14 @@ mod emit_tests {
         shifted.extend_from_slice(&buf);
 
         let mut a = BitWriter::new();
-        emit_sequences(&mut a, &buf, 0, &sink.view(), &statics.litcode, &statics.offcode);
+        emit_sequences(
+            &mut a,
+            &buf,
+            0,
+            &sink.view(),
+            &statics.litcode,
+            &statics.offcode,
+        );
         let mut b = BitWriter::new();
         emit_sequences(
             &mut b,

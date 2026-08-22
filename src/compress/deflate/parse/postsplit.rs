@@ -76,7 +76,8 @@ use super::super::huffman::{
 };
 use super::super::tables::{
     length_slot, DEFLATE_END_OF_BLOCK, DEFLATE_FIRST_LEN_SYM, DEFLATE_NUM_LITLEN_SYMS,
-    DEFLATE_NUM_OFFSET_SYMS, MAX_LITLEN_CODEWORD_LEN, MAX_OFFSET_CODEWORD_LEN,
+    DEFLATE_NUM_OFFSET_SYMS, LENGTH_EXTRA_BITS, MAX_LITLEN_CODEWORD_LEN, MAX_OFFSET_CODEWORD_LEN,
+    OFFSET_EXTRA_BITS,
 };
 use super::{
     cost_from_freqs, emit_block, stored_block_bits, BlockView, Seq, Sink, StaticCodes,
@@ -166,6 +167,26 @@ pub(super) struct SpanSplitter {
     bounds: Vec<usize>,
     done: Vec<bool>,
     cuts: Vec<Cut>,
+    /// The `FIND_MINIMUM_NUM` cheapest probe positions seen in one
+    /// `find_minimum`, kept for exact re-pricing. `(position, cheap cost)`.
+    shortlist: Vec<(usize, u64)>,
+}
+
+/// Keep `value` if it is among the [`FIND_MINIMUM_NUM`] cheapest seen.
+fn push_shortlist(list: &mut Vec<(usize, u64)>, pos: usize, cost: u64) {
+    if list.len() < FIND_MINIMUM_NUM {
+        list.push((pos, cost));
+        return;
+    }
+    let mut worst = 0usize;
+    for k in 1..list.len() {
+        if list[k].1 > list[worst].1 {
+            worst = k;
+        }
+    }
+    if cost < list[worst].1 {
+        list[worst] = (pos, cost);
+    }
 }
 
 impl SpanSplitter {
@@ -187,6 +208,7 @@ impl SpanSplitter {
             bounds: Vec::new(),
             done: Vec::new(),
             cuts: Vec::new(),
+            shortlist: Vec::new(),
         }
     }
 
@@ -442,7 +464,72 @@ impl SpanSplitter {
         dynamic_bits.min(static_bits).min(stored_bits)
     }
 
-    /// `SplitCost` (`blocksplitter.c:125`).
+    /// CHEAP cost of `[a, b)`, for driving `FindMinimum`'s PROBE sequence only.
+    ///
+    /// Same three candidates as [`Self::cost`], and two of the three are the
+    /// SAME NUMBER: `stored` is arithmetic on the byte count and `static` is
+    /// `cost_from_freqs` against a fixed code, neither of which builds a tree.
+    /// Only the DYNAMIC candidate is approximated, by the histogram's
+    /// zeroth-order entropy
+    ///
+    ///     n*log2(n) - SUM c_i*log2(c_i)   (+ the exact extra bits)
+    ///
+    /// which is the standard lower bound on what any prefix code can achieve
+    /// on that histogram, so the estimate is a LOWER BOUND on `cost` and is
+    /// never inflated by a fitted constant. There is no header term and no
+    /// tunable coefficient anywhere in it.
+    ///
+    /// ## Why dropping the header term is safe HERE and only here
+    ///
+    /// Every probe inside one `find_minimum` call compares configurations with
+    /// exactly TWO dynamic headers — one per side — so the header contributes a
+    /// near-constant offset to every candidate and cancels out of the argmin to
+    /// first order. It emphatically does NOT cancel out of the accept/reject
+    /// test, which compares ONE block against TWO; that test still runs the
+    /// exact [`Self::cost`], header included. Approximating the accept test is
+    /// precisely the failure that killed the previous splitter (PR #342, where
+    /// a header measured at ~512 bits only "worked" set to 64).
+    fn cheap_cost(&mut self, buf: &[u8], statics: &StaticCodes, a: Cut, b: Cut) -> u64 {
+        self.histogram(buf, a, b);
+        self.lf[DEFLATE_END_OF_BLOCK] += 1;
+
+        // Dynamic candidate: entropy of the two alphabets + their exact extra
+        // bits. Zero counts are skipped, which is most of the offset alphabet.
+        let mut entropy = 0.0f64;
+        let mut extra = 0u64;
+        for (alphabet, total_slots) in [
+            (&self.lf[..], 0usize),
+            (&self.of[..DEFLATE_NUM_OFFSET_SYMS], 1usize),
+        ] {
+            let mut n = 0u64;
+            let mut sum = 0.0f64;
+            for &c in alphabet.iter() {
+                if c != 0 {
+                    n += c as u64;
+                    sum += (c as f64) * (c as f64).log2();
+                }
+            }
+            if n != 0 {
+                entropy += (n as f64) * (n as f64).log2() - sum;
+            }
+            let _ = total_slots;
+        }
+        for slot in 0..LENGTH_EXTRA_BITS.len() {
+            extra += self.lf[DEFLATE_FIRST_LEN_SYM + slot] as u64 * LENGTH_EXTRA_BITS[slot] as u64;
+        }
+        for slot in 0..OFFSET_EXTRA_BITS.len() {
+            extra += self.of[slot] as u64 * OFFSET_EXTRA_BITS[slot] as u64;
+        }
+        let dynamic_bits = 3 + entropy.ceil() as u64 + extra;
+
+        let static_bits =
+            3 + cost_from_freqs(&self.lf, &self.of, &statics.litcode, &statics.offcode);
+        let stored_bits = stored_block_bits(self.byte_of(b) - self.byte_of(a));
+        dynamic_bits.min(static_bits).min(stored_bits)
+    }
+
+    /// `SplitCost` (`blocksplitter.c:125`), EXACT — used for the accept/reject
+    /// test and for the position finally chosen.
     fn split_cost(
         &mut self,
         buf: &[u8],
@@ -455,6 +542,19 @@ impl SpanSplitter {
         self.cost(buf, statics, a, m) + self.cost(buf, statics, m, b)
     }
 
+    /// `SplitCost` under [`Self::cheap_cost`] — used ONLY to rank probes.
+    fn probe_cost(
+        &mut self,
+        buf: &[u8],
+        statics: &StaticCodes,
+        i: usize,
+        start: usize,
+        end: usize,
+    ) -> u64 {
+        let (a, m, b) = (self.locate(start), self.locate(i), self.locate(end));
+        self.cheap_cost(buf, statics, a, m) + self.cheap_cost(buf, statics, m, b)
+    }
+
     /// `FindMinimum` (`blocksplitter.c:43`) over `[start, end)`.
     fn find_minimum(
         &mut self,
@@ -464,17 +564,13 @@ impl SpanSplitter {
         end: usize,
         block: (usize, usize),
     ) -> (usize, u64) {
+        self.shortlist.clear();
         if end - start < FIND_MINIMUM_BRUTE_FORCE_MAX {
-            let mut best = u64::MAX;
-            let mut result = start;
             for i in start..end {
-                let v = self.split_cost(buf, statics, i, block.0, block.1);
-                if v < best {
-                    best = v;
-                    result = i;
-                }
+                let v = self.probe_cost(buf, statics, i, block.0, block.1);
+                push_shortlist(&mut self.shortlist, i, v);
             }
-            return (result, best);
+            return self.exact_pick(buf, statics, block);
         }
 
         // Recursive 9-way narrowing.
@@ -489,7 +585,8 @@ impl SpanSplitter {
             }
             for i in 0..FIND_MINIMUM_NUM {
                 p[i] = start + (i + 1) * ((end - start) / (FIND_MINIMUM_NUM + 1));
-                vp[i] = self.split_cost(buf, statics, p[i], block.0, block.1);
+                vp[i] = self.probe_cost(buf, statics, p[i], block.0, block.1);
+                push_shortlist(&mut self.shortlist, p[i], vp[i]);
             }
             let mut besti = 0;
             let mut best = vp[0];
@@ -511,7 +608,36 @@ impl SpanSplitter {
             pos = p[besti];
             lastbest = best;
         }
-        (pos, lastbest)
+        let _ = (pos, lastbest);
+        self.exact_pick(buf, statics, block)
+    }
+
+    /// Re-price the shortlist EXACTLY and return its argmin.
+    ///
+    /// The cheap estimator RANKS; the exact cost DECIDES. Bounded at
+    /// [`FIND_MINIMUM_NUM`] exact evaluations per `find_minimum` — zopfli's own
+    /// probe width, not a new constant — against the ~65 the full-exact search
+    /// pays. This exists because the pure cheap-probe arm was MEASURED to move
+    /// 79% of its cut positions off the exact search's choices and to lose the
+    /// one cell the lever closed (`weights.safetensors`, by 280 B).
+    fn exact_pick(
+        &mut self,
+        buf: &[u8],
+        statics: &StaticCodes,
+        block: (usize, usize),
+    ) -> (usize, u64) {
+        let n = self.shortlist.len();
+        let mut best = u64::MAX;
+        let mut result = block.0 + 1;
+        for k in 0..n {
+            let i = self.shortlist[k].0;
+            let v = self.split_cost(buf, statics, i, block.0, block.1);
+            if v < best {
+                best = v;
+                result = i;
+            }
+        }
+        (result, best)
     }
 
     /// `ZopfliBlockSplitLZ77` (`blocksplitter.c:215`). Fills `self.cuts` with
@@ -548,6 +674,11 @@ impl SpanSplitter {
             }
             let (lstart, lend) = (self.bounds[bi], self.bounds[bi + 1]);
 
+            // The SEARCH ranks probes with `cheap_cost`; the DECISION is
+            // exact. `find_minimum` re-prices its shortlist with the real
+            // `split_cost` before returning, so `splitcost` here is exact and
+            // accept/reject compares two exact numbers — it can never be talked
+            // into a split by an underestimate.
             let (llpos, splitcost) =
                 self.find_minimum(buf, statics, lstart + 1, lend, (lstart, lend));
             let (a, b) = (self.locate(lstart), self.locate(lend));
