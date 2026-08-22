@@ -150,7 +150,7 @@ pub(super) fn run_resumable(
             bw,
             buf,
             block_begin,
-            &sink,
+            &sink.view(),
             statics,
             role.is_final() && in_next == in_end,
             &mut header_scratch,
