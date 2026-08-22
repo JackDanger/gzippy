@@ -182,6 +182,16 @@ bucket-oracle-no-histogram = []
 # are incomplete (a real decoder would not reconstruct the full input) --
 # expected for an elimination oracle, see the feature-group doc above.
 bucket-oracle-no-emission = []
+# `split-probe`: `parse::emit_block` records, per emitted block, the exact token
+# list the parser handed it and the exact bit cost of the candidate it chose
+# (`parse::probe`). Purely additive and OFF by default -- it changes no decision
+# and no emitted byte; with the feature off there is no call site at all. It
+# exists for ONE blocked question: how much output size is available from better
+# block PLACEMENT with the LZ77 parse held fixed (`examples/split_headroom.rs`).
+# Nothing else in the tree can answer it -- `blockcensus`/`blockspans` see
+# boundaries without tokens, `fingerprint_tool blocks` sees token COUNTS, and
+# re-pricing a DIFFERENT partition needs the tokens themselves.
+split-probe = []
 # L1-band ratio-close-out empirical config-space search (2026-07-22 campaign).
 # Runtime-tunable knobs for the L1 fast-path matchfinder (lazy-peek gate,
 # insert-depth, block length, bucket2/chain/hash3 levers) so a local grid
@@ -380,6 +390,13 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 iai-callgrind = "0.13"
 # Phase 1.2 microbench harness.
 criterion = "0.5"
+
+# The placement-denominator probe reads `parse::probe`, which only exists behind
+# `split-probe`. Without this, a default `cargo clippy --all-targets` tries to
+# compile the example with the module configured out and fails the pre-commit hook.
+[[example]]
+name = "split_headroom"
+required-features = ["split-probe"]
 
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
