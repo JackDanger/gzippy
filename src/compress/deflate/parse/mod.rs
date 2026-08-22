@@ -1524,7 +1524,7 @@ fn emit_block(
     let (litcode, offcode) = (&*litcode, &*offcode);
 
     crate::block_cost_probe!(
-        sink.block_length,
+        blk.block_length,
         stored_bits,
         static_bits,
         dynamic_bits as i64,
@@ -1639,7 +1639,7 @@ fn emit_block_static_or_stored(
         });
 
     crate::block_cost_probe!(
-        sink.block_length,
+        blk.block_length,
         stored_bits,
         static_bits,
         -1i64,
