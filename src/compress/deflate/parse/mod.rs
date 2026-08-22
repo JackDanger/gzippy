@@ -1228,12 +1228,12 @@ fn continue_block(
         if split_pays(sink) {
             true
         } else {
-            // Declined. Merge the recent window into the running distribution so
-            // the proposer needs a fresh 512 observations before asking again —
-            // without this the confirm would re-run on every token — but leave
-            // the stable point FROZEN, so the tail being measured keeps growing
-            // until it is big enough to pay for its own header.
+            // ARM F: no freeze. The stable point advances on EVERY check, so the
+            // cut being PRICED is at most one check window behind the cut that
+            // would be TAKEN. Matches libdeflate's merge-every-check structure;
+            // the freeze was an invented mechanism with no vendor precedent.
             sink.stats.merge_new_observations();
+            mark_stable_point(sink);
             false
         }
     } else {
