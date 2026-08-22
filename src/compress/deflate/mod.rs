@@ -79,8 +79,20 @@ fn estimate_output_cap(len: usize, level: u32, framing_slack: usize) -> usize {
     if level == 0 {
         len + len.div_ceil(MAX_STORED_SUBBLOCK).max(1) * 5 + framing_slack
     } else {
-        len / 2 + framing_slack
+        compressed_output_cap(len, framing_slack)
     }
+}
+
+/// Output reservation for any COMPRESSING level (everything but 0).
+///
+/// Split out of [`estimate_output_cap`] so the pick-min arms can reserve the
+/// same amount without inventing a level to pass in. They previously started
+/// from `Vec::new()` and grew by DOUBLING: a 4.5 MB arm output reallocates ~19
+/// times and, at the last one, holds the old and new buffers simultaneously.
+/// Two arms are alive at once in `pick_min_two_vecs`, so that churn is paid
+/// twice and lands in peak RSS.
+fn compressed_output_cap(len: usize, framing_slack: usize) -> usize {
+    len / 2 + framing_slack
 }
 
 /// Compress `data` into a raw DEFLATE stream (no gzip/zlib framing) at `level`.
@@ -498,7 +510,16 @@ fn encode_unpadded_deflate_bytes(data: &[u8], params: level::LevelParams) -> Vec
     use encode_types::{BlockRole, HeaderBudget, InputMode};
 
     let len = data.len();
-    let mut bw = BitWriter::from_vec(Vec::new());
+    // Reserve like every other compressing path. `Vec::new()` here meant each
+    // pick-min arm grew its output by doubling from zero; see
+    // `compressed_output_cap`. Counted, so the allocation instrument can see
+    // the arms at all -- it previously reported ~0.5x input at EVERY level and
+    // could not distinguish a pick-min route from a streaming one that uses
+    // 1.6x less memory.
+    let cap = compressed_output_cap(len, 32);
+    crate::anatomy_count!(alloc_events);
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut bw = BitWriter::from_vec(Vec::with_capacity(cap));
     let mut state = parse::ParseState::new();
     state.input_total_len = len;
     let mut in_next = 0usize;
