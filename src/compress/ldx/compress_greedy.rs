@@ -91,9 +91,9 @@ pub(crate) fn deflate_compress_greedy(
         let mut seq_idx: usize = 0;
 
         init_block_split_stats(&mut c.split_stats);
-        deflate_begin_sequences(c, &mut p.sequences[0]);
+        deflate_begin_sequences(c, unsafe { p.sequences.get_unchecked_mut(0) });
         let min_len = calculate_min_match_len(
-            &r#in[in_next..],
+            unsafe { r#in.get_unchecked(in_next..) },
             in_max_block_end - in_next,
             max_search_depth,
         );
@@ -130,9 +130,12 @@ pub(crate) fn deflate_compress_greedy(
                 in_next += length as usize;
             } else {
                 // No match found.
-                let lit = r#in[in_next] as usize;
+                debug_assert!(in_next < r#in.len());
+                let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
                 in_next += 1;
-                deflate_choose_literal(c, lit, true, &mut p.sequences[seq_idx]);
+                deflate_choose_literal(c, lit, true, unsafe {
+                    p.sequences.get_unchecked_mut(seq_idx)
+                });
             }
 
             // Check if it's time to output another block.
@@ -147,7 +150,7 @@ pub(crate) fn deflate_compress_greedy(
         deflate_finish_block(
             c,
             os,
-            &r#in[in_block_begin..],
+            unsafe { r#in.get_unchecked(in_block_begin..) },
             (in_next - in_block_begin) as u32,
             &p.sequences,
             in_next == in_end,

@@ -124,8 +124,11 @@ pub(crate) fn lz_extend(
     // WORDBYTES past the index, so it is only taken while a whole word is in bounds
     // of BOTH pointers.
     let word_at = |i: usize| -> u64 {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&buf[i..i + 8]);
+        // The caller has already proven a whole word is readable here (see the
+        // `len + WORDBYTES <= max_len` guard on the loop below and the
+        // compressor's BUF_PAD). Hot: this is lz_extend's word compare.
+        debug_assert!(i + 8 <= buf.len());
+        let b = unsafe { (buf.as_ptr().add(i) as *const [u8; 8]).read_unaligned() };
         u64::from_le_bytes(b)
     };
     let in_bounds = |i: usize| i + 8 <= buf.len();
@@ -142,7 +145,12 @@ pub(crate) fn lz_extend(
         len += WORDBYTES;
     }
 
-    while len < max_len && buf[matchptr + len as usize] == buf[strptr + len as usize] {
+    while len < max_len && {
+        debug_assert!((matchptr + len as usize) < buf.len() && (strptr + len as usize) < buf.len());
+        unsafe {
+            *buf.get_unchecked(matchptr + len as usize) == *buf.get_unchecked(strptr + len as usize)
+        }
+    } {
         len += 1;
     }
     len

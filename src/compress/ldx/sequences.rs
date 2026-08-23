@@ -63,7 +63,11 @@ pub(crate) fn deflate_choose_literal(
     gather_split_stats: bool,
     seq: &mut DeflateSequence,
 ) {
-    c.freqs.litlen[literal] += 1;
+    // `literal` is a byte read from the input; `freqs.litlen` has
+    // DEFLATE_NUM_LITLEN_SYMS (288) entries. The C indexes with a `u8` widened in
+    // place and emits no check.
+    debug_assert!(literal < c.freqs.litlen.len());
+    unsafe { *c.freqs.litlen.get_unchecked_mut(literal) += 1 };
 
     if gather_split_stats {
         observe_literal(&mut c.split_stats, literal as u8);
@@ -94,22 +98,36 @@ pub(crate) fn deflate_choose_match(
     sequences: &mut [DeflateSequence],
     seq_idx: &mut usize,
 ) {
-    let length_slot = DEFLATE_LENGTH_SLOT[length as usize] as usize;
+    // `length <= DEFLATE_MAX_MATCH_LEN`, which is the last index of
+    // DEFLATE_LENGTH_SLOT; `length_slot < 29` so the litlen index stays under 288;
+    // `deflate_get_offset_slot` returns < DEFLATE_NUM_OFFSET_SYMS by construction.
+    debug_assert!((length as usize) < DEFLATE_LENGTH_SLOT.len());
+    let length_slot = unsafe { *DEFLATE_LENGTH_SLOT.get_unchecked(length as usize) } as usize;
     let offset_slot = deflate_get_offset_slot(offset) as usize;
 
-    c.freqs.litlen[DEFLATE_FIRST_LEN_SYM as usize + length_slot] += 1;
-    c.freqs.offset[offset_slot] += 1;
+    debug_assert!(DEFLATE_FIRST_LEN_SYM as usize + length_slot < c.freqs.litlen.len());
+    debug_assert!(offset_slot < c.freqs.offset.len());
+    unsafe {
+        *c.freqs
+            .litlen
+            .get_unchecked_mut(DEFLATE_FIRST_LEN_SYM as usize + length_slot) += 1;
+        *c.freqs.offset.get_unchecked_mut(offset_slot) += 1;
+    }
     if gather_split_stats {
         observe_match(&mut c.split_stats, length);
     }
 
-    let seq = &mut sequences[*seq_idx];
+    // Every caller guards `seq_idx < SEQ_STORE_LENGTH` while `sequences` is
+    // SEQ_STORE_LENGTH + 1 long precisely so this advance and the following reset
+    // are both in range — that +1 IS the C's guarantee.
+    debug_assert!(*seq_idx + 1 < sequences.len());
+    let seq = unsafe { sequences.get_unchecked_mut(*seq_idx) };
     seq.litrunlen_and_length |= length << SEQ_LENGTH_SHIFT;
     seq.offset = offset as u16;
     seq.offset_slot = offset_slot as u16;
 
     *seq_idx += 1;
-    sequences[*seq_idx].litrunlen_and_length = 0;
+    unsafe { sequences.get_unchecked_mut(*seq_idx).litrunlen_and_length = 0 };
 }
 
 /// C: `adjust_max_and_nice_len(u32 *max_len, u32 *nice_len, size_t remaining)` (:2266)

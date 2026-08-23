@@ -69,6 +69,57 @@ fn bsr32(v: u32) -> i32 {
 /// block's current length, so checks get rarer as the block grows and its literal
 /// statistics stabilise. Greedy never does this — only the lazy parsers do.
 #[allow(clippy::too_many_arguments)]
+/// C: `deflate_compress_lazy` (:2816) — a plain `static void` that calls
+/// `deflate_compress_lazy_generic(..., false)`.
+///
+/// The C's two wrappers exist so `lazy2` const-propagates into two SEPARATELY
+/// register-allocated functions, each reached through the `c->impl` function
+/// pointer. Collapsing them into one `match` arm, as we did, let LLVM merge both
+/// instantiations (and the greedy and fastest paths) into a single function.
+pub(crate) fn deflate_compress_lazy(
+    c: &mut Compressor,
+    p: &mut GreedyState,
+    r#in: &[u8],
+    in_nbytes: usize,
+    os: &mut DeflateOutputBitstream<'_>,
+    max_search_depth: u32,
+    nice_match_length: u32,
+) {
+    deflate_compress_lazy_generic(
+        c,
+        p,
+        r#in,
+        in_nbytes,
+        os,
+        max_search_depth,
+        nice_match_length,
+        false,
+    );
+}
+
+/// C: `deflate_compress_lazy2` (:2830) — `deflate_compress_lazy_generic(..., true)`.
+pub(crate) fn deflate_compress_lazy2(
+    c: &mut Compressor,
+    p: &mut GreedyState,
+    r#in: &[u8],
+    in_nbytes: usize,
+    os: &mut DeflateOutputBitstream<'_>,
+    max_search_depth: u32,
+    nice_match_length: u32,
+) {
+    deflate_compress_lazy_generic(
+        c,
+        p,
+        r#in,
+        in_nbytes,
+        os,
+        max_search_depth,
+        nice_match_length,
+        true,
+    );
+}
+
+#[inline(always)]
 pub(crate) fn deflate_compress_lazy_generic(
     c: &mut Compressor,
     p: &mut GreedyState,
@@ -96,9 +147,9 @@ pub(crate) fn deflate_compress_lazy_generic(
         let mut seq_idx: usize = 0;
 
         init_block_split_stats(&mut c.split_stats);
-        deflate_begin_sequences(c, &mut p.sequences[0]);
+        deflate_begin_sequences(c, unsafe { p.sequences.get_unchecked_mut(0) });
         let mut min_len = calculate_min_match_len(
-            &r#in[in_next..],
+            unsafe { r#in.get_unchecked(in_next..) },
             in_max_block_end - in_next,
             max_search_depth,
         );
@@ -131,9 +182,12 @@ pub(crate) fn deflate_compress_lazy_generic(
             // has already paid for a lookahead, so it is stricter about cheap matches.
             if cur_len < min_len || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192) {
                 // No match found. Choose a literal.
-                let lit = r#in[in_next] as usize;
+                debug_assert!(in_next < r#in.len());
+                let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
                 in_next += 1;
-                deflate_choose_literal(c, lit, true, &mut p.sequences[seq_idx]);
+                deflate_choose_literal(c, lit, true, unsafe {
+                    p.sequences.get_unchecked_mut(seq_idx)
+                });
             } else {
                 in_next += 1;
 
@@ -189,8 +243,11 @@ pub(crate) fn deflate_compress_lazy_generic(
                     {
                         // Found a better match at the next position. Output a literal.
                         // Then the next match becomes the current match.
-                        let lit = r#in[in_next - 2] as usize;
-                        deflate_choose_literal(c, lit, true, &mut p.sequences[seq_idx]);
+                        debug_assert!(in_next - 2 < r#in.len());
+                        let lit = unsafe { *r#in.get_unchecked(in_next - 2) } as usize;
+                        deflate_choose_literal(c, lit, true, unsafe {
+                            p.sequences.get_unchecked_mut(seq_idx)
+                        });
                         cur_len = next_len;
                         cur_offset = next_offset;
                         continue 'have_cur_match;
@@ -220,10 +277,16 @@ pub(crate) fn deflate_compress_lazy_generic(
                         {
                             // There's a much better match two positions ahead, so use
                             // two literals.
-                            let l3 = r#in[in_next - 3] as usize;
-                            deflate_choose_literal(c, l3, true, &mut p.sequences[seq_idx]);
-                            let l2 = r#in[in_next - 2] as usize;
-                            deflate_choose_literal(c, l2, true, &mut p.sequences[seq_idx]);
+                            debug_assert!(in_next - 3 < r#in.len());
+                            let l3 = unsafe { *r#in.get_unchecked(in_next - 3) } as usize;
+                            deflate_choose_literal(c, l3, true, unsafe {
+                                p.sequences.get_unchecked_mut(seq_idx)
+                            });
+                            debug_assert!(in_next - 2 < r#in.len());
+                            let l2 = unsafe { *r#in.get_unchecked(in_next - 2) } as usize;
+                            deflate_choose_literal(c, l2, true, unsafe {
+                                p.sequences.get_unchecked_mut(seq_idx)
+                            });
                             cur_len = next_len;
                             cur_offset = next_offset;
                             continue 'have_cur_match;
@@ -288,7 +351,7 @@ pub(crate) fn deflate_compress_lazy_generic(
         deflate_finish_block(
             c,
             os,
-            &r#in[in_block_begin..],
+            unsafe { r#in.get_unchecked(in_block_begin..) },
             (in_next - in_block_begin) as u32,
             &p.sequences,
             in_next == in_end,

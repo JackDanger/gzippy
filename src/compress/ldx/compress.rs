@@ -22,7 +22,7 @@
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::{deflate_compress_fastest, FastestState};
 use super::compress_greedy::{deflate_compress_greedy, GreedyState};
-use super::compress_lazy::deflate_compress_lazy_generic;
+use super::compress_lazy::{deflate_compress_lazy, deflate_compress_lazy2};
 use super::flush::Compressor;
 use super::{DEFLATE_BLOCKTYPE_UNCOMPRESSED, DEFLATE_MAX_MATCH_LEN};
 
@@ -179,7 +179,7 @@ impl LdxCompressor {
             ),
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
-            5..=9 => deflate_compress_lazy_generic(
+            5..=7 => deflate_compress_lazy(
                 &mut self.c,
                 &mut self.p_g,
                 r#in,
@@ -187,7 +187,15 @@ impl LdxCompressor {
                 &mut os,
                 self.max_search_depth,
                 self.nice_match_length,
-                self.compression_level >= 8,
+            ),
+            8..=9 => deflate_compress_lazy2(
+                &mut self.c,
+                &mut self.p_g,
+                r#in,
+                in_nbytes,
+                &mut os,
+                self.max_search_depth,
+                self.nice_match_length,
             ),
             _ => unreachable!("`new` refuses unported levels"),
         }

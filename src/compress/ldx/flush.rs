@@ -157,7 +157,18 @@ pub(crate) fn deflate_flush_block(
         () => {{
             if out_next < out_fast_end {
                 // Flush a whole word (branchlessly).
-                os.buf[out_next..out_next + WORDBYTES].copy_from_slice(&bitbuf.to_le_bytes());
+                // `out_next < out_fast_end` was just tested, and `out_fast_end` is
+                // set so that a whole WORDBYTES store fits — that IS the meaning of
+                // the fast end. The bounds check is provably dead; this is the
+                // bit-writer's hot store, executed once per flushed word.
+                debug_assert!(out_next + WORDBYTES <= os.buf.len());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bitbuf.to_le_bytes().as_ptr(),
+                        os.buf.as_mut_ptr().add(out_next),
+                        WORDBYTES,
+                    );
+                }
                 // `bitcount & ~7` is why BITBUF_NBITS is one less than the word
                 // width: it caps the shift at 56, never the full 64 (which is UB in
                 // C and a panic in Rust).
@@ -168,7 +179,9 @@ pub(crate) fn deflate_flush_block(
                 // Flush a byte at a time.
                 while bitcount >= 8 {
                     debug_assert!(out_next < os_end);
-                    os.buf[out_next] = bitbuf as u8;
+                    // Guarded by the `debug_assert` above and by
+                    // `deflate_flush_block`'s up-front space check.
+                    unsafe { *os.buf.get_unchecked_mut(out_next) = bitbuf as u8 };
                     out_next += 1;
                     bitcount -= 8;
                     bitbuf >>= 8;
@@ -192,8 +205,8 @@ pub(crate) fn deflate_flush_block(
                 MAX_LITLEN_CODEWORD_LEN as u32 + DEFLATE_MAX_EXTRA_LENGTH_BITS
             ));
             add_bits!(
-                c.o_length.codewords[length__ as usize],
-                c.o_length.lens[length__ as usize]
+                unsafe { *c.o_length.codewords.get_unchecked(length__ as usize) },
+                unsafe { *c.o_length.lens.get_unchecked(length__ as usize) }
             );
 
             if !can_buffer(
@@ -207,8 +220,8 @@ pub(crate) fn deflate_flush_block(
 
             // Offset symbol.
             add_bits!(
-                $codes.codewords.offset[offset_slot__],
-                $codes.lens.offset[offset_slot__]
+                unsafe { *$codes.codewords.offset.get_unchecked(offset_slot__) },
+                unsafe { *$codes.lens.offset.get_unchecked(offset_slot__) }
             );
 
             if !can_buffer(MAX_OFFSET_CODEWORD_LEN as u32 + DEFLATE_MAX_EXTRA_OFFSET_BITS) {
@@ -217,8 +230,8 @@ pub(crate) fn deflate_flush_block(
 
             // Extra offset bits.
             add_bits!(
-                offset__ - DEFLATE_OFFSET_SLOT_BASE[offset_slot__],
-                DEFLATE_EXTRA_OFFSET_BITS[offset_slot__]
+                offset__ - unsafe { *DEFLATE_OFFSET_SLOT_BASE.get_unchecked(offset_slot__) },
+                unsafe { *DEFLATE_EXTRA_OFFSET_BITS.get_unchecked(offset_slot__) }
             );
 
             flush_bits!();
@@ -243,18 +256,21 @@ pub(crate) fn deflate_flush_block(
     // Account for the cost of encoding dynamic Huffman codes.
     dynamic_cost += 5 + 5 + 4 + (3 * c.o_precode.num_explicit_lens as u32);
     for sym in 0..DEFLATE_NUM_PRECODE_SYMS {
-        let extra = DEFLATE_EXTRA_PRECODE_BITS[sym] as u32;
-        dynamic_cost += c.o_precode.freqs[sym] * (extra + c.o_precode.lens[sym] as u32);
+        let extra = unsafe { *DEFLATE_EXTRA_PRECODE_BITS.get_unchecked(sym) } as u32;
+        dynamic_cost += unsafe { *c.o_precode.freqs.get_unchecked(sym) }
+            * (extra + unsafe { *c.o_precode.lens.get_unchecked(sym) } as u32);
     }
 
     // Account for the cost of encoding literals.
     for sym in 0..144 {
-        dynamic_cost += c.freqs.litlen[sym] * c.codes.lens.litlen[sym] as u32;
-        static_cost += c.freqs.litlen[sym] * 8;
+        dynamic_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) }
+            * unsafe { *c.codes.lens.litlen.get_unchecked(sym) } as u32;
+        static_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) } * 8;
     }
     for sym in 144..256 {
-        dynamic_cost += c.freqs.litlen[sym] * c.codes.lens.litlen[sym] as u32;
-        static_cost += c.freqs.litlen[sym] * 9;
+        dynamic_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) }
+            * unsafe { *c.codes.lens.litlen.get_unchecked(sym) } as u32;
+        static_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) } * 9;
     }
 
     // Account for the cost of encoding the end-of-block symbol.
@@ -265,18 +281,23 @@ pub(crate) fn deflate_flush_block(
     for sym in DEFLATE_FIRST_LEN_SYM as usize
         ..DEFLATE_FIRST_LEN_SYM as usize + DEFLATE_EXTRA_LENGTH_BITS.len()
     {
-        let extra = DEFLATE_EXTRA_LENGTH_BITS[sym - DEFLATE_FIRST_LEN_SYM as usize] as u32;
+        let extra = unsafe {
+            *DEFLATE_EXTRA_LENGTH_BITS.get_unchecked(sym - DEFLATE_FIRST_LEN_SYM as usize)
+        } as u32;
 
-        dynamic_cost += c.freqs.litlen[sym] * (extra + c.codes.lens.litlen[sym] as u32);
-        static_cost += c.freqs.litlen[sym] * (extra + c.static_codes.lens.litlen[sym] as u32);
+        dynamic_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) }
+            * (extra + unsafe { *c.codes.lens.litlen.get_unchecked(sym) } as u32);
+        static_cost += unsafe { *c.freqs.litlen.get_unchecked(sym) }
+            * (extra + unsafe { *c.static_codes.lens.litlen.get_unchecked(sym) } as u32);
     }
 
     // Account for the cost of encoding offsets.
     for sym in 0..DEFLATE_EXTRA_OFFSET_BITS.len() {
-        let extra = DEFLATE_EXTRA_OFFSET_BITS[sym] as u32;
+        let extra = unsafe { *DEFLATE_EXTRA_OFFSET_BITS.get_unchecked(sym) } as u32;
 
-        dynamic_cost += c.freqs.offset[sym] * (extra + c.codes.lens.offset[sym] as u32);
-        static_cost += c.freqs.offset[sym] * (extra + 5);
+        dynamic_cost += unsafe { *c.freqs.offset.get_unchecked(sym) }
+            * (extra + unsafe { *c.codes.lens.offset.get_unchecked(sym) } as u32);
+        static_cost += unsafe { *c.freqs.offset.get_unchecked(sym) } * (extra + 5);
     }
 
     // Compute the cost of using uncompressed blocks.
@@ -327,21 +348,39 @@ pub(crate) fn deflate_flush_block(
             // boundary. (BTYPE for an uncompressed block is 0, so only BFINAL is
             // written — that is what the C's STATIC_ASSERT records.)
             const _: () = assert!(super::DEFLATE_BLOCKTYPE_UNCOMPRESSED == 0);
-            os.buf[out_next] = ((bfinal as BitbufT) << bitcount | bitbuf) as u8;
+            // The `debug_assert!` above is the C's already-checked space guarantee;
+            // every write below is inside it, so the checks are dead code.
+            unsafe {
+                *os.buf.get_unchecked_mut(out_next) =
+                    ((bfinal as BitbufT) << bitcount | bitbuf) as u8;
+            }
             out_next += 1;
             if bitcount > 5 {
-                os.buf[out_next] = 0;
+                unsafe { *os.buf.get_unchecked_mut(out_next) = 0 };
                 out_next += 1;
             }
             bitbuf = 0;
             bitcount = 0;
 
             // Output LEN and NLEN, then the data itself.
-            os.buf[out_next..out_next + 2].copy_from_slice(&(len as u16).to_le_bytes());
+            unsafe {
+                os.buf
+                    .get_unchecked_mut(out_next..out_next + 2)
+                    .copy_from_slice(&(len as u16).to_le_bytes());
+            }
             out_next += 2;
-            os.buf[out_next..out_next + 2].copy_from_slice(&(!(len as u16)).to_le_bytes());
+            unsafe {
+                os.buf
+                    .get_unchecked_mut(out_next..out_next + 2)
+                    .copy_from_slice(&(!(len as u16)).to_le_bytes());
+            }
             out_next += 2;
-            os.buf[out_next..out_next + len].copy_from_slice(&block_begin[in_next..in_next + len]);
+            debug_assert!(in_next + len <= block_begin.len());
+            unsafe {
+                os.buf
+                    .get_unchecked_mut(out_next..out_next + len)
+                    .copy_from_slice(block_begin.get_unchecked(in_next..in_next + len));
+            }
             out_next += len;
             in_next += len;
 
@@ -387,12 +426,13 @@ pub(crate) fn deflate_flush_block(
             // of precode lens, so to minimize flushes we merge one len with the
             // previous fields.
             let mut precode_sym = DEFLATE_PRECODE_LENS_PERMUTATION[0] as usize;
-            add_bits!(c.o_precode.lens[precode_sym], 3);
+            add_bits!(unsafe { *c.o_precode.lens.get_unchecked(precode_sym) }, 3);
             flush_bits!();
             let mut i = 1; // num_explicit_lens >= 4
             loop {
-                precode_sym = DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize;
-                add_bits!(c.o_precode.lens[precode_sym], 3);
+                precode_sym =
+                    unsafe { *DEFLATE_PRECODE_LENS_PERMUTATION.get_unchecked(i) } as usize;
+                add_bits!(unsafe { *c.o_precode.lens.get_unchecked(precode_sym) }, 3);
                 i += 1;
                 if i >= num_explicit_lens {
                     break;
@@ -403,8 +443,9 @@ pub(crate) fn deflate_flush_block(
             flush_bits!();
             let mut i = 0;
             loop {
-                let precode_sym = DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize;
-                add_bits!(c.o_precode.lens[precode_sym], 3);
+                let precode_sym =
+                    unsafe { *DEFLATE_PRECODE_LENS_PERMUTATION.get_unchecked(i) } as usize;
+                add_bits!(unsafe { *c.o_precode.lens.get_unchecked(precode_sym) }, 3);
                 flush_bits!();
                 i += 1;
                 if i >= num_explicit_lens {
@@ -417,14 +458,16 @@ pub(crate) fn deflate_flush_block(
         // by the precode.
         let mut i = 0;
         loop {
-            let precode_item = c.o_precode.items[i];
+            let precode_item = unsafe { *c.o_precode.items.get_unchecked(i) };
             let precode_sym = (precode_item & 0x1F) as usize;
             const _: () = assert!(can_buffer(super::MAX_PRE_CODEWORD_LEN as u32 + 7));
             add_bits!(
-                c.o_precode.codewords[precode_sym],
-                c.o_precode.lens[precode_sym]
+                unsafe { *c.o_precode.codewords.get_unchecked(precode_sym) },
+                unsafe { *c.o_precode.lens.get_unchecked(precode_sym) }
             );
-            add_bits!(precode_item >> 5, DEFLATE_EXTRA_PRECODE_BITS[precode_sym]);
+            add_bits!(precode_item >> 5, unsafe {
+                *DEFLATE_EXTRA_PRECODE_BITS.get_unchecked(precode_sym)
+            });
             flush_bits!();
             i += 1;
             if i >= num_precode_items {
@@ -436,21 +479,39 @@ pub(crate) fn deflate_flush_block(
     // Output the literals and matches for a dynamic or static block.
     debug_assert!(bitcount <= 7);
     {
-        // C: `deflate_compute_full_len_codewords(c, codes);` — split into a clone of
-        // the chosen table so the borrow checker can see the write to `c.o_length`
-        // does not alias the table being read. `static_codes` is immutable state and
-        // `codes` is not written here, so the clone is observationally identical.
-        let chosen = if use_static {
-            c.static_codes.clone()
+        // C: `deflate_compute_full_len_codewords(c, codes);` — the C passes
+        // `const struct deflate_codes *codes` and copies nothing.
+        //
+        // This used to `.clone()` the chosen table so the borrow checker could see
+        // that writing `c.o_length` does not alias the table being read. That clone
+        // is ~1.5 KB of DeflateCodes memcpy PER BLOCK that the C never performs, and
+        // it moved every codeword load in the emit loop onto a fresh stack copy.
+        // Destructuring `c` borrows the fields disjointly, which is the same
+        // aliasing fact the C states with `restrict` — no copy, same guarantee.
+        // The mutable borrow is scoped to the compute call so the emit loop below can
+        // hold shared borrows of `c.o_length` (via `write_match!`) and `c.codes`
+        // simultaneously — which is all the C ever needed.
+        {
+            let Compressor {
+                codes,
+                static_codes,
+                o_length,
+                ..
+            } = &mut *c;
+            let src: &DeflateCodes = if use_static { static_codes } else { codes };
+            deflate_compute_full_len_codewords(o_length, src);
+        }
+        let chosen: &DeflateCodes = if use_static {
+            &c.static_codes
         } else {
-            c.codes.clone()
+            &c.codes
         };
-        deflate_compute_full_len_codewords(&mut c.o_length, &chosen);
 
         // Output the literals and matches from the sequences list.
         let mut seq_idx = 0usize;
         loop {
-            let seq = sequences[seq_idx];
+            debug_assert!(seq_idx < sequences.len());
+            let seq = unsafe { *sequences.get_unchecked(seq_idx) };
             let mut litrunlen = seq.litrunlen_and_length & SEQ_LITRUNLEN_MASK;
             let length = seq.litrunlen_and_length >> SEQ_LENGTH_SHIFT;
 
@@ -458,9 +519,13 @@ pub(crate) fn deflate_flush_block(
             if can_buffer(4 * MAX_LITLEN_CODEWORD_LEN as u32) {
                 while litrunlen >= 4 {
                     for _ in 0..4 {
-                        let lit = block_begin[in_next] as usize;
+                        debug_assert!(in_next < block_begin.len());
+                        let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                         in_next += 1;
-                        add_bits!(chosen.codewords.litlen[lit], chosen.lens.litlen[lit]);
+                        add_bits!(
+                            unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                            unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                        );
                     }
                     flush_bits!();
                     litrunlen -= 4;
@@ -471,18 +536,30 @@ pub(crate) fn deflate_flush_block(
                 // codegen; the single flush is the point.
                 if litrunlen != 0 {
                     litrunlen -= 1;
-                    let lit = block_begin[in_next] as usize;
+                    debug_assert!(in_next < block_begin.len());
+                    let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                     in_next += 1;
-                    add_bits!(chosen.codewords.litlen[lit], chosen.lens.litlen[lit]);
+                    add_bits!(
+                        unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                        unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                    );
                     if litrunlen != 0 {
                         litrunlen -= 1;
-                        let lit = block_begin[in_next] as usize;
+                        debug_assert!(in_next < block_begin.len());
+                        let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                         in_next += 1;
-                        add_bits!(chosen.codewords.litlen[lit], chosen.lens.litlen[lit]);
+                        add_bits!(
+                            unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                            unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                        );
                         if litrunlen != 0 {
-                            let lit = block_begin[in_next] as usize;
+                            debug_assert!(in_next < block_begin.len());
+                            let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                             in_next += 1;
-                            add_bits!(chosen.codewords.litlen[lit], chosen.lens.litlen[lit]);
+                            add_bits!(
+                                unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                                unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                            );
                         }
                     }
                     flush_bits!();
@@ -490,9 +567,13 @@ pub(crate) fn deflate_flush_block(
             } else {
                 while litrunlen != 0 {
                     litrunlen -= 1;
-                    let lit = block_begin[in_next] as usize;
+                    debug_assert!(in_next < block_begin.len());
+                    let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                     in_next += 1;
-                    add_bits!(chosen.codewords.litlen[lit], chosen.lens.litlen[lit]);
+                    add_bits!(
+                        unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                        unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                    );
                     flush_bits!();
                 }
             }
