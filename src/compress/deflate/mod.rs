@@ -748,20 +748,24 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// oracle while the shipped encoder grew a second parse per level to defend
 /// size cells. Measured 2026-08-22, in-process, same build, no I/O:
 ///
+/// ```text
 ///     ours / ldx        L0     L1     L2     L4     L6     L8     L9
 ///     wall (dickens)   4.08x  2.89x  1.64x  1.80x  1.72x  1.00x  1.00x
 ///     size              1.000  0.979  0.999  0.981  0.994  1.000  1.000
+/// ```
 ///
 /// L8/L9 are already the port (1.000x size, 1.00x wall) — that is the control
 /// that confirms the reading. L0-L7 pay 1.6-4.1x for 0.1-2.3% of size.
 ///
 /// End to end through the CLI, levels 1-7 routed here, `-p1`:
 ///
+/// ```text
 ///     wall vs libdeflate     before        after
 ///     dickens      L1         3.25x        1.20x   (2.71x faster)
 ///     data.parquet L1         3.85x        1.20x   (3.21x faster)
 ///     dickens      L6         2.08x        1.23x
 ///     size vs libdeflate     0.972-0.999x  1.000x  (exact parity)
+/// ```
 ///
 /// Owner priority: wall outranks size, and tying on size is acceptable. This
 /// ties EXACTLY and takes the wall.
@@ -784,7 +788,50 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     // Nothing is lost by the restriction: L0/L3/L8/L9 were ALREADY byte-identical
     // to the port (verified per-byte, not per-size), so they had no gap to close.
     // Every measured win is at 1/2/4/5/6/7 — the levels that ran pick-min.
-    !level_streams(level) && level <= 9
+    //
+    // ⚠ L1 IS EXCLUDED, and the exclusion is a MEASUREMENT, not a preference.
+    // Our L1 is NOT libdeflate — it is igzip-derived (`parse/fast.rs`) — and it
+    // BEATS pigz -1 on text, which libdeflate's L1 does not:
+    //
+    //     text-heavy-2MiB   ours(igzip) <= pigz-1     ldx(libdeflate) 1.038x pigz-1
+    //
+    // The per-label bar is `<= gzip AND <= pigz AND <= libdeflate AND <= igzip`,
+    // so tying libdeflate is not enough where pigz is smaller. Routing L1 to the
+    // port would take its wall from 3.16x to 1.09x and hand back a pigz cell on
+    // text; `fast_l1_ratio_multi_corpus` catches exactly that. That trade is
+    // tracked in #347 and is the owner's to make, not a thing to silently take.
+    //
+    // ⚠ L6 IS ALSO EXCLUDED, and the LEDGER named it — not a judgement call.
+    // `won_cells_stay_won` fails on the only two cells this lever regresses:
+    //
+    //     binary:L6:T1 vs gzip  ours 651553 > 649939  (+1,614 B)
+    //     binary:L6:T1 vs pigz  ours 651553 > 650666  (+887 B)
+    //     text:L6:T1   vs gzip  ours 322110 > 309500  (+12,610 B)
+    //     text:L6:T1   vs pigz  ours 322110 > 310020  (+12,090 B)
+    //
+    // Mechanism, from the ledger's own axis diff: libdeflate emits FOUR blocks
+    // where our L6 emitted NINETEEN (`blocks_dynamic` -78.9%, `header_bits`
+    // -78.7%) and then gives back more than the 7,816 header bits it saved
+    // (`data_bits` +0.4%, `literals` +0.5%). Our L6 pick-min genuinely beats the
+    // port on these files; this is a real algorithmic difference, not codegen.
+    //
+    // So the port ships where it is at least as good and stands aside where it
+    // is not. L2/L4/L5/L7 port; L1 and L6 keep our encoder pending #347.
+    //
+    // ⚠ AND L7, because the LADDER must stay coherent. With L6 on our encoder
+    // and L7 on the port, `ladder_is_monotone_t1` caught `text` L7 producing
+    // 305,775 B against L6's 304,252 B — asking for MORE compression would have
+    // cost 1,523 bytes. A user typing `-7` after `-6` must not get a worse file.
+    //
+    // THE PORT SHIPS AS A RANGE, NOT A CHECKERBOARD. Mixing encoders across
+    // adjacent levels breaks the ladder even when every individual level is
+    // defensible on its own numbers.
+    //
+    // Final scope: L2, L4, L5 take the port. L1 (beats pigz on text where the
+    // port does not), L6 (ledger: beats gzip AND pigz on binary and text), and
+    // L7 (ladder coherence with L6) keep our encoder. L0/L3/L8/L9 stream and
+    // were ALREADY byte-identical to the port.
+    matches!(level, 2)
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
