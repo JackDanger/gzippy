@@ -157,7 +157,18 @@ pub(crate) fn deflate_flush_block(
         () => {{
             if out_next < out_fast_end {
                 // Flush a whole word (branchlessly).
-                os.buf[out_next..out_next + WORDBYTES].copy_from_slice(&bitbuf.to_le_bytes());
+                // `out_next < out_fast_end` was just tested, and `out_fast_end` is
+                // set so that a whole WORDBYTES store fits — that IS the meaning of
+                // the fast end. The bounds check is provably dead; this is the
+                // bit-writer's hot store, executed once per flushed word.
+                debug_assert!(out_next + WORDBYTES <= os.buf.len());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bitbuf.to_le_bytes().as_ptr(),
+                        os.buf.as_mut_ptr().add(out_next),
+                        WORDBYTES,
+                    );
+                }
                 // `bitcount & ~7` is why BITBUF_NBITS is one less than the word
                 // width: it caps the shift at 56, never the full 64 (which is UB in
                 // C and a panic in Rust).
@@ -168,7 +179,9 @@ pub(crate) fn deflate_flush_block(
                 // Flush a byte at a time.
                 while bitcount >= 8 {
                     debug_assert!(out_next < os_end);
-                    os.buf[out_next] = bitbuf as u8;
+                    // Guarded by the `debug_assert` above and by
+                    // `deflate_flush_block`'s up-front space check.
+                    unsafe { *os.buf.get_unchecked_mut(out_next) = bitbuf as u8 };
                     out_next += 1;
                     bitcount -= 8;
                     bitbuf >>= 8;
@@ -192,8 +205,8 @@ pub(crate) fn deflate_flush_block(
                 MAX_LITLEN_CODEWORD_LEN as u32 + DEFLATE_MAX_EXTRA_LENGTH_BITS
             ));
             add_bits!(
-                c.o_length.codewords[length__ as usize],
-                c.o_length.lens[length__ as usize]
+                unsafe { *c.o_length.codewords.get_unchecked(length__ as usize) },
+                unsafe { *c.o_length.lens.get_unchecked(length__ as usize) }
             );
 
             if !can_buffer(
@@ -207,8 +220,8 @@ pub(crate) fn deflate_flush_block(
 
             // Offset symbol.
             add_bits!(
-                $codes.codewords.offset[offset_slot__],
-                $codes.lens.offset[offset_slot__]
+                unsafe { *$codes.codewords.offset.get_unchecked(offset_slot__) },
+                unsafe { *$codes.lens.offset.get_unchecked(offset_slot__) }
             );
 
             if !can_buffer(MAX_OFFSET_CODEWORD_LEN as u32 + DEFLATE_MAX_EXTRA_OFFSET_BITS) {
@@ -217,8 +230,8 @@ pub(crate) fn deflate_flush_block(
 
             // Extra offset bits.
             add_bits!(
-                offset__ - DEFLATE_OFFSET_SLOT_BASE[offset_slot__],
-                DEFLATE_EXTRA_OFFSET_BITS[offset_slot__]
+                offset__ - unsafe { *DEFLATE_OFFSET_SLOT_BASE.get_unchecked(offset_slot__) },
+                unsafe { *DEFLATE_EXTRA_OFFSET_BITS.get_unchecked(offset_slot__) }
             );
 
             flush_bits!();

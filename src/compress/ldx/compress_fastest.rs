@@ -108,7 +108,7 @@ pub(crate) fn deflate_compress_fastest(
         let in_max_block_end = choose_max_block_end(in_next, in_end, FAST_SOFT_MAX_BLOCK_LENGTH);
         let mut seq_idx: usize = 0;
 
-        deflate_begin_sequences(c, &mut p.sequences[0]);
+        deflate_begin_sequences(c, unsafe { p.sequences.get_unchecked_mut(0) });
 
         loop {
             let remaining = in_end - in_next;
@@ -118,9 +118,12 @@ pub(crate) fn deflate_compress_fastest(
                 if max_len < HT_MATCHFINDER_REQUIRED_NBYTES {
                     // C: `do { deflate_choose_literal(...); } while (--max_len);`
                     while max_len != 0 {
-                        let lit = r#in[in_next] as usize;
+                        debug_assert!(in_next < r#in.len());
+                        let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
                         in_next += 1;
-                        deflate_choose_literal(c, lit, false, &mut p.sequences[seq_idx]);
+                        deflate_choose_literal(c, lit, false, unsafe {
+                            p.sequences.get_unchecked_mut(seq_idx)
+                        });
                         max_len -= 1;
                     }
                     break;
@@ -155,9 +158,12 @@ pub(crate) fn deflate_compress_fastest(
                 in_next += length as usize;
             } else {
                 // No match found.
-                let lit = r#in[in_next] as usize;
+                debug_assert!(in_next < r#in.len());
+                let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
                 in_next += 1;
-                deflate_choose_literal(c, lit, false, &mut p.sequences[seq_idx]);
+                deflate_choose_literal(c, lit, false, unsafe {
+                    p.sequences.get_unchecked_mut(seq_idx)
+                });
             }
 
             // Check if it's time to output another block.
@@ -169,7 +175,7 @@ pub(crate) fn deflate_compress_fastest(
         deflate_finish_block(
             c,
             os,
-            &r#in[in_block_begin..],
+            unsafe { r#in.get_unchecked(in_block_begin..) },
             (in_next - in_block_begin) as u32,
             &p.sequences,
             in_next == in_end,

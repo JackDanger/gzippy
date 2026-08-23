@@ -28,11 +28,22 @@
 /// maxheap property, swap the node with its greater child until it is greater than
 /// or equal to both of its children, so that the maxheap property is satisfied in
 /// the subtree rooted at `A[subtree_idx]`. `A` uses 1-based indices.
+///
+/// # Bounds
+///
+/// Every index this touches is `<= length` by the loop conditions (`child_idx`
+/// only advances while `child_idx <= length`, and `parent_idx` only ever takes a
+/// previous `child_idx`), and the caller guarantees `length <= a.len()`. The
+/// accesses are therefore in range by construction and the bounds checks are
+/// elided; the `debug_assert`s below fail closed in test builds if that ever
+/// stops being true.
 fn heapify_subtree(a: &mut [u32], length: usize, subtree_idx: usize) {
     debug_assert!(subtree_idx >= 1);
+    debug_assert!(length <= a.len());
+    debug_assert!(subtree_idx <= length);
 
     // v = A[subtree_idx];
-    let v = a[subtree_idx - 1];
+    let v = unsafe { *a.get_unchecked(subtree_idx - 1) };
     let mut parent_idx = subtree_idx;
     let mut child_idx;
 
@@ -43,19 +54,21 @@ fn heapify_subtree(a: &mut [u32], length: usize, subtree_idx: usize) {
             break;
         }
         // if (child_idx < length && A[child_idx + 1] > A[child_idx]) child_idx++;
-        if child_idx < length && a[child_idx] > a[child_idx - 1] {
+        if child_idx < length
+            && unsafe { *a.get_unchecked(child_idx) > *a.get_unchecked(child_idx - 1) }
+        {
             child_idx += 1;
         }
         // if (v >= A[child_idx]) break;
-        if v >= a[child_idx - 1] {
+        if v >= unsafe { *a.get_unchecked(child_idx - 1) } {
             break;
         }
         // A[parent_idx] = A[child_idx];
-        a[parent_idx - 1] = a[child_idx - 1];
+        unsafe { *a.get_unchecked_mut(parent_idx - 1) = *a.get_unchecked(child_idx - 1) };
         parent_idx = child_idx;
     }
     // A[parent_idx] = v;
-    a[parent_idx - 1] = v;
+    unsafe { *a.get_unchecked_mut(parent_idx - 1) = v };
 }
 
 /// C: `heapify_array(u32 A[], unsigned length)` (:785)
@@ -89,7 +102,12 @@ pub(crate) fn heap_sort(a: &mut [u32], length: usize) {
     // while (length >= 2) { swap A[length], A[1]; length--; heapify_subtree(A, length, 1); }
     let mut length = length;
     while length >= 2 {
-        a.swap(length - 1, 0);
+        // `length <= a.len()` and `length >= 2`, so both indices are in range.
+        unsafe {
+            let t = *a.get_unchecked(length - 1);
+            *a.get_unchecked_mut(length - 1) = *a.get_unchecked(0);
+            *a.get_unchecked_mut(0) = t;
+        }
         length -= 1;
         heapify_subtree(a, length, 1);
     }
