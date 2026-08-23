@@ -479,16 +479,33 @@ pub(crate) fn deflate_flush_block(
     // Output the literals and matches for a dynamic or static block.
     debug_assert!(bitcount <= 7);
     {
-        // C: `deflate_compute_full_len_codewords(c, codes);` — split into a clone of
-        // the chosen table so the borrow checker can see the write to `c.o_length`
-        // does not alias the table being read. `static_codes` is immutable state and
-        // `codes` is not written here, so the clone is observationally identical.
-        let chosen = if use_static {
-            c.static_codes.clone()
+        // C: `deflate_compute_full_len_codewords(c, codes);` — the C passes
+        // `const struct deflate_codes *codes` and copies nothing.
+        //
+        // This used to `.clone()` the chosen table so the borrow checker could see
+        // that writing `c.o_length` does not alias the table being read. That clone
+        // is ~1.5 KB of DeflateCodes memcpy PER BLOCK that the C never performs, and
+        // it moved every codeword load in the emit loop onto a fresh stack copy.
+        // Destructuring `c` borrows the fields disjointly, which is the same
+        // aliasing fact the C states with `restrict` — no copy, same guarantee.
+        // The mutable borrow is scoped to the compute call so the emit loop below can
+        // hold shared borrows of `c.o_length` (via `write_match!`) and `c.codes`
+        // simultaneously — which is all the C ever needed.
+        {
+            let Compressor {
+                codes,
+                static_codes,
+                o_length,
+                ..
+            } = &mut *c;
+            let src: &DeflateCodes = if use_static { static_codes } else { codes };
+            deflate_compute_full_len_codewords(o_length, src);
+        }
+        let chosen: &DeflateCodes = if use_static {
+            &c.static_codes
         } else {
-            c.codes.clone()
+            &c.codes
         };
-        deflate_compute_full_len_codewords(&mut c.o_length, &chosen);
 
         // Output the literals and matches from the sequences list.
         let mut seq_idx = 0usize;
