@@ -161,6 +161,7 @@ pub(crate) fn deflate_flush_block(
                 // set so that a whole WORDBYTES store fits — that IS the meaning of
                 // the fast end. The bounds check is provably dead; this is the
                 // bit-writer's hot store, executed once per flushed word.
+                crate::anatomy_count!(bitstream_flush_word_calls);
                 debug_assert!(out_next + WORDBYTES <= os.buf.len());
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -328,6 +329,8 @@ pub(crate) fn deflate_flush_block(
     // the choice is carried as a flag and resolved at each use. Behaviour identical;
     // the C's pointer indirection is not observable in the output.
     let use_static: bool;
+    #[cfg(feature = "anatomy-counters")]
+    let mut hdr_bit_start: usize = 0;
 
     if best_cost == uncompressed_cost {
         // Uncompressed block(s). DEFLATE limits the length of uncompressed blocks to
@@ -362,6 +365,7 @@ pub(crate) fn deflate_flush_block(
             bitbuf = 0;
             bitcount = 0;
 
+            crate::anatomy_count!(blocks_emitted_stored);
             // Output LEN and NLEN, then the data itself.
             unsafe {
                 os.buf
@@ -404,6 +408,7 @@ pub(crate) fn deflate_flush_block(
     if best_cost == static_cost {
         // Static Huffman block.
         use_static = true;
+        crate::anatomy_count!(blocks_emitted_fixed);
         add_bits!(is_final_block as u32, 1);
         add_bits!(DEFLATE_BLOCKTYPE_STATIC_HUFFMAN, 2);
         flush_bits!();
@@ -413,9 +418,17 @@ pub(crate) fn deflate_flush_block(
 
         // Dynamic Huffman block.
         use_static = false;
+        crate::anatomy_count!(blocks_emitted_dynamic);
         const _: () = assert!(can_buffer(1 + 2 + 5 + 5 + 4 + 3));
         add_bits!(is_final_block as u32, 1);
         add_bits!(DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN, 2);
+        // Start counting AFTER bfinal+btype: `HuffmanHeader::header_bits()`, which
+        // the legacy site records, is the table description only and excludes those
+        // 3 bits. (Measured: including them was +3 per block, +12 over 4 blocks.)
+        #[cfg(feature = "anatomy-counters")]
+        {
+            hdr_bit_start = out_next * 8 + bitcount as usize;
+        }
         add_bits!(c.o_precode.num_litlen_syms as u32 - 257, 5);
         add_bits!(c.o_precode.num_offset_syms as u32 - 1, 5);
         add_bits!(num_explicit_lens as u32 - 4, 4);
@@ -477,7 +490,16 @@ pub(crate) fn deflate_flush_block(
     }
 
     // Output the literals and matches for a dynamic or static block.
+    #[cfg(feature = "anatomy-counters")]
+    if !use_static {
+        crate::anatomy_count!(
+            dynamic_header_bits_total,
+            (out_next * 8 + bitcount as usize - hdr_bit_start) as u64
+        );
+    }
     debug_assert!(bitcount <= 7);
+    #[cfg(feature = "anatomy-counters")]
+    let body_bit_start = out_next * 8 + bitcount as usize;
     {
         // C: `deflate_compute_full_len_codewords(c, codes);` — the C passes
         // `const struct deflate_codes *codes` and copies nothing.
@@ -600,6 +622,13 @@ pub(crate) fn deflate_flush_block(
         flush_bits!();
     }
 
+    // Body bits = the bit-position delta across the literal/match emit, which is
+    // the same quantity parse/mod.rs accumulates per symbol as `e >> 24`.
+    #[cfg(feature = "anatomy-counters")]
+    crate::anatomy_count!(
+        emit_body_bits,
+        (out_next * 8 + bitcount as usize).saturating_sub(body_bit_start) as u64
+    );
     finish(
         os,
         bitbuf,

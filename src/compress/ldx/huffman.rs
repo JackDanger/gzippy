@@ -493,6 +493,7 @@ pub(crate) fn deflate_make_huffman_code(
     lens: &mut [u8],
     codewords: &mut [u32],
 ) {
+    crate::anatomy_count!(huffman_make_code_calls);
     // STATIC_ASSERT(DEFLATE_MAX_NUM_SYMS <= 1 << NUM_SYMBOL_BITS);
     const _: () = assert!(DEFLATE_MAX_NUM_SYMS <= 1 << NUM_SYMBOL_BITS);
     // (The C's second static assert bounds MAX_BLOCK_LENGTH against NUM_FREQ_BITS;

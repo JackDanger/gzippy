@@ -86,7 +86,6 @@ impl HcMatchfinder {
 /// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
 /// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
 /// 1.34x. Matching the vendor's `forceinline`.
-#[inline(always)]
 /// C: `hc_matchfinder_longest_match(...)` (:181)
 ///
 /// Find the longest match longer than `best_len` bytes. Returns the length of the
@@ -106,7 +105,69 @@ impl HcMatchfinder {
 /// the `cur_node4 <= cutoff` test before each dereference is what guarantees the entry
 /// is live. Dropping the mask indexes out of bounds; dropping the cutoff test reads a
 /// stale link.
+
+/// Per-call chain-walk accumulator, mirroring
+/// `compress::deflate::matchfinder::hc::HcLocalCounters` event for event so the
+/// anatomy pins hold when a level is routed to the port. Batched in locals and
+/// flushed once per call: an atomic at every visited node costs 10-14% wall at
+/// L6-L9, which is why the legacy instrument batches too.
+#[cfg(feature = "anatomy-counters")]
+#[derive(Default)]
+struct LdxHcCounters {
+    attempts: u64,
+    too_short: u64,
+    accepted: u64,
+    chain_reads: u64,
+}
+
+#[cfg(feature = "anatomy-counters")]
+impl LdxHcCounters {
+    #[inline(always)]
+    fn flush(self) {
+        crate::anatomy_count!(hc_probe_attempts, self.attempts);
+        // A probe that neither advanced `best_len` nor was rejected as too short
+        // MISSED the 4-byte test. Deriving keeps the hot path to one increment per
+        // event, exactly as the legacy accumulator does.
+        crate::anatomy_count!(
+            hc_probe_outcome_miss,
+            self.attempts
+                .saturating_sub(self.accepted)
+                .saturating_sub(self.too_short)
+        );
+        crate::anatomy_count!(hc_probe_outcome_too_short, self.too_short);
+        crate::anatomy_count!(hc_probe_outcome_accepted, self.accepted);
+        crate::anatomy_count!(hc_chain_table_reads, self.chain_reads);
+    }
+}
+
+/// No-op stand-in so the walk reads identically with the feature off.
+#[cfg(not(feature = "anatomy-counters"))]
+struct LdxHcCounters;
+#[cfg(not(feature = "anatomy-counters"))]
+impl LdxHcCounters {
+    #[inline(always)]
+    fn default() -> Self {
+        LdxHcCounters
+    }
+    #[inline(always)]
+    fn flush(self) {}
+}
+
+#[cfg(not(feature = "anatomy-counters"))]
+macro_rules! bump {
+    ($l:ident . $f:ident) => {{
+        let _ = &$l;
+    }};
+}
+#[cfg(feature = "anatomy-counters")]
+macro_rules! bump {
+    ($l:ident . $f:ident) => {
+        $l.$f += 1
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn hc_matchfinder_longest_match(
     mf: &mut HcMatchfinder,
     buf: &[u8],
@@ -119,6 +180,8 @@ pub(crate) fn hc_matchfinder_longest_match(
     next_hashes: &mut [u32; 2],
     offset_ret: &mut u32,
 ) -> u32 {
+    #[allow(unused_mut)]
+    let mut local = LdxHcCounters::default();
     let mut depth_remaining = max_search_depth;
     let mut best_matchptr: usize = in_next;
     let mut cur_pos = (in_next - *in_base) as i32;
@@ -135,7 +198,10 @@ pub(crate) fn hc_matchfinder_longest_match(
     // Can we read 4 bytes from 'in_next + 1'?
     if max_len < 5 {
         *offset_ret = (in_next - best_matchptr) as u32;
-        return best_len;
+        {
+            local.flush();
+            return best_len;
+        }
     }
 
     // Get the precomputed hash codes.
@@ -154,6 +220,8 @@ pub(crate) fn hc_matchfinder_longest_match(
     // Update for length 3 matches. This replaces the singleton node in the 'hash3'
     // bucket with the node for the current sequence.
     debug_assert!(hash3 < mf.hash3_tab.len());
+    crate::anatomy_count!(hc_head_table_reads, 2u64);
+    crate::anatomy_count!(hc_head_table_writes, 2u64);
     unsafe { *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos };
 
     // Update for length 4 matches. This prepends the node for the current sequence to
@@ -166,6 +234,7 @@ pub(crate) fn hc_matchfinder_longest_match(
 
     // Compute the next hash codes.
     let next_hashseq = load_u32(buf, in_next + 1);
+    crate::anatomy_count!(hc_hash_computations);
     next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_MATCHFINDER_HASH3_ORDER);
     next_hashes[1] = lz_hash(next_hashseq, HC_MATCHFINDER_HASH4_ORDER);
 
@@ -177,7 +246,10 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Check for a length 3 match if needed.
         if cur_node3 <= cutoff {
             *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
+            {
+                local.flush();
+                return best_len;
+            }
         }
 
         let seq4 = load_u32(buf, in_next);
@@ -193,13 +265,17 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Check for a length 4 match.
         if cur_node4 <= cutoff {
             *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
+            {
+                local.flush();
+                return best_len;
+            }
         }
 
         loop {
             // No length 4 match found yet. Check the first 4 bytes.
             matchptr = node_ptr(in_base_v, cur_node4);
 
+            bump!(local.attempts);
             if load_u32(buf, matchptr) == seq4 {
                 break;
             }
@@ -211,18 +287,26 @@ pub(crate) fn hc_matchfinder_longest_match(
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.next_tab.len());
             cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+            bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
-                return best_len;
+                {
+                    local.flush();
+                    return best_len;
+                }
             }
         }
 
         // Found a match of length >= 4. Extend it to its full length.
         best_matchptr = matchptr;
+        bump!(local.accepted);
         best_len = lz_extend(buf, in_next, best_matchptr, 4, max_len);
         if best_len >= nice_len {
             *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
+            {
+                local.flush();
+                return best_len;
+            }
         }
         // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
         // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
@@ -230,13 +314,20 @@ pub(crate) fn hc_matchfinder_longest_match(
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.next_tab.len());
         cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+        bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
+            {
+                local.flush();
+                return best_len;
+            }
         }
     } else if cur_node4 <= cutoff || best_len >= nice_len {
         *offset_ret = (in_next - best_matchptr) as u32;
-        return best_len;
+        {
+            local.flush();
+            return best_len;
+        }
     }
 
     // Check for matches of length >= 5.
@@ -248,6 +339,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             // checking either the last 4 bytes and the first 4 bytes, or the last
             // byte. (The last byte, the one which would extend the match length by 1,
             // is the most important.)
+            bump!(local.attempts);
             if load_u32(buf, matchptr + best_len as usize - 3)
                 == load_u32(buf, in_next + best_len as usize - 3)
                 && load_u32(buf, matchptr) == load_u32(buf, in_next)
@@ -262,22 +354,35 @@ pub(crate) fn hc_matchfinder_longest_match(
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.next_tab.len());
             cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+            bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
-                return best_len;
+                {
+                    local.flush();
+                    return best_len;
+                }
             }
         }
 
         // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
         // the extension may start at 4 rather than 0.
         let len = lz_extend(buf, in_next, matchptr, 4, max_len);
+        if len <= best_len {
+            // Passed the 4-byte test but did not beat the incumbent — the legacy
+            // accumulator calls this outcome `too_short`.
+            bump!(local.too_short);
+        }
         if len > best_len {
+            bump!(local.accepted);
             // This is the new longest match.
             best_len = len;
             best_matchptr = matchptr;
             if best_len >= nice_len {
                 *offset_ret = (in_next - best_matchptr) as u32;
-                return best_len;
+                {
+                    local.flush();
+                    return best_len;
+                }
             }
         }
 
@@ -288,9 +393,13 @@ pub(crate) fn hc_matchfinder_longest_match(
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.next_tab.len());
         cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+        bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
+            {
+                local.flush();
+                return best_len;
+            }
         }
     }
 }
@@ -323,6 +432,7 @@ pub(crate) fn hc_matchfinder_skip_bytes(
     if count as usize + 5 > in_end - in_next {
         return;
     }
+    crate::anatomy_count!(hc_positions_skipped, count as u64);
     if remaining == 0 {
         // The C's `do { } while (--remaining)` documents `count > 0`; guard rather
         // than wrap.
