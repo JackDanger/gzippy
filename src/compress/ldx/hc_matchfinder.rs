@@ -80,6 +80,13 @@ impl HcMatchfinder {
     }
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `hc_matchfinder_longest_match(...)` (:181)
 ///
 /// Find the longest match longer than `best_len` bytes. Returns the length of the
@@ -259,6 +266,13 @@ pub(crate) fn hc_matchfinder_longest_match(
     }
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `hc_matchfinder_skip_bytes(...)` (:360)
 ///
 /// Advance the matchfinder, but don't search for matches. `count` must be > 0.

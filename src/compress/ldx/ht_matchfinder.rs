@@ -87,6 +87,13 @@ impl HtMatchfinder {
     }
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `ht_matchfinder_longest_match(...)` (:80)
 ///
 /// Returns the best match length (0 if none) and writes the offset to `offset_ret`.
@@ -203,6 +210,13 @@ pub(crate) fn ht_matchfinder_longest_match(
     best_len
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `ht_matchfinder_skip_bytes(...)` (:196)
 ///
 /// Insert `count` consecutive positions into the table without searching. Used after a
