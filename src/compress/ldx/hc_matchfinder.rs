@@ -28,7 +28,6 @@ use super::matchfinder_common::{
     lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
     MATCHFINDER_WINDOW_SIZE,
 };
-use core::mem::MaybeUninit;
 
 /// C: `#define HC_MATCHFINDER_HASH3_ORDER 15` (:110)
 pub(crate) const HC_MATCHFINDER_HASH3_ORDER: u32 = 15;
@@ -48,9 +47,7 @@ pub(crate) struct HcMatchfinder {
     pub(crate) hash4_tab: Box<[MfPos]>,
     /// The "next node" references for the linked lists. The "next node" of the node
     /// for the sequence with position `pos` is `next_tab[pos]`.
-    /// C deliberately does not initialize this table.  A link is read only after
-    /// its hash bucket has reached it, and every such position is written first.
-    next_tab: Box<[MaybeUninit<MfPos>]>,
+    pub(crate) next_tab: Box<[MfPos]>,
 }
 
 impl HcMatchfinder {
@@ -58,11 +55,7 @@ impl HcMatchfinder {
         let mut mf = Self {
             hash3_tab: vec![0 as MfPos; HASH3_LEN].into_boxed_slice(),
             hash4_tab: vec![0 as MfPos; HASH4_LEN].into_boxed_slice(),
-            // C: `hc_matchfinder_init()` clears only the hash tables.  Zeroing
-            // this 64 KiB link table adds stores and first-touch page faults to
-            // every one-shot compression for values that are unreachable until
-            // the matchfinder overwrites them.
-            next_tab: Box::<[MfPos]>::new_uninit_slice(NEXT_LEN),
+            next_tab: vec![0 as MfPos; NEXT_LEN].into_boxed_slice(),
         };
         mf.init();
         mf
@@ -84,27 +77,7 @@ impl HcMatchfinder {
     pub(crate) fn slide_window(&mut self) {
         matchfinder_rebase(&mut self.hash3_tab);
         matchfinder_rebase(&mut self.hash4_tab);
-        // SAFETY: a window can slide only after every position in the prior
-        // 32 KiB window has been inserted, so every link has been initialized.
-        let next_tab = unsafe {
-            core::slice::from_raw_parts_mut(self.next_tab.as_mut_ptr().cast::<MfPos>(), NEXT_LEN)
-        };
-        matchfinder_rebase(next_tab);
-    }
-
-    /// C: `mf->next_tab[i]`, after the hash-chain reachability invariant has
-    /// established that this node was inserted.
-    #[inline(always)]
-    unsafe fn next_unchecked(&self, i: usize) -> MfPos {
-        // SAFETY: callers establish both the table index and initialization.
-        unsafe { self.next_tab.get_unchecked(i).assume_init_read() }
-    }
-
-    /// C: `mf->next_tab[i] = node`.
-    #[inline(always)]
-    unsafe fn set_next_unchecked(&mut self, i: usize, node: MfPos) {
-        // SAFETY: callers establish `i < NEXT_LEN`.
-        unsafe { self.next_tab.get_unchecked_mut(i).write(node) };
+        matchfinder_rebase(&mut self.next_tab);
     }
 }
 
@@ -257,7 +230,7 @@ pub(crate) fn hc_matchfinder_longest_match(
     debug_assert!(hash4 < mf.hash4_tab.len() && (cur_pos as usize) < mf.next_tab.len());
     unsafe {
         *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
-        mf.set_next_unchecked(cur_pos as usize, cur_node4);
+        *mf.next_tab.get_unchecked_mut(cur_pos as usize) = cur_node4;
     }
 
     // Compute the next hash codes.
@@ -316,7 +289,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             // Runs `max_search_depth` times PER POSITION (600 at L9).
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.next_tab.len());
-            cur_node4 = unsafe { mf.next_unchecked(ni) };
+            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
@@ -343,7 +316,7 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Runs `max_search_depth` times PER POSITION (600 at L9).
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.next_tab.len());
-        cur_node4 = unsafe { mf.next_unchecked(ni) };
+        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
@@ -383,7 +356,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             // Runs `max_search_depth` times PER POSITION (600 at L9).
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.next_tab.len());
-            cur_node4 = unsafe { mf.next_unchecked(ni) };
+            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
@@ -422,7 +395,7 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Runs `max_search_depth` times PER POSITION (600 at L9).
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.next_tab.len());
-        cur_node4 = unsafe { mf.next_unchecked(ni) };
+        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
@@ -497,7 +470,7 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         unsafe {
             *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos;
             let h4 = *mf.hash4_tab.get_unchecked(hash4);
-            mf.set_next_unchecked(cur_pos as usize, h4);
+            *mf.next_tab.get_unchecked_mut(cur_pos as usize) = h4;
             *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
         }
 
@@ -793,8 +766,7 @@ mod tests {
     #[test]
     fn init_clears_the_hash_tables_but_not_next_tab() {
         let mut mf = HcMatchfinder::new();
-        // SAFETY: this test initializes the entry before observing it.
-        unsafe { mf.set_next_unchecked(0, 1234) };
+        mf.next_tab[0] = 1234;
         mf.hash3_tab[7] = 99;
         mf.hash4_tab[9] = 77;
 
@@ -809,10 +781,7 @@ mod tests {
             super::super::matchfinder_common::MATCHFINDER_INITVAL
         );
         assert_eq!(
-            // SAFETY: initialized directly above and `init()` deliberately does
-            // not touch the link table.
-            unsafe { mf.next_unchecked(0) },
-            1234,
+            mf.next_tab[0], 1234,
             "C: hc_matchfinder_init passes TOTAL_HASH_SIZE, not sizeof(*mf)"
         );
     }
