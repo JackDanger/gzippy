@@ -66,6 +66,8 @@ pub(crate) fn deflate_choose_literal(
     // `literal` is a byte read from the input; `freqs.litlen` has
     // DEFLATE_NUM_LITLEN_SYMS (288) entries. The C indexes with a `u8` widened in
     // place and emits no check.
+    crate::anatomy_count!(literals_emitted);
+    crate::anatomy_count!(histogram_updates);
     debug_assert!(literal < c.freqs.litlen.len());
     unsafe { *c.freqs.litlen.get_unchecked_mut(literal) += 1 };
 
@@ -101,6 +103,11 @@ pub(crate) fn deflate_choose_match(
     // `length <= DEFLATE_MAX_MATCH_LEN`, which is the last index of
     // DEFLATE_LENGTH_SLOT; `length_slot < 29` so the litlen index stays under 288;
     // `deflate_get_offset_slot` returns < DEFLATE_NUM_OFFSET_SYMS by construction.
+    crate::anatomy_count!(matches_emitted);
+    crate::anatomy_count!(match_length_bytes_total, length as u64);
+    // A match updates TWO histograms (litlen and offset); a literal updates one.
+    // That is the legacy accounting: 60,363 literals + 2 x 112,068 matches = 284,499.
+    crate::anatomy_count!(histogram_updates, 2u64);
     debug_assert!((length as usize) < DEFLATE_LENGTH_SLOT.len());
     let length_slot = unsafe { *DEFLATE_LENGTH_SLOT.get_unchecked(length as usize) } as usize;
     let offset_slot = deflate_get_offset_slot(offset) as usize;

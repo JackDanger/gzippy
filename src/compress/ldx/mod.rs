@@ -241,6 +241,18 @@ pub const DEFLATE_MAX_EXTRA_OFFSET_BITS: u32 = 13;
 /// plus 5 bytes of block header per 65535-byte sub-block plus framing slack.
 /// `spare_capacity_mut` hands the compressor uninitialised bytes — nothing is
 /// zeroed — and `set_len` commits only what it wrote.
+/// C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919).
+///
+/// Inputs at or below this length never reach a parser in libdeflate — it emits an
+/// uncompressed block. Our streaming encoder does not, and is 3 bytes smaller there
+/// (e.g. n=1: ours 3, port 6). The router uses this to keep the port off inputs where
+/// it is strictly worse, which is what makes routing a level here a ZERO-size change
+/// rather than a trade.
+#[inline]
+pub fn max_passthrough_size(level: u32) -> usize {
+    55usize.saturating_sub((level as usize) * 4)
+}
+
 pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
     let Some(mut c) = compress::LdxCompressor::new(level) else {
         return false;

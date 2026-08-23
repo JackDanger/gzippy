@@ -96,6 +96,7 @@ pub(crate) fn init_block_split_stats(stats: &mut BlockSplitStats) {
 /// "ASCII vs non-ASCII" a visible aggregate.
 #[inline(always)]
 pub(crate) fn observe_literal(stats: &mut BlockSplitStats, lit: u8) {
+    crate::anatomy_count!(block_split_observations);
     stats.new_observations[(((lit >> 5) & 0x6) | (lit & 1)) as usize] += 1;
     stats.num_new_observations += 1;
 }
@@ -106,6 +107,7 @@ pub(crate) fn observe_literal(stats: &mut BlockSplitStats, lit: u8) {
 /// observation type for "long match".
 #[inline(always)]
 pub(crate) fn observe_match(stats: &mut BlockSplitStats, length: u32) {
+    crate::anatomy_count!(block_split_observations);
     stats.new_observations[NUM_LITERAL_OBSERVATION_TYPES + (length >= 9) as usize] += 1;
     stats.num_new_observations += 1;
 }
