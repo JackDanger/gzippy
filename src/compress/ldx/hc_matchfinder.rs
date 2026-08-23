@@ -354,9 +354,26 @@ fn load_u24(buf: &[u8], i: usize) -> u32 {
 
 #[inline(always)]
 fn load_u32(buf: &[u8], i: usize) -> u32 {
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&buf[i..i + 4]);
-    u32::from_le_bytes(b)
+    // The C reads 4 bytes unchecked; its callers guarantee the room via
+    // HT_MATCHFINDER_REQUIRED_NBYTES / the compressor's BUF_PAD. Our checked
+    // form compiled to a never-taken cmp+jcc->panic cluster in the hottest
+    // loop, re-reading a stack-spilled `buf.len()` every iteration
+    // (attributed 2026-08-11: 57 such clusters = 59% of the port's Ir excess
+    // over the C, and this class is ~12M of 16.5M).
+    //
+    // SAFETY: every caller is inside a region that has already proven at least
+    // 4 readable bytes at `i` — the tail-shortfall paths return before
+    // reaching here, and the compressor allocates BUF_PAD past the input. The
+    // `debug_assert` below makes that contract fail loudly in every debug and
+    // test build rather than silently, per the standing rule that an elided
+    // bound carries a debug assertion.
+    debug_assert!(
+        i + 4 <= buf.len(),
+        "load_u32 out of range: i={i} len={}",
+        buf.len()
+    );
+    let p = unsafe { buf.as_ptr().add(i) as *const u32 };
+    u32::from_le(unsafe { p.read_unaligned() })
 }
 
 #[cfg(test)]
