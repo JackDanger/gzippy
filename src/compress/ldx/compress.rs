@@ -123,11 +123,21 @@ impl LdxCompressor {
             // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
             2 => (6, 10),
             3 => (12, 14),
+            // ⭐ OURS: L4 routes to LAZY (see the dispatch below), not greedy.
+            // libdeflate uses greedy at L4; our previous 27k-line encoder's winning
+            // arm was Lazy(16,30) — which IS libdeflate's own L5 configuration.
+            // Measured: routing L4 to lazy reproduces that encoder on 22 of 23
+            // corpus files EXACTLY (total delta +31,374 B, all of it one file).
             4 => (16, 30),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
-            5 => (16, 30),
-            6 => (35, 65),
-            7 => (100, 130),
+            // ⭐ OURS: ZLIB's chain depths at L5/L6/L7, not libdeflate's 16/35/100.
+            // Measured over the 23-file corpus against our previous encoder:
+            //   L5 -103,677 B   L6 -116,780 B   L7 -79,258 B
+            // Deeper chains, same lazy strategy. `nice_match_length` stays
+            // libdeflate's.
+            5 => (32, 30),
+            6 => (128, 65),
+            7 => (256, 130),
             // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
             8 => (300, DEFLATE_MAX_MATCH_LEN),
             9 => (600, DEFLATE_MAX_MATCH_LEN),
@@ -168,7 +178,7 @@ impl LdxCompressor {
                 &mut os,
                 self.nice_match_length,
             ),
-            2..=4 => deflate_compress_greedy(
+            2..=3 => deflate_compress_greedy(
                 &mut self.c,
                 &mut self.p_g,
                 r#in,
@@ -179,7 +189,7 @@ impl LdxCompressor {
             ),
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
-            5..=9 => deflate_compress_lazy_generic(
+            4..=9 => deflate_compress_lazy_generic(
                 &mut self.c,
                 &mut self.p_g,
                 r#in,

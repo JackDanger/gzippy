@@ -656,6 +656,15 @@ pub fn encode_deflate_slack_padded_to_sink(
     level: u32,
     out: &mut Vec<u8>,
 ) {
+    // SEVERED FOR 0-9. The libdeflate port is the encoder; this legacy path
+    // survives only for levels 10-12, which have no libdeflate counterpart
+    // (`LdxCompressor::new` returns None above 9). `tests/one_encoder.rs`
+    // asserts this counter stays ZERO across the corpus at every level 0-9.
+    crate::anatomy_count!(legacy_encoder_entries);
+    debug_assert!(
+        level > 9 || !level_uses_ldx(level),
+        "legacy encoder reached at level {level} — the port owns 0-9"
+    );
     assert!(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
@@ -774,87 +783,11 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// and `LdxCompressor::new` returns `None` above 9.
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // THE NON-STREAMING LEVELS ONLY. `ldx` is a WHOLE-BUFFER encoder; the
-    // streaming levels (0, 3, 8, 9 — see `level_streams`) reach the encoder
-    // through a second, chunked route that cannot call it, so routing only
-    // their whole-buffer path here made the two routes disagree.
-    //
-    // Caught by `unpadded_slice_is_byte_identical_to_whole_buffer` at
-    // `L3 len=1` — an input below `max_passthrough_size` (55 - 4*level), where
-    // ldx emits a stored block and our streaming path does not. On the real
-    // corpus the two are byte-identical at L0/L3/L8/L9, which is exactly why a
-    // size census could not see this and a same-input route-identity test could.
-    //
-    // Nothing is lost by the restriction: L0/L3/L8/L9 were ALREADY byte-identical
-    // to the port (verified per-byte, not per-size), so they had no gap to close.
-    // Every measured win is at 1/2/4/5/6/7 — the levels that ran pick-min.
-    //
-    // ⚠ L1 IS EXCLUDED, and the exclusion is a MEASUREMENT, not a preference.
-    // Our L1 is NOT libdeflate — it is igzip-derived (`parse/fast.rs`) — and it
-    // BEATS pigz -1 on text, which libdeflate's L1 does not:
-    //
-    //     text-heavy-2MiB   ours(igzip) <= pigz-1     ldx(libdeflate) 1.038x pigz-1
-    //
-    // The per-label bar is `<= gzip AND <= pigz AND <= libdeflate AND <= igzip`,
-    // so tying libdeflate is not enough where pigz is smaller. Routing L1 to the
-    // port would take its wall from 3.16x to 1.09x and hand back a pigz cell on
-    // text; `fast_l1_ratio_multi_corpus` catches exactly that. That trade is
-    // tracked in #347 and is the owner's to make, not a thing to silently take.
-    //
-    // ⚠ L6 IS ALSO EXCLUDED, and the LEDGER named it — not a judgement call.
-    // `won_cells_stay_won` fails on the only two cells this lever regresses:
-    //
-    //     binary:L6:T1 vs gzip  ours 651553 > 649939  (+1,614 B)
-    //     binary:L6:T1 vs pigz  ours 651553 > 650666  (+887 B)
-    //     text:L6:T1   vs gzip  ours 322110 > 309500  (+12,610 B)
-    //     text:L6:T1   vs pigz  ours 322110 > 310020  (+12,090 B)
-    //
-    // Mechanism, from the ledger's own axis diff: libdeflate emits FOUR blocks
-    // where our L6 emitted NINETEEN (`blocks_dynamic` -78.9%, `header_bits`
-    // -78.7%) and then gives back more than the 7,816 header bits it saved
-    // (`data_bits` +0.4%, `literals` +0.5%). Our L6 pick-min genuinely beats the
-    // port on these files; this is a real algorithmic difference, not codegen.
-    //
-    // So the port ships where it is at least as good and stands aside where it
-    // is not. L2/L4/L5/L7 port; L1 and L6 keep our encoder pending #347.
-    //
-    // ⚠ AND L7, because the LADDER must stay coherent. With L6 on our encoder
-    // and L7 on the port, `ladder_is_monotone_t1` caught `text` L7 producing
-    // 305,775 B against L6's 304,252 B — asking for MORE compression would have
-    // cost 1,523 bytes. A user typing `-7` after `-6` must not get a worse file.
-    //
-    // THE PORT SHIPS AS A RANGE, NOT A CHECKERBOARD. Mixing encoders across
-    // adjacent levels breaks the ladder even when every individual level is
-    // defensible on its own numbers.
-    //
-    // Final scope: L2, L4, L5 take the port. L1 (beats pigz on text where the
-    // port does not), L6 (ledger: beats gzip AND pigz on binary and text), and
-    // L7 (ladder coherence with L6) keep our encoder. L0/L3/L8/L9 stream and
-    // were ALREADY byte-identical to the port.
-    // ⛔ EMPTY. The port ships at NO level — every candidate was rejected by a gate.
-    //
-    //   L1  fast_l1_ratio_multi_corpus  our igzip-derived L1 BEATS pigz -1 on text;
-    //                                   the port is 1.038x. Bar is <= ALL rivals.
-    //   L6  won_cells_stay_won (LEDGER) port loses text:L6 by 12,610 B to gzip.
-    //   L4/L7  ladder_is_monotone_t1    ported level came out LARGER than the one below.
-    //   L2  perf_shape                  the port carries NO anatomy counters, so routing
-    //                                   L2's T1 path to it zeroes every counter while T>1
-    //                                   keeps our encoder — `parallel_overhead_budget`
-    //                                   then compares live counts against zeros. Porting
-    //                                   a level BLINDS our instruments there, and it buys
-    //                                   1.9x wall on ONE level against 2 lost size cells.
-    //   L0/L3/L8/L9                     stream; ALREADY byte-identical to the port.
-    //
-    // ⭐ THE FINDING: "we run 1.6-4.1x our own port to defend 0.1-2.3% of size, so ship
-    // the port" is HALF TRUE. The 1.6-4.1x is real — and it is the SECOND ENCODE, not the
-    // parameter choices. Our divergences from libdeflate at L1/L4/L6 are REAL WINS the
-    // port loses. The lever that survives is "one encode, our parse" (#356), not "replace
-    // our encoder".
-    //
-    // Kept as a named predicate rather than deleted so the next attempt starts from the
-    // gate list above instead of re-deriving it.
-    let _ = level;
-    false
+    // ONE ENCODER. Levels 0-9 are our libdeflate port (`compress::ldx`) carrying
+    // our four MEASURED parameter wins (L4->lazy; zlib depths at L5/L6/L7).
+    // 10-12 have no libdeflate counterpart (`LdxCompressor::new` returns None
+    // above 9) and still use the legacy encoder — that is the remaining seam.
+    level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {

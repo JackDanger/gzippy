@@ -352,6 +352,7 @@ define_counters!(
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,
+    legacy_encoder_entries,
 );
 
 /// Reset every counter. Only exists when `anatomy-counters` is on. No
