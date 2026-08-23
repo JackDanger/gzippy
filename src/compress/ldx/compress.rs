@@ -87,9 +87,9 @@ pub(crate) fn deflate_compress_none(r#in: &[u8], in_nbytes: usize, out: &mut [u8
 /// The ported subset of `struct libdeflate_compressor`'s configuration. C: `:466` and
 /// the level map at `:3874`.
 ///
-/// **Only levels 0 and 1 are wired up so far** — those are the two whose compressors
-/// are ported. `impl_for` returns `None` for anything else rather than silently
-/// falling back, so a caller cannot get a wrong answer from an unported level.
+/// Levels 0-9 are wired up. Higher vendor levels use near-optimal parsing and
+/// remain outside this isolated port; `new` returns `None` for them rather
+/// than silently selecting a different algorithm.
 pub(crate) struct LdxCompressor {
     pub(crate) compression_level: u32,
     /// C: `c->max_passthrough_size` (:468)
@@ -104,7 +104,7 @@ pub(crate) struct LdxCompressor {
 }
 
 impl LdxCompressor {
-    /// C: `libdeflate_alloc_compressor_ex` (:3874), the levels ported so far.
+    /// C: `libdeflate_alloc_compressor_ex` (:3874), for levels 0-9.
     pub(crate) fn new(compression_level: u32) -> Option<Self> {
         // C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919)
         let mut max_passthrough_size = 55usize.wrapping_sub(compression_level as usize * 4);

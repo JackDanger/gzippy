@@ -67,7 +67,10 @@ fn every_thread_count_preserves_the_whole_stream_structure() {
     let input = fixtures::generate("text");
     for level in 1..=12 {
         let expected = encode_gzip_bytes_to_vec(&input, level);
-        for threads in [2, 4, 16] {
+        // The whole-stream route does not schedule workers; exercise ordinary,
+        // non-power-of-two, high, and extreme requested counts so a future
+        // routing change cannot accidentally make structure depend on them.
+        for threads in [1, 2, 3, 4, 8, 16, 31, 64, 256, usize::MAX] {
             let mut encoder = PipelinedGzEncoder::new(level, threads);
             encoder.set_minimal_gzip_header(true);
             let mut actual = Vec::new();
