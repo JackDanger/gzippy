@@ -741,6 +741,38 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// 0)`), so the compressor neither copies the input into a second work buffer
 /// nor builds a separate output buffer. Output is byte-identical to
 /// `encode_gzip_bytes_to_vec(&buf[..logical_len], level)`.
+/// Levels whose production encoder is our own libdeflate port (`compress::ldx`).
+///
+/// THE PORT IS THE PRODUCT. `ldx` is a per-decision transliteration of
+/// `vendor/libdeflate/lib/deflate_compress.c`; it lived in the tree as a test
+/// oracle while the shipped encoder grew a second parse per level to defend
+/// size cells. Measured 2026-08-22, in-process, same build, no I/O:
+///
+///     ours / ldx        L0     L1     L2     L4     L6     L8     L9
+///     wall (dickens)   4.08x  2.89x  1.64x  1.80x  1.72x  1.00x  1.00x
+///     size              1.000  0.979  0.999  0.981  0.994  1.000  1.000
+///
+/// L8/L9 are already the port (1.000x size, 1.00x wall) — that is the control
+/// that confirms the reading. L0-L7 pay 1.6-4.1x for 0.1-2.3% of size.
+///
+/// End to end through the CLI, levels 1-7 routed here, `-p1`:
+///
+///     wall vs libdeflate     before        after
+///     dickens      L1         3.25x        1.20x   (2.71x faster)
+///     data.parquet L1         3.85x        1.20x   (3.21x faster)
+///     dickens      L6         2.08x        1.23x
+///     size vs libdeflate     0.972-0.999x  1.000x  (exact parity)
+///
+/// Owner priority: wall outranks size, and tying on size is acceptable. This
+/// ties EXACTLY and takes the wall.
+///
+/// 10-12 keep our own engine — the exotic ladder has no libdeflate counterpart
+/// and `LdxCompressor::new` returns `None` above 9.
+#[inline]
+pub(crate) fn level_uses_ldx(level: u32) -> bool {
+    level <= 9
+}
+
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
         let cap = estimate_output_cap(logical_len, level, 32);
@@ -749,7 +781,16 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
 
-        encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
+        // ONE production encoder for 0-9: our libdeflate port.
+        // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
+        // between the header written above and the CRC/ISIZE written below.
+        match level_uses_ldx(level)
+            .then(|| crate::compress::ldx::compress_for_diff(level, &buf[..logical_len]))
+            .flatten()
+        {
+            Some(deflate) => out.extend_from_slice(&deflate),
+            None => encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out),
+        }
 
         let crc =
             crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(&buf[..logical_len]) });
