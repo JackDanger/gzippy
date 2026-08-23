@@ -143,17 +143,26 @@ pub(crate) fn hc_matchfinder_longest_match(
     let hash4 = next_hashes[1] as usize;
 
     // From the hash buckets, get the first node of each linked list.
-    let cur_node3 = mf.hash3_tab[hash3];
-    let mut cur_node4 = mf.hash4_tab[hash4];
+    debug_assert!(hash3 < mf.hash3_tab.len() && hash4 < mf.hash4_tab.len());
+    let (cur_node3, mut cur_node4) = unsafe {
+        (
+            *mf.hash3_tab.get_unchecked(hash3),
+            *mf.hash4_tab.get_unchecked(hash4),
+        )
+    };
 
     // Update for length 3 matches. This replaces the singleton node in the 'hash3'
     // bucket with the node for the current sequence.
-    mf.hash3_tab[hash3] = cur_pos as MfPos;
+    debug_assert!(hash3 < mf.hash3_tab.len());
+    unsafe { *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos };
 
     // Update for length 4 matches. This prepends the node for the current sequence to
     // the linked list in the 'hash4' bucket.
-    mf.hash4_tab[hash4] = cur_pos as MfPos;
-    mf.next_tab[cur_pos as usize] = cur_node4;
+    debug_assert!(hash4 < mf.hash4_tab.len() && (cur_pos as usize) < mf.next_tab.len());
+    unsafe {
+        *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
+        *mf.next_tab.get_unchecked_mut(cur_pos as usize) = cur_node4;
+    }
 
     // Compute the next hash codes.
     let next_hashseq = load_u32(buf, in_next + 1);
@@ -196,7 +205,12 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
 
             // The first 4 bytes did not match. Keep trying.
-            cur_node4 = mf.next_tab[(cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize];
+            // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
+            // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
+            // Runs `max_search_depth` times PER POSITION (600 at L9).
+            let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+            debug_assert!(ni < mf.next_tab.len());
+            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
                 return best_len;
@@ -210,7 +224,12 @@ pub(crate) fn hc_matchfinder_longest_match(
             *offset_ret = (in_next - best_matchptr) as u32;
             return best_len;
         }
-        cur_node4 = mf.next_tab[(cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize];
+        // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
+        // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
+        // Runs `max_search_depth` times PER POSITION (600 at L9).
+        let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+        debug_assert!(ni < mf.next_tab.len());
+        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
             return best_len;
@@ -237,7 +256,12 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
 
             // Continue to the next node in the list.
-            cur_node4 = mf.next_tab[(cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize];
+            // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
+            // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
+            // Runs `max_search_depth` times PER POSITION (600 at L9).
+            let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+            debug_assert!(ni < mf.next_tab.len());
+            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
                 return best_len;
@@ -258,7 +282,12 @@ pub(crate) fn hc_matchfinder_longest_match(
         }
 
         // Continue to the next node in the list.
-        cur_node4 = mf.next_tab[(cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize];
+        // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
+        // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
+        // Runs `max_search_depth` times PER POSITION (600 at L9).
+        let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+        debug_assert!(ni < mf.next_tab.len());
+        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
             return best_len;
