@@ -60,6 +60,7 @@ mod backends;
 pub use backends::isal_decompress as isal_decompress_oracle;
 mod cli;
 mod format;
+#[doc(hidden)]
 pub mod infra;
 mod utils;
 

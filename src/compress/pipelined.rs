@@ -183,7 +183,11 @@ impl PipelinedGzEncoder {
     pub fn new(compression_level: u32, num_threads: usize) -> Self {
         Self {
             compression_level,
-            num_threads,
+            // Keep this public constructor total: callers of the library can
+            // pass zero even though the CLI rejects it.  The parallel scheduler
+            // also normalizes defensively, but storing the effective value here
+            // keeps the block-grid calculation and the worker count consistent.
+            num_threads: num_threads.max(1),
             header_info: GzipHeaderInfo::default(),
             block_size_override: None,
             minimal_gzip_header: false,
@@ -256,103 +260,11 @@ impl PipelinedGzEncoder {
             writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
             return Ok(0);
         }
-        if self.num_threads > 1
-            && (self.compression_level == 8 || self.compression_level == 9)
-            && crate::compress::deflate::parse::level_uses_stateful_t4(self.compression_level)
-        {
-            // L8/L9 T>1: the chunk workers run the NEAR-OPTIMAL parse
-            // (`params_parallel(8)`/`params_parallel(9)` route to the L11 T>1
-            // knobs — see the measured receipts in `level.rs`). L8 joined L9
-            // here after the nearoptimal-down-ladder probe (2026-08-11)
-            // measured its old SEQUENTIAL triple pick-min (chunked Lazy2 +
-            // whole_parallel + whole_t1) as a strict Pareto LOSS against this
-            // structure on every fixture: 881 -> ~381 ms on 8 MiB text at -p4
-            // while the output shrinks 2,444,590 -> 2,260,495 (its old best
-            // bytes LOST to gzip -8 there). The probe also measured L6/L7 and
-            // they do NOT pay (no failing cell, 2.5-7.3x pure added wall
-            // against 2-5x slack) — the scope boundary is measured, not
-            // inherited. Two candidates, picked by size:
-            //
-            //   chunked  — near-optimal per ≤512 KiB chunk, parallel workers.
-            //              2-7% smaller than every rival AND than both #290
-            //              whole-file candidates on every measured fixture
-            //              class (text/tabular/binary/float/noise).
-            //   whole_t1 — one continuous Lazy2 `ParseState` at T1 knobs, the
-            //              #290 candidate that ties libdeflate byte-for-byte on
-            //              the seam-tax=gap cells (data.csv L9 class). Kept as
-            //              the monotone guard for content where the chunk grid
-            //              or the cost-model parse loses to a continuous Lazy2.
-            //
-            // The #289/#290 `whole_parallel` (parallel-knob continuous) candidate
-            // is GONE at L8/L9: with `params_parallel` now NearOptimal at both
-            // levels it would be a SERIAL whole-file near-optimal encode —
-            // strictly slower than the chunked pass running the same parse in
-            // parallel — and `parse_resumable` cannot run NearOptimal at all.
-            // Its former wins are covered: the chunked near-optimal output was
-            // smaller than the parallel-knob continuous output on every
-            // measured fixture (at L8 it was also smaller than the shipped
-            // triple's min on all five).
-            //
-            // The two survivors run CONCURRENTLY (the #293 T1 pick-min
-            // precedent): pick-min wall is max(candidates), not sum. Measured
-            // on 8 MiB text at -p4 (M1): L9 1,030 ms (three sequential
-            // candidates, main) -> ~800 ms here with the output 185 KB
-            // smaller; L8 881 ms -> max(381, 375) ms with the output 184 KB
-            // smaller.
-            let level = self.compression_level;
-            let header = self.gzip_header_bytes();
-            let (chunked, whole_t1) = std::thread::scope(|scope| {
-                let guard = scope.spawn(|| {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(&header);
-                    crate::compress::deflate::encode_deflate_stateful_to_writer(
-                        data, &mut v, level, false,
-                    )
-                    .map(|_| v)
-                });
-                let mut chunked = Vec::new();
-                let r = self.compress_parallel_pipeline_pure(data, &mut chunked);
-                (
-                    r.map(|_| chunked),
-                    guard.join().expect("whole_t1 candidate"),
-                )
-            });
-            let chunked = chunked?;
-            let whole_t1 = whole_t1?;
-            // Tie goes to chunked, matching #290's `min_by_key` first-minimum
-            // semantics (chunked was the first element).
-            let best = if whole_t1.len() < chunked.len() {
-                whole_t1
-            } else {
-                chunked
-            };
-            writer.write_all(&best)?;
-            return Ok(data.len() as u64);
-        }
         if self.compression_level == 0 {
-            // Genuine STORED mode (see `deflate::deflate_into`'s `level == 0`
-            // branch) has no compute to parallelize — it is a memcpy plus a
-            // fixed 5-byte-per-65535-byte framing tax, not a matchfinder/
-            // Huffman workload. Chunking it through `compress_parallel_pipeline_pure`
-            // like every other level would still roundtrip correctly, but it
-            // pays a REAL, measured cost for zero benefit: each of the
-            // (input_len / up-to-512KiB) parallel chunks gets its own
-            // sync-flush seam (`deflate_into`'s `!is_last` stored marker) so
-            // the chunked T>1 output is reproducibly a few hundred bytes
-            // LARGER than the single-shot T1 output on every multi-chunk file
-            // measured (e.g. dickens: T1=12,175,467 vs the old chunked
-            // T4=12,175,705, +238 bytes) — the opposite of the "T>1 must not
-            // be larger than T1" requirement. So L0 at T>1 bypasses the
-            // parallel pipeline entirely and emits ONE single-shot stored
-            // pass over the whole buffer, `num_threads`-independent — the
-            // body is byte-identical to the T1 path's
-            // (`encode_gzip_slack_padded_to_vec`/`encode_deflate_segment_to_sink` share the
-            // same `deflate_into` level-0 branch), so T>1 can never exceed T1
-            // in size at this level, and there is no thread/orchestration
-            // overhead to pay for a workload that is memory-bandwidth-, not
-            // CPU-, bound (a single `crc32fast::hash` pass over tens of MB is
-            // sub-millisecond — parallelizing it buys negligible wall time
-            // for the framing-size cost above).
+            // Stored blocks are memory-bandwidth work, not a workload for the
+            // matchfinder workers. Emit one stream so parallel chunk boundaries
+            // cannot add stored-block framing. This is a single encode, not a
+            // competing candidate.
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::with_capacity(data.len() + data.len() / 65535 + 16);
             crate::compress::deflate::encode_deflate_segment_to_sink(
