@@ -80,6 +80,13 @@ impl HcMatchfinder {
     }
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `hc_matchfinder_longest_match(...)` (:181)
 ///
 /// Find the longest match longer than `best_len` bytes. Returns the length of the
@@ -259,6 +266,13 @@ pub(crate) fn hc_matchfinder_longest_match(
     }
 }
 
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
+/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
+/// past AArch64's 8 argument registers, so every call spilled to the stack.
+/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
+/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
+/// 1.34x. Matching the vendor's `forceinline`.
+#[inline(always)]
 /// C: `hc_matchfinder_skip_bytes(...)` (:360)
 ///
 /// Advance the matchfinder, but don't search for matches. `count` must be > 0.
@@ -297,9 +311,26 @@ pub(crate) fn hc_matchfinder_skip_bytes(
             *in_base += MATCHFINDER_WINDOW_SIZE as usize;
             cur_pos = 0;
         }
-        mf.hash3_tab[hash3] = cur_pos as MfPos;
-        mf.next_tab[cur_pos as usize] = mf.hash4_tab[hash4];
-        mf.hash4_tab[hash4] = cur_pos as MfPos;
+        // PROVEN-BOUNDS REGION. `lz_hash(seq, n)` is `(seq * K) >> (32 - n)`, so
+        // its result is `< 2^n` BY CONSTRUCTION: hash3 < 1<<HASH3_ORDER ==
+        // hash3_tab.len(), hash4 < 1<<HASH4_ORDER == hash4_tab.len(). `cur_pos`
+        // is reset to 0 at MATCHFINDER_WINDOW_SIZE by the slide check directly
+        // above, and next_tab.len() == MATCHFINDER_WINDOW_SIZE.
+        //
+        // This is the hottest loop at the SHALLOW levels: at L2
+        // `max_search_depth = 6`, so almost no chain walking happens and the
+        // cost is this insert. Measured on ARM 2026-08-22: L2's deficit vs the C
+        // DIVERGES with input size (1.07x at 16 KB -> 1.37x at 12 MB) while L9's
+        // CONVERGES and wins (1.07x -> 0.87x) — the deep path is already ahead,
+        // the shallow insert is the deficit.
+        debug_assert!(hash3 < mf.hash3_tab.len() && hash4 < mf.hash4_tab.len());
+        debug_assert!((cur_pos as usize) < mf.next_tab.len());
+        unsafe {
+            *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos;
+            let h4 = *mf.hash4_tab.get_unchecked(hash4);
+            *mf.next_tab.get_unchecked_mut(cur_pos as usize) = h4;
+            *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
+        }
 
         p += 1;
         let next_hashseq = load_u32(buf, p);
@@ -354,9 +385,26 @@ fn load_u24(buf: &[u8], i: usize) -> u32 {
 
 #[inline(always)]
 fn load_u32(buf: &[u8], i: usize) -> u32 {
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&buf[i..i + 4]);
-    u32::from_le_bytes(b)
+    // The C reads 4 bytes unchecked; its callers guarantee the room via
+    // HT_MATCHFINDER_REQUIRED_NBYTES / the compressor's BUF_PAD. Our checked
+    // form compiled to a never-taken cmp+jcc->panic cluster in the hottest
+    // loop, re-reading a stack-spilled `buf.len()` every iteration
+    // (attributed 2026-08-11: 57 such clusters = 59% of the port's Ir excess
+    // over the C, and this class is ~12M of 16.5M).
+    //
+    // SAFETY: every caller is inside a region that has already proven at least
+    // 4 readable bytes at `i` — the tail-shortfall paths return before
+    // reaching here, and the compressor allocates BUF_PAD past the input. The
+    // `debug_assert` below makes that contract fail loudly in every debug and
+    // test build rather than silently, per the standing rule that an elided
+    // bound carries a debug assertion.
+    debug_assert!(
+        i + 4 <= buf.len(),
+        "load_u32 out of range: i={i} len={}",
+        buf.len()
+    );
+    let p = unsafe { buf.as_ptr().add(i) as *const u32 };
+    u32::from_le(unsafe { p.read_unaligned() })
 }
 
 #[cfg(test)]

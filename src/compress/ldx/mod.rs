@@ -226,6 +226,47 @@ pub const DEFLATE_MAX_EXTRA_OFFSET_BITS: u32 = 13;
 /// port's rung-3 gate — byte-for-byte against libdeflate's own
 /// `libdeflate_deflate_compress` — can be run from `examples/ldxdump.rs`. Nothing in
 /// `src/compress/deflate` calls it, and nothing routes here.
+/// PRODUCTION entry point: compress `input` and APPEND the raw DEFLATE bytes to
+/// `out`, with no scratch buffer and no copy.
+///
+/// [`compress_for_diff`] is the divergence ORACLE and allocates
+/// `vec![0u8; input.len() * 2 + 65536]` — it ZEROES twice the input plus 64 KB on
+/// every call, then the caller copies the result out again. That is fine for a
+/// test; shipping it cost a 24.4 MB memset per compression on a 12 MB input, and
+/// it is a FIXED cost, so it dominated the fast levels and vanished at L9 —
+/// exactly the level pattern we could not explain (we lost 1.07-1.15x at L1-L6
+/// and WON 0.84-0.96x at L9 against the very C we are a port of).
+///
+/// The bound is libdeflate's own worst case for its stored fallback: the input
+/// plus 5 bytes of block header per 65535-byte sub-block plus framing slack.
+/// `spare_capacity_mut` hands the compressor uninitialised bytes — nothing is
+/// zeroed — and `set_len` commits only what it wrote.
+pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
+    let Some(mut c) = compress::LdxCompressor::new(level) else {
+        return false;
+    };
+    let bound = input.len() + input.len().div_ceil(65535) * 5 + 64;
+    let start = out.len();
+    out.reserve(bound);
+    let n = {
+        let spare = out.spare_capacity_mut();
+        // SAFETY: `spare` is `[MaybeUninit<u8>]` with at least `bound` elements.
+        // `compress` writes only within the slice it is given and returns how
+        // many bytes it wrote; we commit exactly that many below. Writing
+        // uninitialised bytes through a `&mut [u8]` view is sound here because
+        // the compressor never READS the buffer before writing it — it is a
+        // pure output sink (the C takes a raw `void *out` for the same reason).
+        let buf = unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, bound) };
+        c.compress(input, input.len(), buf)
+    };
+    if n == 0 {
+        return false;
+    }
+    // SAFETY: `compress` reported writing `n` bytes into the reserved region.
+    unsafe { out.set_len(start + n) };
+    true
+}
+
 pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
     let mut c = compress::LdxCompressor::new(level)?;
     let mut out = vec![0u8; input.len() * 2 + 65536];
