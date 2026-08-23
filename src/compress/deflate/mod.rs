@@ -798,12 +798,11 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         // ONE production encoder for 0-9: our libdeflate port.
         // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
         // between the header written above and the CRC/ISIZE written below.
-        match level_uses_ldx(level)
-            .then(|| crate::compress::ldx::compress_for_diff(level, &buf[..logical_len]))
-            .flatten()
+        // Append straight into `out` — no scratch buffer, no zeroing, no copy.
+        if !(level_uses_ldx(level)
+            && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
         {
-            Some(deflate) => out.extend_from_slice(&deflate),
-            None => encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out),
+            encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
         }
 
         let crc =
