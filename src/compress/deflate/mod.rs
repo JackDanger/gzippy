@@ -851,10 +851,24 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     // port loses. The lever that survives is "one encode, our parse" (#356), not "replace
     // our encoder".
     //
-    // Kept as a named predicate rather than deleted so the next attempt starts from the
-    // gate list above instead of re-deriving it.
-    let _ = level;
-    false
+    // ⭐ 2026-08-23: TURNED ON for the levels MEASURED byte-identical to production.
+    //
+    // The gate list above is about levels where the port emits DIFFERENT bytes. L0, L8
+    // and L9 are not in that class: `compress_for_diff` is byte-identical to
+    // `encode_deflate_bytes_to_vec` on all 23 corpus files at each of them (0 differ,
+    // 0 refused). Routing them to the port is therefore a ZERO-size change — no cell
+    // can flip, clause 3 is untouched — and it buys the port's codegen on the wall
+    // axis. L3 is excluded because it genuinely differs (23/23 files); the levels that
+    // ran pick-min are excluded because dropping the second arm is a separate,
+    // owner-facing trade (PR #356).
+    //
+    // The route-identity caveat the exclusion was originally written for is real and is
+    // handled by the caller, not here: at or below `ldx::max_passthrough_size(level)`
+    // the port emits a stored block where our streaming path emits fewer bytes (n=1:
+    // ours 3, port 6). Measured across n = 0..=300 on two contents: 46 such inputs at
+    // L8, 38 at L9 — exactly 2 x 23 and 2 x 19, i.e. precisely the threshold and
+    // nothing else. Above the threshold there are ZERO divergences.
+    matches!(level, 0 | 8 | 9)
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
@@ -870,6 +884,7 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         // between the header written above and the CRC/ISIZE written below.
         // Append straight into `out` — no scratch buffer, no zeroing, no copy.
         if !(level_uses_ldx(level)
+            && logical_len > crate::compress::ldx::max_passthrough_size(level)
             && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
         {
             encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
