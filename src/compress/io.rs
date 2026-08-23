@@ -37,18 +37,12 @@ use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
 use crate::utils::preserve_metadata;
 
-/// The fixed 10-byte gzip header every T1 encoder emits (CM=8, FLG=0,
-/// MTIME=0, XFL=0, OS=0xff) — see the literal in
-/// `deflate::encode_gzip_unpadded_slice_to_writer` and its whole-buffer /
-/// streaming siblings.
-const T1_MINIMAL_GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
-
-/// Splices a full FNAME/MTIME gzip header over the fixed minimal header the
-/// T1 encoders emit (issue #309: gzip's contract stores FNAME and MTIME when
+/// Splices a full FNAME/MTIME gzip header over the minimal header the T1
+/// encoders emit (issue #309: gzip's contract stores FNAME and MTIME when
 /// compressing a named FILE; `gzip -l`/`gzip -dN` rely on them).
 ///
 /// The T1 encoders write header + DEFLATE stream + trailer through one
-/// writer, always starting with exactly [`T1_MINIMAL_GZIP_HEADER`]. This
+/// writer, always starting with the level-specific minimal header. This
 /// adapter swallows those 10 bytes, emits `replacement` in their place, and
 /// passes everything after them through untouched — the DEFLATE bytes and
 /// trailer cannot change, so T1 `-c` output (every graded board/tie-guard
@@ -58,15 +52,17 @@ const T1_MINIMAL_GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x
 struct HeaderSpliceWriter<W: Write> {
     inner: W,
     replacement: Vec<u8>,
+    expected: [u8; 10],
     /// Bytes of the minimal header consumed so far (0..=10).
     seen: usize,
 }
 
 impl<W: Write> HeaderSpliceWriter<W> {
-    fn new(inner: W, replacement: Vec<u8>) -> Self {
+    fn new(inner: W, replacement: Vec<u8>, expected: [u8; 10]) -> Self {
         Self {
             inner,
             replacement,
+            expected,
             seen: 0,
         }
     }
@@ -74,9 +70,9 @@ impl<W: Write> HeaderSpliceWriter<W> {
 
 impl<W: Write> Write for HeaderSpliceWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.seen < T1_MINIMAL_GZIP_HEADER.len() {
-            let take = (T1_MINIMAL_GZIP_HEADER.len() - self.seen).min(buf.len());
-            if buf[..take] != T1_MINIMAL_GZIP_HEADER[self.seen..self.seen + take] {
+        if self.seen < self.expected.len() {
+            let take = (self.expected.len() - self.seen).min(buf.len());
+            if buf[..take] != self.expected[self.seen..self.seen + take] {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "T1 encoder did not emit the fixed minimal gzip header; \
@@ -480,6 +476,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let mut out = HeaderSpliceWriter::new(
                 BufWriter::new(File::create(output_path.as_ref().unwrap())?),
                 header_info.to_member_header(),
+                crate::compress::deflate::minimal_gzip_header(args.compression_level as u32),
             );
             encode(&mut out)
         }
@@ -502,7 +499,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             // full header from `header_info` and must NOT be wrapped.
             crate::compress::compress_with_pipeline_sized(
                 input_file,
-                HeaderSpliceWriter::new(output_file, header_info.to_member_header()),
+                HeaderSpliceWriter::new(
+                    output_file,
+                    header_info.to_member_header(),
+                    crate::compress::deflate::minimal_gzip_header(args.compression_level as u32),
+                ),
                 args,
                 &opt_config,
                 &header_info,

@@ -63,6 +63,21 @@ use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 /// Largest payload of a single stored (BTYPE=00) sub-block.
 const MAX_STORED_SUBBLOCK: usize = 65535;
 
+/// The deterministic gzip header emitted by `libdeflate-gzip -c`.
+///
+/// XFL is metadata, but it is part of byte-for-byte gzip compatibility: the
+/// vendor marks its fastest level with 4 and its maximum-compression levels
+/// with 2.
+#[inline]
+pub(crate) fn minimal_gzip_header(level: u32) -> [u8; 10] {
+    let xfl = match level {
+        1 => 4,
+        8..=u32::MAX => 2,
+        _ => 0,
+    };
+    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, xfl, 0xff]
+}
+
 /// Output-buffer capacity estimate for a one-shot compress of `len` bytes at
 /// `level`, plus `framing_slack` bytes for whatever header/trailer the caller
 /// adds around the raw DEFLATE stream (gzip header + CRC32 + ISIZE = 18 for
@@ -536,33 +551,8 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23). Every level it can serve routes
-    // here, so libdeflate is our FLOOR on both axes rather than something a second
-    // encode approximates. L10-L12 have no libdeflate counterpart.
-    //
-    // THREE EXCEPTIONS, each a MEASUREMENT with a named gate, not a preference — and
-    // all three collapse the moment the port learns ONE knob, `good_match` (shorten the
-    // chain walk once a match >= good_match is found; zlib/gzip/pigz all use it, and
-    // libdeflate does not implement it):
-    //
-    //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
-    //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
-    //
-    //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
-    //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
-    //         text:L6   vs gzip +12,610 B / vs pigz +12,090 B
-    //       Those cells were won by the ZLIB arm = baseline + `good_match` 8 + chain
-    //       128. Carrying those knobs on the level keeps the cells with ONE encode.
-    //
-    //   L7  follows from L6: the port has no `good_match`, so our L6 is stronger than
-    //       the port's L7 (100, 130) and `ladder_is_monotone_t1` fires (305,775 >
-    //       304,252 on text). L7 keeps the legacy encoder at its own measured-best
-    //       single config (chain 256, `good_match` 32) — monotone, and 2 clause-3 flips
-    //       against 4 for `params(7)`.
-    //
-    // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
-    // has lied about exactly this three times in this campaign.
-    !matches!(level, 1 | 6 | 7) && level <= 9
+    // The port is the structural baseline for every level it implements.
+    level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
@@ -571,14 +561,13 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
         let mut out = Vec::with_capacity(cap);
-        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+        out.extend_from_slice(&minimal_gzip_header(level));
 
         // ONE production encoder for 0-9: our libdeflate port.
         // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
         // between the header written above and the CRC/ISIZE written below.
         // Append straight into `out` — no scratch buffer, no zeroing, no copy.
         if !(level_uses_ldx(level)
-            && logical_len > crate::compress::ldx::max_passthrough_size(level)
             && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
         {
             encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
@@ -666,7 +655,7 @@ fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
     let mut total: u64 = 0;
 
     let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    out.extend_from_slice(&minimal_gzip_header(level));
     let mut bw = BitWriter::from_vec(out);
 
     // NOTE: no `anatomy_wall_cli!` here. The CLI route in `compress::mod`
@@ -1048,7 +1037,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     crate::anatomy_count!(alloc_events);
     crate::anatomy_count!(alloc_bytes, out_cap);
     let mut out = Vec::with_capacity(out_cap);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    out.extend_from_slice(&minimal_gzip_header(level));
     let mut bw = BitWriter::from_vec(out);
 
     if level == 0 {

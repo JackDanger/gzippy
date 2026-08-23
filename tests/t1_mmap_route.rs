@@ -127,7 +127,7 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     let cgz = stdout_run.get_output().stdout.clone();
     assert_eq!(
         &cgz[..10],
-        &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
+        &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x04, 0xff]
     );
     assert_eq!(
         gz[3] & 0x08,

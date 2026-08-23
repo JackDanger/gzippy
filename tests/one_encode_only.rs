@@ -97,41 +97,13 @@ fn the_port_is_the_production_encoder_for_levels_0_through_9() {
     let _guard = census_lock();
     let data = b"the quick brown fox jumps over the lazy dog. ".repeat(4000);
     let mut failures = Vec::new();
-    // EXACTLY ONE documented exception. Adding a second one fails this test, which
-    // is the point: exceptions must be argued individually, with a number.
-    //
-    // L1 is igzip-derived and BEATS pigz -1 on text where libdeflate's L1 does not
-    // (43,980 vs 42,384 = 1.038x pigz). `fast_l1_ratio_multi_corpus` enforces that
-    // cell. Closing it means porting the advantage INTO ldx (#347), not routing L1.
-    // L6: `won_cells_stay_won` (append-only) fails on 4 cells if L6 routes to the
-    //     port — libdeflate emits 4 blocks where our L6 emits 19, saving 7,816 header
-    //     bits and giving back more in data_bits. A block-placement difference, so
-    //     closing it means improving the PORT's splitter.
-    // L7: follows from L6 — the port has no `good_match`, so our L6 (which needs it)
-    //     is stronger than the port's L7, and `ladder_is_monotone_t1` fires. L7 keeps
-    //     the legacy encoder at its measured-best config (256, good_match 32).
-    //
-    // ⭐ ALL THREE COLLAPSE the moment the port learns `good_match` — one knob.
-    const PORT_EXCEPTIONS: &[u32] = &[1, 6, 7];
-
     for level in 0..=9u32 {
         encode_census::reset();
         let _ = encode_gzip_bytes_to_vec(&data, level);
         let (port, legacy) = encode_census::snapshot();
-        let want_port = !PORT_EXCEPTIONS.contains(&level);
-        let ok = if want_port {
-            port == 1 && legacy == 0
-        } else {
-            port == 0 && legacy == 1
-        };
-        if !ok {
+        if !(port == 1 && legacy == 0) {
             failures.push(format!(
-                "L{level}: port={port} legacy={legacy}, expected {}",
-                if want_port {
-                    "port=1 legacy=0"
-                } else {
-                    "port=0 legacy=1 (documented exception)"
-                }
+                "L{level}: port={port} legacy={legacy}, expected port=1 legacy=0"
             ));
         }
     }

@@ -219,7 +219,7 @@ impl PipelinedGzEncoder {
     /// stdout (`-c`) uses the minimal header that libdeflate-gzip emits.
     fn gzip_header_bytes(&self) -> Vec<u8> {
         if self.minimal_gzip_header {
-            return vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+            return crate::compress::deflate::minimal_gzip_header(self.compression_level).to_vec();
         }
         self.header_info.to_member_header()
     }
@@ -243,6 +243,14 @@ impl PipelinedGzEncoder {
             self.compression_level,
             self.num_threads,
         );
+        // Exact libdeflate structure is a whole-stream property. Its parser
+        // makes decisions from one evolving matchfinder state, so independently
+        // encoding chunks cannot reproduce the same DEFLATE body. Levels 0-12
+        // therefore use the established one-shot encoder at every requested
+        // thread count. This is one encode, not a fallback or a candidate race.
+        if self.compression_level <= 12 {
+            return self.compress_exact_to_writer(data, &mut writer);
+        }
         if data.is_empty() {
             // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
             writer.write_all(&self.gzip_header_bytes())?;
@@ -282,6 +290,35 @@ impl PipelinedGzEncoder {
             return Ok(data.len() as u64);
         }
         self.compress_parallel_pipeline_pure(data, writer)?;
+        Ok(data.len() as u64)
+    }
+
+    /// Emit the established whole-stream gzip encoding with the caller's
+    /// header. Levels 0-9 use the raw libdeflate port without an input copy;
+    /// levels 10-12 delegate to the existing near-optimal whole-stream route.
+    /// The minimal-header case is byte-for-byte identical to
+    /// `libdeflate-gzip -c`; file metadata may intentionally differ.
+    fn compress_exact_to_writer<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
+        if self.compression_level <= 9 {
+            writer.write_all(&self.gzip_header_bytes())?;
+            let mut body = Vec::new();
+            if !crate::compress::ldx::compress_into(self.compression_level, data, &mut body) {
+                return Err(io::Error::other(
+                    "libdeflate port does not support this level",
+                ));
+            }
+            writer.write_all(&body)?;
+            writer.write_all(&crc32fast::hash(data).to_le_bytes())?;
+            writer.write_all(&(data.len() as u32).to_le_bytes())?;
+            return Ok(data.len() as u64);
+        }
+
+        // The L10-L12 near-optimal route already owns the exact T1 stream.
+        // Reframe only its ten-byte header for named file output; DEFLATE and
+        // trailer remain untouched.
+        let gzip = crate::compress::deflate::encode_gzip_bytes_to_vec(data, self.compression_level);
+        writer.write_all(&self.gzip_header_bytes())?;
+        writer.write_all(&gzip[10..])?;
         Ok(data.len() as u64)
     }
 
