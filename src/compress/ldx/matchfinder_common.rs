@@ -99,6 +99,37 @@ pub(crate) fn lz_hash(seq: u32, num_bits: u32) -> u32 {
     seq.wrapping_mul(0x1E35_A7BD) >> (32 - num_bits)
 }
 
+/// C: `prefetchw(addr)` (`common_defs.h:260`).
+///
+/// The matchfinders compute the hash for the *next* input position before
+/// touching that bucket.  libdeflate prefetches it into L1 with write intent;
+/// on x86 GCC lowers its `__builtin_prefetch(addr, 1)` to `prefetcht0`.
+/// Prefetches are hints only, so this has no effect on the DEFLATE stream.
+#[inline(always)]
+pub(crate) fn prefetchw<T>(addr: *const T) {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        use core::arch::x86::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // GCC's `__builtin_prefetch(addr, 1)` uses the same L1 write-prefetch
+        // operation on AArch64.
+        core::arch::asm!("prfm pstl1keep, [{addr}]", addr = in(reg) addr, options(nostack));
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = addr;
+}
+
 /// C: `lz_extend(strptr, matchptr, start_len, max_len)` (:178)
 ///
 /// Return the number of bytes at `matchptr` that match the bytes at `strptr`, up to a

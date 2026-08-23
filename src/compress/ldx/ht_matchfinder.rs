@@ -28,7 +28,8 @@
 //! against a derivative.
 
 use super::matchfinder_common::{
-    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, MfPos, MATCHFINDER_WINDOW_SIZE,
+    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
+    MATCHFINDER_WINDOW_SIZE,
 };
 
 /// C: `#define HT_MATCHFINDER_HASH_ORDER 15` (:49)
@@ -148,6 +149,11 @@ pub(crate) fn ht_matchfinder_longest_match(
     const _: () = assert!(HT_MATCHFINDER_REQUIRED_NBYTES == 5);
     *next_hash = lz_hash(load_u32(buf, in_next + 1), HT_MATCHFINDER_HASH_ORDER);
     let seq = load_u32(buf, in_next);
+    prefetchw(unsafe {
+        mf.hash_tab
+            .as_ptr()
+            .add(*next_hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
+    });
 
     // --- C: the BUCKET_SIZE == 2 hand-unrolled version ---
     let s0 = mf.slot(hash, 0);
@@ -281,6 +287,11 @@ pub(crate) fn ht_matchfinder_skip_bytes(
         }
     }
 
+    prefetchw(unsafe {
+        mf.hash_tab
+            .as_ptr()
+            .add(hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
+    });
     *next_hash = hash;
 }
 

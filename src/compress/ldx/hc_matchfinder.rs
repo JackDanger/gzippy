@@ -25,7 +25,8 @@
 //! differential can be run per level, not because `hc.rs` was suspected.
 
 use super::matchfinder_common::{
-    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, MfPos, MATCHFINDER_WINDOW_SIZE,
+    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
+    MATCHFINDER_WINDOW_SIZE,
 };
 
 /// C: `#define HC_MATCHFINDER_HASH3_ORDER 15` (:110)
@@ -237,6 +238,8 @@ pub(crate) fn hc_matchfinder_longest_match(
     crate::anatomy_count!(hc_hash_computations);
     next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_MATCHFINDER_HASH3_ORDER);
     next_hashes[1] = lz_hash(next_hashseq, HC_MATCHFINDER_HASH4_ORDER);
+    prefetchw(unsafe { mf.hash3_tab.as_ptr().add(next_hashes[0] as usize) });
+    prefetchw(unsafe { mf.hash4_tab.as_ptr().add(next_hashes[1] as usize) });
 
     let mut matchptr: usize;
 
@@ -483,6 +486,8 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         }
     }
 
+    prefetchw(unsafe { mf.hash3_tab.as_ptr().add(hash3) });
+    prefetchw(unsafe { mf.hash4_tab.as_ptr().add(hash4) });
     next_hashes[0] = hash3 as u32;
     next_hashes[1] = hash4 as u32;
 }
