@@ -384,13 +384,44 @@ pub(crate) fn note_stored_block_emitted() {
 /// Levels where the T1 whole-buffer path runs zlib pick-min (L5-L7).
 #[inline]
 fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
-    matches!(level, 5..=7)
+    // DISABLED. See `level_uses_t1_mmap_pick_min` for the measurement.
+    let _ = level;
+    false
 }
 
 /// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
 #[inline]
+/// WHOLE-BUFFER PICK-MIN IS OFF. Both predicates return false; the arms and the
+/// fold below are gone.
+///
+/// It ran TWO full encodes per input and kept the smaller — at L1/L2/L4 (mmap)
+/// and L5-L7 (zlib), six of nine levels. Measured 2026-08-22, `-p1`, M1,
+/// min-of-7, both binaries sha-identified, and verified by COUNTING
+/// `encode_unpadded_deflate_bytes` invocations rather than trusting a predicate:
+///
+///     file          L   with pick-min   one encode   speedup
+///     dickens       1      3.23x ld       1.61x ld     2.01x
+///     dickens       2      2.19x          1.10x        1.98x
+///     dickens       4      2.22x          1.02x        2.18x
+///     dickens       6      2.06x          0.92x  <-WIN 2.24x
+///     data.parquet  6      2.22x          1.09x        2.05x
+///
+/// The second encode costs ~2x WALL AT EVERY LEVEL to buy size:
+///
+///     L1 +0.002%  L2 +0.279%  L4 +1.948%  L5 +0.273%  L6 +0.258%  L7 +0.064%
+///
+/// Owner priority (2026-08-22): **wall outranks size; tying on size is
+/// acceptable, losing on wall is not.** Under that rule the trade inverts — we
+/// were paying 2x on the axis that decides to defend a lead on the axis that
+/// does not.
+///
+/// Corroborated independently by `ir_vs_ldx` (same-host ratio, drift cancels):
+/// every two-encode level is 1.4-4.1x our own exact libdeflate port, while L9 —
+/// the one level that ran a SINGLE encode — is 0.67-0.81x and the only level we
+/// beat it.
 fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
-    matches!(level, 1 | 2 | 4)
+    let _ = level;
+    false
 }
 
 /// Pick-min helper: the arms run SEQUENTIALLY.
