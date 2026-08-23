@@ -76,6 +76,7 @@ fn bsr32(v: u32) -> i32 {
 /// register-allocated functions, each reached through the `c->impl` function
 /// pointer. Collapsing them into one `match` arm, as we did, let LLVM merge both
 /// instantiations (and the greedy and fastest paths) into a single function.
+#[inline(never)]
 pub(crate) fn deflate_compress_lazy(
     c: &mut Compressor,
     p: &mut GreedyState,
@@ -98,6 +99,7 @@ pub(crate) fn deflate_compress_lazy(
 }
 
 /// C: `deflate_compress_lazy2` (:2830) — `deflate_compress_lazy_generic(..., true)`.
+#[inline(never)]
 pub(crate) fn deflate_compress_lazy2(
     c: &mut Compressor,
     p: &mut GreedyState,

@@ -66,6 +66,7 @@ impl GreedyState {
 /// `in_max_block_end - in_next`, so each block re-approximates from its own data. The C
 /// also has `recalculate_min_match_len`, but greedy does not use it — only the lazy
 /// parsers do. Hoisting this out of the loop would be a different program.
+#[inline(never)]
 pub(crate) fn deflate_compress_greedy(
     c: &mut Compressor,
     p: &mut GreedyState,

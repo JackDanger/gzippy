@@ -85,6 +85,7 @@ impl FastestState {
 /// shortens them they stay short for the rest of the stream. Since they only shrink at
 /// the very end that is harmless, but recomputing them per iteration would be a
 /// different program.
+#[inline(never)]
 pub(crate) fn deflate_compress_fastest(
     c: &mut Compressor,
     p: &mut FastestState,
