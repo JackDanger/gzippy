@@ -74,9 +74,13 @@ pub(crate) fn sort_symbols(
 
     // for (sym = 0; sym < num_syms; sym++)
     //         counters[MIN(freqs[sym], num_counters - 1)]++;
+    debug_assert!(num_syms <= freqs.len() && num_syms <= lens.len() && num_syms <= symout.len());
     for sym in 0..num_syms {
-        let idx = core::cmp::min(freqs[sym] as usize, num_counters - 1);
-        counters[idx] += 1;
+        let idx = core::cmp::min(
+            unsafe { *freqs.get_unchecked(sym) } as usize,
+            num_counters - 1,
+        );
+        unsafe { *counters.get_unchecked_mut(idx) += 1 };
     }
 
     // Sum the counts to transform them into offsets.
@@ -86,21 +90,23 @@ pub(crate) fn sort_symbols(
     // contribute to any offset.
     let mut num_used_syms = 0usize;
     for i in 1..num_counters {
-        let count = counters[i];
-        counters[i] = num_used_syms;
+        let count = unsafe { *counters.get_unchecked(i) };
+        unsafe { *counters.get_unchecked_mut(i) = num_used_syms };
         num_used_syms += count;
     }
 
     // Sort the symbols into symout, in order of increasing frequency.
     for sym in 0..num_syms {
-        let freq = freqs[sym];
+        let freq = unsafe { *freqs.get_unchecked(sym) };
 
         if freq != 0 {
             let idx = core::cmp::min(freq as usize, num_counters - 1);
-            symout[counters[idx]] = (sym as u32) | (freq << NUM_SYMBOL_BITS);
-            counters[idx] += 1;
+            let slot = unsafe { *counters.get_unchecked(idx) };
+            debug_assert!(slot < symout.len());
+            unsafe { *symout.get_unchecked_mut(slot) = (sym as u32) | (freq << NUM_SYMBOL_BITS) };
+            unsafe { *counters.get_unchecked_mut(idx) += 1 };
         } else {
-            lens[sym] = 0;
+            unsafe { *lens.get_unchecked_mut(sym) = 0 };
         }
     }
 
@@ -111,9 +117,10 @@ pub(crate) fn sort_symbols(
     // After the fill loop each counters[i] points just past the end of bucket i,
     // so counters[num_counters - 2] is the START of the last bucket and
     // counters[num_counters - 1] is its END.
-    let start = counters[num_counters - 2];
-    let end = counters[num_counters - 1];
-    heap_sort(&mut symout[start..], end - start);
+    let start = unsafe { *counters.get_unchecked(num_counters - 2) };
+    let end = unsafe { *counters.get_unchecked(num_counters - 1) };
+    debug_assert!(start <= end && end <= symout.len());
+    heap_sort(unsafe { symout.get_unchecked_mut(start..) }, end - start);
 
     num_used_syms
 }
@@ -185,26 +192,46 @@ pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
     loop {
         let new_freq: u32;
 
-        if i + 1 <= last_idx && (b == e || (a[i + 1] & FREQ_MASK) <= (a[b] & FREQ_MASK)) {
+        if i + 1 <= last_idx
+            && (b == e
+                || (unsafe { *a.get_unchecked(i + 1) } & FREQ_MASK)
+                    <= (unsafe { *a.get_unchecked(b) } & FREQ_MASK))
+        {
             // Two leaves are the cheapest pair.
-            new_freq = (a[i] & FREQ_MASK) + (a[i + 1] & FREQ_MASK);
+            new_freq = (unsafe { *a.get_unchecked(i) } & FREQ_MASK)
+                + (unsafe { *a.get_unchecked(i + 1) } & FREQ_MASK);
             i += 2;
-        } else if b + 2 <= e && (i > last_idx || (a[b + 1] & FREQ_MASK) < (a[i] & FREQ_MASK)) {
+        } else if b + 2 <= e
+            && (i > last_idx
+                || (unsafe { *a.get_unchecked(b + 1) } & FREQ_MASK)
+                    < (unsafe { *a.get_unchecked(i) } & FREQ_MASK))
+        {
             // Two internal nodes are the cheapest pair. Record `e` as their parent.
-            new_freq = (a[b] & FREQ_MASK) + (a[b + 1] & FREQ_MASK);
-            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
-            a[b + 1] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b + 1] & SYMBOL_MASK);
+            new_freq = (unsafe { *a.get_unchecked(b) } & FREQ_MASK)
+                + (unsafe { *a.get_unchecked(b + 1) } & FREQ_MASK);
+            unsafe {
+                *a.get_unchecked_mut(b) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK)
+            };
+            unsafe {
+                *a.get_unchecked_mut(b + 1) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b + 1) & SYMBOL_MASK)
+            };
             b += 2;
         } else {
             // One leaf and one internal node. Only the internal node needs its
             // parent recorded here; the leaf's parent is recorded when the leaf
             // slot is later overwritten as a node (see the C's comment).
-            new_freq = (a[i] & FREQ_MASK) + (a[b] & FREQ_MASK);
-            a[b] = ((e as u32) << NUM_SYMBOL_BITS) | (a[b] & SYMBOL_MASK);
+            new_freq = (unsafe { *a.get_unchecked(i) } & FREQ_MASK)
+                + (unsafe { *a.get_unchecked(b) } & FREQ_MASK);
+            unsafe {
+                *a.get_unchecked_mut(b) =
+                    ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK)
+            };
             i += 1;
             b += 1;
         }
-        a[e] = new_freq | (a[e] & SYMBOL_MASK);
+        unsafe { *a.get_unchecked_mut(e) = new_freq | (*a.get_unchecked(e) & SYMBOL_MASK) };
 
         e += 1;
         if e >= last_idx {
@@ -264,16 +291,17 @@ pub(crate) fn compute_length_counts(
 ) {
     // for (len = 0; len <= max_codeword_len; len++) len_counts[len] = 0;
     for len in 0..=max_codeword_len {
-        len_counts[len] = 0;
+        unsafe { *len_counts.get_unchecked_mut(len) = 0 };
     }
 
     // The root node counts as 2 codewords of length 1: it has two children, and
     // every codeword descends from one of them.
-    len_counts[1] = 2;
+    unsafe { *len_counts.get_unchecked_mut(1) = 2 };
 
     // Set the root node's depth to 0. (The high bits held its parent index, which
     // is meaningless for the root.)
-    a[root_idx] &= SYMBOL_MASK;
+    debug_assert!(root_idx < a.len());
+    unsafe { *a.get_unchecked_mut(root_idx) &= SYMBOL_MASK };
 
     // Walk from the root downward. `node` descends, and because a node's parent
     // always has a GREATER index, every parent's depth is already computed by the
@@ -283,12 +311,16 @@ pub(crate) fn compute_length_counts(
     // ends when node goes negative. A usize would wrap, so this is written as a
     // descending range — the visit order is identical.
     for node in (0..root_idx).rev() {
-        let parent = (a[node] >> NUM_SYMBOL_BITS) as usize;
-        let parent_depth = a[parent] >> NUM_SYMBOL_BITS;
+        let parent = (unsafe { *a.get_unchecked(node) } >> NUM_SYMBOL_BITS) as usize;
+        debug_assert!(parent < a.len());
+        let parent_depth = unsafe { *a.get_unchecked(parent) } >> NUM_SYMBOL_BITS;
         let mut depth = parent_depth + 1;
 
         // Overwrite the parent index with this node's depth, in place.
-        a[node] = (a[node] & SYMBOL_MASK) | (depth << NUM_SYMBOL_BITS);
+        unsafe {
+            *a.get_unchecked_mut(node) =
+                (*a.get_unchecked(node) & SYMBOL_MASK) | (depth << NUM_SYMBOL_BITS)
+        };
 
         // If needed, decrease the length to meet the length-limited constraint,
         // paying for it by lengthening a codeword at some shorter, non-empty length.
@@ -297,14 +329,14 @@ pub(crate) fn compute_length_counts(
             // do { depth--; } while (len_counts[depth] == 0);
             loop {
                 depth -= 1;
-                if len_counts[depth as usize] != 0 {
+                if unsafe { *len_counts.get_unchecked(depth as usize) } != 0 {
                     break;
                 }
             }
         }
 
-        len_counts[depth as usize] -= 1;
-        len_counts[depth as usize + 1] += 2;
+        unsafe { *len_counts.get_unchecked_mut(depth as usize) -= 1 };
+        unsafe { *len_counts.get_unchecked_mut(depth as usize + 1) += 2 };
     }
 }
 
@@ -377,11 +409,19 @@ pub(crate) fn gen_codewords(
     let mut next_codewords = [0u32; super::DEFLATE_MAX_CODEWORD_LEN as usize + 1];
 
     // Pass 1: assign lengths, longest first, to the least frequent symbols.
+    // `len <= max_codeword_len < len_counts.len()`; the counts sum to the number of
+    // used symbols, so `i < num_syms <= a.len()`; and `a[i] & SYMBOL_MASK` is a
+    // symbol index `< num_syms <= lens.len()`. The C indexes raw pointers here.
+    debug_assert!(max_codeword_len < len_counts.len());
+    debug_assert!(num_syms <= a.len() && num_syms <= lens.len());
     let mut i: usize = 0;
     for len in (1..=max_codeword_len).rev() {
-        let mut count = len_counts[len];
+        let mut count = unsafe { *len_counts.get_unchecked(len) };
         while count != 0 {
-            lens[(a[i] & SYMBOL_MASK) as usize] = len as u8;
+            debug_assert!(i < num_syms);
+            let sym = (unsafe { *a.get_unchecked(i) } & SYMBOL_MASK) as usize;
+            debug_assert!(sym < lens.len());
+            unsafe { *lens.get_unchecked_mut(sym) = len as u8 };
             i += 1;
             count -= 1;
         }
@@ -391,13 +431,20 @@ pub(crate) fn gen_codewords(
     next_codewords[0] = 0;
     next_codewords[1] = 0;
     for len in 2..=max_codeword_len {
-        next_codewords[len] = (next_codewords[len - 1] + len_counts[len - 1]) << 1;
+        unsafe {
+            *next_codewords.get_unchecked_mut(len) =
+                (*next_codewords.get_unchecked(len - 1) + *len_counts.get_unchecked(len - 1)) << 1;
+        }
     }
 
     for sym in 0..num_syms {
-        let len = lens[sym];
-        a[sym] = reverse_codeword(next_codewords[len as usize], len);
-        next_codewords[len as usize] += 1;
+        let len = unsafe { *lens.get_unchecked(sym) };
+        debug_assert!((len as usize) < next_codewords.len());
+        unsafe {
+            *a.get_unchecked_mut(sym) =
+                reverse_codeword(*next_codewords.get_unchecked(len as usize), len);
+            *next_codewords.get_unchecked_mut(len as usize) += 1;
+        }
     }
 }
 
