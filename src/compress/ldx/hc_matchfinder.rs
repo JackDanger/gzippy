@@ -297,9 +297,26 @@ pub(crate) fn hc_matchfinder_skip_bytes(
             *in_base += MATCHFINDER_WINDOW_SIZE as usize;
             cur_pos = 0;
         }
-        mf.hash3_tab[hash3] = cur_pos as MfPos;
-        mf.next_tab[cur_pos as usize] = mf.hash4_tab[hash4];
-        mf.hash4_tab[hash4] = cur_pos as MfPos;
+        // PROVEN-BOUNDS REGION. `lz_hash(seq, n)` is `(seq * K) >> (32 - n)`, so
+        // its result is `< 2^n` BY CONSTRUCTION: hash3 < 1<<HASH3_ORDER ==
+        // hash3_tab.len(), hash4 < 1<<HASH4_ORDER == hash4_tab.len(). `cur_pos`
+        // is reset to 0 at MATCHFINDER_WINDOW_SIZE by the slide check directly
+        // above, and next_tab.len() == MATCHFINDER_WINDOW_SIZE.
+        //
+        // This is the hottest loop at the SHALLOW levels: at L2
+        // `max_search_depth = 6`, so almost no chain walking happens and the
+        // cost is this insert. Measured on ARM 2026-08-22: L2's deficit vs the C
+        // DIVERGES with input size (1.07x at 16 KB -> 1.37x at 12 MB) while L9's
+        // CONVERGES and wins (1.07x -> 0.87x) — the deep path is already ahead,
+        // the shallow insert is the deficit.
+        debug_assert!(hash3 < mf.hash3_tab.len() && hash4 < mf.hash4_tab.len());
+        debug_assert!((cur_pos as usize) < mf.next_tab.len());
+        unsafe {
+            *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos;
+            let h4 = *mf.hash4_tab.get_unchecked(hash4);
+            *mf.next_tab.get_unchecked_mut(cur_pos as usize) = h4;
+            *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
+        }
 
         p += 1;
         let next_hashseq = load_u32(buf, p);
