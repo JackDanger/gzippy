@@ -254,6 +254,7 @@ pub fn max_passthrough_size(level: u32) -> usize {
 }
 
 pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
+    crate::compress::deflate::encode_census::port_encode();
     let Some(mut c) = compress::LdxCompressor::new(level) else {
         return false;
     };

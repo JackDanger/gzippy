@@ -813,9 +813,6 @@ pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
     // piping cost 5,429,807 B = 0.6377% larger, up to 2.535% at L4
     // (minjs.min.js). Per-level on engine.wasm: L4 +9,528 B, L5 +1,085,
     // L6 +754, L7 +70; L3/L8/L9 byte-identical (they run no pick-min).
-    if super::level_uses_t1_zlib_pick_min(level) || super::level_uses_t1_mmap_pick_min(level) {
-        return false;
-    }
     let strategy = super::level::params(level).strategy;
     if matches!(
         strategy,
