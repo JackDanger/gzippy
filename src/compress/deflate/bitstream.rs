@@ -89,10 +89,10 @@ impl BitWriter {
     /// `add_bits`/`ADD_BITS` in libdeflate requires the caller to flush often
     /// enough that `bitcount + n <= BITBUF_NBITS`. We keep the same LSB-first
     /// packing but auto-flush first whenever the accumulator could not
-    /// otherwise hold `n` more bits, so the primitive is safe for any `n <= 56`.
+    /// otherwise hold `n` more bits, so the primitive is safe for any `n <= 64`.
     #[inline]
     pub fn add_bits(&mut self, val: u64, n: u32) {
-        debug_assert!(n <= 57, "add_bits n={n} too large for a single word");
+        debug_assert!(n <= 64, "add_bits n={n} too large for a single word");
         debug_assert!(
             n == 64 || val < (1u64 << n),
             "add_bits value has bits above n"
