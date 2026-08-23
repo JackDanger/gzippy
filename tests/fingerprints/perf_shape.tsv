@@ -81,7 +81,7 @@ binary	6	huffman_tree_nodes_visited	0	23812
 binary	6	literals_emitted	568710	574340
 binary	6	match_length_bytes_total	479866	474236
 binary	6	matches_emitted	31678	27348
-binary	9	bitstream_flush_word_calls	177040	354111
+binary	9	bitstream_flush_word_calls	177569	354111
 binary	9	block_split_observations	599835	1780983
 binary	9	blocks_emitted_dynamic	4	8
 binary	9	bt_child_table_reads	0	10046493
@@ -96,7 +96,7 @@ binary	9	bt_probe_outcome_miss	0	3507469
 binary	9	bt_probe_outcome_too_short	0	4771163
 binary	9	dynamic_header_bits_total	2079	4059
 binary	9	emit_body_bits	5094407	10174862
-binary	9	hc_chain_table_reads	11697421	11697421
+binary	9	hc_chain_table_reads	11697420	11697421
 binary	9	hc_hash_computations	650373	650373
 binary	9	hc_head_table_reads	1300746	1300746
 binary	9	hc_head_table_writes	1300746	1300746
@@ -106,7 +106,7 @@ binary	9	hc_probe_outcome_accepted	131642	131642
 binary	9	hc_probe_outcome_miss	11559752	11559752
 binary	9	hc_probe_outcome_too_short	6027	6027
 binary	9	histogram_updates	625105	1246235
-binary	9	huffman_make_code_calls	12	109
+binary	9	huffman_make_code_calls	14	109
 binary	9	literals_emitted	574565	1142349
 binary	9	match_length_bytes_total	474011	954803
 binary	9	matches_emitted	25270	51943
@@ -185,7 +185,7 @@ noise	9	hc_probe_attempts	325491	325491
 noise	9	hc_probe_outcome_accepted	8	8
 noise	9	hc_probe_outcome_miss	325483	325483
 noise	9	histogram_updates	1048122	2096670
-noise	9	huffman_make_code_calls	12	81
+noise	9	huffman_make_code_calls	14	81
 noise	9	literals_emitted	1047230	2095724
 noise	9	match_length_bytes_total	1346	1428
 noise	9	matches_emitted	446	473
@@ -255,7 +255,7 @@ tabular	6	huffman_tree_nodes_visited	0	4286
 tabular	6	literals_emitted	121321	122959
 tabular	6	match_length_bytes_total	927255	925617
 tabular	6	matches_emitted	77174	75069
-tabular	9	bitstream_flush_word_calls	134464	270072
+tabular	9	bitstream_flush_word_calls	134669	270072
 tabular	9	block_split_observations	204174	587440
 tabular	9	blocks_emitted_dynamic	4	10
 tabular	9	bt_child_table_reads	0	6872731
@@ -280,7 +280,7 @@ tabular	9	hc_probe_outcome_accepted	171293	171293
 tabular	9	hc_probe_outcome_miss	19750118	19750118
 tabular	9	hc_probe_outcome_too_short	72372	72372
 tabular	9	histogram_updates	275492	555459
-tabular	9	huffman_make_code_calls	12	147
+tabular	9	huffman_make_code_calls	14	147
 tabular	9	literals_emitted	132856	271143
 tabular	9	match_length_bytes_total	915720	1826009
 tabular	9	matches_emitted	71318	142158
@@ -351,7 +351,7 @@ text	6	huffman_tree_nodes_visited	0	6428
 text	6	literals_emitted	32224	33553
 text	6	match_length_bytes_total	1016352	1015023
 text	6	matches_emitted	121838	121086
-text	9	bitstream_flush_word_calls	148641	286642
+text	9	bitstream_flush_word_calls	149040	286642
 text	9	block_split_observations	172431	453628
 text	9	blocks_emitted_dynamic	4	9
 text	9	bt_child_table_reads	0	7271806
@@ -366,7 +366,7 @@ text	9	bt_probe_outcome_miss	0	2203316
 text	9	bt_probe_outcome_too_short	0	2325783
 text	9	dynamic_header_bits_total	1910	4157
 text	9	emit_body_bits	2451968	4716298
-text	9	hc_chain_table_reads	25292382	25292382
+text	9	hc_chain_table_reads	25292381	25292382
 text	9	hc_hash_computations	396565	396565
 text	9	hc_head_table_reads	793130	793130
 text	9	hc_head_table_writes	793130	793130
@@ -376,7 +376,7 @@ text	9	hc_probe_outcome_accepted	299850	299850
 text	9	hc_probe_outcome_miss	24978030	24978030
 text	9	hc_probe_outcome_too_short	14502	14502
 text	9	histogram_updates	284499	550811
-text	9	huffman_make_code_calls	12	132
+text	9	huffman_make_code_calls	14	132
 text	9	literals_emitted	60363	73849
 text	9	match_length_bytes_total	988213	2023303
 text	9	matches_emitted	112068	238481
