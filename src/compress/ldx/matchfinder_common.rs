@@ -120,37 +120,69 @@ pub(crate) fn lz_extend(
     const WORDBYTES: u32 = 8;
     let mut len = start_len;
 
-    // The C's `UNALIGNED_ACCESS_IS_FAST` branch. `load_word_unaligned` reads
-    // WORDBYTES past the index, so it is only taken while a whole word is in bounds
-    // of BOTH pointers.
-    let word_at = |i: usize| -> u64 {
-        // The caller has already proven a whole word is readable here (see the
-        // `len + WORDBYTES <= max_len` guard on the loop below and the
-        // compressor's BUF_PAD). Hot: this is lz_extend's word compare.
-        debug_assert!(i + 8 <= buf.len());
-        let b = unsafe { (buf.as_ptr().add(i) as *const [u8; 8]).read_unaligned() };
-        u64::from_le_bytes(b)
+    // C's callers always bound `max_len` by the bytes remaining at `strptr`; a
+    // match pointer is earlier in the same input, so both whole-word reads are
+    // then in-bounds.  Clamp once here as well: the standalone unit primitive is
+    // intentionally usable with a larger logical limit, whereas the C helper has
+    // only production callers.  This replaces the previous two comparisons on
+    // every word with two cold, entry-only calculations.
+    let max_readable = core::cmp::min(
+        buf.len().saturating_sub(strptr),
+        buf.len().saturating_sub(matchptr),
+    );
+    let max_len = if max_readable < max_len as usize {
+        max_readable as u32
+    } else {
+        max_len
     };
-    let in_bounds = |i: usize| i + 8 <= buf.len();
 
-    while len + WORDBYTES <= max_len
-        && in_bounds(matchptr + len as usize)
-        && in_bounds(strptr + len as usize)
-    {
-        let v_word = word_at(matchptr + len as usize) ^ word_at(strptr + len as usize);
+    #[inline(always)]
+    unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
+        // SAFETY: the caller proves that `[i, i + WORDBYTES)` is in `buf`.
+        u64::from_le(unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() })
+    }
+
+    // C: four `COMPARE_WORD_STEP`s before the regular word loop.  This is not
+    // merely an unroll hint: spelling all four keeps the same fast-path control
+    // flow and lets LLVM schedule the independent unaligned loads as C does.
+    if max_len - len >= 4 * WORDBYTES {
+        macro_rules! compare_word_step {
+            () => {{
+                // SAFETY: the enclosing guard leaves at least four full words.
+                let v_word = unsafe {
+                    load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
+                };
+                if v_word != 0 {
+                    return len + (v_word.trailing_zeros() >> 3);
+                }
+                len += WORDBYTES;
+            }};
+        }
+        compare_word_step!();
+        compare_word_step!();
+        compare_word_step!();
+        compare_word_step!();
+    }
+
+    while len + WORDBYTES <= max_len {
+        // SAFETY: the loop condition and entry clamp prove both loads fit.
+        let v_word = unsafe {
+            load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
+        };
         if v_word != 0 {
-            // CPU_IS_LITTLE_ENDIAN: len += bsfw(v_word) >> 3
+            // C: `len += bsfw(v_word) >> 3` on little-endian targets.
             return len + (v_word.trailing_zeros() >> 3);
         }
         len += WORDBYTES;
     }
 
-    while len < max_len && {
-        debug_assert!((matchptr + len as usize) < buf.len() && (strptr + len as usize) < buf.len());
-        unsafe {
-            *buf.get_unchecked(matchptr + len as usize) == *buf.get_unchecked(strptr + len as usize)
+    while len < max_len {
+        // SAFETY: `len < max_len` and the entry clamp prove both loads fit.
+        if unsafe {
+            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
+        } {
+            break;
         }
-    } {
         len += 1;
     }
     len
