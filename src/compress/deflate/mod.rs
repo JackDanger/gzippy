@@ -770,7 +770,21 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// and `LdxCompressor::new` returns `None` above 9.
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    level <= 9
+    // THE NON-STREAMING LEVELS ONLY. `ldx` is a WHOLE-BUFFER encoder; the
+    // streaming levels (0, 3, 8, 9 — see `level_streams`) reach the encoder
+    // through a second, chunked route that cannot call it, so routing only
+    // their whole-buffer path here made the two routes disagree.
+    //
+    // Caught by `unpadded_slice_is_byte_identical_to_whole_buffer` at
+    // `L3 len=1` — an input below `max_passthrough_size` (55 - 4*level), where
+    // ldx emits a stored block and our streaming path does not. On the real
+    // corpus the two are byte-identical at L0/L3/L8/L9, which is exactly why a
+    // size census could not see this and a same-input route-identity test could.
+    //
+    // Nothing is lost by the restriction: L0/L3/L8/L9 were ALREADY byte-identical
+    // to the port (verified per-byte, not per-size), so they had no gap to close.
+    // Every measured win is at 1/2/4/5/6/7 — the levels that ran pick-min.
+    !level_streams(level) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
