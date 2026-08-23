@@ -831,7 +831,30 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     // port does not), L6 (ledger: beats gzip AND pigz on binary and text), and
     // L7 (ladder coherence with L6) keep our encoder. L0/L3/L8/L9 stream and
     // were ALREADY byte-identical to the port.
-    matches!(level, 2)
+    // ⛔ EMPTY. The port ships at NO level — every candidate was rejected by a gate.
+    //
+    //   L1  fast_l1_ratio_multi_corpus  our igzip-derived L1 BEATS pigz -1 on text;
+    //                                   the port is 1.038x. Bar is <= ALL rivals.
+    //   L6  won_cells_stay_won (LEDGER) port loses text:L6 by 12,610 B to gzip.
+    //   L4/L7  ladder_is_monotone_t1    ported level came out LARGER than the one below.
+    //   L2  perf_shape                  the port carries NO anatomy counters, so routing
+    //                                   L2's T1 path to it zeroes every counter while T>1
+    //                                   keeps our encoder — `parallel_overhead_budget`
+    //                                   then compares live counts against zeros. Porting
+    //                                   a level BLINDS our instruments there, and it buys
+    //                                   1.9x wall on ONE level against 2 lost size cells.
+    //   L0/L3/L8/L9                     stream; ALREADY byte-identical to the port.
+    //
+    // ⭐ THE FINDING: "we run 1.6-4.1x our own port to defend 0.1-2.3% of size, so ship
+    // the port" is HALF TRUE. The 1.6-4.1x is real — and it is the SECOND ENCODE, not the
+    // parameter choices. Our divergences from libdeflate at L1/L4/L6 are REAL WINS the
+    // port loses. The lever that survives is "one encode, our parse" (#356), not "replace
+    // our encoder".
+    //
+    // Kept as a named predicate rather than deleted so the next attempt starts from the
+    // gate list above instead of re-deriving it.
+    let _ = level;
+    false
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
