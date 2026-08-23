@@ -25,6 +25,23 @@ fn is_debug_enabled() -> bool {
 }
 
 /// A slot for storing a compressed block's output
+/// Size of the bounded reorder window: how many compressed blocks may be in flight.
+///
+/// ⭐ THE MEMORY BOUND LIVES HERE. This is a function of THREAD COUNT, never of block
+/// count — that is the whole point. The scheduler used to allocate one slot per block
+/// (`(0..num_blocks).map(BlockSlot::new)`) and the writer never released one, so peak
+/// RSS tracked the INPUT: 86.7 MiB in -> 226.1 MiB RSS at -p8, against a documented
+/// bound of "~128 MiB of payload at T16". Now `window * slot_capacity` is the cap.
+///
+/// `+ 2` keeps a block in flight ahead of the writer so workers are not serialised
+/// behind it. It must be `> num_threads` or the scheduler can deadlock: the worker
+/// holding the lowest unwritten block would be gated waiting for the writer, which is
+/// waiting for exactly that block. Asserted by `tests/scheduler_memory_bound.rs`.
+#[inline]
+pub fn reorder_window_for(num_threads: usize, num_blocks: usize) -> usize {
+    (num_threads + 2).min(num_blocks)
+}
+
 pub struct BlockSlot {
     /// Whether this block has been compressed
     ready: AtomicBool,
@@ -105,6 +122,26 @@ impl BlockSlot {
         *self.meta.get() = meta;
     }
 
+    /// Release this slot for reuse by a later block (writer thread, after the
+    /// fragment has been spliced out).
+    ///
+    /// Truncates rather than frees: the allocation is the point of the pool, and
+    /// `Vec::clear` keeps capacity. Clearing `ready` with `Release` and then bumping
+    /// the writer's counter (also `Release`) is what lets the next worker for this
+    /// ring position see a reset slot rather than the previous block's `ready`.
+    ///
+    /// # Safety
+    /// Only call from the writer thread, after `is_ready()` and after the data has
+    /// been consumed. No worker may hold a reference to this slot at that point —
+    /// guaranteed by the reorder window: a worker for block `i` does not touch this
+    /// slot until the writer has released block `i - window`.
+    #[inline]
+    pub unsafe fn release(&self) {
+        (*self.data.get()).clear();
+        *self.meta.get() = ChunkMeta::ALIGNED;
+        self.ready.store(false, Ordering::Release);
+    }
+
     /// Get this block's splice metadata (writer thread, after `is_ready`).
     #[inline]
     pub fn meta(&self) -> ChunkMeta {
@@ -152,20 +189,46 @@ where
         );
     }
 
-    // Pre-allocate output slots with conservative capacity
+    // BOUNDED REORDER WINDOW — output memory is O(threads), not O(input).
+    //
+    // This used to allocate ONE SLOT PER BLOCK up front, each ~1.1x block_size, and
+    // the writer never released one after splicing (`slots` is borrowed immutably by
+    // the writer AND every worker, so nothing COULD be freed). Peak RSS therefore
+    // tracked the INPUT, not the worker count — measured on this box before the fix:
+    //
+    //     movie.mp4    12.3 MiB in  ->   56.2 MiB peak RSS  (4.55x)
+    //     monorepo.tar 48.6 MiB in  ->   97.6 MiB peak RSS  (2.01x)
+    //     weights      86.7 MiB in  ->  226.1 MiB peak RSS  (2.61x, -p8)
+    //
+    // which contradicts the RSS bound `pipelined.rs` documents ("at T16 it allows
+    // ~128 MiB of payload") for any input past ~100 MiB.
+    //
+    // Now: a ring of `window` reusable slots. A worker claiming block `i` waits until
+    // the writer has released block `i - window`; the writer releases each slot right
+    // after splicing it.
+    //
+    // WHY `num_threads + 2` CANNOT DEADLOCK: workers claim strictly increasing block
+    // indices via `fetch_add`, so the lowest unwritten block is always held by some
+    // worker (or already ready). That worker computes `i - written == 0 < window` and
+    // is never blocked, so the writer always gets its next block. The +2 keeps one
+    // slot in flight ahead of the writer so workers are not serialised behind it.
     let alloc_start = Instant::now();
     let slot_capacity = block_size + (block_size / 10) + 1024;
-    let slots: Vec<BlockSlot> = (0..num_blocks)
-        .map(|_| BlockSlot::new(slot_capacity))
-        .collect();
+    let window = reorder_window_for(num_threads, num_blocks);
+    let slots: Vec<BlockSlot> = (0..window).map(|_| BlockSlot::new(slot_capacity)).collect();
     let alloc_time = alloc_start.elapsed();
+
+    // Blocks the writer has spliced AND released. Workers read this to find out
+    // whether their ring position is free yet.
+    let blocks_written = AtomicUsize::new(0);
 
     if debug {
         eprintln!(
-            "[gzippy] slot allocation: {}ms for {} slots ({}KB each)",
+            "[gzippy] slot allocation: {}ms for {} slots ({}KB each) — reorder window              {window} of {num_blocks} blocks, {}KB bounded",
             alloc_time.as_millis(),
-            num_blocks,
-            slot_capacity / 1024
+            window,
+            slot_capacity / 1024,
+            window * slot_capacity / 1024,
         );
     }
 
@@ -194,7 +257,10 @@ where
             // `write_all`s, so non-DEFLATE users of this scheduler are
             // unaffected.
             let mut splicer = BitSplicer::new();
-            for (slot_idx, slot) in slots.iter().enumerate() {
+            // Walk BLOCK indices and map them onto the ring; `slots.len()` is the
+            // reorder window, not the block count.
+            for slot_idx in 0..num_blocks {
+                let slot = &slots[slot_idx % window];
                 let wait_start = Instant::now();
                 let t0 = crate::infra::trace_spans::now_us();
                 wait_for_slot_ready(slot);
@@ -210,6 +276,12 @@ where
                 crate::infra::trace_spans::record("write", 0, t1, slot_idx, slot.data().len());
                 total_write_ns
                     .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                // Hand this ring position back. `release` clears `ready` with Release
+                // and the counter bump below is also Release, so the worker that
+                // acquires `blocks_written` sees a reset slot.
+                unsafe { slot.release() };
+                blocks_written.fetch_add(1, Ordering::Release);
             }
             // Zero-pad the trailing partial byte (normal DEFLATE padding
             // after the final BFINAL block).
@@ -225,6 +297,7 @@ where
         let compress_fn = &compress_fn;
         let slots_ref = &slots;
         let next_block_ref = &next_block;
+        let blocks_written_ref = &blocks_written;
         let total_compress_ns_ref = &total_compress_ns;
         let blocks_compressed_ref = &blocks_compressed;
         for wid in 0..num_threads {
@@ -235,6 +308,7 @@ where
                     num_blocks,
                     slots_ref,
                     next_block_ref,
+                    blocks_written_ref,
                     compress_fn,
                     total_compress_ns_ref,
                     blocks_compressed_ref,
@@ -295,6 +369,7 @@ fn worker_loop_timed<F>(
     num_blocks: usize,
     slots: &[BlockSlot],
     next_block: &AtomicUsize,
+    blocks_written: &AtomicUsize,
     compress_fn: &F,
     total_compress_ns: &AtomicU64,
     blocks_compressed: &AtomicUsize,
@@ -307,6 +382,29 @@ fn worker_loop_timed<F>(
         let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
         if block_idx >= num_blocks {
             break;
+        }
+
+        // WAIT FOR RING SPACE. This ring position is shared with block
+        // `block_idx - window`, so it must not be touched until the writer has
+        // spliced and released that block. Acquire pairs with the writer's Release
+        // bump, so once this returns the slot is observed reset.
+        //
+        // Cannot deadlock: workers claim strictly increasing indices, so the lowest
+        // unwritten block is always held by some worker, and for that worker
+        // `block_idx - blocks_written == 0 < window`.
+        let window = slots.len();
+        if block_idx >= window {
+            let mut spins = 0u32;
+            while block_idx - blocks_written.load(Ordering::Acquire) >= window {
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    // Yield rather than burn a core: this thread is waiting on the
+                    // writer, not on work.
+                    std::thread::yield_now();
+                }
+            }
         }
 
         // Calculate block boundaries
@@ -325,15 +423,16 @@ fn worker_loop_timed<F>(
 
         let is_last = block_idx == num_blocks - 1;
 
-        // Get output buffer from pre-allocated slot
-        let output = unsafe { slots[block_idx].data_mut() };
+        // Get output buffer from the ring position for this block
+        let slot = &slots[block_idx % slots.len()];
+        let output = unsafe { slot.data_mut() };
 
         // Time the compression
         let compress_start = Instant::now();
         let t0 = crate::infra::trace_spans::now_us();
         let meta = compress_fn(block_idx, block, dict, is_last, output);
         crate::infra::trace_spans::record("chunk_compress", trace_tid, t0, block_idx, block.len());
-        unsafe { slots[block_idx].set_meta(meta) };
+        unsafe { slot.set_meta(meta) };
         total_compress_ns.fetch_add(
             compress_start.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -341,7 +440,7 @@ fn worker_loop_timed<F>(
         blocks_compressed.fetch_add(1, Ordering::Relaxed);
 
         // Signal completion
-        slots[block_idx].mark_ready();
+        slot.mark_ready();
     }
 }
 
@@ -370,24 +469,30 @@ where
         return Ok(writer);
     }
 
+    // Same bounded reorder window as `compress_parallel` — see the long note there
+    // for why one-slot-per-block made peak RSS track the INPUT rather than the worker
+    // count, and why `num_threads + 2` cannot deadlock.
     let slot_capacity = block_size + (block_size / 10) + 1024;
-    let slots: Vec<BlockSlot> = (0..num_blocks)
-        .map(|_| BlockSlot::new(slot_capacity))
-        .collect();
+    let window = reorder_window_for(num_threads, num_blocks);
+    let slots: Vec<BlockSlot> = (0..window).map(|_| BlockSlot::new(slot_capacity)).collect();
 
     let next_block = AtomicUsize::new(0);
+    let blocks_written = AtomicUsize::new(0);
     let write_error = AtomicBool::new(false);
 
     thread::scope(|scope| {
         // Spawn dedicated writer thread
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
-            for slot in slots.iter() {
+            for block_idx in 0..num_blocks {
+                let slot = &slots[block_idx % window];
                 wait_for_slot_ready(slot);
                 if w.write_all(slot.data()).is_err() {
                     write_error.store(true, Ordering::Relaxed);
                     break;
                 }
+                unsafe { slot.release() };
+                blocks_written.fetch_add(1, Ordering::Release);
             }
             w
         });
@@ -400,13 +505,27 @@ where
                     break;
                 }
 
+                // Wait for ring space (see `compress_parallel`).
+                if block_idx >= window {
+                    let mut spins = 0u32;
+                    while block_idx - blocks_written.load(Ordering::Acquire) >= window {
+                        spins += 1;
+                        if spins < 64 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
                 let start = block_idx * block_size;
                 let end = (start + block_size).min(input.len());
                 let block = &input[start..end];
 
-                let output = unsafe { slots[block_idx].data_mut() };
+                let slot = &slots[block_idx % window];
+                let output = unsafe { slot.data_mut() };
                 compress_fn(block, output);
-                slots[block_idx].mark_ready();
+                slot.mark_ready();
             });
         }
 

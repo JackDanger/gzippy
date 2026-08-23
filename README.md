@@ -81,8 +81,11 @@ gzippy = "0.8"
 let compressed = gzippy::compress(&data, 6)?;
 let restored = gzippy::decompress(&compressed)?;
 
-// Explicit threads, or streaming without buffering the whole input:
+// Explicit worker count (parallel; buffers the whole input):
 let out = gzippy::compress_with_threads(&data, 6, 4)?;
+
+// Genuine streaming — output starts before input ends, memory does not scale
+// with input size. Single-threaded, because the parallel encoder is whole-buffer:
 let n = gzippy::compress_to_writer(reader, writer, 6)?;
 ```
 
