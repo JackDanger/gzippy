@@ -168,9 +168,9 @@ text	6	literals_emitted_fast	0
 text	6	match_length_bytes_total	1016352
 text	6	matches_emitted	121838
 text	6	matches_emitted_fast	0
-text	9	alloc_bytes	524621
-text	9	alloc_events	2
-text	9	bitstream_flush_word_calls	148641
+text	9	alloc_bytes	524320
+text	9	alloc_events	1
+text	9	bitstream_flush_word_calls	149040
 text	9	block_split_observations	172431
 text	9	blocks_emitted_dynamic	4
 text	9	blocks_emitted_fixed	0
@@ -200,7 +200,7 @@ text	9	fast_probe_outcome_accepted	0
 text	9	fast_probe_outcome_deferred	0
 text	9	fast_probe_outcome_miss	0
 text	9	fast_probe_outcome_too_short	0
-text	9	hc_chain_table_reads	25292382
+text	9	hc_chain_table_reads	25292381
 text	9	hc_hash_computations	396565
 text	9	hc_head_table_reads	793130
 text	9	hc_head_table_writes	793130
@@ -212,7 +212,7 @@ text	9	hc_probe_outcome_too_short	14502
 text	9	histogram_updates	284499
 text	9	huffman_exact_code_chosen	0
 text	9	huffman_length_limited_calls	0
-text	9	huffman_make_code_calls	12
+text	9	huffman_make_code_calls	14
 text	9	huffman_tree_nodes_visited	0
 text	9	literals_emitted	60363
 text	9	literals_emitted_fast	0
@@ -372,9 +372,9 @@ tabular	6	literals_emitted_fast	0
 tabular	6	match_length_bytes_total	927255
 tabular	6	matches_emitted	77174
 tabular	6	matches_emitted_fast	0
-tabular	9	alloc_bytes	524623
-tabular	9	alloc_events	2
-tabular	9	bitstream_flush_word_calls	134464
+tabular	9	alloc_bytes	524320
+tabular	9	alloc_events	1
+tabular	9	bitstream_flush_word_calls	134669
 tabular	9	block_split_observations	204174
 tabular	9	blocks_emitted_dynamic	4
 tabular	9	blocks_emitted_fixed	0
@@ -416,7 +416,7 @@ tabular	9	hc_probe_outcome_too_short	72372
 tabular	9	histogram_updates	275492
 tabular	9	huffman_exact_code_chosen	0
 tabular	9	huffman_length_limited_calls	0
-tabular	9	huffman_make_code_calls	12
+tabular	9	huffman_make_code_calls	14
 tabular	9	huffman_tree_nodes_visited	0
 tabular	9	literals_emitted	132856
 tabular	9	literals_emitted_fast	0
@@ -576,9 +576,9 @@ binary	6	literals_emitted_fast	0
 binary	6	match_length_bytes_total	479866
 binary	6	matches_emitted	31678
 binary	6	matches_emitted_fast	0
-binary	9	alloc_bytes	524626
-binary	9	alloc_events	2
-binary	9	bitstream_flush_word_calls	177040
+binary	9	alloc_bytes	524320
+binary	9	alloc_events	1
+binary	9	bitstream_flush_word_calls	177569
 binary	9	block_split_observations	599835
 binary	9	blocks_emitted_dynamic	4
 binary	9	blocks_emitted_fixed	0
@@ -608,7 +608,7 @@ binary	9	fast_probe_outcome_accepted	0
 binary	9	fast_probe_outcome_deferred	0
 binary	9	fast_probe_outcome_miss	0
 binary	9	fast_probe_outcome_too_short	0
-binary	9	hc_chain_table_reads	11697421
+binary	9	hc_chain_table_reads	11697420
 binary	9	hc_hash_computations	650373
 binary	9	hc_head_table_reads	1300746
 binary	9	hc_head_table_writes	1300746
@@ -620,7 +620,7 @@ binary	9	hc_probe_outcome_too_short	6027
 binary	9	histogram_updates	625105
 binary	9	huffman_exact_code_chosen	0
 binary	9	huffman_length_limited_calls	0
-binary	9	huffman_make_code_calls	12
+binary	9	huffman_make_code_calls	14
 binary	9	huffman_tree_nodes_visited	0
 binary	9	literals_emitted	574565
 binary	9	literals_emitted_fast	0
@@ -780,8 +780,8 @@ noise	6	literals_emitted_fast	0
 noise	6	match_length_bytes_total	1346
 noise	6	matches_emitted	446
 noise	6	matches_emitted_fast	0
-noise	9	alloc_bytes	524609
-noise	9	alloc_events	2
+noise	9	alloc_bytes	524320
+noise	9	alloc_events	1
 noise	9	bitstream_flush_word_calls	0
 noise	9	block_split_observations	1047676
 noise	9	blocks_emitted_dynamic	0
@@ -824,7 +824,7 @@ noise	9	hc_probe_outcome_too_short	0
 noise	9	histogram_updates	1048122
 noise	9	huffman_exact_code_chosen	0
 noise	9	huffman_length_limited_calls	0
-noise	9	huffman_make_code_calls	12
+noise	9	huffman_make_code_calls	14
 noise	9	huffman_tree_nodes_visited	0
 noise	9	literals_emitted	1047230
 noise	9	literals_emitted_fast	0
