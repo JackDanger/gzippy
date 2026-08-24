@@ -6,6 +6,7 @@
 
 use super::heap::heap_sort;
 use super::DEFLATE_MAX_NUM_SYMS;
+use core::mem::MaybeUninit;
 
 // C: :816-819
 //
@@ -64,13 +65,23 @@ pub(crate) fn sort_symbols(
     symout: &mut [u32],
 ) -> usize {
     // unsigned counters[GET_NUM_COUNTERS(DEFLATE_MAX_NUM_SYMS)];
-    let mut counters = [0usize; DEFLATE_MAX_NUM_SYMS];
-
     let num_counters = get_num_counters(num_syms);
 
-    // memset(counters, 0, num_counters * sizeof(counters[0]));
-    // (already zero-initialised above; the slice below is the live prefix)
-    let counters = &mut counters[..num_counters];
+    // C's `unsigned` is 32 bits on every target we support.  These are counts
+    // and offsets within the at-most-288-symbol alphabet, so `u32` is also the
+    // exact Rust representation.  Just as importantly, C initializes only the
+    // live `num_counters` prefix (288 for litlen, 32 for offsets, 19 for the
+    // precode).  A `[0; DEFLATE_MAX_NUM_SYMS]` initializes all 288 entries on
+    // every call, including the two small alphabets at every dynamic block.
+    //
+    // Only this initialized prefix is ever exposed as `u32`, so the trailing
+    // `MaybeUninit` entries remain unobservable.
+    let mut counter_storage = [MaybeUninit::<u32>::uninit(); DEFLATE_MAX_NUM_SYMS];
+    let counters = unsafe {
+        let ptr = counter_storage.as_mut_ptr().cast::<u32>();
+        core::ptr::write_bytes(ptr, 0, num_counters);
+        core::slice::from_raw_parts_mut(ptr, num_counters)
+    };
 
     // for (sym = 0; sym < num_syms; sym++)
     //         counters[MIN(freqs[sym], num_counters - 1)]++;
@@ -90,8 +101,8 @@ pub(crate) fn sort_symbols(
     // contribute to any offset.
     let mut num_used_syms = 0usize;
     for i in 1..num_counters {
-        let count = unsafe { *counters.get_unchecked(i) };
-        unsafe { *counters.get_unchecked_mut(i) = num_used_syms };
+        let count = unsafe { *counters.get_unchecked(i) } as usize;
+        unsafe { *counters.get_unchecked_mut(i) = num_used_syms as u32 };
         num_used_syms += count;
     }
 
@@ -101,7 +112,7 @@ pub(crate) fn sort_symbols(
 
         if freq != 0 {
             let idx = core::cmp::min(freq as usize, num_counters - 1);
-            let slot = unsafe { *counters.get_unchecked(idx) };
+            let slot = unsafe { *counters.get_unchecked(idx) } as usize;
             debug_assert!(slot < symout.len());
             unsafe { *symout.get_unchecked_mut(slot) = (sym as u32) | (freq << NUM_SYMBOL_BITS) };
             unsafe { *counters.get_unchecked_mut(idx) += 1 };
@@ -117,8 +128,8 @@ pub(crate) fn sort_symbols(
     // After the fill loop each counters[i] points just past the end of bucket i,
     // so counters[num_counters - 2] is the START of the last bucket and
     // counters[num_counters - 1] is its END.
-    let start = unsafe { *counters.get_unchecked(num_counters - 2) };
-    let end = unsafe { *counters.get_unchecked(num_counters - 1) };
+    let start = unsafe { *counters.get_unchecked(num_counters - 2) } as usize;
+    let end = unsafe { *counters.get_unchecked(num_counters - 1) } as usize;
     debug_assert!(start <= end && end <= symout.len());
     heap_sort(unsafe { symout.get_unchecked_mut(start..) }, end - start);
 

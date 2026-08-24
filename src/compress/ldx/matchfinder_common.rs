@@ -140,8 +140,16 @@ pub(crate) fn prefetchw<T>(addr: *const T) {
 /// path is reproduced with `u64` loads and `trailing_zeros`, which is `bsfw` on
 /// little-endian; the result is identical to the byte loop, so the shape here is about
 /// codegen, not about the answer.
+/// # Safety
+///
+/// `max_len` bytes beginning at both `strptr` and `matchptr` must lie within
+/// `buf`, and `start_len <= max_len`.  The parsers establish this by capping
+/// `max_len` at the remaining input from `strptr` and only matching against an
+/// earlier input position.  This is the same caller-side contract as C's helper;
+/// keeping it in the type prevents a future direct caller from turning its
+/// unchecked loads into release-build undefined behaviour.
 #[inline(always)]
-pub(crate) fn lz_extend(
+pub(crate) unsafe fn lz_extend(
     buf: &[u8],
     strptr: usize,
     matchptr: usize,
@@ -325,7 +333,7 @@ mod tests {
             for max in [4u32, 8, 16, 17, 33, 64, 100, 258] {
                 let start = 0u32;
                 assert_eq!(
-                    lz_extend(&buf, 256, 0, start, max),
+                    unsafe { lz_extend(&buf, 256, 0, start, max) },
                     naive(&buf, 256, 0, start, max),
                     "run={run} max={max}"
                 );
@@ -351,6 +359,6 @@ mod tests {
         buf[20] = 1;
         buf[84] = 2;
 
-        assert_eq!(lz_extend(&buf, 64, 0, 4, 258), 20);
+        assert_eq!(unsafe { lz_extend(&buf, 64, 0, 4, 258) }, 20);
     }
 }

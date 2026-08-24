@@ -335,7 +335,7 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Found a match of length >= 4. Extend it to its full length.
         best_matchptr = matchptr;
         bump!(local.accepted);
-        best_len = lz_extend(buf, in_next, best_matchptr, 4, max_len);
+        best_len = unsafe { lz_extend(buf, in_next, best_matchptr, 4, max_len) };
         if best_len >= nice_len {
             *offset_ret = (in_next - best_matchptr) as u32;
             {
@@ -401,7 +401,7 @@ pub(crate) fn hc_matchfinder_longest_match(
 
         // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
         // the extension may start at 4 rather than 0.
-        let len = lz_extend(buf, in_next, matchptr, 4, max_len);
+        let len = unsafe { lz_extend(buf, in_next, matchptr, 4, max_len) };
         if len <= best_len {
             // Passed the 4-byte test but did not beat the incumbent — the legacy
             // accumulator calls this outcome `too_short`.

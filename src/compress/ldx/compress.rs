@@ -149,6 +149,11 @@ impl LdxCompressor {
     ///
     /// Returns the compressed size in bytes, or 0 if the output buffer is too small.
     pub(crate) fn compress(&mut self, r#in: &[u8], in_nbytes: usize, out: &mut [u8]) -> usize {
+        // Every production caller passes `input.len()`.  Keep that boundary
+        // contract checked: the matchfinders use unchecked input loads after this
+        // entry point has selected the logical input extent.
+        debug_assert!(in_nbytes <= r#in.len());
+
         // For extremely short inputs, or for compression level 0, just output
         // uncompressed blocks.
         if in_nbytes <= self.max_passthrough_size {
