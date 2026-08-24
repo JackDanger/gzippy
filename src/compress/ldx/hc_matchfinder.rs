@@ -215,16 +215,21 @@ pub(crate) fn hc_matchfinder_longest_match(
     let mut local = LdxHcCounters::default();
     let mut depth_remaining = max_search_depth;
     let mut best_matchptr: usize = in_next;
-    let mut cur_pos = (in_next - *in_base) as i32;
+    // C deliberately carries the current position as `u32`.  The table stores a
+    // signed 16-bit relative position, but the live position itself is never
+    // negative.  Keeping it unsigned avoids a sign-extension every time it is
+    // used to address `next_tab` while retaining the C wrap-before-narrowing
+    // cutoff calculation below.
+    let mut cur_pos = (in_next - *in_base) as u32;
 
-    if cur_pos == MATCHFINDER_WINDOW_SIZE {
+    if cur_pos == MATCHFINDER_WINDOW_SIZE as u32 {
         mf.slide_window();
         *in_base += MATCHFINDER_WINDOW_SIZE as usize;
         cur_pos = 0;
     }
 
     let in_base_v = *in_base;
-    let cutoff: MfPos = (cur_pos - MATCHFINDER_WINDOW_SIZE) as MfPos;
+    let cutoff: MfPos = cur_pos.wrapping_sub(MATCHFINDER_WINDOW_SIZE as u32) as MfPos;
 
     // Can we read 4 bytes from 'in_next + 1'?
     if max_len < 5 {
@@ -474,13 +479,15 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         return;
     }
 
-    let mut cur_pos = (in_next - *in_base) as i32;
+    // See `hc_matchfinder_longest_match`: this is a nonnegative live position,
+    // so use C's unsigned representation for direct table addressing.
+    let mut cur_pos = (in_next - *in_base) as u32;
     let mut hash3 = next_hashes[0] as usize;
     let mut hash4 = next_hashes[1] as usize;
     let mut p = in_next;
 
     loop {
-        if cur_pos == MATCHFINDER_WINDOW_SIZE {
+        if cur_pos == MATCHFINDER_WINDOW_SIZE as u32 {
             mf.slide_window();
             *in_base += MATCHFINDER_WINDOW_SIZE as usize;
             cur_pos = 0;
