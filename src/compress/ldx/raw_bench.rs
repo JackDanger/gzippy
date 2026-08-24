@@ -14,10 +14,11 @@
 //! `SIDE` is `rust`, `c`, or `alternate` (the default).  Use `rust` or `c` for
 //! `perf stat` and `perf record`; alternating intentionally perturbs the other
 //! compressor's cache footprint and is only a directional wall-time check. `ITERS`
-//! and `WARMUP` default to 100 and 3. The libdeflater crate uses libdeflate 1.25,
-//! matching this repository's vendored API version. This harness measures aggregate
-//! raw-compression work; phase attribution still requires sampled symbols or explicit
-//! counters.
+//! and `WARMUP` default to 100 and 3. `VALIDATE=0` skips the one-time dual
+//! compression/decode check for callgrind attribution; leave it enabled for all
+//! ordinary measurements. The libdeflater crate uses libdeflate 1.25, matching this
+//! repository's vendored API version. This harness measures aggregate raw-compression
+//! work; phase attribution still requires sampled symbols or explicit counters.
 
 use super::compress::LdxCompressor;
 use flate2::read::DeflateDecoder;
@@ -41,6 +42,15 @@ fn env_usize(name: &str, default: usize) -> usize {
                 .unwrap_or_else(|_| panic!("{name} must be an unsigned integer"))
         })
         .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name).as_deref() {
+        Ok("1" | "true") => true,
+        Ok("0" | "false") => false,
+        Ok(other) => panic!("{name} must be 1, 0, true, or false; got {other:?}"),
+        Err(_) => default,
+    }
 }
 
 fn side_from_env() -> Side {
@@ -106,6 +116,7 @@ fn raw_deflate_in_process() {
     let iters = env_usize("GZIPPY_LDX_BENCH_ITERS", 100);
     assert!(iters != 0, "GZIPPY_LDX_BENCH_ITERS must be nonzero");
     let warmup = env_usize("GZIPPY_LDX_BENCH_WARMUP", 3);
+    let validate = env_bool("GZIPPY_LDX_BENCH_VALIDATE", true);
     let side = side_from_env();
 
     let mut rust = LdxCompressor::new(level).expect("validated LDX level");
@@ -119,12 +130,19 @@ fn raw_deflate_in_process() {
     // run serially and never read the prior output, so sharing is sound.
     let mut out = vec![0u8; bound];
 
-    // Validate the actual buffers once.  Timed iterations use the same fully
-    // initialized objects, but no decoder or allocation work.
-    let rust_size = run_rust(&mut rust, &input, &mut out);
-    decode_exact(&out[..rust_size], &input);
-    let vendor_size = run_c(&mut vendor, &input, &mut out);
-    decode_exact(&out[..vendor_size], &input);
+    // Validate the actual buffers once. Timed iterations use the same fully
+    // initialized objects, but no decoder or allocation work. Callgrind needs
+    // the ability to omit this setup entirely so it can count one selected
+    // compressor call without a decoder or the opposite compressor mixed in.
+    let validated_sizes = if validate {
+        let rust_size = run_rust(&mut rust, &input, &mut out);
+        decode_exact(&out[..rust_size], &input);
+        let vendor_size = run_c(&mut vendor, &input, &mut out);
+        decode_exact(&out[..vendor_size], &input);
+        Some((rust_size, vendor_size))
+    } else {
+        None
+    };
 
     for i in 0..warmup {
         match side {
@@ -194,8 +212,11 @@ fn raw_deflate_in_process() {
         Side::Alternate => {
             report("rust", rust_elapsed, iters);
             report("libdeflate", vendor_elapsed, iters);
+            let sizes = validated_sizes
+                .map(|(rust, c)| format!("raw sizes rust={rust}, c={c}"))
+                .unwrap_or_else(|| "round-trip validation disabled".to_owned());
             eprintln!(
-                "ratio rust/c={:.4} (raw sizes rust={rust_size}, c={vendor_size})",
+                "ratio rust/c={:.4} ({sizes})",
                 rust_elapsed.as_secs_f64() / vendor_elapsed.as_secs_f64(),
             );
         }
