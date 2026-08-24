@@ -214,7 +214,6 @@ pub(crate) fn hc_matchfinder_longest_match(
     #[allow(unused_mut)]
     let mut local = LdxHcCounters::default();
     let mut depth_remaining = max_search_depth;
-    let mut best_matchptr: usize = in_next;
     // C deliberately carries the current position as `u32`.  The table stores a
     // signed 16-bit relative position, but the live position itself is never
     // negative.  Keeping it unsigned avoids a sign-extension every time it is
@@ -228,12 +227,17 @@ pub(crate) fn hc_matchfinder_longest_match(
         cur_pos = 0;
     }
 
-    let in_base_v = *in_base;
     let cutoff: MfPos = cur_pos.wrapping_sub(MATCHFINDER_WINDOW_SIZE as u32) as MfPos;
+    // Keep C's cursor representation through the probe.  Reconstructing these
+    // pointers from a slice base and integer index at every chain node left a
+    // repeated base reload in the inner loop on x86.
+    let in_base_ptr = unsafe { buf.as_ptr().add(*in_base) };
+    let in_next_ptr = unsafe { buf.as_ptr().add(in_next) };
+    let mut best_matchptr = in_next_ptr;
 
     // Can we read 4 bytes from 'in_next + 1'?
     if max_len < 5 {
-        *offset_ret = (in_next - best_matchptr) as u32;
+        *offset_ret = offset_between(in_next_ptr, best_matchptr);
         {
             local.flush();
             return best_len;
@@ -271,32 +275,32 @@ pub(crate) fn hc_matchfinder_longest_match(
     }
 
     // Compute the next hash codes.
-    let next_hashseq = load_u32(buf, in_next + 1);
+    let next_hashseq = unsafe { load_u32_ptr(in_next_ptr.add(1)) };
     crate::anatomy_count!(hc_hash_computations);
     next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_MATCHFINDER_HASH3_ORDER);
     next_hashes[1] = lz_hash(next_hashseq, HC_MATCHFINDER_HASH4_ORDER);
     prefetchw(unsafe { mf.tables.hash3_tab.as_ptr().add(next_hashes[0] as usize) });
     prefetchw(unsafe { mf.tables.hash4_tab.as_ptr().add(next_hashes[1] as usize) });
 
-    let mut matchptr: usize;
+    let mut matchptr: *const u8;
 
     if best_len < 4 {
         // No match of length >= 4 found yet.
 
         // Check for a length 3 match if needed.
         if cur_node3 <= cutoff {
-            *offset_ret = (in_next - best_matchptr) as u32;
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
                 return best_len;
             }
         }
 
-        let seq4 = load_u32(buf, in_next);
+        let seq4 = unsafe { load_u32_ptr(in_next_ptr) };
 
         if best_len < 3 {
-            matchptr = node_ptr(in_base_v, cur_node3);
-            if load_u24(buf, matchptr) == loaded_u32_to_u24(seq4) {
+            matchptr = unsafe { in_base_ptr.offset(cur_node3 as isize) };
+            if unsafe { load_u24_ptr(matchptr) } == loaded_u32_to_u24(seq4) {
                 best_len = 3;
                 best_matchptr = matchptr;
             }
@@ -304,7 +308,7 @@ pub(crate) fn hc_matchfinder_longest_match(
 
         // Check for a length 4 match.
         if cur_node4 <= cutoff {
-            *offset_ret = (in_next - best_matchptr) as u32;
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
                 return best_len;
@@ -313,10 +317,10 @@ pub(crate) fn hc_matchfinder_longest_match(
 
         loop {
             // No length 4 match found yet. Check the first 4 bytes.
-            matchptr = node_ptr(in_base_v, cur_node4);
+            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
 
             bump!(local.attempts);
-            if load_u32(buf, matchptr) == seq4 {
+            if unsafe { load_u32_ptr(matchptr) } == seq4 {
                 break;
             }
 
@@ -329,7 +333,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
-                *offset_ret = (in_next - best_matchptr) as u32;
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
@@ -340,9 +344,10 @@ pub(crate) fn hc_matchfinder_longest_match(
         // Found a match of length >= 4. Extend it to its full length.
         best_matchptr = matchptr;
         bump!(local.accepted);
-        best_len = unsafe { lz_extend(buf, in_next, best_matchptr, 4, max_len) };
+        best_len =
+            unsafe { lz_extend(buf, in_next, index_from_buf(buf, best_matchptr), 4, max_len) };
         if best_len >= nice_len {
-            *offset_ret = (in_next - best_matchptr) as u32;
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
                 return best_len;
@@ -356,14 +361,14 @@ pub(crate) fn hc_matchfinder_longest_match(
         cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
-            *offset_ret = (in_next - best_matchptr) as u32;
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
                 return best_len;
             }
         }
     } else if cur_node4 <= cutoff || best_len >= nice_len {
-        *offset_ret = (in_next - best_matchptr) as u32;
+        *offset_ret = offset_between(in_next_ptr, best_matchptr);
         {
             local.flush();
             return best_len;
@@ -373,16 +378,16 @@ pub(crate) fn hc_matchfinder_longest_match(
     // Check for matches of length >= 5.
     loop {
         loop {
-            matchptr = node_ptr(in_base_v, cur_node4);
+            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
 
             // Already found a length 4 match. Try for a longer match; start by
             // checking either the last 4 bytes and the first 4 bytes, or the last
             // byte. (The last byte, the one which would extend the match length by 1,
             // is the most important.)
             bump!(local.attempts);
-            if load_u32(buf, matchptr + best_len as usize - 3)
-                == load_u32(buf, in_next + best_len as usize - 3)
-                && load_u32(buf, matchptr) == load_u32(buf, in_next)
+            if unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
+                == unsafe { load_u32_ptr(in_next_ptr.add(best_len as usize - 3)) }
+                && unsafe { load_u32_ptr(matchptr) } == unsafe { load_u32_ptr(in_next_ptr) }
             {
                 break;
             }
@@ -396,7 +401,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
-                *offset_ret = (in_next - best_matchptr) as u32;
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
@@ -406,7 +411,7 @@ pub(crate) fn hc_matchfinder_longest_match(
 
         // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
         // the extension may start at 4 rather than 0.
-        let len = unsafe { lz_extend(buf, in_next, matchptr, 4, max_len) };
+        let len = unsafe { lz_extend(buf, in_next, index_from_buf(buf, matchptr), 4, max_len) };
         if len <= best_len {
             // Passed the 4-byte test but did not beat the incumbent — the legacy
             // accumulator calls this outcome `too_short`.
@@ -418,7 +423,7 @@ pub(crate) fn hc_matchfinder_longest_match(
             best_len = len;
             best_matchptr = matchptr;
             if best_len >= nice_len {
-                *offset_ret = (in_next - best_matchptr) as u32;
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
@@ -435,7 +440,7 @@ pub(crate) fn hc_matchfinder_longest_match(
         cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
-            *offset_ret = (in_next - best_matchptr) as u32;
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
                 return best_len;
@@ -547,10 +552,22 @@ fn cutoff_or_exhausted(cur_node: MfPos, cutoff: MfPos, depth_remaining: &mut u32
     *depth_remaining == 0
 }
 
-/// C: `matchptr = &in_base[cur_node]` — SIGNED, see `ht_matchfinder::node_ptr`.
+/// C: `in_next - best_matchptr`.
 #[inline(always)]
-fn node_ptr(in_base: usize, cur_node: MfPos) -> usize {
-    (in_base as isize + cur_node as isize) as usize
+fn offset_between(in_next: *const u8, matchptr: *const u8) -> u32 {
+    // Both cursors are derived from the same input slice and the chain only
+    // reaches earlier positions, so the difference is nonnegative and fits the
+    // DEFLATE window.
+    unsafe { in_next.offset_from(matchptr) as u32 }
+}
+
+/// Return a cursor's byte index in `buf` for the index-based extension helper.
+///
+/// SAFETY: `p` must be derived from `buf` and point within it.  The cutoff
+/// checks before every chain-node dereference establish that here.
+#[inline(always)]
+unsafe fn index_from_buf(buf: &[u8], p: *const u8) -> usize {
+    unsafe { p.offset_from(buf.as_ptr()) as usize }
 }
 
 /// C: `loaded_u32_to_u24(u32 v)` (`matchfinder_common.h:21`), little-endian arm.
@@ -559,11 +576,21 @@ fn loaded_u32_to_u24(v: u32) -> u32 {
     v & 0xFF_FFFF
 }
 
+/// C: `load_u32_unaligned(const u8 *p)` (`matchfinder_common.h:31`).
+///
+/// SAFETY: `p..p+4` must be within the input allocation.  The longest-match
+/// caller has the same tail proof as C (`max_len >= 5`); chain pointers have
+/// already passed the cutoff check.
+#[inline(always)]
+unsafe fn load_u32_ptr(p: *const u8) -> u32 {
+    u32::from_le(unsafe { (p as *const u32).read_unaligned() })
+}
+
 /// C: `load_u24_unaligned(const u8 *p)` (`matchfinder_common.h:35`).
 /// **At least 4 bytes (not 3) must be available at `p`** — the C says so explicitly.
 #[inline(always)]
-fn load_u24(buf: &[u8], i: usize) -> u32 {
-    loaded_u32_to_u24(load_u32(buf, i))
+unsafe fn load_u24_ptr(p: *const u8) -> u32 {
+    loaded_u32_to_u24(unsafe { load_u32_ptr(p) })
 }
 
 #[inline(always)]
