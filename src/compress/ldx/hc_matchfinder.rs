@@ -37,25 +37,58 @@ pub(crate) const HC_MATCHFINDER_HASH4_ORDER: u32 = 16;
 const HASH3_LEN: usize = 1 << HC_MATCHFINDER_HASH3_ORDER;
 const HASH4_LEN: usize = 1 << HC_MATCHFINDER_HASH4_ORDER;
 const NEXT_LEN: usize = MATCHFINDER_WINDOW_SIZE as usize;
+const HASH_TABLE_LEN: usize = HASH3_LEN + HASH4_LEN;
+const HC_TABLE_LEN: usize = HASH_TABLE_LEN + NEXT_LEN;
+
+/// C: `struct MATCHFINDER_ALIGNED hc_matchfinder`.
+///
+/// The three tables must remain one object.  Besides allowing the one-pass C-shaped
+/// init/rebase operations below, this makes their addresses fixed offsets from one
+/// aligned base in the matchfinder's hot probe loop.  Three independent boxed slices
+/// are semantically equivalent but force three unrelated base loads there.
+#[repr(C, align(32))]
+struct HcTables {
+    hash3_tab: [MfPos; HASH3_LEN],
+    hash4_tab: [MfPos; HASH4_LEN],
+    next_tab: [MfPos; NEXT_LEN],
+}
+
+const _: () = assert!(core::mem::align_of::<HcTables>() >= 32);
+const _: () =
+    assert!(core::mem::size_of::<HcTables>() == HC_TABLE_LEN * core::mem::size_of::<MfPos>());
+const _: () = assert!(core::mem::size_of::<HcTables>().is_multiple_of(1024));
+
+impl HcTables {
+    #[inline(always)]
+    fn hash_tables_mut(&mut self) -> &mut [MfPos] {
+        // `repr(C)` keeps hash3 and hash4 adjacent, exactly as C's
+        // HC_MATCHFINDER_TOTAL_HASH_SIZE range requires.
+        unsafe {
+            core::slice::from_raw_parts_mut((self as *mut Self).cast::<MfPos>(), HASH_TABLE_LEN)
+        }
+    }
+
+    #[inline(always)]
+    fn all_mut(&mut self) -> &mut [MfPos] {
+        unsafe {
+            core::slice::from_raw_parts_mut((self as *mut Self).cast::<MfPos>(), HC_TABLE_LEN)
+        }
+    }
+}
 
 /// C: `struct hc_matchfinder` (:119)
 pub(crate) struct HcMatchfinder {
-    /// The hash table for finding length 3 matches.
-    pub(crate) hash3_tab: Box<[MfPos]>,
-    /// The hash table which contains the first nodes of the linked lists for finding
-    /// length 4+ matches.
-    pub(crate) hash4_tab: Box<[MfPos]>,
-    /// The "next node" references for the linked lists. The "next node" of the node
-    /// for the sequence with position `pos` is `next_tab[pos]`.
-    pub(crate) next_tab: Box<[MfPos]>,
+    tables: Box<HcTables>,
 }
 
 impl HcMatchfinder {
     pub(crate) fn new() -> Self {
         let mut mf = Self {
-            hash3_tab: vec![0 as MfPos; HASH3_LEN].into_boxed_slice(),
-            hash4_tab: vec![0 as MfPos; HASH4_LEN].into_boxed_slice(),
-            next_tab: vec![0 as MfPos; NEXT_LEN].into_boxed_slice(),
+            tables: Box::new(HcTables {
+                hash3_tab: [0; HASH3_LEN],
+                hash4_tab: [0; HASH4_LEN],
+                next_tab: [0; NEXT_LEN],
+            }),
         };
         mf.init();
         mf
@@ -66,8 +99,7 @@ impl HcMatchfinder {
     /// Prepare the matchfinder for a new input buffer. **Hash tables only** — see the
     /// module docs for why `next_tab` is deliberately left alone.
     pub(crate) fn init(&mut self) {
-        matchfinder_init(&mut self.hash3_tab);
-        matchfinder_init(&mut self.hash4_tab);
+        matchfinder_init(self.tables.hash_tables_mut());
     }
 
     /// C: `hc_matchfinder_slide_window(struct hc_matchfinder *mf)` (:144)
@@ -75,9 +107,7 @@ impl HcMatchfinder {
     /// Rebases ALL THREE arrays, including `next_tab` — the links are positions too.
     #[inline(always)]
     pub(crate) fn slide_window(&mut self) {
-        matchfinder_rebase(&mut self.hash3_tab);
-        matchfinder_rebase(&mut self.hash4_tab);
-        matchfinder_rebase(&mut self.next_tab);
+        matchfinder_rebase(self.tables.all_mut());
     }
 }
 
@@ -210,27 +240,29 @@ pub(crate) fn hc_matchfinder_longest_match(
     let hash4 = next_hashes[1] as usize;
 
     // From the hash buckets, get the first node of each linked list.
-    debug_assert!(hash3 < mf.hash3_tab.len() && hash4 < mf.hash4_tab.len());
+    debug_assert!(hash3 < mf.tables.hash3_tab.len() && hash4 < mf.tables.hash4_tab.len());
     let (cur_node3, mut cur_node4) = unsafe {
         (
-            *mf.hash3_tab.get_unchecked(hash3),
-            *mf.hash4_tab.get_unchecked(hash4),
+            *mf.tables.hash3_tab.get_unchecked(hash3),
+            *mf.tables.hash4_tab.get_unchecked(hash4),
         )
     };
 
     // Update for length 3 matches. This replaces the singleton node in the 'hash3'
     // bucket with the node for the current sequence.
-    debug_assert!(hash3 < mf.hash3_tab.len());
+    debug_assert!(hash3 < mf.tables.hash3_tab.len());
     crate::anatomy_count!(hc_head_table_reads, 2u64);
     crate::anatomy_count!(hc_head_table_writes, 2u64);
-    unsafe { *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos };
+    unsafe { *mf.tables.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos };
 
     // Update for length 4 matches. This prepends the node for the current sequence to
     // the linked list in the 'hash4' bucket.
-    debug_assert!(hash4 < mf.hash4_tab.len() && (cur_pos as usize) < mf.next_tab.len());
+    debug_assert!(
+        hash4 < mf.tables.hash4_tab.len() && (cur_pos as usize) < mf.tables.next_tab.len()
+    );
     unsafe {
-        *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
-        *mf.next_tab.get_unchecked_mut(cur_pos as usize) = cur_node4;
+        *mf.tables.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
+        *mf.tables.next_tab.get_unchecked_mut(cur_pos as usize) = cur_node4;
     }
 
     // Compute the next hash codes.
@@ -238,8 +270,8 @@ pub(crate) fn hc_matchfinder_longest_match(
     crate::anatomy_count!(hc_hash_computations);
     next_hashes[0] = lz_hash(next_hashseq & 0xFF_FFFF, HC_MATCHFINDER_HASH3_ORDER);
     next_hashes[1] = lz_hash(next_hashseq, HC_MATCHFINDER_HASH4_ORDER);
-    prefetchw(unsafe { mf.hash3_tab.as_ptr().add(next_hashes[0] as usize) });
-    prefetchw(unsafe { mf.hash4_tab.as_ptr().add(next_hashes[1] as usize) });
+    prefetchw(unsafe { mf.tables.hash3_tab.as_ptr().add(next_hashes[0] as usize) });
+    prefetchw(unsafe { mf.tables.hash4_tab.as_ptr().add(next_hashes[1] as usize) });
 
     let mut matchptr: usize;
 
@@ -288,8 +320,8 @@ pub(crate) fn hc_matchfinder_longest_match(
             // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
             // Runs `max_search_depth` times PER POSITION (600 at L9).
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-            debug_assert!(ni < mf.next_tab.len());
-            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+            debug_assert!(ni < mf.tables.next_tab.len());
+            cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
@@ -315,8 +347,8 @@ pub(crate) fn hc_matchfinder_longest_match(
         // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
         // Runs `max_search_depth` times PER POSITION (600 at L9).
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-        debug_assert!(ni < mf.next_tab.len());
-        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+        debug_assert!(ni < mf.tables.next_tab.len());
+        cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
@@ -355,8 +387,8 @@ pub(crate) fn hc_matchfinder_longest_match(
             // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
             // Runs `max_search_depth` times PER POSITION (600 at L9).
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-            debug_assert!(ni < mf.next_tab.len());
-            cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+            debug_assert!(ni < mf.tables.next_tab.len());
+            cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             bump!(local.chain_reads);
             if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
                 *offset_ret = (in_next - best_matchptr) as u32;
@@ -394,8 +426,8 @@ pub(crate) fn hc_matchfinder_longest_match(
         // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
         // Runs `max_search_depth` times PER POSITION (600 at L9).
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-        debug_assert!(ni < mf.next_tab.len());
-        cur_node4 = unsafe { *mf.next_tab.get_unchecked(ni) };
+        debug_assert!(ni < mf.tables.next_tab.len());
+        cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
         bump!(local.chain_reads);
         if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
             *offset_ret = (in_next - best_matchptr) as u32;
@@ -465,13 +497,13 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         // DIVERGES with input size (1.07x at 16 KB -> 1.37x at 12 MB) while L9's
         // CONVERGES and wins (1.07x -> 0.87x) — the deep path is already ahead,
         // the shallow insert is the deficit.
-        debug_assert!(hash3 < mf.hash3_tab.len() && hash4 < mf.hash4_tab.len());
-        debug_assert!((cur_pos as usize) < mf.next_tab.len());
+        debug_assert!(hash3 < mf.tables.hash3_tab.len() && hash4 < mf.tables.hash4_tab.len());
+        debug_assert!((cur_pos as usize) < mf.tables.next_tab.len());
         unsafe {
-            *mf.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos;
-            let h4 = *mf.hash4_tab.get_unchecked(hash4);
-            *mf.next_tab.get_unchecked_mut(cur_pos as usize) = h4;
-            *mf.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
+            *mf.tables.hash3_tab.get_unchecked_mut(hash3) = cur_pos as MfPos;
+            *mf.tables.next_tab.get_unchecked_mut(cur_pos as usize) =
+                *mf.tables.hash4_tab.get_unchecked(hash4);
+            *mf.tables.hash4_tab.get_unchecked_mut(hash4) = cur_pos as MfPos;
         }
 
         p += 1;
@@ -486,8 +518,8 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         }
     }
 
-    prefetchw(unsafe { mf.hash3_tab.as_ptr().add(hash3) });
-    prefetchw(unsafe { mf.hash4_tab.as_ptr().add(hash4) });
+    prefetchw(unsafe { mf.tables.hash3_tab.as_ptr().add(hash3) });
+    prefetchw(unsafe { mf.tables.hash4_tab.as_ptr().add(hash4) });
     next_hashes[0] = hash3 as u32;
     next_hashes[1] = hash4 as u32;
 }
@@ -754,11 +786,11 @@ mod tests {
         let mut mf = HcMatchfinder::new();
         let mut in_base = 0usize;
         let mut next_hashes = [0xAAAA_1111u32, 0xBBBB_2222];
-        let before = (mf.hash3_tab[0], mf.hash4_tab[0]);
+        let before = (mf.tables.hash3_tab[0], mf.tables.hash4_tab[0]);
 
         hc_matchfinder_skip_bytes(&mut mf, &buf, &mut in_base, 54, 64, 8, &mut next_hashes);
         assert_eq!(next_hashes, [0xAAAA_1111u32, 0xBBBB_2222]);
-        assert_eq!((mf.hash3_tab[0], mf.hash4_tab[0]), before);
+        assert_eq!((mf.tables.hash3_tab[0], mf.tables.hash4_tab[0]), before);
     }
 
     /// `init` clears the hash tables and deliberately does NOT touch `next_tab`. Pinned
@@ -766,22 +798,22 @@ mod tests {
     #[test]
     fn init_clears_the_hash_tables_but_not_next_tab() {
         let mut mf = HcMatchfinder::new();
-        mf.next_tab[0] = 1234;
-        mf.hash3_tab[7] = 99;
-        mf.hash4_tab[9] = 77;
+        mf.tables.next_tab[0] = 1234;
+        mf.tables.hash3_tab[7] = 99;
+        mf.tables.hash4_tab[9] = 77;
 
         mf.init();
 
         assert_eq!(
-            mf.hash3_tab[7],
+            mf.tables.hash3_tab[7],
             super::super::matchfinder_common::MATCHFINDER_INITVAL
         );
         assert_eq!(
-            mf.hash4_tab[9],
+            mf.tables.hash4_tab[9],
             super::super::matchfinder_common::MATCHFINDER_INITVAL
         );
         assert_eq!(
-            mf.next_tab[0], 1234,
+            mf.tables.next_tab[0], 1234,
             "C: hc_matchfinder_init passes TOTAL_HASH_SIZE, not sizeof(*mf)"
         );
     }
