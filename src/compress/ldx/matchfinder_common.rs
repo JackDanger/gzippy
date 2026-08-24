@@ -151,21 +151,14 @@ pub(crate) fn lz_extend(
     const WORDBYTES: u32 = 8;
     let mut len = start_len;
 
-    // C's callers always bound `max_len` by the bytes remaining at `strptr`; a
-    // match pointer is earlier in the same input, so both whole-word reads are
-    // then in-bounds.  Clamp once here as well: the standalone unit primitive is
-    // intentionally usable with a larger logical limit, whereas the C helper has
-    // only production callers.  This replaces the previous two comparisons on
-    // every word with two cold, entry-only calculations.
-    let max_readable = core::cmp::min(
-        buf.len().saturating_sub(strptr),
-        buf.len().saturating_sub(matchptr),
-    );
-    let max_len = if max_readable < max_len as usize {
-        max_readable as u32
-    } else {
-        max_len
-    };
+    // C relies on this caller contract rather than clamping its inner-loop limit.
+    // The parsers establish it by capping `max_len` at bytes remaining from
+    // `strptr`; `matchptr` is an earlier input position.  Keep that proof live in
+    // debug builds, but do not turn it into release work on every extension.
+    debug_assert!(strptr <= buf.len() && matchptr <= buf.len());
+    debug_assert!(max_len as usize <= buf.len() - strptr);
+    debug_assert!(max_len as usize <= buf.len() - matchptr);
+    debug_assert!(start_len <= max_len);
 
     #[inline(always)]
     unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
@@ -320,7 +313,7 @@ mod tests {
 
         // A buffer where a match runs for a controlled number of bytes.
         for run in 0..80usize {
-            let mut buf = vec![0u8; 512];
+            let mut buf = vec![0u8; 600];
             // matchptr region at 0, strptr region at 256.
             for i in 0..run {
                 buf[i] = (i % 7) as u8;
@@ -346,7 +339,7 @@ mod tests {
     /// checking a 4-byte sequence equality.
     #[test]
     fn lz_extend_trusts_start_len() {
-        let mut buf = vec![0u8; 128];
+        let mut buf = vec![0u8; 400];
         // Deliberately make the first 4 bytes differ.
         buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
         buf[64..68].copy_from_slice(&[9, 9, 9, 9]);
