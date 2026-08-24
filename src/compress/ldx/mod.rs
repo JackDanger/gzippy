@@ -292,6 +292,9 @@ pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod raw_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
