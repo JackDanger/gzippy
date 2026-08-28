@@ -315,30 +315,40 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
         }
 
+        // C-shaped chain walk (libdeflate `hc_matchfinder_longest_match`): the
+        // cutoff/depth test happens on the node we have just loaded, BEFORE the next
+        // compare, so one check per step and the depth budget is a single `sub`.
+        // `matchptr` keeps the base folded into the live pointer so the base is not
+        // reloaded from the stack on every step.
+        matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
         loop {
-            // No length 4 match found yet. Check the first 4 bytes.
-            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
-
             bump!(local.attempts);
             if unsafe { load_u32_ptr(matchptr) } == seq4 {
                 break;
             }
 
-            // The first 4 bytes did not match. Keep trying.
-            // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
-            // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
-            // Runs `max_search_depth` times PER POSITION (600 at L9).
+            // The first 4 bytes did not match. Advance to the next node in the list,
+            // spending one step of the budget on the node we just loaded.
+            bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-            bump!(local.chain_reads);
-            if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
+            if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
                 }
             }
+            depth_remaining -= 1;
+            if depth_remaining == 0 {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
+            }
+            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
         }
 
         // Found a match of length >= 4. Extend it to its full length.
@@ -353,14 +363,20 @@ pub(crate) fn hc_matchfinder_longest_match(
                 return best_len;
             }
         }
-        // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
-        // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
-        // Runs `max_search_depth` times PER POSITION (600 at L9).
+        // One more chain step to enter the >=5 search, spending the budget in C's order.
+        bump!(local.chain_reads);
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.tables.next_tab.len());
         cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-        bump!(local.chain_reads);
-        if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
+        if cur_node4 <= cutoff {
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
+            {
+                local.flush();
+                return best_len;
+            }
+        }
+        depth_remaining -= 1;
+        if depth_remaining == 0 {
             *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
@@ -377,9 +393,9 @@ pub(crate) fn hc_matchfinder_longest_match(
 
     // Check for matches of length >= 5.
     loop {
+        // C-shaped inner chain walk: same budget order as the length-4 loop.
+        matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
         loop {
-            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
-
             // Already found a length 4 match. Try for a longer match; start by
             // checking either the last 4 bytes and the first 4 bytes, or the last
             // byte. (The last byte, the one which would extend the match length by 1,
@@ -392,21 +408,28 @@ pub(crate) fn hc_matchfinder_longest_match(
                 break;
             }
 
-            // Continue to the next node in the list.
-            // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
-            // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
-            // Runs `max_search_depth` times PER POSITION (600 at L9).
+            // Continue to the next node in the list, spending one step of the budget
+            // on the node we just loaded.
+            bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-            bump!(local.chain_reads);
-            if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
+            if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
                 }
             }
+            depth_remaining -= 1;
+            if depth_remaining == 0 {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
+            }
+            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
         }
 
         // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
@@ -431,15 +454,20 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
         }
 
-        // Continue to the next node in the list.
-        // CHAIN WALK: masked by `MATCHFINDER_WINDOW_SIZE - 1` on a table whose len IS
-        // MATCHFINDER_WINDOW_SIZE (power of two) — the bounds check is provably dead.
-        // Runs `max_search_depth` times PER POSITION (600 at L9).
+        // Continue to the next node in the list, spending the budget in C's order.
+        bump!(local.chain_reads);
         let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
         debug_assert!(ni < mf.tables.next_tab.len());
         cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-        bump!(local.chain_reads);
-        if cutoff_or_exhausted(cur_node4, cutoff, &mut depth_remaining) {
+        if cur_node4 <= cutoff {
+            *offset_ret = offset_between(in_next_ptr, best_matchptr);
+            {
+                local.flush();
+                return best_len;
+            }
+        }
+        depth_remaining -= 1;
+        if depth_remaining == 0 {
             *offset_ret = offset_between(in_next_ptr, best_matchptr);
             {
                 local.flush();
@@ -534,22 +562,6 @@ pub(crate) fn hc_matchfinder_skip_bytes(
     prefetchw(unsafe { mf.tables.hash4_tab.as_ptr().add(hash4) });
     next_hashes[0] = hash3 as u32;
     next_hashes[1] = hash4 as u32;
-}
-
-/// C: `if (cur_node4 <= cutoff || !--depth_remaining)`
-///
-/// **The `||` SHORT-CIRCUITS, so the decrement does not happen when the cutoff test
-/// fires.** Decrementing unconditionally and then testing gives the same control flow
-/// here — both paths return — but it is a different program, and in Rust it also opens
-/// an underflow when `depth_remaining` is already 0. Reproducing the short-circuit
-/// keeps the shape and closes that class.
-#[inline(always)]
-fn cutoff_or_exhausted(cur_node: MfPos, cutoff: MfPos, depth_remaining: &mut u32) -> bool {
-    if cur_node <= cutoff {
-        return true;
-    }
-    *depth_remaining -= 1;
-    *depth_remaining == 0
 }
 
 /// C: `in_next - best_matchptr`.
