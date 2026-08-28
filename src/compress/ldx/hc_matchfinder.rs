@@ -328,10 +328,12 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
 
             // The first 4 bytes did not match. Advance to the next node in the list,
-            // spending one step of the budget on the node we just loaded.
+            // spending one step of the budget on the node we just loaded. The candidate
+            // pointer moves by the node delta, so the base is never reloaded per step.
             bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
+            let prev = cur_node4;
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
@@ -348,7 +350,7 @@ pub(crate) fn hc_matchfinder_longest_match(
                     return best_len;
                 }
             }
-            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+            matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
         }
 
         // Found a match of length >= 4. Extend it to its full length.
@@ -409,10 +411,12 @@ pub(crate) fn hc_matchfinder_longest_match(
             }
 
             // Continue to the next node in the list, spending one step of the budget
-            // on the node we just loaded.
+            // on the node we just loaded. The candidate pointer moves by the node
+            // delta, so the base is never reloaded per step.
             bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
+            let prev = cur_node4;
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
@@ -429,7 +433,7 @@ pub(crate) fn hc_matchfinder_longest_match(
                     return best_len;
                 }
             }
-            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+            matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
         }
 
         // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
