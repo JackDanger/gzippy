@@ -243,12 +243,9 @@ impl PipelinedGzEncoder {
             self.compression_level,
             self.num_threads,
         );
-        // Exact libdeflate structure is a whole-stream property. Its parser
-        // makes decisions from one evolving matchfinder state, so independently
-        // encoding chunks cannot reproduce the same DEFLATE body. Levels 0-12
-        // therefore use the established one-shot encoder at every requested
-        // thread count. This is one encode, not a fallback or a candidate race.
-        if self.compression_level <= 12 {
+        // T1 uses the exact one-shot encoder. T>1 uses the parallel pipeline
+        // (which may emit different bytes than T1 — CLAUDE.md STEP 2 allows this).
+        if self.compression_level <= 12 && self.num_threads == 1 {
             return self.compress_exact_to_writer(data, &mut writer);
         }
         if data.is_empty() {
