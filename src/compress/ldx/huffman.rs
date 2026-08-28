@@ -58,6 +58,7 @@ const fn get_num_counters(num_syms: usize) -> usize {
 /// bucket — symbols with `freq >= num_counters - 1`, which all collide — gets
 /// `heap_sort`. That is the whole trick, and it is why the sort is O(n) in the
 /// common case.
+#[inline(always)]
 pub(crate) fn sort_symbols(
     num_syms: usize,
     freqs: &[u32],
@@ -184,6 +185,7 @@ pub(crate) fn sort_symbols(
 // arithmetically identical here, which is precisely why taking it costs a real
 // review property and buys nothing.
 #[allow(clippy::int_plus_one)]
+#[inline(always)]
 pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
     debug_assert!(
         sym_count >= 2,
@@ -294,6 +296,7 @@ pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
 /// costing 10-14% wall. So: this heuristic is the thing to COPY, not to improve.
 /// Replacing it with an exact limiter is a known-dead lever, and doing so would also
 /// break byte-identity, which is the entire point of this module.
+#[inline(always)]
 pub(crate) fn compute_length_counts(
     a: &mut [u32],
     root_idx: usize,
@@ -410,6 +413,7 @@ pub(crate) fn reverse_codeword(codeword: u32, len: u8) -> u32 {
 /// Note `next_codewords[0] = 0` is set but never used for a real symbol: length 0
 /// means "symbol does not occur". Assigning to it is harmless and keeps the
 /// indexing uniform, exactly as the C does.
+#[inline(always)]
 pub(crate) fn gen_codewords(
     a: &mut [u32],
     lens: &mut [u8],
@@ -497,6 +501,7 @@ pub(crate) fn gen_codewords(
 /// symbols is dead. Emitting a genuine 1-symbol code here would produce a stream
 /// that other decoders reject. This case is reached for real — e.g. a block whose
 /// offset alphabet is unused, or an all-one-byte input.
+#[inline(always)]
 pub(crate) fn deflate_make_huffman_code(
     num_syms: usize,
     max_codeword_len: usize,
