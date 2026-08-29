@@ -132,14 +132,15 @@ pub(crate) fn ht_matchfinder_longest_match(
 ) -> u32 {
     let mut best_len: u32 = 0;
     let mut best_matchptr: usize = in_next;
-    let mut cur_pos = (in_next - *in_base) as i32;
+    let mut in_base_local = *in_base;
+    let mut cur_pos = (in_next - in_base_local) as i32;
 
     // This is assumed throughout this function.
     const _: () = assert!(HT_MATCHFINDER_MIN_MATCH_LEN == 4);
 
     if cur_pos == MATCHFINDER_WINDOW_SIZE {
         mf.slide_window();
-        *in_base += MATCHFINDER_WINDOW_SIZE as usize;
+        in_base_local += MATCHFINDER_WINDOW_SIZE as usize;
         cur_pos = 0;
     }
     // Raw pointer for the hot loop (helps register allocation vs usize on stack).
@@ -164,6 +165,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     mf.hash_tab[s0] = cur_pos as MfPos;
     if cur_node <= cutoff {
         *offset_ret = (in_next - best_matchptr) as u32;
+        *in_base = in_base_local;
         return best_len;
     }
     let mut matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
@@ -196,6 +198,7 @@ pub(crate) fn ht_matchfinder_longest_match(
         best_matchptr = matchptr as usize - buf.as_ptr() as usize;
         if cur_node <= cutoff || best_len >= nice_len {
             *offset_ret = (in_next - best_matchptr) as u32;
+            *in_base = in_base_local;
             return best_len;
         }
         matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
@@ -220,6 +223,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     } else {
         if cur_node <= cutoff {
             *offset_ret = (in_next - best_matchptr) as u32;
+            *in_base = in_base_local;
             return best_len;
         }
         matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
@@ -238,6 +242,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     }
 
     *offset_ret = (in_next - best_matchptr) as u32;
+    *in_base = in_base_local;
     best_len
 }
 
