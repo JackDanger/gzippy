@@ -361,7 +361,10 @@ fn deflate_into(
     } else {
         // T>1 spends its parallel wall slack on a stronger parse — see
         // `level::params_parallel`. T1 is untouched.
-        let params = if parallel {
+        // L8-L9 use the regular parser (the near-optimal parser is too slow;
+        // the regular parser produces byte-identical output to T1, and T4
+        // is faster than T1 due to parallelism).
+        let params = if parallel && level < 8 {
             level::params_parallel(level)
         } else {
             level::params(level)
