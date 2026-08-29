@@ -133,6 +133,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     let mut best_len: u32 = 0;
     let mut best_matchptr: usize = in_next;
     let mut in_base_local = *in_base;
+    let in_base_ptr = in_base as *mut usize;
     let mut cur_pos = (in_next - in_base_local) as i32;
 
     // This is assumed throughout this function.
@@ -242,7 +243,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     }
 
     *offset_ret = (in_next - best_matchptr) as u32;
-    *in_base = in_base_local;
+    unsafe { *in_base_ptr = in_base_local };
     best_len
 }
 
