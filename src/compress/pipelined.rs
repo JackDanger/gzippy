@@ -132,7 +132,10 @@ pub fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -
     //     memory. 8 MiB per chunk at T16 is ~128 MiB of in-flight payload, which is the
     //     most this is willing to spend.
     debug_assert!(num_threads >= 1);
-    let target_chunks = num_threads.max(1).saturating_mul(chunks_per_thread());
+    // L1 uses fewer chunks (better amortization of the fast matchfinder);
+    // L2+ uses the standard chunk count.
+    let cpt = if _level <= 1 { 1 } else { chunks_per_thread() };
+    let target_chunks = num_threads.max(1).saturating_mul(cpt);
     let by_parallelism = input_len / target_chunks.max(1);
     // Never go BELOW the old fixed grid's chunk size for a given input: this change is
     // meant to remove seams, never to add them. A file that the old grid split into
