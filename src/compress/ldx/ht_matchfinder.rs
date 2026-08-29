@@ -143,6 +143,8 @@ pub(crate) fn ht_matchfinder_longest_match(
         cur_pos = 0;
     }
     let in_base_v = *in_base;
+    // Raw pointer for the hot loop (helps register allocation vs usize on stack).
+    let in_base_ptr = unsafe { buf.as_ptr().add(in_base_v) };
     let cutoff: MfPos = (cur_pos - MATCHFINDER_WINDOW_SIZE) as MfPos;
 
     let hash = *next_hash;
@@ -165,7 +167,7 @@ pub(crate) fn ht_matchfinder_longest_match(
         *offset_ret = (in_next - best_matchptr) as u32;
         return best_len;
     }
-    let mut matchptr = node_ptr(in_base_v, cur_node);
+    let mut matchptr = unsafe { in_base_ptr.add(cur_node as usize) };
 
     // C: `to_insert = cur_node; cur_node = mf->hash_tab[hash][1];
     //     mf->hash_tab[hash][1] = to_insert;`
@@ -182,22 +184,38 @@ pub(crate) fn ht_matchfinder_longest_match(
         mf.hash_tab[s1] = to_insert;
     }
 
-    if load_u32(buf, matchptr) == seq {
-        best_len = unsafe { lz_extend(buf, in_next, matchptr, 4, max_len) };
-        best_matchptr = matchptr;
+    if unsafe { load_u32_ptr(matchptr) } == seq {
+        best_len = unsafe {
+            lz_extend(
+                buf,
+                in_next,
+                matchptr as usize - buf.as_ptr() as usize,
+                4,
+                max_len,
+            )
+        };
+        best_matchptr = matchptr as usize - buf.as_ptr() as usize;
         if cur_node <= cutoff || best_len >= nice_len {
             *offset_ret = (in_next - best_matchptr) as u32;
             return best_len;
         }
-        matchptr = node_ptr(in_base_v, cur_node);
-        if load_u32(buf, matchptr) == seq
-            && load_u32(buf, matchptr + best_len as usize - 3)
+        matchptr = unsafe { in_base_ptr.add(cur_node as usize) };
+        if unsafe { load_u32_ptr(matchptr) } == seq
+            && unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
                 == load_u32(buf, in_next + best_len as usize - 3)
         {
-            let len = unsafe { lz_extend(buf, in_next, matchptr, 4, max_len) };
+            let len = unsafe {
+                lz_extend(
+                    buf,
+                    in_next,
+                    matchptr as usize - buf.as_ptr() as usize,
+                    4,
+                    max_len,
+                )
+            };
             if len > best_len {
                 best_len = len;
-                best_matchptr = matchptr;
+                best_matchptr = matchptr as usize - buf.as_ptr() as usize;
             }
         }
     } else {
@@ -205,10 +223,18 @@ pub(crate) fn ht_matchfinder_longest_match(
             *offset_ret = (in_next - best_matchptr) as u32;
             return best_len;
         }
-        matchptr = node_ptr(in_base_v, cur_node);
-        if load_u32(buf, matchptr) == seq {
-            best_len = unsafe { lz_extend(buf, in_next, matchptr, 4, max_len) };
-            best_matchptr = matchptr;
+        matchptr = unsafe { in_base_ptr.add(cur_node as usize) };
+        if unsafe { load_u32_ptr(matchptr) } == seq {
+            best_len = unsafe {
+                lz_extend(
+                    buf,
+                    in_next,
+                    matchptr as usize - buf.as_ptr() as usize,
+                    4,
+                    max_len,
+                )
+            };
+            best_matchptr = matchptr as usize - buf.as_ptr() as usize;
         }
     }
 
@@ -341,6 +367,12 @@ fn load_u32(buf: &[u8], i: usize) -> u32 {
     );
     let p = unsafe { buf.as_ptr().add(i) as *const u32 };
     u32::from_le(unsafe { p.read_unaligned() })
+}
+/// Load a 32-bit LE value from a raw pointer.
+/// SAFETY: the caller guarantees 4 readable bytes at `ptr`.
+#[inline(always)]
+unsafe fn load_u32_ptr(ptr: *const u8) -> u32 {
+    u32::from_le(unsafe { (ptr as *const u32).read_unaligned() })
 }
 
 #[cfg(test)]
