@@ -95,7 +95,7 @@ fn estimate_output_cap(len: usize, level: u32, framing_slack: usize) -> usize {
     if level == 0 {
         len + len.div_ceil(MAX_STORED_SUBBLOCK).max(1) * 5 + framing_slack
     } else {
-        len / 4 + framing_slack
+        len / 2 + framing_slack
     }
 }
 

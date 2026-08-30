@@ -26,6 +26,7 @@ use crate::compress::ldx::flush::SEQ_LITRUNLEN_MASK;
 /// The end-of-block frequency is incremented HERE and not by the parser, so a parser
 /// that never emits a symbol still produces a well-formed block. It is also why
 /// `deflate_flush_block` can assume `codes.lens.litlen[256] != 0`.
+#[inline(always)]
 pub(crate) fn deflate_finish_block(
     c: &mut Compressor,
     os: &mut DeflateOutputBitstream<'_>,
