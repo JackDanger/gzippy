@@ -240,10 +240,10 @@ pub(crate) unsafe fn lz_extend_sse(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_mm_loadu_si128, _mm_cmpeq_epi8, _mm_movemask_epi8, __m128i};
     #[cfg(target_arch = "x86")]
-    use core::arch::x86::{_mm_loadu_si128, _mm_cmpeq_epi8, _mm_movemask_epi8, __m128i};
+    use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 
     let mut len = start_len;
     let base = buf.as_ptr();
@@ -284,7 +284,7 @@ pub(crate) unsafe fn lz_extend_neon(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
-    use core::arch::aarch64::{vld1q_u8, veorq_u8, vmaxvq_u8};
+    use core::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8};
 
     let mut len = start_len;
     let base = buf.as_ptr();
@@ -304,22 +304,28 @@ pub(crate) unsafe fn lz_extend_neon(
 
     // 4-byte word tail (up to 12 bytes)
     while max_len - len >= 4 {
-        let a = unsafe { u32::from_le_bytes([
-            *base.add(strptr + len as usize),
-            *base.add(strptr + len as usize + 1),
-            *base.add(strptr + len as usize + 2),
-            *base.add(strptr + len as usize + 3),
-        ]) };
-        let b = unsafe { u32::from_le_bytes([
-            *base.add(matchptr + len as usize),
-            *base.add(matchptr + len as usize + 1),
-            *base.add(matchptr + len as usize + 2),
-            *base.add(matchptr + len as usize + 3),
-        ]) };
+        let a = unsafe {
+            u32::from_le_bytes([
+                *base.add(strptr + len as usize),
+                *base.add(strptr + len as usize + 1),
+                *base.add(strptr + len as usize + 2),
+                *base.add(strptr + len as usize + 3),
+            ])
+        };
+        let b = unsafe {
+            u32::from_le_bytes([
+                *base.add(matchptr + len as usize),
+                *base.add(matchptr + len as usize + 1),
+                *base.add(matchptr + len as usize + 2),
+                *base.add(matchptr + len as usize + 3),
+            ])
+        };
         if a != b {
             // Byte-by-byte within this word
             for i in 0..4u32 {
-                if len + i >= max_len { break; }
+                if len + i >= max_len {
+                    break;
+                }
                 if unsafe {
                     *buf.get_unchecked(matchptr + (len + i) as usize)
                         != *buf.get_unchecked(strptr + (len + i) as usize)
@@ -344,8 +350,6 @@ pub(crate) unsafe fn lz_extend_neon(
     }
     len
 }
-
-
 
 #[cfg(test)]
 mod tests {

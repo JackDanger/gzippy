@@ -148,11 +148,11 @@ pub fn prefetch_write(ptr: *const u8) {
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(ptr as *const i8);
     }
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: `prfm pstl1keep` is a hint instruction; it never faults for any
+    // SAFETY: `prfm pldl1keep` is a hint instruction; it never faults for any
     // address and writes no memory (nostack, preserves flags).
     unsafe {
         core::arch::asm!(
-            "prfm pstl1keep, [{ptr}]",
+            "prfm pldl1keep, [{ptr}]",
             ptr = in(reg) ptr,
             options(nostack, preserves_flags),
         );
