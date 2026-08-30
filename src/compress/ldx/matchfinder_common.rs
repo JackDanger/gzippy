@@ -117,6 +117,11 @@ pub(crate) fn lz_extend(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[allow(unreachable_code)]
+    {
+        return unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) };
+    }
     const WORDBYTES: u32 = 8;
     let mut len = start_len;
 
@@ -180,6 +185,50 @@ pub(crate) fn lz_extend(
     }
     len
 }
+/// SSE-optimized match extension: compares 16 bytes at a time
+/// instead of 8. Produces identical results to `lz_extend`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) unsafe fn lz_extend_sse(
+    buf: &[u8],
+    strptr: usize,
+    matchptr: usize,
+    start_len: u32,
+    max_len: u32,
+) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_mm_loadu_si128, _mm_cmpeq_epi8, _mm_movemask_epi8, __m128i};
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_mm_loadu_si128, _mm_cmpeq_epi8, _mm_movemask_epi8, __m128i};
+
+    let mut len = start_len;
+    let base = buf.as_ptr();
+
+    // 16-byte comparisons
+    while max_len - len >= 16 {
+        let a = unsafe { _mm_loadu_si128(base.add(strptr + len as usize) as *const __m128i) };
+        let b = unsafe { _mm_loadu_si128(base.add(matchptr + len as usize) as *const __m128i) };
+        let cmp = _mm_cmpeq_epi8(a, b);
+        let mask = _mm_movemask_epi8(cmp) as u16;
+        if mask != 0xFFFF {
+            len += (mask as u32).trailing_zeros();
+            break;
+        }
+        len += 16;
+    }
+
+    // Byte-by-byte tail
+    while len < max_len {
+        if unsafe {
+            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
+        } {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
 
 #[cfg(test)]
 mod tests {
