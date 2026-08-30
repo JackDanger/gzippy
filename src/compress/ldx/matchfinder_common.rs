@@ -161,6 +161,11 @@ pub(crate) unsafe fn lz_extend(
     {
         return unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) };
     }
+    #[cfg(target_arch = "aarch64")]
+    #[allow(unreachable_code)]
+    {
+        return unsafe { lz_extend_neon(buf, strptr, matchptr, start_len, max_len) };
+    }
     const WORDBYTES: u32 = 8;
     let mut len = start_len;
 
@@ -267,6 +272,48 @@ pub(crate) unsafe fn lz_extend_sse(
     }
     len
 }
+
+/// NEON-optimized match extension: compares 16 bytes at a time
+/// using XOR + vmaxvq_u8. Produces identical results to `lz_extend`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn lz_extend_neon(
+    buf: &[u8],
+    strptr: usize,
+    matchptr: usize,
+    start_len: u32,
+    max_len: u32,
+) -> u32 {
+    use core::arch::aarch64::{vld1q_u8, veorq_u8, vmaxvq_u8, uint8x16_t};
+
+    let mut len = start_len;
+    let base = buf.as_ptr();
+
+    // 16-byte comparisons via XOR
+    while max_len - len >= 16 {
+        let a = unsafe { vld1q_u8(base.add(strptr + len as usize)) };
+        let b = unsafe { vld1q_u8(base.add(matchptr + len as usize)) };
+        let x = veorq_u8(a, b);
+        let max_byte = vmaxvq_u8(x);
+        if max_byte != 0 {
+            // Not all 16 bytes match; fall through to byte-by-byte
+            break;
+        }
+        len += 16;
+    }
+
+    // Byte-by-byte tail
+    while len < max_len {
+        if unsafe {
+            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
+        } {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
 
 
 #[cfg(test)]
