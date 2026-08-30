@@ -148,19 +148,29 @@ pub fn prefetch_write(ptr: *const u8) {
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(ptr as *const i8);
     }
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: `prfm pldl1keep` is a hint instruction; it never faults for any
-    // address and writes no memory (nostack, preserves flags).
+    // Use a separate noinline function to prevent the compiler from
+    // eliminating the prfm when inlined into the hot loop.
     unsafe {
-        core::arch::asm!(
-            "prfm pldl1keep, [{ptr}]",
-            ptr = in(reg) ptr,
-            options(nostack, preserves_flags),
-        );
+        aarch64_prefetch_l1(ptr);
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = ptr;
     }
+}
+
+/// AArch64-specific L1 load prefetch in a separate noinline function.
+/// The compiler cannot eliminate this because it's a real function call
+/// with a side effect (the prfm instruction).
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+#[inline(never)]
+unsafe extern "C" fn aarch64_prefetch_l1(ptr: *const u8) {
+    core::arch::asm!(
+        "prfm pldl1keep, [{ptr}]",
+        ptr = in(reg) ptr,
+        options(nostack, preserves_flags),
+    );
 }
 
 /// Initialize a matchfinder position table to `MATCHFINDER_INITVAL`
