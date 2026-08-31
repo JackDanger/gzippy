@@ -965,15 +965,21 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         if level == 0 {
             writer.write_all(&minimal_gzip_header(0))?;
             let crc = crc32fast::hash(&data[..logical_len]);
-            let mut in_next: usize = 0;
-            while in_next < logical_len {
-                let len = core::cmp::min(logical_len - in_next, u16::MAX as usize);
-                let bfinal: u8 = if in_next + len == logical_len { 1 } else { 0 };
-                writer.write_all(&[bfinal])?;
-                writer.write_all(&(len as u16).to_le_bytes())?;
-                writer.write_all(&((len as u16 ^ 0xFFFFu16).to_le_bytes()))?;
-                writer.write_all(&data[in_next..in_next + len])?;
-                in_next += len;
+            if logical_len == 0 {
+                // Empty input: must emit one empty stored block for valid DEFLATE.
+                // BFINAL=1, BTYPE=0, LEN=0, NLEN=0xFFFF (matches deflate_compress_none).
+                writer.write_all(&[0x01, 0x00, 0x00, 0xFF, 0xFF])?;
+            } else {
+                let mut in_next: usize = 0;
+                while in_next < logical_len {
+                    let len = core::cmp::min(logical_len - in_next, u16::MAX as usize);
+                    let bfinal: u8 = if in_next + len == logical_len { 1 } else { 0 };
+                    writer.write_all(&[bfinal])?;
+                    writer.write_all(&(len as u16).to_le_bytes())?;
+                    writer.write_all(&((len as u16 ^ 0xFFFFu16).to_le_bytes()))?;
+                    writer.write_all(&data[in_next..in_next + len])?;
+                    in_next += len;
+                }
             }
             writer.write_all(&crc.to_le_bytes())?;
             writer.write_all(&(logical_len as u32).to_le_bytes())?;
