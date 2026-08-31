@@ -132,30 +132,6 @@ impl HtMatchfinder {
 /// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
 /// 1.34x. Matching the vendor's `forceinline`.
 #[inline(always)]
-/// C: `ht_matchfinder_longest_match(...)` (:80)
-///
-/// Returns the best match length (0 if none) and writes the offset to `offset_ret`.
-/// `max_len` must be >= `HT_MATCHFINDER_REQUIRED_NBYTES`.
-///
-/// # The bucket-2 path, and its one deliberate asymmetry
-///
-/// The C's comment on this branch: *"Hand-unrolled version for BUCKET_SIZE == 2. The
-/// logic here also differs slightly in that it copies the first entry to the second
-/// even if nice_len is reached on the first, as this can be slightly faster."*
-///
-/// So the insert into slot 1 happens BEFORE the `nice_len` early-out, unconditionally.
-/// Moving it after — which reads as the obvious cleanup, since the value is unused on
-/// that path — changes what the table holds at every position where a nice-length
-/// match was found, and therefore changes every subsequent match. It is a
-/// table-state divergence, not a dead store.
-///
-/// # The second-candidate guard
-///
-/// Before extending the second candidate the C checks BOTH a 4-byte sequence equality
-/// AND `load_u32(matchptr + best_len - 3) == load_u32(in_next + best_len - 3)` — a
-/// cheap test that the candidate can beat the incumbent at its far end before paying
-/// for `lz_extend`. Dropping it finds the same matches more slowly; keeping it but
-/// getting the `- 3` wrong finds DIFFERENT matches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ht_matchfinder_longest_match(
     mf: &mut HtMatchfinder,
@@ -170,10 +146,8 @@ pub(crate) fn ht_matchfinder_longest_match(
     let mut best_len: u32 = 0;
     let mut best_matchptr: usize = in_next;
     let mut in_base_local = *in_base;
-    let in_base_ptr = in_base as *mut usize;
     let mut cur_pos = (in_next - in_base_local) as i32;
 
-    // This is assumed throughout this function.
     const _: () = assert!(HT_MATCHFINDER_MIN_MATCH_LEN == 4);
 
     if cur_pos == MATCHFINDER_WINDOW_SIZE {
@@ -181,7 +155,6 @@ pub(crate) fn ht_matchfinder_longest_match(
         in_base_local += MATCHFINDER_WINDOW_SIZE as usize;
         cur_pos = 0;
     }
-    // Raw pointer for the hot loop (helps register allocation vs usize on stack).
     let in_next_ptr = unsafe { buf.as_ptr().add(in_next) };
     let cutoff: MfPos = (cur_pos - MATCHFINDER_WINDOW_SIZE) as MfPos;
 
@@ -195,92 +168,73 @@ pub(crate) fn ht_matchfinder_longest_match(
             .add(*next_hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
     });
 
-    // --- C: the BUCKET_SIZE == 2 hand-unrolled version ---
     let s0 = mf.slot(hash, 0);
     let s1 = mf.slot(hash, 1);
 
-    let mut cur_node = mf.hash_tab[s0];
+    let cand0 = mf.hash_tab[s0];
     mf.hash_tab[s0] = cur_pos as MfPos;
-    if cur_node <= cutoff {
-        *offset_ret = (in_next - best_matchptr) as u32;
-        *in_base = in_base_local;
-        return best_len;
-    }
-    let mut matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
+    let cand1 = mf.hash_tab[s1];
+    mf.hash_tab[s1] = cand0;
 
-    // C: `to_insert = cur_node; cur_node = mf->hash_tab[hash][1];
-    //     mf->hash_tab[hash][1] = to_insert;`
-    //
-    // Clippy sees a manual swap and suggests `core::mem::swap`. It is one, but the C
-    // spells it as three statements around a named `to_insert`, and the copy to slot 1
-    // happening HERE — before the `nice_len` early-out below — is the branch's one
-    // documented asymmetry. Keeping the three statements keeps that visible.
-    #[allow(clippy::manual_swap, reason = "C: three statements around `to_insert`")]
-    let to_insert = cur_node;
-    #[allow(clippy::manual_swap, reason = "C: three statements around `to_insert`")]
-    {
-        cur_node = mf.hash_tab[s1];
-        mf.hash_tab[s1] = to_insert;
-    }
-
-    if unsafe { load_u32_ptr(matchptr) } == seq {
-        best_len = unsafe {
-            lz_extend(
-                buf,
-                in_next,
-                matchptr as usize - buf.as_ptr() as usize,
-                4,
-                max_len,
-            )
-        };
-        best_matchptr = matchptr as usize - buf.as_ptr() as usize;
-        if cur_node <= cutoff || best_len >= nice_len {
-            *offset_ret = (in_next - best_matchptr) as u32;
-            *in_base = in_base_local;
-            return best_len;
-        }
-        matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
-        if unsafe { load_u32_ptr(matchptr) } == seq
-            && unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
-                == load_u32(buf, in_next + best_len as usize - 3)
-        {
-            let len = unsafe {
-                lz_extend(
-                    buf,
-                    in_next,
-                    matchptr as usize - buf.as_ptr() as usize,
-                    4,
-                    max_len,
-                )
-            };
-            if len > best_len {
-                best_len = len;
-                best_matchptr = matchptr as usize - buf.as_ptr() as usize;
-            }
-        }
-    } else {
-        if cur_node <= cutoff {
-            *offset_ret = (in_next - best_matchptr) as u32;
-            *in_base = in_base_local;
-            return best_len;
-        }
-        matchptr = unsafe { in_next_ptr.sub((cur_pos - cur_node as i32) as usize) };
-        if unsafe { load_u32_ptr(matchptr) } == seq {
+    // Check first candidate (cand0)
+    if cand0 > cutoff {
+        let matchptr0 = unsafe { in_next_ptr.sub((cur_pos - cand0 as i32) as usize) };
+        if unsafe { load_u32_ptr(matchptr0) } == seq {
             best_len = unsafe {
                 lz_extend(
                     buf,
                     in_next,
-                    matchptr as usize - buf.as_ptr() as usize,
+                    matchptr0 as usize - buf.as_ptr() as usize,
                     4,
                     max_len,
                 )
             };
-            best_matchptr = matchptr as usize - buf.as_ptr() as usize;
+            best_matchptr = matchptr0 as usize - buf.as_ptr() as usize;
+
+            // Check second candidate (cand1) only if needed
+            if cand1 > cutoff && best_len < nice_len {
+                let matchptr1 = unsafe { in_next_ptr.sub((cur_pos - cand1 as i32) as usize) };
+                if unsafe { load_u32_ptr(matchptr1) } == seq
+                    && unsafe { load_u32_ptr(matchptr1.add(best_len as usize - 3)) }
+                        == load_u32(buf, in_next + best_len as usize - 3)
+                {
+                    let len = unsafe {
+                        lz_extend(
+                            buf,
+                            in_next,
+                            matchptr1 as usize - buf.as_ptr() as usize,
+                            4,
+                            max_len,
+                        )
+                    };
+                    if len > best_len {
+                        best_len = len;
+                        best_matchptr = matchptr1 as usize - buf.as_ptr() as usize;
+                    }
+                }
+            }
+        }
+    }
+
+    // If first candidate didn't match, check second candidate (cand1)
+    if best_len == 0 && cand1 > cutoff {
+        let matchptr1 = unsafe { in_next_ptr.sub((cur_pos - cand1 as i32) as usize) };
+        if unsafe { load_u32_ptr(matchptr1) } == seq {
+            best_len = unsafe {
+                lz_extend(
+                    buf,
+                    in_next,
+                    matchptr1 as usize - buf.as_ptr() as usize,
+                    4,
+                    max_len,
+                )
+            };
+            best_matchptr = matchptr1 as usize - buf.as_ptr() as usize;
         }
     }
 
     *offset_ret = (in_next - best_matchptr) as u32;
-    unsafe { *in_base_ptr = in_base_local };
+    *in_base = in_base_local;
     best_len
 }
 
