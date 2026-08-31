@@ -94,6 +94,19 @@ pub(crate) fn deflate_compress_fastest(
     os: &mut DeflateOutputBitstream<'_>,
     nice_match_length: u32,
 ) {
+    deflate_compress_fastest_with_dict(c, p, r#in, in_nbytes, os, nice_match_length, &[]);
+}
+
+#[inline(never)]
+pub(crate) fn deflate_compress_fastest_with_dict(
+    c: &mut Compressor,
+    p: &mut FastestState,
+    r#in: &[u8],
+    in_nbytes: usize,
+    os: &mut DeflateOutputBitstream<'_>,
+    nice_match_length: u32,
+    dict: &[u8],
+) {
     let mut in_next: usize = 0;
     let in_end: usize = in_nbytes;
     let mut in_cur_base: usize = 0;
@@ -101,7 +114,11 @@ pub(crate) fn deflate_compress_fastest(
     let mut nice_len: u32 = core::cmp::min(nice_match_length, max_len);
     let mut next_hash: u32 = 0;
 
-    p.ht_mf.init();
+    if !dict.is_empty() {
+        p.ht_mf.seed_with_dict(dict);
+    } else {
+        p.ht_mf.init();
+    }
 
     loop {
         // Starting a new DEFLATE block.

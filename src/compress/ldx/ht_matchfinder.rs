@@ -86,6 +86,43 @@ impl HtMatchfinder {
     fn slot(&self, hash: u32, i: usize) -> usize {
         (hash as usize) * HT_MATCHFINDER_BUCKET_SIZE + i
     }
+
+    /// Seed the hash table with dictionary data. This processes `dict` through
+    /// the matchfinder's hash computation and populates the hash table, so that
+    /// subsequent match searches can find matches that reference the dictionary.
+    /// This is used by the T>1 parallel pipeline to provide inter-chunk context.
+    pub(crate) fn seed_with_dict(&mut self, dict: &[u8]) {
+        if dict.len() < HT_MATCHFINDER_REQUIRED_NBYTES as usize {
+            return;
+        }
+        self.init();
+        let mut cur_pos: i32 = 0;
+        let mut p: usize = 0;
+        while p + HT_MATCHFINDER_REQUIRED_NBYTES as usize <= dict.len() {
+            // Window slide check
+            if cur_pos >= MATCHFINDER_WINDOW_SIZE {
+                self.slide_window();
+                cur_pos -= MATCHFINDER_WINDOW_SIZE;
+                // in_base would advance but we don't track it for seeding
+            }
+            // Compute hash for the 4-byte sequence at position p
+            let seq = u32::from_le_bytes([
+                dict[p],
+                dict[p + 1],
+                dict[p + 2],
+                dict[p + 3],
+            ]);
+            let hash = lz_hash(seq, HT_MATCHFINDER_HASH_ORDER);
+            let base = (hash as usize) * HT_MATCHFINDER_BUCKET_SIZE;
+            // Bucket shift: shift positions up and insert at position 0
+            for i in (1..HT_MATCHFINDER_BUCKET_SIZE).rev() {
+                self.hash_tab[base + i] = self.hash_tab[base + i - 1];
+            }
+            self.hash_tab[base] = cur_pos as MfPos;
+            cur_pos += 1;
+            p += 1;
+        }
+    }
 }
 
 /// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
