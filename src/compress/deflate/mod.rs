@@ -959,6 +959,27 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     debug_assert!(logical_len <= data.len());
 
     if !level_streams(level) || level_uses_ldx(level) {
+        // L0 FAST PATH: write stored blocks directly to the writer, no intermediate Vec.
+        // L0 is "stored" (no compression) — just copy the data into gzip blocks.
+        // This avoids the extra copy of the entire input into an output Vec.
+        if level == 0 {
+            writer.write_all(&minimal_gzip_header(0))?;
+            let crc = crc32fast::hash(&data[..logical_len]);
+            let mut in_next: usize = 0;
+            while in_next < logical_len {
+                let len = core::cmp::min(logical_len - in_next, u16::MAX as usize);
+                let bfinal: u8 = if in_next + len == logical_len { 1 } else { 0 };
+                writer.write_all(&[bfinal])?;
+                writer.write_all(&(len as u16).to_le_bytes())?;
+                writer.write_all(&((len as u16 ^ 0xFFFFu16).to_le_bytes()))?;
+                writer.write_all(&data[in_next..in_next + len])?;
+                in_next += len;
+            }
+            writer.write_all(&crc.to_le_bytes())?;
+            writer.write_all(&(logical_len as u32).to_le_bytes())?;
+            return Ok(logical_len as u64);
+        }
+
         // FAST PATH: the caller already gave us the pad, so parse IN PLACE.
         //
         // `data` is usually an mmap of the whole input. Copying it just to
