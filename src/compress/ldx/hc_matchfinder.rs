@@ -562,8 +562,6 @@ pub(crate) fn hc_matchfinder_skip_bytes(
         }
     }
 
-    prefetchw(unsafe { mf.tables.hash3_tab.as_ptr().add(hash3) });
-    prefetchw(unsafe { mf.tables.hash4_tab.as_ptr().add(hash4) });
     next_hashes[0] = hash3 as u32;
     next_hashes[1] = hash4 as u32;
 }
