@@ -412,7 +412,11 @@ impl PipelinedGzEncoder {
         }
 
         if self.num_threads > 1 {
-            self.compress_parallel_pipeline(&mmap, writer)?;
+            if self.compression_level >= 6 {
+                self.compress_parallel_pipeline_pure(&mmap, writer)?;
+            } else {
+                self.compress_parallel_pipeline(&mmap, writer)?;
+            }
         } else {
             self.compress_sequential(&mmap, writer)?;
         }
