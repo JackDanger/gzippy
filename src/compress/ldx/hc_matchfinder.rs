@@ -208,12 +208,21 @@ pub(crate) fn hc_matchfinder_longest_match(
     max_len: u32,
     nice_len: u32,
     max_search_depth: u32,
+    good_match: u32,
     next_hashes: &mut [u32; 2],
     offset_ret: &mut u32,
 ) -> u32 {
     #[allow(unused_mut)]
     let mut local = LdxHcCounters::default();
-    let mut depth_remaining = max_search_depth;
+    // zlib/gzip/pigz `good_length` rule (deflate_slow: "Do not waste too much time
+    // if we have already found a good match"): when the current best is already
+    // >= good_match, quarter the chain walk. libdeflate has no such knob; the
+    // legacy zlib arm did (and won the L6 cells with it). 0 disables.
+    let mut depth_remaining = if good_match != 0 && best_len >= good_match {
+        (max_search_depth >> 2).max(1)
+    } else {
+        max_search_depth
+    };
     // C deliberately carries the current position as `u32`.  The table stores a
     // signed 16-bit relative position, but the live position itself is never
     // negative.  Keeping it unsigned avoids a sign-extension every time it is
@@ -686,6 +695,7 @@ mod tests {
                 max_len,
                 core::cmp::min(32, max_len),
                 16,
+                0, // good_match: disabled in the oracle test
                 &mut next_hashes,
                 &mut offset,
             );
@@ -762,6 +772,7 @@ mod tests {
                     258,
                     32,
                     16,
+                    0, // good_match: disabled in the invariant test
                     &mut next_hashes,
                     &mut offset,
                 );
@@ -805,6 +816,7 @@ mod tests {
                     258,
                     258,
                     depth,
+                    0, // good_match: disabled in the monotonicity test
                     &mut next_hashes,
                     &mut offset,
                 );

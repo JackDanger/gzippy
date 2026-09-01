@@ -113,6 +113,11 @@ pub(crate) struct LdxCompressor {
     pub(crate) nice_match_length: u32,
     /// C: `c->max_search_depth`
     pub(crate) max_search_depth: u32,
+    /// Not in C (libdeflate has no good_length). The zlib/gzip/pigz `good_match`
+    /// rule: when the current best match is already >= good_match, quarter the
+    /// chain walk (zlib `deflate_slow`). The legacy zlib arm carried it and won
+    /// the L6 cells with it (see `level_uses_ldx`); 0 disables.
+    pub(crate) good_match: u32,
     pub(crate) c: Compressor,
     parser: ParserState,
 }
@@ -125,26 +130,36 @@ impl LdxCompressor {
         // C: the level -> config map at :3919-3990, ported verbatim for the levels whose
         // compressor exists. CLAUDE.md clause 5: no test pins these VALUES; the
         // invariant test lives in `compress_greedy` and checks that effort RISES.
-        let (max_search_depth, nice_match_length) = match compression_level {
+        let (max_search_depth, nice_match_length, good_match) = match compression_level {
             0 => {
                 // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
                 max_passthrough_size = usize::MAX;
-                (0, 0)
+                (0, 0, 0)
             }
             // C: `c->impl = deflate_compress_fastest;` (:3926). `max_search_depth` is
             // unused at this level — it is hardcoded in ht_matchfinder.h.
-            1 => (0, 32),
+            // No chain walk at this level, so good_match is inert.
+            1 => (0, 32, 0),
             // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
-            2 => (6, 10),
-            3 => (12, 14),
-            4 => (16, 30),
+            2 => (6, 10, 0),
+            3 => (12, 14, 0),
+            4 => (16, 30, 0),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
-            5 => (16, 30),
-            6 => (35, 65),
-            7 => (100, 130),
+            // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) was
+            // measured MIXED at L5 (11-file probe: dovi -4,149 B, logs +134,778 B);
+            // the lever is L6/L7 only. L6-L7: the zlib arm's depth + good_match
+            // pair (legacy L6/L7 win config: good_length 8/32, chain 128/256).
+            // The 2026-09-01 probe shows port(128,65,8)/(256,130,32) is
+            // BYTE-IDENTICAL to the legacy L6/L7 arm on 11/11 files — the two
+            // Rust ports of the same C agree when the configs agree — which is
+            // what retires the L6/L7 routing exceptions (one encode, zero size
+            // change). Measured on the 23-file board corpus before the flip.
+            5 => (16, 30, 0),
+            6 => (128, 65, 8),
+            7 => (256, 130, 32),
             // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
-            8 => (300, DEFLATE_MAX_MATCH_LEN),
-            9 => (600, DEFLATE_MAX_MATCH_LEN),
+            8 => (300, DEFLATE_MAX_MATCH_LEN, 0),
+            9 => (600, DEFLATE_MAX_MATCH_LEN, 0),
             _ => return None,
         };
 
@@ -160,6 +175,7 @@ impl LdxCompressor {
             max_passthrough_size,
             max_search_depth,
             nice_match_length,
+            good_match,
             c: Compressor::new(),
             parser,
         })
@@ -186,6 +202,7 @@ impl LdxCompressor {
         // Call the actual compression function. C: `(*c->impl)(c, in, in_nbytes, &os);`
         let max_search_depth = self.max_search_depth;
         let nice_match_length = self.nice_match_length;
+        let good_match = self.good_match;
         match (&mut self.parser, self.compression_level) {
             (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
@@ -203,6 +220,7 @@ impl LdxCompressor {
                 &mut os,
                 max_search_depth,
                 nice_match_length,
+                good_match,
             ),
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
@@ -214,6 +232,7 @@ impl LdxCompressor {
                 &mut os,
                 max_search_depth,
                 nice_match_length,
+                good_match,
             ),
             (ParserState::Greedy(p), 8..=9) => deflate_compress_lazy2(
                 &mut self.c,
@@ -223,6 +242,7 @@ impl LdxCompressor {
                 &mut os,
                 max_search_depth,
                 nice_match_length,
+                good_match,
             ),
             _ => unreachable!("parser state must match the immutable compression level"),
         }
