@@ -63,19 +63,19 @@ use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 /// Largest payload of a single stored (BTYPE=00) sub-block.
 const MAX_STORED_SUBBLOCK: usize = 65535;
 
-/// The deterministic gzip header emitted by `libdeflate-gzip -c`.
-///
-/// XFL is metadata, but it is part of byte-for-byte gzip compatibility: the
-/// vendor marks its fastest level with 4 and its maximum-compression levels
-/// with 2.
 #[inline]
 pub(crate) fn minimal_gzip_header(level: u32) -> [u8; 10] {
-    let xfl = match level {
-        1 => 4,
-        8..=u32::MAX => 2,
-        _ => 0,
-    };
-    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, xfl, 0xff]
+    // XFL is metadata, not compression state: this project's contract is the
+    // flat 0x00 that main has always written (see T1_MINIMAL_GZIP_HEADER and
+    // man/gzippy-format.5, which documents XFL 0x00). b28e96f3 briefly set
+    // libdeflate's habit values here (L1 -> 4, L8+ -> 2) to chase byte-for-byte
+    // vendor compatibility — that is the vendor-habit cage the charter names
+    // ("cite a contract, never a vendor's habit"), and the user retracted the
+    // byte-exactness goal outright (2026-08-30: valid gzip is the only bar).
+    // RFC 1952 would have said 2 for -1 and 4 for -0 anyway; either way, not
+    // the vendor's table. Flat 0 it is.
+    let _ = level;
+    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
 }
 
 /// Output-buffer capacity estimate for a one-shot compress of `len` bytes at
@@ -566,7 +566,7 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with THREE measured
+    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with FOUR measured
     // exceptions. Routing L1/L6/L7 to the port was tried on this branch
     // (`b28e96f3`) and the per-commit ledger gate went red immediately and
     // stayed red for 45 commits: `won_cells_stay_won` regresses FOUR cells
@@ -577,14 +577,27 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     // edited to fit a result, so the routing comes back.
     //
     // Each exception is a MEASUREMENT with a named gate, not a preference —
-    // and all three collapse the moment the port learns ONE knob, `good_match`
-    // (shorten the chain walk once a match >= good_match is found; zlib/gzip/
-    // pigz all use it, and libdeflate does not implement it). That is the
-    // named follow-up lever (port `good_match` INTO ldx, then re-measure on
-    // the frozen board and retire the exceptions one level at a time):
+    // and the good_match ones (L6/L7) collapse the moment the port learns
+    // `good_match` (shorten the chain walk once a match >= good_match is
+    // found; zlib/gzip/pigz all use it, and libdeflate does not implement it).
+    // That is the named follow-up lever (PR #363: port `good_match` INTO ldx,
+    // L6/L7 verified byte-identical 11/11, then retire those two exceptions
+    // one at a time):
     //
     //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
     //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
+    //
+    //   L3  the port has NO len-3/sparse machinery (l3_sparse_split, far_len3 —
+    //       the campaign-winning L3 guards), so port L3 (12, 14) is 1-7% LARGER
+    //       than the legacy L3 (8, 14 + len-3 guards) on the 11-file Mac corpus
+    //       (deterministic, 2026-09-01: tabular +18,886 B = 7.4%, text +6,831 B
+    //       = 2.0%, binary +4,316 B; 2MB+ files same direction) and the running
+    //       solvency try shows it LOSING 11 T1 wall cells vs the legacy L3.
+    //       The legacy L3 is exactly what main ships at T1 L3 (main's own
+    //       receipt: whole-buffer and streaming legacy L3 are byte-identical on
+    //       the real corpus), so the exception restores main's bytes AND wall.
+    //       Retires only when the port learns the len-3 machinery (named lever,
+    //       not good_match).
     //
     //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
     //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
@@ -600,7 +613,7 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times in this campaign.
-    !matches!(level, 1 | 6 | 7) && level <= 9
+    !matches!(level, 1 | 3 | 6 | 7) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {

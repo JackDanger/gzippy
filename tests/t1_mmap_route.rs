@@ -130,7 +130,10 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     let cgz = stdout_run.get_output().stdout.clone();
     assert_eq!(
         &cgz[..10],
-        &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x04, 0xff]
+        // Minimal header per this project's contract: XFL=0x00 flat (see
+        // `minimal_gzip_header`); b28e96f3 briefly pinned the vendor's habit
+        // value (0x04) here and that is what this assertion used to carry.
+        &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
     );
     assert_eq!(
         gz[3] & 0x08,

@@ -15,12 +15,10 @@ use gzippy::compress::{
 use gzippy::fixtures;
 
 fn expected_header(level: u32) -> [u8; 10] {
-    let xfl = match level {
-        1 => 4,
-        8..=u32::MAX => 2,
-        _ => 0,
-    };
-    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, xfl, 0xff]
+    // XFL pinned to OUR contract (flat 0x00; man/gzippy-format.5), not to
+    // libdeflate's habit values — the DEFLATE body below is the parity axis.
+    let _ = level;
+    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
 }
 
 #[test]
@@ -56,12 +54,13 @@ fn t1_gzip_matches_the_libdeflate_port_at_every_vendor_level() {
                 "{name} L{level}: ISIZE"
             );
 
-            if matches!(level, 1 | 6 | 7) {
-                // Documented L1/L6/L7 exception: these levels route to the legacy
-                // encoder (measured size wins, see `level_uses_ldx`), so their body
-                // is NOT the port's. Pin what still holds: valid gzip that
-                // round-trips through an independent decoder. The routing itself
-                // is pinned by `tests/one_encode_only.rs` (encoder-entry census).
+            if matches!(level, 1 | 3 | 6 | 7) {
+                // Documented L1/L3/L6/L7 exceptions: these levels route to the
+                // legacy encoder (measured size wins, see `level_uses_ldx`), so
+                // their body is NOT the port's. Pin what still holds: valid
+                // gzip that round-trips through an independent decoder. The
+                // routing itself is pinned by `tests/one_encode_only.rs`
+                // (encoder-entry census).
                 assert_eq!(
                     independent_roundtrip(&gzip),
                     input,
