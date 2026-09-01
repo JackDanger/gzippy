@@ -157,77 +157,83 @@ pub(crate) unsafe fn lz_extend(
     max_len: u32,
 ) -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[allow(unreachable_code)]
     {
-        return unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) };
+        unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) }
     }
     #[cfg(target_arch = "aarch64")]
-    #[allow(unreachable_code)]
     {
-        return unsafe { lz_extend_neon(buf, strptr, matchptr, start_len, max_len) };
+        unsafe { lz_extend_neon(buf, strptr, matchptr, start_len, max_len) }
     }
-    const WORDBYTES: u32 = 8;
-    let mut len = start_len;
+    // Generic fallback: compiled ONLY on arches without the SIMD paths above
+    // (wrapping it in a negated cfg is what keeps `unreachable_code` from
+    // firing on x86/aarch64 builds, where the early return above dominates).
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        const WORDBYTES: u32 = 8;
+        let mut len = start_len;
 
-    // C relies on this caller contract rather than clamping its inner-loop limit.
-    // The parsers establish it by capping `max_len` at bytes remaining from
-    // `strptr`; `matchptr` is an earlier input position.  Keep that proof live in
-    // debug builds, but do not turn it into release work on every extension.
-    debug_assert!(strptr <= buf.len() && matchptr <= buf.len());
-    debug_assert!(max_len as usize <= buf.len() - strptr);
-    debug_assert!(max_len as usize <= buf.len() - matchptr);
-    debug_assert!(start_len <= max_len);
+        // C relies on this caller contract rather than clamping its inner-loop limit.
+        // The parsers establish it by capping `max_len` at bytes remaining from
+        // `strptr`; `matchptr` is an earlier input position.  Keep that proof live in
+        // debug builds, but do not turn it into release work on every extension.
+        debug_assert!(strptr <= buf.len() && matchptr <= buf.len());
+        debug_assert!(max_len as usize <= buf.len() - strptr);
+        debug_assert!(max_len as usize <= buf.len() - matchptr);
+        debug_assert!(start_len <= max_len);
 
-    #[inline(always)]
-    unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
-        // SAFETY: the caller proves that `[i, i + WORDBYTES)` is in `buf`.
-        u64::from_le(unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() })
-    }
-
-    // C: four `COMPARE_WORD_STEP`s before the regular word loop.  This is not
-    // merely an unroll hint: spelling all four keeps the same fast-path control
-    // flow and lets LLVM schedule the independent unaligned loads as C does.
-    if max_len - len >= 4 * WORDBYTES {
-        macro_rules! compare_word_step {
-            () => {{
-                // SAFETY: the enclosing guard leaves at least four full words.
-                let v_word = unsafe {
-                    load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
-                };
-                if v_word != 0 {
-                    return len + (v_word.trailing_zeros() >> 3);
-                }
-                len += WORDBYTES;
-            }};
+        #[inline(always)]
+        unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
+            // SAFETY: the caller proves that `[i, i + WORDBYTES)` is in `buf`.
+            u64::from_le(unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() })
         }
-        compare_word_step!();
-        compare_word_step!();
-        compare_word_step!();
-        compare_word_step!();
-    }
 
-    while len + WORDBYTES <= max_len {
-        // SAFETY: the loop condition and entry clamp prove both loads fit.
-        let v_word = unsafe {
-            load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
-        };
-        if v_word != 0 {
-            // C: `len += bsfw(v_word) >> 3` on little-endian targets.
-            return len + (v_word.trailing_zeros() >> 3);
+        // C: four `COMPARE_WORD_STEP`s before the regular word loop.  This is not
+        // merely an unroll hint: spelling all four keeps the same fast-path control
+        // flow and lets LLVM schedule the independent unaligned loads as C does.
+        if max_len - len >= 4 * WORDBYTES {
+            macro_rules! compare_word_step {
+                () => {{
+                    // SAFETY: the enclosing guard leaves at least four full words.
+                    let v_word = unsafe {
+                        load_word(buf, matchptr + len as usize)
+                            ^ load_word(buf, strptr + len as usize)
+                    };
+                    if v_word != 0 {
+                        return len + (v_word.trailing_zeros() >> 3);
+                    }
+                    len += WORDBYTES;
+                }};
+            }
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
         }
-        len += WORDBYTES;
-    }
 
-    while len < max_len {
-        // SAFETY: `len < max_len` and the entry clamp prove both loads fit.
-        if unsafe {
-            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
-        } {
-            break;
+        while len + WORDBYTES <= max_len {
+            // SAFETY: the loop condition and entry clamp prove both loads fit.
+            let v_word = unsafe {
+                load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
+            };
+            if v_word != 0 {
+                // C: `len += bsfw(v_word) >> 3` on little-endian targets.
+                return len + (v_word.trailing_zeros() >> 3);
+            }
+            len += WORDBYTES;
         }
-        len += 1;
+
+        while len < max_len {
+            // SAFETY: `len < max_len` and the entry clamp prove both loads fit.
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    != *buf.get_unchecked(strptr + len as usize)
+            } {
+                break;
+            }
+            len += 1;
+        }
+        len
     }
-    len
 }
 /// SSE-optimized match extension: compares 16 bytes at a time
 /// instead of 8. Produces identical results to `lz_extend`.

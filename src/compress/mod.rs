@@ -40,14 +40,17 @@ pub(crate) mod route {
     /// Explicit zopfli tuning (`-F`/`-I`/`-J`) — pure-Rust `zopfli_pure`
     /// (`ZopfliGzEncoder`), single-member, any thread count.
     pub const ZOPFLI: &str = "Zopfli";
-    /// T1 pure-Rust single-member DEFLATE (`deflate::encode_gzip_slack_padded_to_vec`).
+    /// T1 pure-Rust single-member DEFLATE (`deflate::encode_gzip_reader_to_writer_sized`):
+    /// read-to-end into one Vec, then the whole-buffer parse. `ldx` is
+    /// whole-buffer by construction, so this route buffers the whole input at
+    /// every level (the 2026-08-30 streaming deletion made this the honest
+    /// contract; pinned by `tests/streaming_api_is_honest.rs`).
     pub const PURE_T1: &str = "PureT1";
-    /// T1 FILE inputs above the mmap threshold: whole-buffer-equivalent parse
-    /// directly over a read-only mmap of the input
+    /// T1 FILE inputs above the mmap threshold: whole-buffer parse directly
+    /// over a read-only mmap of the input
     /// (`deflate::encode_gzip_unpadded_slice_to_writer`, called from `io.rs`),
-    /// byte-identical to `PURE_T1` at every level. Non-seekable T1 inputs
-    /// (stdin/pipes) keep `PURE_T1`'s streaming route, where the sliding
-    /// window is a memory-correctness win rather than a copy tax.
+    /// byte-identical to `PURE_T1` at every level. The mmap route exists to
+    /// change WALL (in-place parse, no input copy), never bytes.
     pub const PURE_T1_MMAP: &str = "PureT1Mmap";
     /// T>1 pure-Rust parallel pipeline (`PipelinedGzEncoder::compress_buffer_pure`).
     /// Reached from two call sites (the `io.rs` mmap fast path and the
@@ -162,10 +165,10 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
             );
         }
         route::emit(route::PURE_T1, args.compression_level as u32, 1);
-        // ONE call for every level 0-12. `encode_gzip_reader_to_writer` streams when
-        // the level's bytes provably cannot change and falls back to the
-        // whole-buffer encoder otherwise, so this routing function carries no
-        // level-dependent branch of its own.
+        // ONE call for every level 0-12. `encode_gzip_reader_to_writer_sized`
+        // reads the reader to end (whole-buffer — `ldx` is whole-buffer by
+        // construction and L10-12 has no resumable parser), so this routing
+        // function carries no level-dependent branch of its own.
         //
         // The `anatomy-wall` CLI span (feature default OFF, compiles to just
         // the body) encloses the whole T1 route so the instrument's level-2

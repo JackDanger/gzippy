@@ -20,7 +20,7 @@
 //! wrong, not the port: the C never makes that call.
 
 use super::bitstream::DeflateOutputBitstream;
-use super::compress_fastest::{deflate_compress_fastest, deflate_compress_fastest_with_dict, FastestState};
+use super::compress_fastest::{deflate_compress_fastest, FastestState};
 use super::compress_greedy::{deflate_compress_greedy, GreedyState};
 use super::compress_lazy::{deflate_compress_lazy, deflate_compress_lazy2};
 use super::flush::Compressor;
@@ -169,17 +169,6 @@ impl LdxCompressor {
     ///
     /// Returns the compressed size in bytes, or 0 if the output buffer is too small.
     pub(crate) fn compress(&mut self, r#in: &[u8], in_nbytes: usize, out: &mut [u8]) -> usize {
-        self.compress_with_dict(r#in, in_nbytes, out, &[])
-    }
-
-    /// Like `compress` but with a dictionary for inter-chunk context (T>1 path).
-    pub(crate) fn compress_with_dict(
-        &mut self,
-        r#in: &[u8],
-        in_nbytes: usize,
-        out: &mut [u8],
-        dict: &[u8],
-    ) -> usize {
         // Every production caller passes `input.len()`.  Keep that boundary
         // contract checked: the matchfinders use unchecked input loads after this
         // entry point has selected the logical input extent.
@@ -198,14 +187,13 @@ impl LdxCompressor {
         let max_search_depth = self.max_search_depth;
         let nice_match_length = self.nice_match_length;
         match (&mut self.parser, self.compression_level) {
-            (ParserState::Fastest(p), 1) => deflate_compress_fastest_with_dict(
+            (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
                 p.get_or_insert_with(FastestState::new),
                 r#in,
                 in_nbytes,
                 &mut os,
                 nice_match_length,
-                dict,
             ),
             (ParserState::Greedy(p), 2..=4) => deflate_compress_greedy(
                 &mut self.c,

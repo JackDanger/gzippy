@@ -18,14 +18,14 @@
 //! DIFFERENT C function. It is a derivative, not a port, and it must not be diffed
 //! against this file as though it were one.
 //!
-//! The binding FALSIFY record at `src/compress/deflate/parse/mod.rs:540` covers both
-//! prior attempts to route L1 through a ht-style finder: attempt 1 DIED ON SIZE
-//! (clause 3, 7 pass->fail flips) because `fast`'s `head3` length-3 table wins on
-//! BINARIES and `ht_matchfinder` has no length-3 support; attempt 2 (2-way buckets AND
-//! a length-3 table) passed size and died on the T1 WALL at 1.2662x. **Read it before
-//! proposing to route anything from here.** This module is the FAITHFUL C, built so
-//! that a third attempt can at least be measured against the real thing rather than
-//! against a derivative.
+//! Two prior attempts to route L1 through a ht-style finder are on record in git
+//! history: attempt 1 DIED ON SIZE (clause 3, 7 pass->fail flips) because `fast`'s
+//! `head3` length-3 table wins on BINARIES and `ht_matchfinder` has no length-3
+//! support; attempt 2 (2-way buckets AND a length-3 table) passed size and died on
+//! the T1 WALL at 1.2662x. Per the standing rule those records are NOT binding —
+//! re-measure instead of trusting a citation. This module is the FAITHFUL C, built
+//! so that a third attempt can at least be measured against the real thing rather
+//! than against a derivative.
 
 use super::matchfinder_common::{
     lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
@@ -85,43 +85,6 @@ impl HtMatchfinder {
     #[inline(always)]
     fn slot(&self, hash: u32, i: usize) -> usize {
         (hash as usize) * HT_MATCHFINDER_BUCKET_SIZE + i
-    }
-
-    /// Seed the hash table with dictionary data. This processes `dict` through
-    /// the matchfinder's hash computation and populates the hash table, so that
-    /// subsequent match searches can find matches that reference the dictionary.
-    /// This is used by the T>1 parallel pipeline to provide inter-chunk context.
-    pub(crate) fn seed_with_dict(&mut self, dict: &[u8]) {
-        if dict.len() < HT_MATCHFINDER_REQUIRED_NBYTES as usize {
-            return;
-        }
-        self.init();
-        let mut cur_pos: i32 = 0;
-        let mut p: usize = 0;
-        while p + HT_MATCHFINDER_REQUIRED_NBYTES as usize <= dict.len() {
-            // Window slide check
-            if cur_pos >= MATCHFINDER_WINDOW_SIZE {
-                self.slide_window();
-                cur_pos -= MATCHFINDER_WINDOW_SIZE;
-                // in_base would advance but we don't track it for seeding
-            }
-            // Compute hash for the 4-byte sequence at position p
-            let seq = u32::from_le_bytes([
-                dict[p],
-                dict[p + 1],
-                dict[p + 2],
-                dict[p + 3],
-            ]);
-            let hash = lz_hash(seq, HT_MATCHFINDER_HASH_ORDER);
-            let base = (hash as usize) * HT_MATCHFINDER_BUCKET_SIZE;
-            // Bucket shift: shift positions up and insert at position 0
-            for i in (1..HT_MATCHFINDER_BUCKET_SIZE).rev() {
-                self.hash_tab[base + i] = self.hash_tab[base + i - 1];
-            }
-            self.hash_tab[base] = cur_pos as MfPos;
-            cur_pos += 1;
-            p += 1;
-        }
     }
 }
 
@@ -315,24 +278,6 @@ pub(crate) fn ht_matchfinder_skip_bytes(
             .add(hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
     });
     *next_hash = hash;
-}
-
-/// C: `matchptr = &in_base[cur_node];`
-///
-/// **`cur_node` is SIGNED and is routinely negative, so this is signed pointer
-/// arithmetic and not an unsigned add.** After a window slide, `in_base` has advanced
-/// by `MATCHFINDER_WINDOW_SIZE` and every surviving table entry has had the same
-/// amount subtracted, so entries in the older half of the window are negative — and
-/// `cur_node > cutoff` accepts them, because `cutoff` is `cur_pos - WINDOW_SIZE` and
-/// is itself negative.
-///
-/// Writing this as `in_base + cur_node as usize` compiles, works for the whole first
-/// 32 KiB, and then panics (debug) or reads gigabytes out of bounds (release) at the
-/// first slide. It is exactly the bug `matches_stay_valid_across_a_window_slide`
-/// exists to catch, and it did.
-#[inline(always)]
-fn node_ptr(in_base: usize, cur_node: MfPos) -> usize {
-    (in_base as isize + cur_node as isize) as usize
 }
 
 /// C: `load_u32_unaligned` / `get_unaligned_le32`.

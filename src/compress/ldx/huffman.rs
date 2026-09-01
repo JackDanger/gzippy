@@ -288,12 +288,12 @@ pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
 /// non-empty length and steals from it. That is a HEURISTIC rebalance, not the
 /// optimal length-limited code (package-merge would be optimal).
 ///
-/// This matters for the campaign and is worth stating precisely: a binding
-/// falsification already exists at `src/compress/deflate/huffman/fast.rs:432`
-/// recording that libdeflate's heuristic limiter is within ~0.001% of the exact
-/// package-merge optimum, that building it both ways is a wash which OPENS cells,
-/// and that the costed dual-candidate variant holds size flat at ~0.001% while
-/// costing 10-14% wall. So: this heuristic is the thing to COPY, not to improve.
+/// This matters for the campaign and is worth stating precisely: this is a CLOSED
+/// CLASS per CLAUDE.md ("The needed margin is ~0.01%, and Huffman CONSTRUCTION
+/// cannot supply it"): the measurement built the exact package-merge code BOTH ways
+/// and found the unconditional swap a wash that OPENS cells, while the costed
+/// dual-candidate variant holds its size invariant at ~0.001% margin while costing
+/// 10-14% wall. So: this heuristic is the thing to COPY, not to improve.
 /// Replacing it with an exact limiter is a known-dead lever, and doing so would also
 /// break byte-identity, which is the entire point of this module.
 #[inline(always)]

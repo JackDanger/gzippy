@@ -14,11 +14,12 @@
 //! other level is already a byte tie. So this pair of functions is very nearly the
 //! whole phase-1 parity gap.
 //!
-//! **This does not mean routing L1 here will close those cells.** The binding FALSIFY
-//! at `src/compress/deflate/parse/mod.rs:540` records two prior attempts, one dead on
-//! size and one dead on the T1 wall at 1.2662x on a cell `main` already ties. What
-//! this module changes is that a third attempt can be measured against the REAL
-//! libdeflate algorithm instead of against a derivative of it.
+//! **This does not mean routing L1 here will close those cells.** Git history
+//! records two prior attempts, one dead on size and one dead on the T1 wall at
+//! 1.2662x on a cell `main` already ties; per the standing rule those records are
+//! not binding — re-measure. What this module changes is that a third attempt can
+//! be measured against the REAL libdeflate algorithm instead of against a
+//! derivative of it.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::flush::{Compressor, DeflateSequence};
@@ -94,19 +95,6 @@ pub(crate) fn deflate_compress_fastest(
     os: &mut DeflateOutputBitstream<'_>,
     nice_match_length: u32,
 ) {
-    deflate_compress_fastest_with_dict(c, p, r#in, in_nbytes, os, nice_match_length, &[]);
-}
-
-#[inline(never)]
-pub(crate) fn deflate_compress_fastest_with_dict(
-    c: &mut Compressor,
-    p: &mut FastestState,
-    r#in: &[u8],
-    in_nbytes: usize,
-    os: &mut DeflateOutputBitstream<'_>,
-    nice_match_length: u32,
-    dict: &[u8],
-) {
     let mut in_next: usize = 0;
     let in_end: usize = in_nbytes;
     let mut in_cur_base: usize = 0;
@@ -114,11 +102,7 @@ pub(crate) fn deflate_compress_fastest_with_dict(
     let mut nice_len: u32 = core::cmp::min(nice_match_length, max_len);
     let mut next_hash: u32 = 0;
 
-    if !dict.is_empty() {
-        p.ht_mf.seed_with_dict(dict);
-    } else {
-        p.ht_mf.init();
-    }
+    p.ht_mf.init();
 
     loop {
         // Starting a new DEFLATE block.

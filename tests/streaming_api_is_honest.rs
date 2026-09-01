@@ -1,16 +1,28 @@
-//! `compress_to_writer` promises streaming. This proves it, rather than documenting it.
+//! `compress_to_writer`'s buffering contract, pinned by execution rather than
+//! documentation.
 //!
 //! ⭐ OWNER REVIEW, 2026-08-23:
 //!
 //!   "The library's 'streaming' writer API buffers the entire input whenever it uses
 //!    more than one thread. compress_to_writer() defaults to all CPUs, then
 //!    read_to_end()s the reader before any output. This violates both the API docs
-//!    and README promise for large inputs."
+//!    and the README promise for large inputs."
 //!
-//! The CLI already had the correct rule for the identical situation and it was never
-//! generalised to the library (`compress::io`, pipe stdin: "stream directly without
-//! buffering all input first. Single-threaded so output begins immediately without
-//! OOM risk.").
+//! The review landed, and the fix it forced had two halves. The first half —
+//! never default to all CPUs — shipped 2026-08-23: the function is
+//! single-threaded. The second half — a genuinely streaming single-threaded
+//! path — has never been possible since `ldx` became the production T1 parser
+//! for L0-9 (whole-buffer by construction) and L10-12 has no resumable parser:
+//! every level read_to_end()s, and the ~220 lines of single-pass machinery
+//! that would have made the original claim true were unreachable for every
+//! production level. They were deleted 2026-08-30 along with the false
+//! "genuinely streaming" doc, and THIS FILE NOW PINS THE HONEST CONTRACT:
+//!
+//!   1. The first output byte waits for the LAST input byte — the whole-buffer
+//!      behavior is asserted, so a future resumable-ldx streaming change must
+//!      update this test in the same commit (it cannot drift silently in
+//!      either direction).
+//!   2. Whatever it emits is a valid gzip stream that round-trips.
 //!
 //! A doc comment cannot fail CI. This can.
 
@@ -60,19 +72,22 @@ impl Write for SnapshotWriter {
     }
 }
 
-/// Output must begin before the input has been fully consumed.
-///
-/// If this fails, `compress_to_writer` is buffering the whole input — the exact
-/// defect the owner review named, regardless of what the doc comment says.
+/// The HONEST contract (2026-08-30): `compress_to_writer` buffers the whole
+/// input — the first output byte is emitted only after the last input byte has
+/// been read. This is the behavior `src/lib.rs` documents; the test exists so
+/// the documentation and the code cannot drift apart. When a resumable `ldx`
+/// port lands and this function genuinely streams, THIS TEST is the tripwire
+/// that forces the doc, the test and the routing to change in one commit.
 #[test]
-fn compress_to_writer_emits_before_consuming_all_input() {
-    // 8 MiB of compressible text: many blocks, so a streaming encoder has ample
-    // opportunity to emit before EOF.
+fn compress_to_writer_documents_its_whole_buffer_contract() {
+    // 8 MiB of compressible text: many blocks, so a streaming encoder would
+    // have ample opportunity to emit before EOF — this input cannot make the
+    // assertion pass by accident.
     let data = b"the quick brown fox jumps over the lazy dog. ".repeat(190_000);
     let total = data.len();
 
     let read_so_far = Arc::new(AtomicUsize::new(0));
-    let read_at_first_write = Arc::new(AtomicUsize::new(usize::MAX));
+    let read_at_first_write = Arc::new(AtomicUsize::new(0));
 
     let reader = CountingReader {
         data,
@@ -90,26 +105,33 @@ fn compress_to_writer_emits_before_consuming_all_input() {
     assert_eq!(n, total as u64, "reported consumed length");
 
     let at_first = read_at_first_write.load(Ordering::SeqCst);
-    assert!(at_first != usize::MAX, "no output was produced at all");
     assert!(
-        at_first < total,
-        "compress_to_writer read ALL {total} input bytes before emitting its first \
-         output byte (read {at_first} at first write) — it is buffering, not \
-         streaming, and its documentation says otherwise. The parallel encoder is \
-         whole-buffer, so this function must stay single-threaded; use \
-         compress_to_writer_with_threads when buffering is acceptable."
+        at_first == total,
+        "compress_to_writer emitted its first output byte after reading only {at_first} of \
+         {total} input bytes — the documented whole-buffer contract changed. If a resumable \
+         streaming path landed, update src/lib.rs AND this test in the same commit; if it \
+         did not land, the routing has quietly regressed to a buffering change nobody \
+         announced."
     );
 }
 
-/// Whatever it emits must still be a valid gzip stream that round-trips.
+/// Whatever it emits must still be a valid gzip stream that round-trips —
+/// through our decoder AND an independent one (flate2/zlib-ng), per the
+/// project's validity bar.
 #[test]
-fn streamed_output_roundtrips() {
+fn compress_to_writer_output_roundtrips() {
     let data = b"the quick brown fox jumps over the lazy dog. ".repeat(190_000);
     let mut out = Vec::new();
     let n = gzippy::compress_to_writer(std::io::Cursor::new(data.clone()), &mut out, 6)
         .expect("compress_to_writer");
     assert_eq!(n, data.len() as u64);
 
-    let back = gzippy::decompress(&out).expect("roundtrip");
-    assert_eq!(back, data, "streamed output did not round-trip");
+    let back = gzippy::decompress(&out).expect("our-decoder roundtrip");
+    assert_eq!(back, data, "our-decoder roundtrip mismatch");
+
+    let mut d = flate2::read::GzDecoder::new(&out[..]);
+    let mut independent = Vec::new();
+    d.read_to_end(&mut independent)
+        .expect("independent decoder accepted the stream");
+    assert_eq!(independent, data, "independent-decoder roundtrip mismatch");
 }

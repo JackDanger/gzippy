@@ -32,7 +32,10 @@ fn is_debug_enabled() -> bool {
 /// starved by a full ring.
 #[inline]
 pub fn reorder_window_for(num_threads: usize, num_blocks: usize) -> usize {
-    (num_threads + 2).min(num_blocks)
+    // `saturating_add`: this is public infrastructure; a caller may pass an
+    // unvalidated (even `usize::MAX`) thread count, and the window must stay
+    // finite rather than overflow.
+    num_threads.saturating_add(2).min(num_blocks)
 }
 
 pub struct BlockSlot {

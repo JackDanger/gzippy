@@ -280,26 +280,6 @@ pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
     true
 }
 
-pub fn compress_into_with_dict(level: u32, input: &[u8], dict: &[u8], out: &mut Vec<u8>) -> bool {
-    crate::compress::deflate::encode_census::port_encode();
-    let Some(mut c) = compress::LdxCompressor::new(level) else {
-        return false;
-    };
-    let bound = input.len() + input.len().div_ceil(65535) * 5 + 64;
-    let start = out.len();
-    out.reserve(bound);
-    let n = {
-        let spare = out.spare_capacity_mut();
-        let buf = unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, bound) };
-        c.compress_with_dict(input, input.len(), buf, dict)
-    };
-    if n == 0 {
-        return false;
-    }
-    unsafe { out.set_len(start + n) };
-    true
-}
-
 pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
     let mut c = compress::LdxCompressor::new(level)?;
     let mut out = vec![0u8; input.len() * 2 + 65536];

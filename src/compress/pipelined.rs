@@ -190,7 +190,17 @@ impl PipelinedGzEncoder {
             // pass zero even though the CLI rejects it.  The parallel scheduler
             // also normalizes defensively, but storing the effective value here
             // keeps the block-grid calculation and the worker count consistent.
-            num_threads: num_threads.max(1),
+            //
+            // An EXPLICIT count is capped at the available parallelism (the
+            // `compress_with_threads` doc has always claimed this). Without the
+            // cap, `usize::MAX` overflowed `reorder_window_for`'s add and then
+            // would have attempted to spawn 2^64 workers — the T>1 validity
+            // gate exercises exactly these extreme requested counts.
+            num_threads: num_threads.max(1).min(
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1),
+            ),
             header_info: GzipHeaderInfo::default(),
             block_size_override: None,
             minimal_gzip_header: false,

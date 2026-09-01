@@ -135,40 +135,39 @@ pub fn compress(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
 ///
 /// # `threads > 1` buffers the whole input
 ///
-/// The parallel encoder is whole-buffer. See [`compress_to_writer`] for the
-/// streaming (single-threaded) path.
+/// The parallel encoder is whole-buffer. Every compression entry point in this
+/// crate buffers the whole input (see [`compress_to_writer`]); the difference
+/// is worker count, not memory.
 pub fn compress_with_threads(data: &[u8], level: u8, threads: usize) -> GzippyResult<Vec<u8>> {
     let mut out = Vec::new();
     compress::compress_bytes(std::io::Cursor::new(data), &mut out, level, threads)?;
     Ok(out)
 }
 
-/// Compress data from `reader` into `writer` at `level`, **genuinely streaming**:
-/// output begins before the input has been fully read, and memory does not scale
-/// with input size.
+/// Compress data from `reader` into `writer` at `level`, single-threaded.
 ///
-/// # Threading
+/// # ⚠ THIS BUFFERS THE ENTIRE INPUT
 ///
-/// This is **single-threaded**, and that is the point: the parallel encoder is
-/// whole-buffer (it needs random access to the input for inter-block dictionaries),
-/// so any thread count above 1 must `read_to_end` first. Use
-/// [`compress_to_writer_with_threads`] if you want parallelism and can afford to
-/// buffer the whole input; use this when you cannot.
+/// This used to be documented as "genuinely streaming", and that claim was
+/// false: `ldx` (the production T1 parser for L0-9) is whole-buffer by
+/// construction and L10-12 has no resumable parser, so EVERY level reads the
+/// reader to end before emitting a byte. The single-pass streaming machinery
+/// behind the claim was deleted 2026-08-30 once the routing that could have
+/// used it was gone, and this doc now states the actual contract. Peak memory
+/// is `input + output`, same as [`compress_with_threads`] at `threads = 1` —
+/// the only difference this entry point makes is that it uses one worker.
 ///
-/// ⭐ OWNER REVIEW, 2026-08-23 — this function used to default to all CPUs while its
-/// own documentation promised "suitable for large inputs you don't want to buffer
-/// entirely in memory". It then called `read_to_end` before emitting a single byte:
+/// ⭐ OWNER REVIEW, 2026-08-23 — this function used to default to all CPUs
+/// while its own documentation promised "suitable for large inputs you don't
+/// want to buffer entirely in memory". The review is honored in the only way
+/// the current parser set allows: the API is honest about buffering, and a
+/// true streaming T1 path (a resumable `ldx` port) is the named open work
+/// item that will replace this contract.
 ///
-///   "The library's 'streaming' writer API buffers the entire input whenever it uses
-///    more than one thread. This violates both the API docs and README promise for
-///    large inputs."
-///
-/// The CLI already had the right rule for the same situation and it was never applied
-/// here — `compress::io` on pipe stdin: "stream directly without buffering all input
-/// first. Single-threaded so output begins immediately without OOM risk."
-///
-/// Enforced by `tests/streaming_api_is_honest.rs`, which fails if the first byte of
-/// output requires the whole input to have been read.
+/// The buffering contract is pinned — not merely documented — by
+/// `tests/streaming_api_is_honest.rs`, which asserts the first output byte
+/// waits for the last input byte (and that the output round-trips). A future
+/// resumable-ldx change must update that test in the same commit.
 ///
 /// Returns the number of **uncompressed** bytes consumed from `reader`.
 pub fn compress_to_writer<R: std::io::Read, W: std::io::Write + Send>(
@@ -183,14 +182,13 @@ pub fn compress_to_writer<R: std::io::Read, W: std::io::Write + Send>(
 ///
 /// The same threading and format rules as [`compress_with_threads`] apply.
 ///
-/// # ⚠ `threads > 1` BUFFERS THE ENTIRE INPUT
+/// # ⚠ BUFFERS THE ENTIRE INPUT AT EVERY THREAD COUNT
 ///
-/// The parallel encoder is whole-buffer — workers index the input directly and each
-/// block's dictionary is the preceding 32 KiB — so with more than one thread this
-/// reads the reader to end before emitting any output. Peak memory is therefore
-/// `input + O(threads * block_size)`. If you need output to begin before input ends,
-/// or memory that does not scale with input, use [`compress_to_writer`], which is
-/// single-threaded and genuinely streams.
+/// With more than one thread the parallel encoder reads the reader to end
+/// before emitting any output (workers index the input directly and each
+/// block's dictionary is the preceding 32 KiB). At `threads = 1` it is the
+/// same whole-buffer single-worker path as [`compress_to_writer`]. Peak
+/// memory is `input + O(threads * block_size)`.
 ///
 /// Returns the number of **uncompressed** bytes consumed from `reader`.
 pub fn compress_to_writer_with_threads<R: std::io::Read, W: std::io::Write + Send>(

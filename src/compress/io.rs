@@ -363,11 +363,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // T1 FILE inputs above the same threshold: mmap and parse whole-buffer
     // style over the map. The vendor's answer to input-side fault cost is
     // mmap, not streaming (libdeflate-gzip maps its input —
-    // vendor/libdeflate/programs/gzip.c); our streaming path's
-    // copy-through-window traffic measured +3-7% wall on L1 file cells on
-    // Zen2 (PR #256), so streaming is kept ONLY for non-seekable inputs
-    // (stdin/pipes), where its fixed memory footprint is the point. Output is
-    // byte-identical to the Read-based T1 route at every level.
+    // vendor/libdeflate/programs/gzip.c). There is no streaming T1 route
+    // anymore (deleted 2026-08-30 — `ldx` is whole-buffer by construction),
+    // so the mmap route's point is simply in-place parse with no input copy:
+    // the stdin/pipe route reads to end into a Vec and parses the same way.
+    // Output is byte-identical to the Read-based T1 route at every level.
     let use_t1_mmap = opt_config.thread_count == 1
         && file_size > 128 * 1024
         && !args.rsyncable
@@ -568,7 +568,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     // survives only behind the dev `ffi-oracle` feature as a differential oracle.
 
     // Try to mmap stdin when it's a regular file (< file redirection).
-    // For pipes, mmap_data stays None and we fall through to streaming.
+    // For pipes, mmap_data stays None and we fall through to the
+    // whole-buffer `compress_with_pipeline` route.
     #[cfg(unix)]
     let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
         use std::os::unix::io::FromRawFd;
@@ -655,8 +656,10 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             Some(input_data.len()),
         )?
     } else {
-        // Pipe stdin: stream directly without buffering all input first.
-        // Single-threaded so output begins immediately without OOM risk.
+        // Pipe stdin: whole-buffer (read-to-end into one Vec, then the T1
+        // parse — `ldx` is whole-buffer by construction; the 2026-08-30
+        // streaming deletion made buffering the honest contract). Single
+        // worker, so it is the cheapest T1 route for unknown-length input.
         let opt_config = OptimizationConfig::new(1, 0, args.compression_level, ContentType::Binary);
         crate::compress::compress_with_pipeline(
             stdin(),
