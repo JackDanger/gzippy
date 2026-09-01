@@ -98,16 +98,25 @@ fn chunks_per_thread() -> usize {
     CHUNKS_PER_THREAD
 }
 
-/// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an
-/// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
-const MAX_T_AWARE_BLOCK_SIZE: usize = 2 * 1024 * 1024;
+/// Ceiling on the thread-aware chunk size for L1-L5. Chunks are buffered in
+/// flight, so this is an RSS bound (D2), not a performance knob: at T16, 8 MiB
+/// per chunk is ~128 MiB of in-flight payload, the most this is willing to spend.
+const MAX_T_AWARE_BLOCK_SIZE_L1_5: usize = 8 * 1024 * 1024;
+/// L6+ ONLY. `baabae9a` measured 8MB->2MB at L6 (10/16 -> 11/16 T4 L6 wall cells,
+/// zero size regression) and shipped it as a GLOBAL constant — a cross-level
+/// generalisation. The solvency try of 2026-08-30 (frozen box, full census) shows
+/// the 2MB cap regressing BIG-FILE T4 wall at L3/L4/L5: data.sqlite (100 MB) L5 T4
+/// ratio 0.21 / L6 T4 0.19 vs main — 50 chunks instead of 13, paying per-chunk
+/// matchfinder table init + parse setup + extra Huffman builds ~0.3 s each. Scope
+/// the 2MB cap to the levels where it was measured; L1-L5 keep the 8MB bound.
+const MAX_T_AWARE_BLOCK_SIZE_L6_UP: usize = 2 * 1024 * 1024;
 
 #[inline]
 // `pub` (not `pub(crate)`) so the perf-shape pin suite (tests/perf_shape.rs)
 // can derive the chunk count of a T>1 run from the same pure function the
 // encoder uses — bit-splice (#257) deleted the per-chunk sync-flush stored
 // blocks the suite previously counted chunks by.
-pub fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -> usize {
+pub fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
     // THREAD-AWARE. Chunk COUNT is what costs size: every chunk restarts the block
     // grid and pays its own dynamic-header mass plus a seam, so a 26 MB file cut into
     // 512 KiB chunks pays that ~50 times whether it is running on 4 threads or 32.
@@ -126,15 +135,20 @@ pub fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -
     // Bounds, both load-bearing:
     //   * MIN keeps tiny inputs from over-fragmenting (and preserves the small-file
     //     behaviour that existed before this change).
-    //   * MAX_T_AWARE_BLOCK_SIZE caps the win. Chunks are buffered, so unbounded growth
+    //   * the MAX bound caps the win. Chunks are buffered, so unbounded growth
     //     is an RSS regression (D2) — this is the axis `CLAUDE.md` names as
     //     user-visible and ungraded, so the grid must not quietly trade bytes for
-    //     memory. 8 MiB per chunk at T16 is ~128 MiB of in-flight payload, which is the
-    //     most this is willing to spend.
+    //     memory. Level-aware since 2026-08-30: 2 MiB at L6+ (measured there),
+    //     8 MiB at L1-L5 (the global 2 MiB regressed big-file T4 wall at L3-L5).
     debug_assert!(num_threads >= 1);
     // L1 uses fewer chunks (better amortization of the fast matchfinder);
     // L2+ uses the standard chunk count.
-    let cpt = if _level <= 1 { 1 } else { chunks_per_thread() };
+    let cpt = if level <= 1 { 1 } else { chunks_per_thread() };
+    let max_block = if level >= 6 {
+        MAX_T_AWARE_BLOCK_SIZE_L6_UP
+    } else {
+        MAX_T_AWARE_BLOCK_SIZE_L1_5
+    };
     let target_chunks = num_threads.max(1).saturating_mul(cpt);
     let by_parallelism = input_len / target_chunks.max(1);
     // Never go BELOW the old fixed grid's chunk size for a given input: this change is
@@ -142,7 +156,7 @@ pub fn pipelined_block_size(input_len: usize, num_threads: usize, _level: u32) -
     // fewer chunks than `target_chunks` keeps the old size.
     let raw = by_parallelism
         .max(MAX_PARALLEL_BLOCK_SIZE)
-        .clamp(MIN_PARALLEL_BLOCK_SIZE, MAX_T_AWARE_BLOCK_SIZE)
+        .clamp(MIN_PARALLEL_BLOCK_SIZE, max_block)
         .min(input_len.max(MIN_PARALLEL_BLOCK_SIZE));
 
     // ALIGN THE SEAM TO A BLOCK BOUNDARY THE SPLITTER WOULD HAVE CHOSEN ANYWAY.
