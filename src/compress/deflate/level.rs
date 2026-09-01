@@ -885,7 +885,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 32,
+            max_search_depth: 24,
             nice_match_length: 30,
             good_match: 8,
             far_len3_gate: false,
