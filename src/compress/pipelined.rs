@@ -100,7 +100,7 @@ fn chunks_per_thread() -> usize {
 
 /// Ceiling on the thread-aware chunk size. Chunks are buffered in flight, so this is an
 /// RSS bound (D2), not a performance knob: at T16 it allows ~128 MiB of payload.
-const MAX_T_AWARE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
+const MAX_T_AWARE_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
 #[inline]
 // `pub` (not `pub(crate)`) so the perf-shape pin suite (tests/perf_shape.rs)
