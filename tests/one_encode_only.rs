@@ -93,20 +93,26 @@ fn every_level_encodes_each_input_exactly_once() {
 /// If a level silently falls back to the legacy encoder, its wall and size stop being
 /// comparable to the vendor and every ours-vs-libdeflate number becomes meaningless.
 ///
-/// ⭐ WITH FOUR MEASURED EXCEPTIONS (L1, L3, L6, L7), each with a named gate and a
+/// ⭐ WITH THREE MEASURED EXCEPTIONS (L1, L6, L7), each with a named gate and a
 /// path back to the port — see `level_uses_ldx` in `src/compress/deflate/mod.rs`
 /// for the full measurement record. Routing all of 0-9 to the port (`b28e96f3`)
 /// went red on the per-commit ledger immediately and stayed red for 45 commits:
 /// L1 loses to pigz on the `fast_l1_ratio_multi_corpus` cell, and L6 regresses
 /// FOUR `won_cells_stay_won` cells (binary vs gzip +1,614 B / vs pigz +887 B;
-/// text vs gzip +12,610 B / vs pigz +12,090 B). L3 is a different class: the port
-/// has no len-3/sparse machinery, so its L3 is 1-7% LARGER than the legacy L3
+/// text vs gzip +12,610 B / vs pigz +12,090 B). L3 WAS a different class: the port
+/// had no len-3/sparse machinery, so its L3 was 1-7% LARGER than the legacy L3
 /// (the campaign-winning L3 guards) and lost 11 T1 wall cells in the 2026-09-01
-/// solvency try. The port L6/L7 collapse the moment it learns the `good_match`
-/// knob (PR #363, verified byte-identical 11/11); the port L3 collapses the
-/// moment it learns the len-3 machinery. Until then these levels stay on the
-/// measured-best legacy config.
-const PORT_EXCEPTIONS: &[u32] = &[1, 3, 6, 7];
+/// solvency try. RETIRED 2026-09-02 (this branch): the port learned the len-3
+/// machinery — `ldx/far_len3.rs` (the per-block cost gate) + the 224x
+/// sparse-blocks split-hold, wired 1:1 into `ldx/compress_lazy.rs`, L3 routed to
+/// the lazy parser at origin/main's exact L3 config (12, 14) — and the port L3
+/// is BYTE-IDENTICAL to the incumbent (origin/main) L3 on all 11 files of the
+/// local corpus (deterministic, this branch) — zero cells flipped. The port
+/// L6/L7
+/// collapse the moment it learns the `good_match` knob (PR #363, verified
+/// byte-identical 11/11). Until then L1/L6/L7 stay on the measured-best legacy
+/// config.
+const PORT_EXCEPTIONS: &[u32] = &[1, 6, 7];
 
 #[test]
 fn the_port_is_the_production_encoder_for_levels_0_through_9() {
