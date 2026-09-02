@@ -91,6 +91,7 @@ pub mod compress;
 mod compress_fastest;
 mod compress_greedy;
 mod compress_lazy;
+mod far_len3;
 mod flush;
 mod hc_matchfinder;
 mod heap;

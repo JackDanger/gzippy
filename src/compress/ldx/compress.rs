@@ -118,6 +118,13 @@ pub(crate) struct LdxCompressor {
     /// chain walk (zlib `deflate_slow`). The legacy zlib arm carried it and won
     /// the L6 cells with it (see `level_uses_ldx`); 0 disables.
     pub(crate) good_match: u32,
+    /// The far-len-3 cost gate (legacy `far_len3` module): accept a len-3 match
+    /// at a far offset only when the block's cost model says it beats the three
+    /// literals it replaces. L3 only; off everywhere else (see the level map).
+    pub(crate) far_len3_gate: bool,
+    /// The L3 sparse-blocks split-hold + 4096-cutoff modulator (legacy
+    /// `lazy_sparse_len3_guard_mul`); 0 disables.
+    pub(crate) sparse_split_guard_mul: u32,
     pub(crate) c: Compressor,
     parser: ParserState,
 }
@@ -142,6 +149,17 @@ impl LdxCompressor {
             1 => (0, 32, 0),
             // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
             2 => (6, 10, 0),
+            // L3 DIVERGES FROM LIBDEFLATE ON PURPOSE (the campaign's measured L3
+            // win, re-layered onto the port 2026-09-01): libdeflate's L3 is
+            // GREEDY(12,14); the incumbent T1 L3 (origin/main) is ZLIB-STYLE
+            // LAZY(12,14) plus the far-len-3 cost gate (accept far len-3 when it
+            // beats the three literals it replaces) and the 224x sparse-blocks
+            // split hold. The config matches origin/main's L3 LevelParams
+            // EXACTLY (depth 12 — NOT 8: branch commit 37cb96c7 lowered the legacy
+            // arm's depth to 8 as a WALL tweak; that is a lost regression the port
+            // does not inherit — the port must reproduce the WINNING incumbent).
+            // Both arms' lazy parsers are Rust ports of the same C and agree
+            // byte-for-byte at equal configs (the L6/L7 receipts above).
             3 => (12, 14, 0),
             4 => (16, 30, 0),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
@@ -163,6 +181,12 @@ impl LdxCompressor {
             _ => return None,
         };
 
+        let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
+            // ⚠ EXPERIMENT (2026-09-01): gate OFF to isolate its contribution.
+            3 => (true, 224),
+            _ => (false, 0),
+        };
+
         let parser = match compression_level {
             0 => ParserState::None,
             1 => ParserState::Fastest(None),
@@ -176,6 +200,8 @@ impl LdxCompressor {
             max_search_depth,
             nice_match_length,
             good_match,
+            far_len3_gate,
+            sparse_split_guard_mul,
             c: Compressor::new(),
             parser,
         })
@@ -203,6 +229,8 @@ impl LdxCompressor {
         let max_search_depth = self.max_search_depth;
         let nice_match_length = self.nice_match_length;
         let good_match = self.good_match;
+        let far_len3_gate = self.far_len3_gate;
+        let sparse_split_guard_mul = self.sparse_split_guard_mul;
         match (&mut self.parser, self.compression_level) {
             (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
@@ -212,7 +240,11 @@ impl LdxCompressor {
                 &mut os,
                 nice_match_length,
             ),
-            (ParserState::Greedy(p), 2..=4) => deflate_compress_greedy(
+            // L2 and L4 stay on libdeflate's greedy parser; L3 runs the lazy
+            // parser (the measured divergence documented in the level map).
+            // The far-len-3 gate and split-hold knobs are lazy-parser
+            // machinery (L3) — the greedy parser takes no such parameters.
+            (ParserState::Greedy(p), 2 | 4) => deflate_compress_greedy(
                 &mut self.c,
                 p.get_or_insert_with(GreedyState::new),
                 r#in,
@@ -221,6 +253,18 @@ impl LdxCompressor {
                 max_search_depth,
                 nice_match_length,
                 good_match,
+            ),
+            (ParserState::Greedy(p), 3) => deflate_compress_lazy(
+                &mut self.c,
+                p.get_or_insert_with(GreedyState::new),
+                r#in,
+                in_nbytes,
+                &mut os,
+                max_search_depth,
+                nice_match_length,
+                good_match,
+                far_len3_gate,
+                sparse_split_guard_mul,
             ),
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
@@ -233,6 +277,8 @@ impl LdxCompressor {
                 max_search_depth,
                 nice_match_length,
                 good_match,
+                far_len3_gate,
+                sparse_split_guard_mul,
             ),
             (ParserState::Greedy(p), 8..=9) => deflate_compress_lazy2(
                 &mut self.c,
@@ -243,6 +289,8 @@ impl LdxCompressor {
                 max_search_depth,
                 nice_match_length,
                 good_match,
+                far_len3_gate,
+                sparse_split_guard_mul,
             ),
             _ => unreachable!("parser state must match the immutable compression level"),
         }
