@@ -26,6 +26,21 @@ use super::compress_lazy::{deflate_compress_lazy, deflate_compress_lazy2};
 use super::flush::Compressor;
 use super::{DEFLATE_BLOCKTYPE_UNCOMPRESSED, DEFLATE_MAX_MATCH_LEN};
 
+/// C stores parser-private scratch in a union: only the implementation selected
+/// for this compressor exists.  Levels are immutable after construction, so an
+/// enum gives Rust the same lifetime and allocation behavior without a manual
+/// union or drop bookkeeping.
+enum ParserState {
+    None,
+    /// Keep only the selected arm, but do not touch its large tables until an
+    /// input actually crosses the stored-block boundary.  C allocates one
+    /// compressor object and likewise leaves parser scratch untouched for this
+    /// path; eagerly zeroing Rust's separately allocated tables made a one-byte
+    /// level-3 request pay tens of microseconds for work it cannot use.
+    Fastest(Option<FastestState>),
+    Greedy(Option<GreedyState>),
+}
+
 /// C: `deflate_compress_none(const u8 *in, size_t in_nbytes, u8 *out,
 /// size_t out_nbytes_avail)` (:2393)
 ///
@@ -87,9 +102,9 @@ pub(crate) fn deflate_compress_none(r#in: &[u8], in_nbytes: usize, out: &mut [u8
 /// The ported subset of `struct libdeflate_compressor`'s configuration. C: `:466` and
 /// the level map at `:3874`.
 ///
-/// **Only levels 0 and 1 are wired up so far** — those are the two whose compressors
-/// are ported. `impl_for` returns `None` for anything else rather than silently
-/// falling back, so a caller cannot get a wrong answer from an unported level.
+/// Levels 0-9 are wired up. Higher vendor levels use near-optimal parsing and
+/// remain outside this isolated port; `new` returns `None` for them rather
+/// than silently selecting a different algorithm.
 pub(crate) struct LdxCompressor {
     pub(crate) compression_level: u32,
     /// C: `c->max_passthrough_size` (:468)
@@ -98,40 +113,61 @@ pub(crate) struct LdxCompressor {
     pub(crate) nice_match_length: u32,
     /// C: `c->max_search_depth`
     pub(crate) max_search_depth: u32,
+    /// Not in C (libdeflate has no good_length). The zlib/gzip/pigz `good_match`
+    /// rule: when the current best match is already >= good_match, quarter the
+    /// chain walk (zlib `deflate_slow`). The legacy zlib arm carried it and won
+    /// the L6 cells with it (see `level_uses_ldx`); 0 disables.
+    pub(crate) good_match: u32,
     pub(crate) c: Compressor,
-    pub(crate) p_f: FastestState,
-    pub(crate) p_g: GreedyState,
+    parser: ParserState,
 }
 
 impl LdxCompressor {
-    /// C: `libdeflate_alloc_compressor_ex` (:3874), the levels ported so far.
+    /// C: `libdeflate_alloc_compressor_ex` (:3874), for levels 0-9.
     pub(crate) fn new(compression_level: u32) -> Option<Self> {
         // C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919)
         let mut max_passthrough_size = 55usize.wrapping_sub(compression_level as usize * 4);
         // C: the level -> config map at :3919-3990, ported verbatim for the levels whose
         // compressor exists. CLAUDE.md clause 5: no test pins these VALUES; the
         // invariant test lives in `compress_greedy` and checks that effort RISES.
-        let (max_search_depth, nice_match_length) = match compression_level {
+        let (max_search_depth, nice_match_length, good_match) = match compression_level {
             0 => {
                 // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
                 max_passthrough_size = usize::MAX;
-                (0, 0)
+                (0, 0, 0)
             }
             // C: `c->impl = deflate_compress_fastest;` (:3926). `max_search_depth` is
             // unused at this level — it is hardcoded in ht_matchfinder.h.
-            1 => (0, 32),
+            // No chain walk at this level, so good_match is inert.
+            1 => (0, 32, 0),
             // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
-            2 => (6, 10),
-            3 => (12, 14),
-            4 => (16, 30),
+            2 => (6, 10, 0),
+            3 => (12, 14, 0),
+            4 => (16, 30, 0),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
-            5 => (16, 30),
-            6 => (35, 65),
-            7 => (100, 130),
+            // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) was
+            // measured MIXED at L5 (11-file probe: dovi -4,149 B, logs +134,778 B);
+            // the lever is L6/L7 only. L6-L7: the zlib arm's depth + good_match
+            // pair (legacy L6/L7 win config: good_length 8/32, chain 128/256).
+            // The 2026-09-01 probe shows port(128,65,8)/(256,130,32) is
+            // BYTE-IDENTICAL to the legacy L6/L7 arm on 11/11 files — the two
+            // Rust ports of the same C agree when the configs agree — which is
+            // what retires the L6/L7 routing exceptions (one encode, zero size
+            // change). Measured on the 23-file board corpus before the flip.
+            5 => (16, 30, 0),
+            6 => (128, 65, 8),
+            7 => (256, 130, 32),
             // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
-            8 => (300, DEFLATE_MAX_MATCH_LEN),
-            9 => (600, DEFLATE_MAX_MATCH_LEN),
+            8 => (300, DEFLATE_MAX_MATCH_LEN, 0),
+            9 => (600, DEFLATE_MAX_MATCH_LEN, 0),
             _ => return None,
+        };
+
+        let parser = match compression_level {
+            0 => ParserState::None,
+            1 => ParserState::Fastest(None),
+            2..=9 => ParserState::Greedy(None),
+            _ => unreachable!("unported levels returned above"),
         };
 
         Some(Self {
@@ -139,9 +175,9 @@ impl LdxCompressor {
             max_passthrough_size,
             max_search_depth,
             nice_match_length,
+            good_match,
             c: Compressor::new(),
-            p_f: FastestState::new(),
-            p_g: GreedyState::new(),
+            parser,
         })
     }
 
@@ -149,6 +185,11 @@ impl LdxCompressor {
     ///
     /// Returns the compressed size in bytes, or 0 if the output buffer is too small.
     pub(crate) fn compress(&mut self, r#in: &[u8], in_nbytes: usize, out: &mut [u8]) -> usize {
+        // Every production caller passes `input.len()`.  Keep that boundary
+        // contract checked: the matchfinders use unchecked input loads after this
+        // entry point has selected the logical input extent.
+        debug_assert!(in_nbytes <= r#in.len());
+
         // For extremely short inputs, or for compression level 0, just output
         // uncompressed blocks.
         if in_nbytes <= self.max_passthrough_size {
@@ -159,45 +200,51 @@ impl LdxCompressor {
         let mut os = DeflateOutputBitstream::new(out);
 
         // Call the actual compression function. C: `(*c->impl)(c, in, in_nbytes, &os);`
-        match self.compression_level {
-            1 => deflate_compress_fastest(
+        let max_search_depth = self.max_search_depth;
+        let nice_match_length = self.nice_match_length;
+        let good_match = self.good_match;
+        match (&mut self.parser, self.compression_level) {
+            (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
-                &mut self.p_f,
+                p.get_or_insert_with(FastestState::new),
                 r#in,
                 in_nbytes,
                 &mut os,
-                self.nice_match_length,
+                nice_match_length,
             ),
-            2..=4 => deflate_compress_greedy(
+            (ParserState::Greedy(p), 2..=4) => deflate_compress_greedy(
                 &mut self.c,
-                &mut self.p_g,
+                p.get_or_insert_with(GreedyState::new),
                 r#in,
                 in_nbytes,
                 &mut os,
-                self.max_search_depth,
-                self.nice_match_length,
+                max_search_depth,
+                nice_match_length,
+                good_match,
             ),
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
-            5..=7 => deflate_compress_lazy(
+            (ParserState::Greedy(p), 5..=7) => deflate_compress_lazy(
                 &mut self.c,
-                &mut self.p_g,
+                p.get_or_insert_with(GreedyState::new),
                 r#in,
                 in_nbytes,
                 &mut os,
-                self.max_search_depth,
-                self.nice_match_length,
+                max_search_depth,
+                nice_match_length,
+                good_match,
             ),
-            8..=9 => deflate_compress_lazy2(
+            (ParserState::Greedy(p), 8..=9) => deflate_compress_lazy2(
                 &mut self.c,
-                &mut self.p_g,
+                p.get_or_insert_with(GreedyState::new),
                 r#in,
                 in_nbytes,
                 &mut os,
-                self.max_search_depth,
-                self.nice_match_length,
+                max_search_depth,
+                nice_match_length,
+                good_match,
             ),
-            _ => unreachable!("`new` refuses unported levels"),
+            _ => unreachable!("parser state must match the immutable compression level"),
         }
 
         // Return 0 if the output buffer is too small.
@@ -241,6 +288,53 @@ mod tests {
         assert!(n > 0, "level {level}: output buffer reported too small");
         out.truncate(n);
         out
+    }
+
+    #[test]
+    fn allocates_only_the_parser_selected_by_level() {
+        assert!(matches!(
+            LdxCompressor::new(0).unwrap().parser,
+            ParserState::None
+        ));
+        assert!(matches!(
+            LdxCompressor::new(1).unwrap().parser,
+            ParserState::Fastest(None)
+        ));
+        for level in 2..=9 {
+            assert!(matches!(
+                LdxCompressor::new(level).unwrap().parser,
+                ParserState::Greedy(None)
+            ));
+        }
+    }
+
+    /// A stored short input must not leave parser state which contaminates the
+    /// next stream.  Exercise the actual reuse pattern for every parser arm.
+    #[test]
+    fn parser_reuse_survives_a_passthrough_between_streams() {
+        let first: Vec<u8> = (0..80_000).map(|i| b"abcdefghij"[i % 10]).collect();
+        let second: Vec<u8> = (0usize..100_000)
+            .map(|i| ((i.wrapping_mul(37) ^ (i >> 3)) & 0xff) as u8)
+            .collect();
+
+        for level in 1..=9 {
+            let mut c = LdxCompressor::new(level).unwrap();
+            for (stream, data) in [&first[..], b"short stored input".as_slice(), &second[..]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut out = vec![0u8; data.len() * 2 + 4096];
+                let n = c.compress(data, data.len(), &mut out);
+                assert!(n > 0, "level {level}: output buffer reported too small");
+                assert_eq!(inflate(&out[..n]), data, "level {level}: reuse round-trip");
+                if stream == 0 {
+                    assert!(matches!(
+                        (&c.parser, level),
+                        (ParserState::Fastest(Some(_)), 1) | (ParserState::Greedy(Some(_)), 2..=9)
+                    ));
+                }
+            }
+        }
     }
 
     /// Level 0 must be pure stored blocks, and must round-trip at every size —
