@@ -261,7 +261,12 @@ pub(crate) unsafe fn lz_extend_sse(
         let cmp = _mm_cmpeq_epi8(a, b);
         let mask = _mm_movemask_epi8(cmp) as u16;
         if mask != 0xFFFF {
-            len += (mask as u32).trailing_zeros();
+            // `movemask` semantics: bit i is SET when byte i is EQUAL, so the
+            // first differing byte is the run of set bits from bit 0 — i.e.
+            // `trailing_ones`. (`trailing_zeros` is the XOR-word idiom where
+            // bit 0 set means the bytes DIFFER; here the polarity is inverted:
+            // tzcnt(0xFFFE) is 1, but a first-byte mismatch must count as 0.)
+            len += (mask as u32).trailing_ones();
             break;
         }
         len += 16;
