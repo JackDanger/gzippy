@@ -4,10 +4,14 @@
 //! Upstream license: libdeflate is Copyright 2016 Eric Biggers, Copyright
 //! 2024 Google LLC, MIT — see `THIRD_PARTY_NOTICES.md` at the repo root.
 //!
-//! # Why this module exists, and why it is SEPARATE from `super::deflate`
+//! # Why this module is separate from `super::deflate`
 //!
-//! Our shipping encoder is not libdeflate's. It is FOUR lineages stitched together
-//! behind our own dispatch:
+//! This is the production encoder for libdeflate levels 0-9. The remaining
+//! near-optimal levels use the established exact whole-stream implementation
+//! in `super::deflate`. Keeping this port isolated preserves a direct,
+//! function-by-function comparison with the vendor implementation.
+//!
+//! The legacy encoder remains a collection of multiple lineages:
 //!
 //! | module | lines | lineage |
 //! |---|---|---|
@@ -20,9 +24,7 @@
 //! | `deflate/parse/ultra/*` | 5,000+ | **zopfli** |
 //!
 //! ~17,000 lines of core deflate path doing what libdeflate does in 4,155. That
-//! structural fact — not any single number — is the gap. It is why L1 diverges,
-//! why the level->config map is inherited while the code around it is not, and why
-//! byte-identity with libdeflate holds on 154 of 198 T1 cells but not the rest.
+//! structural fact — not any single number — motivated the isolated port.
 //!
 //! **GOAL (user, 2026-08-01): perfectly copy libdeflate's exact implementation in
 //! pure Rust, performing exactly the same and producing the same output.**
@@ -33,9 +35,8 @@
 //! 1. **A clean oracle.** Every function here can be differentially tested against
 //!    the C directly. A refactor-in-place has no oracle — you cannot tell a port bug
 //!    from a pre-existing divergence.
-//! 2. **It cannot regress a closed cell while it is being built.** We are
-//!    byte-identical to libdeflate on 154 T1 cells with ZERO tolerance (clause 3 is
-//!    absolute). Nothing here is routed until it is proven byte-identical.
+//! 2. **A narrow production surface.** Routing is permitted only after whole-stream
+//!    byte identity against libdeflate has been established for that level.
 //!
 //! # Porting rules — these are what make it a COPY and not a rewrite
 //!
@@ -63,7 +64,6 @@
 //!    sha256(libdeflate-gzip)`. This is the real gate — `wc -c` never counts.
 //! 4. **Wall**: only once 3 passes. `fulcrum ab paired`, read `aa_bias`.
 //!
-//! Nothing routes into the shipping path until rung 3 is green for that level, and
 //! `scripts/campaign/tie-guard.sh` runs before any change that alters T1 output.
 //!
 //! # Port status
@@ -72,16 +72,16 @@
 //! order, which is roughly the C's own file order:
 //!
 //! * [x] constants (this file)
-//! * [ ] heap sort + `sort_symbols` + `build_tree` + `compute_length_counts`
-//! * [ ] `gen_codewords` + `deflate_make_huffman_code(s)`
-//! * [ ] precode: `deflate_compute_precode_items` / `deflate_precompute_huffman_header`
-//! * [ ] `deflate_flush_block` (the big one — 334 lines of C)
-//! * [ ] sequence store + `deflate_choose_literal` / `deflate_choose_match`
-//! * [ ] block-split stats (`init_block_split_stats` .. `should_end_block`)
-//! * [ ] matchfinders: `hc_matchfinder.h`, `ht_matchfinder.h`, `bt_matchfinder.h`
-//! * [ ] `deflate_compress_none` / `_fastest` / `_greedy` / `_lazy_generic`
+//! * [x] heap sort + `sort_symbols` + `build_tree` + `compute_length_counts`
+//! * [x] `gen_codewords` + `deflate_make_huffman_code(s)`
+//! * [x] precode: `deflate_compute_precode_items` / `deflate_precompute_huffman_header`
+//! * [x] `deflate_flush_block` (the big one — 334 lines of C)
+//! * [x] sequence store + `deflate_choose_literal` / `deflate_choose_match`
+//! * [x] block-split stats (`init_block_split_stats` .. `should_end_block`)
+//! * [x] matchfinders: `hc_matchfinder.h`, `ht_matchfinder.h`, `bt_matchfinder.h`
+//! * [x] `deflate_compress_none` / `_fastest` / `_greedy` / `_lazy_generic`
 //! * [ ] near-optimal: costs, `deflate_find_min_cost_path`, `_compress_near_optimal`
-//! * [ ] `libdeflate_alloc_compressor_ex` (the level -> config map, ported verbatim)
+//! * [x] `libdeflate_alloc_compressor_ex` for levels 0-9 (the level -> config map)
 
 #![allow(dead_code)] // Ports land bottom-up; unused until the driver is ported.
 
@@ -91,6 +91,7 @@ pub mod compress;
 mod compress_fastest;
 mod compress_greedy;
 mod compress_lazy;
+mod far_len3;
 mod flush;
 mod hc_matchfinder;
 mod heap;
@@ -254,6 +255,7 @@ pub fn max_passthrough_size(level: u32) -> usize {
 }
 
 pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
+    crate::compress::deflate::encode_census::port_encode();
     let Some(mut c) = compress::LdxCompressor::new(level) else {
         return false;
     };
@@ -289,6 +291,9 @@ pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
     out.truncate(n);
     Some(out)
 }
+
+#[cfg(test)]
+mod raw_bench;
 
 #[cfg(test)]
 mod tests {

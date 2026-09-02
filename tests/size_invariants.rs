@@ -37,8 +37,23 @@ const LEVELS: std::ops::RangeInclusive<u32> = 0..=9;
 /// A pair listed here that STOPS sagging fails the test with instructions to
 /// delete it, so this list is honest and can only shrink.
 const KNOWN_SAGS: &[(&str, u32)] = &[
-    // The L3->L4 sags on synthetic tabular/binary HEALED by mmap pick-min entry-point
-    // wiring (#330 L4 + #331 encode_gzip_bytes_to_vec / slack-padded paths).
+    // tabular L3->L4: RE-OPENED on this branch by the pick-min deletion
+    // (`d9418505`, "DELETE pick-min — one encode per input"). origin/main is
+    // GREEN here because the mmap pick-min entry-point wiring (#330/#331) picks
+    // the smaller candidate at L4. With the wiring gone, L4 (greedy 16,30)
+    // = 271,505 B > L3 = 262,033 B at branch HEAD (+9,472 B — this test was
+    // RED at HEAD, before the L3 lever); the L3 len-3 lever (this branch) sets
+    // L3 = 255,735 B (byte-identical to origin/main's L3), making the sag
+    // +15,770 B. The inversion is L4's GREEDY parse being weaker than L3's
+    // LAZY parse on synthetic tabular — an L4 lever (deeper greedy or lazy
+    // routing, board-measured) heals it and removes this entry; the list only
+    // shrinks.
+    ("tabular", 3),
+    ("binary", 3), // same L4-greedy < L3-lazy inversion (binary: L4 663,583 > L3 661,353, +2,230 B)
+    // HISTORY: the L3->L4 sags on synthetic tabular/binary were HEALED by the
+    // mmap pick-min entry-point wiring (#330 L4 + #331 encode_gzip_bytes_to_vec
+    // / slack-padded paths) — and RE-OPENED when that wiring was deleted
+    // (d9418505); see the ("tabular", 3) entry above.
     // High-level sag on prose: L7 is the best level on `text`.
     ("text", 7), // L7 305775 -> L8 306342 (+567 B)
     ("text", 8), // L8 306342 -> L9 306755 (+413 B)

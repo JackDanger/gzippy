@@ -89,10 +89,10 @@ impl BitWriter {
     /// `add_bits`/`ADD_BITS` in libdeflate requires the caller to flush often
     /// enough that `bitcount + n <= BITBUF_NBITS`. We keep the same LSB-first
     /// packing but auto-flush first whenever the accumulator could not
-    /// otherwise hold `n` more bits, so the primitive is safe for any `n <= 56`.
+    /// otherwise hold `n` more bits, so the primitive is safe for any `n <= 64`.
     #[inline]
     pub fn add_bits(&mut self, val: u64, n: u32) {
-        debug_assert!(n <= 57, "add_bits n={n} too large for a single word");
+        debug_assert!(n <= 64, "add_bits n={n} too large for a single word");
         debug_assert!(
             n == 64 || val < (1u64 << n),
             "add_bits value has bits above n"
@@ -263,28 +263,6 @@ impl BitWriter {
     pub fn write_u16_le(&mut self, v: u16) {
         debug_assert_eq!(self.bitcount, 0, "write_u16_le on unaligned stream");
         self.out.extend_from_slice(&v.to_le_bytes());
-    }
-
-    /// Hand every COMPLETE byte accumulated so far to `w` and clear the
-    /// internal buffer, leaving the bit accumulator untouched so the stream
-    /// continues seamlessly across the drain.
-    ///
-    /// This is what makes a single-pass streaming encoder possible: without
-    /// it, a `BitWriter` grows a `Vec` holding the entire compressed output
-    /// (the T1 path's second full-size buffer). After [`flush_bits`] the
-    /// buffer holds only whole bytes and at most 7 bits remain in `bitbuf`,
-    /// so draining here is a clean cut — NOT byte-alignment. Deliberately not
-    /// [`align_to_byte`]: padding to a byte boundary at every drain would
-    /// inject stray zero bits into the middle of the DEFLATE stream and
-    /// change (indeed corrupt) the output. The drain point is therefore
-    /// invisible in the emitted bytes, which is exactly the property that
-    /// lets the streaming encoder stay byte-identical to the whole-buffer
-    /// one.
-    pub fn drain_to<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
-        self.flush_bits();
-        w.write_all(&self.out)?;
-        self.out.clear();
-        Ok(())
     }
 
     /// Finish the stream: flush full bytes, emit any final partial byte

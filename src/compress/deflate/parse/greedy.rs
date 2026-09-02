@@ -14,7 +14,7 @@ use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, far_len3, l3_sparse_split_hold, l3_sparse_split_latch, BlockRole, FarLen3Gate,
-    InputMode, ParseState, Sink, StaticCodes, L3_OVER_SPLIT_LATCH_BLOCKS, STREAM_BLOCK_LOOKAHEAD,
+    ParseState, Sink, StaticCodes, L3_OVER_SPLIT_LATCH_BLOCKS,
 };
 
 pub(super) fn run(
@@ -52,26 +52,21 @@ pub(super) fn run(
         } else {
             BlockRole::Interior
         },
-        InputMode::Drain,
         budget,
     );
 }
 
-/// [`run`] with the matchfinder state supplied by the caller, so it can span
-/// several calls over a sliding buffer.
+/// [`run`] with the matchfinder state supplied by the caller.
 ///
-/// Returns the position after the last COMPLETE block emitted.
+/// Returns the position after the last COMPLETE block emitted (the whole
+/// input — this parser always drains to the end).
 ///
-/// `consume_all` and `is_last` are INDEPENDENT and must not be conflated —
-/// doing so was a real bug caught by the concatenation tests. `is_last` marks
-/// BFINAL on the closing block; it is false for every non-final chunk of a
-/// CONCATENATED stream (the T>1 path), which nonetheless has to consume all
-/// the input it was handed. `consume_all` is what the single-pass streaming
-/// encoder sets to false: it means "this buffer will be refilled, so stop at
-/// the last block boundary that still had [`STREAM_BLOCK_LOOKAHEAD`] bytes of
-/// input behind it and let me carry the tail forward". That margin is exactly
-/// what makes every block-boundary decision identical to a whole-buffer
-/// encode, so the chunk seam leaves no trace in the emitted bytes.
+/// `is_last` marks BFINAL on the closing block; it is false for every
+/// non-final chunk of a CONCATENATED stream (the T>1 path), which nonetheless
+/// has to consume all the input it was handed. (The streaming `Bounded`
+/// mode — stop at the last block boundary with lookahead room to spare —
+/// was deleted with the single-pass streaming encoder, 2026-08-30: no
+/// production level can stream, so the early-return it controlled was dead.)
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_resumable(
     buf: &[u8],
@@ -82,7 +77,6 @@ pub(super) fn run_resumable(
     statics: &StaticCodes,
     bw: &mut BitWriter,
     role: BlockRole,
-    input_mode: InputMode,
     budget: HeaderBudget,
 ) -> usize {
     let mut sink = Sink::acquire();
@@ -100,9 +94,6 @@ pub(super) fn run_resumable(
     let mut split_hold_decided = false;
 
     loop {
-        if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
-            return in_next;
-        }
         // Start a new DEFLATE block.
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);

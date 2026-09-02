@@ -147,6 +147,7 @@ impl DeflateFreqs {
 /// `ADD_BITS`/`FLUSH_BITS` budget hold a litlen codeword plus its extra length bits
 /// plus an offset codeword plus its extra offset bits inside one 64-bit bitbuffer.
 /// Raising it to 15 would be a legal DEFLATE stream and a different one.
+#[inline(always)]
 pub(crate) fn deflate_make_huffman_codes(freqs: &DeflateFreqs, codes: &mut DeflateCodes) {
     deflate_make_huffman_code(
         DEFLATE_NUM_LITLEN_SYMS,

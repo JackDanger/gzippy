@@ -99,6 +99,37 @@ pub(crate) fn lz_hash(seq: u32, num_bits: u32) -> u32 {
     seq.wrapping_mul(0x1E35_A7BD) >> (32 - num_bits)
 }
 
+/// C: `prefetchw(addr)` (`common_defs.h:260`).
+///
+/// The matchfinders compute the hash for the *next* input position before
+/// touching that bucket.  libdeflate prefetches it into L1 with write intent;
+/// on x86 GCC lowers its `__builtin_prefetch(addr, 1)` to `prefetcht0`.
+/// Prefetches are hints only, so this has no effect on the DEFLATE stream.
+#[inline(always)]
+pub(crate) fn prefetchw<T>(addr: *const T) {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        use core::arch::x86::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // GCC's `__builtin_prefetch(addr, 1)` uses the same L1 write-prefetch
+        // operation on AArch64.
+        core::arch::asm!("prfm pstl1keep, [{addr}]", addr = in(reg) addr, options(nostack));
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = addr;
+}
+
 /// C: `lz_extend(strptr, matchptr, start_len, max_len)` (:178)
 ///
 /// Return the number of bytes at `matchptr` that match the bytes at `strptr`, up to a
@@ -109,48 +140,223 @@ pub(crate) fn lz_hash(seq: u32, num_bits: u32) -> u32 {
 /// path is reproduced with `u64` loads and `trailing_zeros`, which is `bsfw` on
 /// little-endian; the result is identical to the byte loop, so the shape here is about
 /// codegen, not about the answer.
+/// # Safety
+///
+/// `max_len` bytes beginning at both `strptr` and `matchptr` must lie within
+/// `buf`, and `start_len <= max_len`.  The parsers establish this by capping
+/// `max_len` at the remaining input from `strptr` and only matching against an
+/// earlier input position.  This is the same caller-side contract as C's helper;
+/// keeping it in the type prevents a future direct caller from turning its
+/// unchecked loads into release-build undefined behaviour.
 #[inline(always)]
-pub(crate) fn lz_extend(
+pub(crate) unsafe fn lz_extend(
     buf: &[u8],
     strptr: usize,
     matchptr: usize,
     start_len: u32,
     max_len: u32,
 ) -> u32 {
-    const WORDBYTES: u32 = 8;
-    let mut len = start_len;
-
-    // The C's `UNALIGNED_ACCESS_IS_FAST` branch. `load_word_unaligned` reads
-    // WORDBYTES past the index, so it is only taken while a whole word is in bounds
-    // of BOTH pointers.
-    let word_at = |i: usize| -> u64 {
-        // The caller has already proven a whole word is readable here (see the
-        // `len + WORDBYTES <= max_len` guard on the loop below and the
-        // compressor's BUF_PAD). Hot: this is lz_extend's word compare.
-        debug_assert!(i + 8 <= buf.len());
-        let b = unsafe { (buf.as_ptr().add(i) as *const [u8; 8]).read_unaligned() };
-        u64::from_le_bytes(b)
-    };
-    let in_bounds = |i: usize| i + 8 <= buf.len();
-
-    while len + WORDBYTES <= max_len
-        && in_bounds(matchptr + len as usize)
-        && in_bounds(strptr + len as usize)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        let v_word = word_at(matchptr + len as usize) ^ word_at(strptr + len as usize);
-        if v_word != 0 {
-            // CPU_IS_LITTLE_ENDIAN: len += bsfw(v_word) >> 3
-            return len + (v_word.trailing_zeros() >> 3);
+        unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { lz_extend_neon(buf, strptr, matchptr, start_len, max_len) }
+    }
+    // Generic fallback: compiled ONLY on arches without the SIMD paths above
+    // (wrapping it in a negated cfg is what keeps `unreachable_code` from
+    // firing on x86/aarch64 builds, where the early return above dominates).
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        const WORDBYTES: u32 = 8;
+        let mut len = start_len;
+
+        // C relies on this caller contract rather than clamping its inner-loop limit.
+        // The parsers establish it by capping `max_len` at bytes remaining from
+        // `strptr`; `matchptr` is an earlier input position.  Keep that proof live in
+        // debug builds, but do not turn it into release work on every extension.
+        debug_assert!(strptr <= buf.len() && matchptr <= buf.len());
+        debug_assert!(max_len as usize <= buf.len() - strptr);
+        debug_assert!(max_len as usize <= buf.len() - matchptr);
+        debug_assert!(start_len <= max_len);
+
+        #[inline(always)]
+        unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
+            // SAFETY: the caller proves that `[i, i + WORDBYTES)` is in `buf`.
+            u64::from_le(unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() })
         }
-        len += WORDBYTES;
+
+        // C: four `COMPARE_WORD_STEP`s before the regular word loop.  This is not
+        // merely an unroll hint: spelling all four keeps the same fast-path control
+        // flow and lets LLVM schedule the independent unaligned loads as C does.
+        if max_len - len >= 4 * WORDBYTES {
+            macro_rules! compare_word_step {
+                () => {{
+                    // SAFETY: the enclosing guard leaves at least four full words.
+                    let v_word = unsafe {
+                        load_word(buf, matchptr + len as usize)
+                            ^ load_word(buf, strptr + len as usize)
+                    };
+                    if v_word != 0 {
+                        return len + (v_word.trailing_zeros() >> 3);
+                    }
+                    len += WORDBYTES;
+                }};
+            }
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
+        }
+
+        while len + WORDBYTES <= max_len {
+            // SAFETY: the loop condition and entry clamp prove both loads fit.
+            let v_word = unsafe {
+                load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
+            };
+            if v_word != 0 {
+                // C: `len += bsfw(v_word) >> 3` on little-endian targets.
+                return len + (v_word.trailing_zeros() >> 3);
+            }
+            len += WORDBYTES;
+        }
+
+        while len < max_len {
+            // SAFETY: `len < max_len` and the entry clamp prove both loads fit.
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    != *buf.get_unchecked(strptr + len as usize)
+            } {
+                break;
+            }
+            len += 1;
+        }
+        len
+    }
+}
+/// SSE-optimized match extension: compares 16 bytes at a time
+/// instead of 8. Produces identical results to `lz_extend`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) unsafe fn lz_extend_sse(
+    buf: &[u8],
+    strptr: usize,
+    matchptr: usize,
+    start_len: u32,
+    max_len: u32,
+) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+    let mut len = start_len;
+    let base = buf.as_ptr();
+
+    // 16-byte comparisons
+    while max_len - len >= 16 {
+        let a = unsafe { _mm_loadu_si128(base.add(strptr + len as usize) as *const __m128i) };
+        let b = unsafe { _mm_loadu_si128(base.add(matchptr + len as usize) as *const __m128i) };
+        let cmp = _mm_cmpeq_epi8(a, b);
+        let mask = _mm_movemask_epi8(cmp) as u16;
+        if mask != 0xFFFF {
+            // `movemask` semantics: bit i is SET when byte i is EQUAL, so the
+            // first differing byte is the run of set bits from bit 0 — i.e.
+            // `trailing_ones`. (`trailing_zeros` is the XOR-word idiom where
+            // bit 0 set means the bytes DIFFER; here the polarity is inverted:
+            // tzcnt(0xFFFE) is 1, but a first-byte mismatch must count as 0.)
+            len += (mask as u32).trailing_ones();
+            break;
+        }
+        len += 16;
     }
 
-    while len < max_len && {
-        debug_assert!((matchptr + len as usize) < buf.len() && (strptr + len as usize) < buf.len());
-        unsafe {
-            *buf.get_unchecked(matchptr + len as usize) == *buf.get_unchecked(strptr + len as usize)
+    // Byte-by-byte tail
+    while len < max_len {
+        if unsafe {
+            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
+        } {
+            break;
         }
-    } {
+        len += 1;
+    }
+    len
+}
+
+/// NEON-optimized match extension: compares 16 bytes at a time
+/// using XOR + vmaxvq_u8. Produces identical results to `lz_extend`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn lz_extend_neon(
+    buf: &[u8],
+    strptr: usize,
+    matchptr: usize,
+    start_len: u32,
+    max_len: u32,
+) -> u32 {
+    use core::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8};
+
+    let mut len = start_len;
+    let base = buf.as_ptr();
+
+    // 16-byte comparisons via XOR
+    while max_len - len >= 16 {
+        let a = unsafe { vld1q_u8(base.add(strptr + len as usize)) };
+        let b = unsafe { vld1q_u8(base.add(matchptr + len as usize)) };
+        let x = veorq_u8(a, b);
+        let max_byte = vmaxvq_u8(x);
+        if max_byte != 0 {
+            // Not all 16 bytes match; fall through to word tail
+            break;
+        }
+        len += 16;
+    }
+
+    // 4-byte word tail (up to 12 bytes)
+    while max_len - len >= 4 {
+        let a = unsafe {
+            u32::from_le_bytes([
+                *base.add(strptr + len as usize),
+                *base.add(strptr + len as usize + 1),
+                *base.add(strptr + len as usize + 2),
+                *base.add(strptr + len as usize + 3),
+            ])
+        };
+        let b = unsafe {
+            u32::from_le_bytes([
+                *base.add(matchptr + len as usize),
+                *base.add(matchptr + len as usize + 1),
+                *base.add(matchptr + len as usize + 2),
+                *base.add(matchptr + len as usize + 3),
+            ])
+        };
+        if a != b {
+            // Byte-by-byte within this word
+            for i in 0..4u32 {
+                if len + i >= max_len {
+                    break;
+                }
+                if unsafe {
+                    *buf.get_unchecked(matchptr + (len + i) as usize)
+                        != *buf.get_unchecked(strptr + (len + i) as usize)
+                } {
+                    return len + i;
+                }
+            }
+            len += 4;
+        } else {
+            len += 4;
+        }
+    }
+
+    // Byte-by-byte tail (up to 3 bytes)
+    while len < max_len {
+        if unsafe {
+            *buf.get_unchecked(matchptr + len as usize) != *buf.get_unchecked(strptr + len as usize)
+        } {
+            break;
+        }
         len += 1;
     }
     len
@@ -257,7 +463,7 @@ mod tests {
 
         // A buffer where a match runs for a controlled number of bytes.
         for run in 0..80usize {
-            let mut buf = vec![0u8; 512];
+            let mut buf = vec![0u8; 600];
             // matchptr region at 0, strptr region at 256.
             for i in 0..run {
                 buf[i] = (i % 7) as u8;
@@ -269,7 +475,7 @@ mod tests {
             for max in [4u32, 8, 16, 17, 33, 64, 100, 258] {
                 let start = 0u32;
                 assert_eq!(
-                    lz_extend(&buf, 256, 0, start, max),
+                    unsafe { lz_extend(&buf, 256, 0, start, max) },
                     naive(&buf, 256, 0, start, max),
                     "run={run} max={max}"
                 );
@@ -283,7 +489,7 @@ mod tests {
     /// checking a 4-byte sequence equality.
     #[test]
     fn lz_extend_trusts_start_len() {
-        let mut buf = vec![0u8; 128];
+        let mut buf = vec![0u8; 400];
         // Deliberately make the first 4 bytes differ.
         buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
         buf[64..68].copy_from_slice(&[9, 9, 9, 9]);
@@ -295,6 +501,6 @@ mod tests {
         buf[20] = 1;
         buf[84] = 2;
 
-        assert_eq!(lz_extend(&buf, 64, 0, 4, 258), 20);
+        assert_eq!(unsafe { lz_extend(&buf, 64, 0, 4, 258) }, 20);
     }
 }

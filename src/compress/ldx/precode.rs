@@ -78,6 +78,7 @@ impl Precode {
 /// Every one of those thresholds is a byte-identity surface: emitting the same
 /// codeword lengths through a different item sequence produces a valid but different
 /// stream.
+#[inline(always)]
 pub(crate) fn deflate_compute_precode_items(
     lens: &[u8],
     num_lens: usize,
@@ -199,6 +200,7 @@ pub(crate) fn deflate_compute_precode_items(
 /// A "cleanup" that zeroed the gap would be a divergence from the C in a function
 /// whose whole purpose is byte-identity. `precompute_leaves_the_same_residue_as_c`
 /// pins the residue so a future tidy-up fails a test instead of a corpus.
+#[inline(always)]
 pub(crate) fn deflate_precompute_huffman_header(precode: &mut Precode, codes: &mut DeflateCodes) {
     // Compute how many litlen and offset symbols are needed.
     precode.num_litlen_syms = DEFLATE_NUM_LITLEN_SYMS;

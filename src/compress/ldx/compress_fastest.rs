@@ -14,11 +14,12 @@
 //! other level is already a byte tie. So this pair of functions is very nearly the
 //! whole phase-1 parity gap.
 //!
-//! **This does not mean routing L1 here will close those cells.** The binding FALSIFY
-//! at `src/compress/deflate/parse/mod.rs:540` records two prior attempts, one dead on
-//! size and one dead on the T1 wall at 1.2662x on a cell `main` already ties. What
-//! this module changes is that a third attempt can be measured against the REAL
-//! libdeflate algorithm instead of against a derivative of it.
+//! **This does not mean routing L1 here will close those cells.** Git history
+//! records two prior attempts, one dead on size and one dead on the T1 wall at
+//! 1.2662x on a cell `main` already ties; per the standing rule those records are
+//! not binding — re-measure. What this module changes is that a third attempt can
+//! be measured against the REAL libdeflate algorithm instead of against a
+//! derivative of it.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::flush::{Compressor, DeflateSequence};
@@ -85,6 +86,7 @@ impl FastestState {
 /// shortens them they stay short for the rest of the stream. Since they only shrink at
 /// the very end that is harmless, but recomputing them per iteration would be a
 /// different program.
+#[inline(never)]
 pub(crate) fn deflate_compress_fastest(
     c: &mut Compressor,
     p: &mut FastestState,

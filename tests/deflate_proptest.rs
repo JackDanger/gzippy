@@ -4,7 +4,7 @@
 //! encoder's riskiest code is edge GEOMETRY, which fixed fixtures under-sample:
 //!   * chunk straddles in the T>1 splice path (`pipelined.rs`, 512 KiB grid),
 //!   * stored-block fallback at unaligned offsets (65,535-byte sub-blocks),
-//!   * the T1 streaming resume boundary (`STREAM_CHUNK` = 65,535 * 64),
+//!   * multi-MiB inputs (several blocks, several stored sub-blocks),
 //!   * tiny/empty inputs and the buffer tail.
 //!
 //! Every case drives the SAME functions the binary routes through
@@ -30,10 +30,6 @@ use std::io::Read;
 /// `pipelined_block_size` never goes below this for multi-chunk inputs, so
 /// sizes bracketing it exercise the 1-chunk/2-chunk seam transition at T>1.
 const PARALLEL_CHUNK: usize = 512 * 1024;
-
-/// The T1 streaming-path chunk (public), 65,535 * 64 = 4,194,240 bytes.
-/// Sizes bracketing it exercise streaming resume and the final short read.
-const STREAM_CHUNK: usize = gzippy::compress::deflate::STREAM_CHUNK;
 
 /// DEFLATE stored-block payload maximum; level 0 splits on this grid.
 const STORED_SUBBLOCK: usize = 65_535;
@@ -290,19 +286,21 @@ fn long_match_straddles_chunk_boundary() {
     }
 }
 
-/// Sizes bracketing the T1 streaming chunk (65,535 * 64 = 4,194,240): the
-/// streaming resume boundary and the final short read / buffer tail.
+/// Multi-megabyte sizes around ~4.2 MiB (65,535 * 64): several blocks at
+/// every level, several stored sub-blocks at L0 — the multi-MB boundary class
+/// the old streaming chunk grid used to define.
 #[test]
-fn stream_chunk_boundary_t1() {
-    for n in [STREAM_CHUNK - 1, STREAM_CHUNK, STREAM_CHUNK + 1] {
+fn multi_megabyte_boundary_t1() {
+    const MB4: usize = 4_194_240;
+    for n in [MB4 - 1, MB4, MB4 + 1] {
         for level in [0u8, 1, 6] {
-            assert_roundtrip(&zeros(n), level, 1, "stream-zeros");
-            assert_roundtrip(&textish(n, 0xE7), level, 1, "stream-text");
+            assert_roundtrip(&zeros(n), level, 1, "mb-zeros");
+            assert_roundtrip(&textish(n, 0xE7), level, 1, "mb-text");
         }
     }
     // One T>1 pass over the same boundary: 4 MiB at T4 is a full multi-chunk
     // grid with a 1-byte logical tail.
-    assert_roundtrip(&textish(STREAM_CHUNK + 1, 0xE8), 6, 4, "stream-text-t4");
+    assert_roundtrip(&textish(MB4 + 1, 0xE8), 6, 4, "mb-text-t4");
 }
 
 // ── Proptest: randomized shapes x sizes x level x threads ────────────────────

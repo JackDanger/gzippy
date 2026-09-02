@@ -14,8 +14,8 @@
 ///
 /// This is purely about the BFINAL bit. A segment in the middle of a
 /// CONCATENATED stream (the T>1 path) is [`BlockRole::Interior`] even though
-/// it consumes all of its own input — which is exactly the distinction
-/// [`InputMode`] carries and this type does not.
+/// it consumes all of its own input — the BFINAL question and the
+/// consume-all question are independent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockRole {
     /// More blocks follow; BFINAL stays 0.
@@ -28,29 +28,6 @@ impl BlockRole {
     #[inline]
     pub fn is_final(self) -> bool {
         matches!(self, BlockRole::Final)
-    }
-}
-
-/// Whether the parser must consume every byte it was handed.
-///
-/// [`InputMode::Drain`] is the whole-buffer contract: this is all the input
-/// there will ever be for this call, parse to the end. [`InputMode::Bounded`]
-/// is the single-pass streaming contract: the buffer will be refilled, so stop
-/// at the last block boundary that still had a full lookahead behind it and
-/// leave the tail for the caller to carry forward. Only `Bounded` can return a
-/// position short of the end.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InputMode {
-    /// Parse to the end of the supplied range.
-    Drain,
-    /// The buffer will be refilled; stop at a block boundary and report where.
-    Bounded,
-}
-
-impl InputMode {
-    #[inline]
-    pub fn must_drain(self) -> bool {
-        matches!(self, InputMode::Drain)
     }
 }
 

@@ -331,32 +331,6 @@ fn apply_l1_fast_parallel_knobs(p: &mut LevelParams) {
     p.fast_hash_update_inserts = usize::MAX;
 }
 
-/// Resolve a compression level (clamped to 0..=12) to its parser parameters.
-///
-/// The `max_search_depth`/`nice_match_length` values transliterate the vendor
-/// presets exactly; the strategy mapping substitutes a fallback for the two
-/// strategies not yet implemented in this increment (see the module docs).
-/// Gzip-shaped L1 primary hash (3-byte keys) for mmap pick-min's second arm.
-pub fn params_l1_gzip_primary() -> LevelParams {
-    let mut p = params(1);
-    p.fast_gzip_primary = true;
-    p
-}
-
-/// Gzip `deflate_fast` L2 on the greedy path for mmap pick-min: chain 8,
-/// nice 16, always min-match 3, no far-len-3 gate/shadow deferral.
-pub fn params_l2_gzip_deflate_fast() -> LevelParams {
-    let mut p = params(2);
-    p.max_search_depth = 8;
-    p.nice_match_length = 16;
-    p.far_len3_gate = false;
-    p.greedy_len3_shadow = false;
-    p.forced_min_match_len = 3;
-    p.greedy_accept_far_len3 = true;
-    p.hash3_chain_depth = super::matchfinder::hc::HC_HASH3_CHAIN_DEPTH;
-    p
-}
-
 pub fn params(level: u32) -> LevelParams {
     let p = params_baseline(level);
     // zlib-ng knobs apply only on the T1 whole-buffer pick-min path — see
@@ -375,6 +349,26 @@ pub fn params(level: u32) -> LevelParams {
 
 /// libdeflate-table knobs (streaming / segmented / pick-min baseline).
 pub(crate) fn params_baseline(level: u32) -> LevelParams {
+    // ⭐ L5/L6/L7 KEEP THEIR SECOND ARM'S KNOBS AS THEIR ONLY KNOBS (2026-08-23).
+    //
+    // Deleting pick-min made `params(6)` the single encode, and the ledger
+    // (`won_cells_stay_won`, append-only) immediately regressed FOUR cells:
+    // binary:L6 and text:L6 against both gzip and pigz. Those cells were won by the
+    // ZLIB arm, which is `params_baseline` plus exactly two knobs — zlib's chain depth
+    // and `good_match`. Carrying those knobs on the level itself keeps the cells
+    // without a second encode. Measured per-level clause-3 flip counts, one encode,
+    // 23-file corpus x {gzip, pigz, libdeflate}:
+    //
+    //     L5   params(5) 4 flips   ->  zlib knobs (32, good 8)    2 flips
+    //     L6   params(6) 6 flips   ->  zlib knobs (128, good 8)   2 flips
+    //     L7   params(7) 4 flips   ->  (256, good 32)             2 flips
+    //
+    // and the new depths are monotone in level (16 < 32 < 128 < 256 < 300), which
+    // `search_effort_is_monotonic_in_level` requires.
+    //
+    // `good_match` SHORTENS the walk once a good match is found, so this is a deeper
+    // chain WITH an early exit, not simply more search.
+
     #[allow(unused_mut)]
     let mut p = params_inner(level);
     #[cfg(feature = "ladder-tune")]
@@ -385,13 +379,6 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
         // doc comment for the adjudicated T4 wall cell that is the reason.
         apply_l1_match_reach_t1_knobs(&mut p);
     }
-    p
-}
-
-/// zlib-ng chain depth + `good_match` for the T1 whole-buffer L5-L7 path.
-pub(crate) fn params_zlib_t1(level: u32) -> LevelParams {
-    let mut p = params_baseline(level);
-    apply_zlib_t1_search_knobs(level, &mut p);
     p
 }
 
@@ -676,29 +663,6 @@ pub mod ladder_tune {
     }
 }
 
-/// zlib-ng `configuration_table` chain depth + `good_length` for the T1 path
-/// (G31/G31a). libdeflate's map gives shallow chains with no early exit; gzip
-/// runs deep chains BECAUSE `good_match` quarters the walk once a match is long
-/// enough. Applied only in [`params`], not [`params_parallel`], so T>1 keeps
-/// libdeflate depths ×4.
-fn apply_zlib_t1_search_knobs(level: u32, p: &mut LevelParams) {
-    match level {
-        5 => {
-            p.good_match = 8;
-            p.max_search_depth = 32;
-        }
-        6 => {
-            p.good_match = 8;
-            p.max_search_depth = 128;
-        }
-        7 => {
-            p.good_match = 8;
-            p.max_search_depth = 256;
-        }
-        _ => {}
-    }
-}
-
 fn params_inner(level: u32) -> LevelParams {
     let max_match = DEFLATE_MAX_MATCH_LEN;
     // Placeholder near-optimal knobs for the non-near-optimal levels (unused).
@@ -859,7 +823,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 12,
+            max_search_depth: 8,
             nice_match_length: 14,
             good_match: 0,
             far_len3_gate: true,
@@ -896,7 +860,7 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Greedy,
-            max_search_depth: 16,
+            max_search_depth: 12,
             nice_match_length: 30,
             good_match: 0,
             far_len3_gate: false,
@@ -921,9 +885,9 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 16,
+            max_search_depth: 24,
             nice_match_length: 30,
-            good_match: 0,
+            good_match: 8,
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
@@ -946,9 +910,9 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 35,
+            max_search_depth: 128,
             nice_match_length: 65,
-            good_match: 0,
+            good_match: 8,
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
@@ -971,9 +935,9 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 100,
+            max_search_depth: 256,
             nice_match_length: 130,
-            good_match: 0,
+            good_match: 32,
             far_len3_gate: false,
             greedy_len3_shadow: false,
             lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
