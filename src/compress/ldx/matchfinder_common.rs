@@ -456,10 +456,16 @@ mod tests {
             buf[256 + run] = 0xBB;
 
             for max in [4u32, 8, 16, 17, 33, 64, 100, 258] {
+                // The caller contract is `strptr + max_len <= buf.len()`: slide
+                // strptr itself back to the exact buffer boundary when the
+                // 256-region start would overshoot (max > 256), so the probe
+                // exercises that boundary instead of violating the contract the
+                // SIMD paths cannot recover from.
+                let strptr = 256usize.min(buf.len() - max as usize);
                 let start = 0u32;
                 assert_eq!(
-                    lz_extend(&buf, 256, 0, start, max),
-                    naive(&buf, 256, 0, start, max),
+                    lz_extend(&buf, strptr, 0, start, max),
+                    naive(&buf, strptr, 0, start, max),
                     "run={run} max={max}"
                 );
             }
@@ -484,6 +490,9 @@ mod tests {
         buf[20] = 1;
         buf[84] = 2;
 
-        assert_eq!(lz_extend(&buf, 64, 0, 4, 258), 20);
+        // max_len caps at the honest caller bound (`strptr + max_len <= buf.len()`):
+        // the point is that lz_extend stops at the first post-start mismatch
+        // (len 20), not that max_len may walk past the buffer.
+        assert_eq!(lz_extend(&buf, 64, 0, 4, 64), 20);
     }
 }
