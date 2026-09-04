@@ -237,6 +237,20 @@ X"; any framing of a divergence as a regression. A cell that was "tied" because
 we emitted a vendor's exact bytes was never a win — it was a guarantee that we
 could not beat them.
 
+⚠ SUPERSEDED 2026-08-22→09-03, owner-directed — the paragraphs above
+("byte-identity is never required", "delete on sight", "T>1 may emit different
+bytes") describe the PRE-PIVOT tree and no longer the owner's direction: wall
+outranks size and "if we have to tie on one of them, we tie on size" (#356,
+2026-08-22). The production encoder is now our per-decision libdeflate port
+(`/src/compress/ldx/`), whose output is byte-tied to the vendor at its levels
+BY DESIGN — the tie is the construction, not an accident to delete. T>1 emits
+the T1 bytes by construction (docs/plan-2026-09-one-encoder.md §3, exact state
+carry; `scripts/campaign/parity-census.sh` is that construction's falsifier),
+not because a gate reappeared but because the one-encoder reality made T>1 and
+T1 the same encode. VALID GZIP remains the unchanged correctness floor. Read
+CLAUDE.md (warning box in the build order) and the plan doc before acting on
+anything above this banner.
+
 Audited 2026-07-28: no test asserts byte-equality against a vendor. Every
 `libdeflater` use in `src/tests/` is either the roundtrip DECODER oracle or a
 size BAR to beat; both are legitimate and both stay. The rationale in

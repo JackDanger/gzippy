@@ -11,6 +11,16 @@ justified against it.
 
 ## The product constraint that drives everything
 
+⚠ SUPERSEDED-IN-PART 2026-09-03 (one-encoder pivot): the level-engine paragraph
+below predates the pivot to `src/compress/ldx/` (the per-decision libdeflate
+port, now THE production encoder for L0-9 at the routed levels). The
+byte-identity claims are TRUE again under the new mechanism — but for a
+different reason than the legacy parse engine: the port ties libdeflate
+by CONSTRUCTION, and T>1 emits the T1 bytes by construction
+(docs/plan-2026-09-one-encoder.md §1/§3; `scripts/campaign/parity-census.sh`
+is the falsifier). The legacy levels' byte-identity wording below is kept for
+provenance only. The per-label bar and peak-memory axis are unchanged.
+
 At the level the user typed, output at least as small AND less wall time than gzip, pigz,
 libdeflate-gzip and igzip. Per-label, not curve. That means:
 

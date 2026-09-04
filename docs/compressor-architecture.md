@@ -1,6 +1,13 @@
 # The gzippy Unified Compressor — Architecture
 
-Status: DESIGN (2026-07-21). Owner: campaign supervisor. Basis: the full two-engine
+Status: DESIGN (2026-07-21), ⚠ PARTLY SUPERSEDED 2026-09-03 (one-encoder
+pivot, docs/plan-2026-09-one-encoder.md): the "level engine" named below as
+one of two complete encoders is no longer THE production encoder —
+`src/compress/ldx/` (the per-decision libdeflate port) is, at the routed
+levels, T1 and T>1 alike (T>1 emits the T1 bytes by construction;
+`scripts/campaign/parity-census.sh` is the falsifier). Byte-identity claims
+below describe the pre-pivot mechanism and survive as provenance of the
+legacy engine. Owner: campaign supervisor. Basis: the full two-engine
 inventory (technique catalog + duplication map, measured provenance for every piece).
 
 ## 1. What exists today, and why it must become one thing
