@@ -136,9 +136,12 @@ pub fn lz_extend(
 /// `prefetchw`, `common_defs.h:260-271`).
 ///
 /// Same purity and safety as [`prefetch_read`]: a pure hint that never faults
-/// and mutates nothing. The write/exclusive variant hints that the line will be
-/// stored to next (the hash-bucket update), so the cache can fetch it in an
-/// exclusive state and avoid a later read-for-ownership stall.
+/// and mutates nothing. Per-target reality: x86_64 issues the write/exclusive
+/// hint (`_MM_HINT_ET0`, as the C does); aarch64 deliberately issues the LOAD
+/// hint `pldl1keep` (commit bbe56823, store->load for the ARM head table), so
+/// on ARM the line is NOT fetched exclusive and the "avoid a later
+/// read-for-ownership stall" wording does not describe this code.
+/// Wall-only either way — bytes are untouched at every level.
 ///
 /// SAFETY (for the clippy raw-pointer lint): a prefetch hint is not a
 /// dereference — it cannot fault, cannot read, and touches no architectural
@@ -170,7 +173,6 @@ pub fn prefetch_write(ptr: *const u8) {
 /// The compiler cannot eliminate this because it's a real function call
 /// with a side effect (the prfm instruction).
 #[cfg(target_arch = "aarch64")]
-#[no_mangle]
 #[inline(never)]
 unsafe extern "C" fn aarch64_prefetch_l1(ptr: *const u8) {
     core::arch::asm!(

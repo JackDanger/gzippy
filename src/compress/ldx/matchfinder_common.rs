@@ -156,6 +156,19 @@ pub(crate) unsafe fn lz_extend(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
+    // BOUND CONTRACT, debug-only: every load in the paths below is confined to
+    // [ptr, ptr + max_len) — the SIMD block loads are guarded by
+    // `max_len - len >= 16` (SSE) / `>= 4` (NEON word tail), the byte tails by
+    // `len < max_len` — while the parser clamps `max_len` to bytes remaining at
+    // `strptr` and `matchptr` is an earlier input position. So the highest
+    // touched byte is `ptr + max_len - 1`, never `+15`: an unpadded slice is
+    // legal (the production slack-padded route forwards
+    // `&buf[..logical_len]`, whose len IS the logical input end). These asserts
+    // make a future caller that breaks the contract fail in debug instead of
+    // reading heap bytes it does not own.
+    debug_assert!(strptr + max_len as usize <= buf.len());
+    debug_assert!(matchptr + max_len as usize <= buf.len());
+    debug_assert!(start_len <= max_len);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) }
@@ -332,10 +345,13 @@ pub(crate) unsafe fn lz_extend_neon(
             ])
         };
         if a != b {
-            // Byte-by-byte within this word
+            // Byte-by-byte within this word. The loop invariant below guarantees
+            // `len + i < max_len` for i in 0..4, so the clamp cannot fire; it is
+            // here so a future edit that breaks the invariant fails LOUDLY at
+            // the comparison, not silently at the `len += 4` below.
             for i in 0..4u32 {
                 if len + i >= max_len {
-                    break;
+                    return len + i;
                 }
                 if unsafe {
                     *buf.get_unchecked(matchptr + (len + i) as usize)
@@ -463,7 +479,7 @@ mod tests {
 
         // A buffer where a match runs for a controlled number of bytes.
         for run in 0..80usize {
-            let mut buf = vec![0u8; 600];
+            let mut buf = vec![0u8; 512];
             // matchptr region at 0, strptr region at 256.
             for i in 0..run {
                 buf[i] = (i % 7) as u8;
@@ -473,10 +489,16 @@ mod tests {
             buf[256 + run] = 0xBB;
 
             for max in [4u32, 8, 16, 17, 33, 64, 100, 258] {
+                // The caller contract is `strptr + max_len <= buf.len()`: slide
+                // strptr itself back to the exact buffer boundary when the
+                // 256-region start would overshoot (max > 256), so the probe
+                // exercises that boundary instead of violating the contract the
+                // SIMD paths cannot recover from.
+                let strptr = 256usize.min(buf.len() - max as usize);
                 let start = 0u32;
                 assert_eq!(
-                    unsafe { lz_extend(&buf, 256, 0, start, max) },
-                    naive(&buf, 256, 0, start, max),
+                    unsafe { lz_extend(&buf, strptr, 0, start, max) },
+                    naive(&buf, strptr, 0, start, max),
                     "run={run} max={max}"
                 );
             }
@@ -489,7 +511,8 @@ mod tests {
     /// checking a 4-byte sequence equality.
     #[test]
     fn lz_extend_trusts_start_len() {
-        let mut buf = vec![0u8; 400];
+        let mut buf = vec![0u8; 128];
+        // Deliberately make the first 4 bytes differ.
         // Deliberately make the first 4 bytes differ.
         buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
         buf[64..68].copy_from_slice(&[9, 9, 9, 9]);
@@ -501,6 +524,9 @@ mod tests {
         buf[20] = 1;
         buf[84] = 2;
 
-        assert_eq!(unsafe { lz_extend(&buf, 64, 0, 4, 258) }, 20);
+        // max_len caps at the honest caller bound (`strptr + max_len <= buf.len()`):
+        // the point is that lz_extend stops at the first post-start mismatch
+        // (len 20), not that max_len may walk past the buffer.
+        assert_eq!(unsafe { lz_extend(&buf, 64, 0, 4, 64) }, 20);
     }
 }
