@@ -10,10 +10,13 @@ DECOMPRESSION IS DONE AND WON (four months, PR #116, merged 2026-07-18). Do not
 revisit it, re-measure it, or optimise it. This file is about the encoder.
 
 **Where everything is.** This file is the charter; it is not the state and it is not
-the toolbox. `~/.claude/.../memory/MEMORY.md` holds the measured board structure —
-read it first. The four commands you will actually use:
+the toolbox. `docs/plan-2026-09-one-encoder.md` is the live state, the phase plan and
+the board-numbers contract — read it FIRST. `docs/encoder-campaign-plan.md` is kept
+for its falsification records; everything above those records is superseded. The
+four commands you will actually use:
 
-    make falsified                        # every FALSIFY and PARK record in src/
+    grep -rnE 'FALSIF|REOPEN' src/        # every surviving record lives in src/,
+                                             # in the code that was falsified
     CAMPAIGN_LEVELS=1-9 make board-size    # the deterministic size board, all levels
     make lever REF=<ref> ARGS="--threads 1,4"   # the promotion adjudicator
     scripts/campaign/tie-guard.sh          # 2 min; the T1 tie cage, before any T1 edit
@@ -21,7 +24,32 @@ read it first. The four commands you will actually use:
 `make lever` grades levels 2,6,9 and threads 1 BY DEFAULT. Both defaults have shipped
 a wrong verdict; pass the level and thread range the change actually acts on.
 
-## Build order — this is the plan, in this order
+## Build order — the plan IS one encoder now (reset 2026-09-03)
+
+**STATUS — the Aug-20 build order below is SUPERSEDED by what shipped 2026-08-21→23,
+kept for the receipt trail. Read this box, then the history only for provenance.**
+
+* **The production encoder is `src/compress/ldx`**, our per-decision port of
+  libdeflate's `deflate_compress.c` (#357/#358/#359/#360, merged 2026-08-23):
+  decision-for-decision identical bytes, 1.03–1.11x of C in-process. The old
+  encoder ran 1.6–4.1x slower than our own port to defend 0.1–2.3% of size.
+* **The 55-commit stack `perf/t1-output-cap` (UNMERGED, no PR — systematic
+  violation of working rule 9, being fixed first)** finishes the pivot:
+  L2/L4/L5 routed to the port, pick-min deleted (one encode per input), a
+  bit-splicing T>1 writer replacing sync-flush seams, a thread-aware chunk
+  grid, NEON/SSE match extension, an SSE lz_extend x86 corruption fix.
+* **#363 (`good_match`) and #364 (`len-3`) retire the L6/L7 and L3 routing
+  exceptions with byte-identical output.** L1 is the only remaining exception
+  (our igzip-derived L1 beats pigz -1 on text; seen in #347).
+* **The plan, falsifiers and stop-rules live in `docs/plan-2026-09-one-encoder.md`.**
+  Phase 1 = exact state carry (T>1 == T1 == libdeflate bytes, seam class dies by
+  construction). Phase 2 = L1-in-ldx (`hash3@256` re-measured on port codegen).
+  Phase 3 = L4/L5 ladder repairs. Phase 4 = codegen parity on the wall.
+* The per-label bar below is UNCHANGED and is the DONE bar for every phase.
+
+---
+
+### [SUPERSEDED 2026-09-03 — kept for receipts] the pre-port build order
 
 **STEP 1 — T=1, beating every other implementation.** One code path. Read the input
 once. Single pass. Shared buffers. Zero copies. No per-block, per-run or per-chunk
@@ -31,6 +59,24 @@ monomorphisation, unsafe, bounds-check elision, instruction selection — includ
 avoiding the instructions that force the core to down-clock.
 DONE WHEN: per-label, at every level 0-9, on every corpus file, on both arches, we
 are <= gzip AND <= pigz AND <= libdeflate AND <= igzip on size and on wall.
+(Outcome 2026-08-23: pursued not by racing our own parser but by SHIPPING THE VENDOR'S
+DECISIONS — see the status box above.)
+
+**STEP 2 — T>1, a separate code path.** A consumer thread plus compression threads
+writing to a shared fd. Fulcrum proves no thread is ever starved and that reads and
+writes are scheduled correctly — the same starvation/causation/perturbation tooling
+that won parallel decode.
+THE ONLY CORRECTNESS BAR, at every thread count, is VALID GZIP: roundtrip sha256
+through our decoder plus one independent decoder. T>1 may emit different bytes than
+T1. Byte-identity to a vendor, to our own T1, or to our own previous run is never a
+goal and never a gate. (User, 2026-07-28, stated three times. This paragraph once
+mandated T1==T4; that is WHY the rule had to be restated three times — each
+correction landed in a leaf doc while the root file kept regenerating the cage.)
+⚠ AND THE OWNER HAS SINCE MOVED 2026-08-22→23: wall outranks size; "if we have to tie
+on one of them, we tie on size" (#356); the stack makes T>1 byte-structure a gated
+property on FOUR FIXTURES ONLY, which sees no real seam. The reconciliation — exact
+state carry as a construction, parity-census as its falsifier — is Phase 1 in the plan
+doc. This is recorded as owner-directed, not silently reinterpreted.
 
 **STEP 2 — T>1, a separate code path.** A consumer thread plus compression threads
 writing to a shared fd. Fulcrum proves no thread is ever starved and that reads and
@@ -45,7 +91,12 @@ correction landed in a leaf doc while the root file kept regenerating the cage.)
 
 **The T>1 size leg is NOT closed by making seams smaller.** This paragraph used to
 say it was — "pad choice, chunk grid, block splitting" — and that was MEASURED FALSE
-on 2026-08-01 from `/root/sizeboard-all-12fcd0ed/census.json`. Pairing every
+on 2026-08-01 from `/root/sizeboard-all-12fcd0ed/census.json`. ⚠ **2026-09-03: the
+closure route prescribed below ("monotone T1 size wins that buy headroom”) is
+retired in favour of Phase 1 — exact state carry (plan doc §3) — which converges
+T>1 to the T1 stream and needs ZERO T1 headroom, because at a tie the headroom
+IS zero. The measurement below STANDS and is precisely why no shape-only lever
+worked; do not re-derive it.** Pairing every
 libdeflate cell's T1 and T4 rows:
 
     fail-at-T4-only=109   fail-both=16   pass-both=72
@@ -202,10 +253,11 @@ least once in a single session.
 
    **THE BINDING RECORDS LIVE IN `src/`. SEARCH THEM BEFORE PROPOSING ANYTHING:**
 
-       git fetch origin && make falsified      # indexes FALSIFY *and* PARK (#240)
+       git fetch origin && grep -rnE "FALSIF|REOPEN|PARK" src/ --include='*.rs'
 
-   A checkout 26 commits behind once made `make falsified` look like it did not
-   exist, and a whole session on 2026-08-01 was spent re-deriving three findings
+   (`make falsified` was deleted with the records themselves — hard stop #2 below.)
+   A checkout 26 commits behind once made this look like it did not exist, and a
+   whole session on 2026-08-01 was spent re-deriving three findings
    already written down — two in `level.rs` and one in a memory file whose opening
    sentence was a warning not to re-derive it. **A prose warning did not work; the
    command is the fix.**

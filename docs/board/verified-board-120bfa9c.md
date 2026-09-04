@@ -1,3 +1,8 @@
+<!-- 2026-09-03: SUPERSEDED by docs/plan-2026-09-one-encoder.md. Kept as a
+     measured receipt; its commit and its encoder topology predate the ldx
+     pivot (#357-#360, 2026-08-23). Do not plan from these numbers without
+     re-censusing the current stack (board-size.sh / parity-census.sh). -->
+
 # The board, re-measured on main: 200/1320 CONFIRMED — and one cell is 63% of it
 
 Full 22-file size census, solvency (AMD Zen2), main `120bfa9c`, vanilla binary

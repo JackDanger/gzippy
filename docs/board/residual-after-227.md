@@ -1,3 +1,8 @@
+<!-- 2026-09-03: SUPERSEDED by docs/plan-2026-09-one-encoder.md. Kept as a
+     measured receipt; its commit and its encoder topology predate the ldx
+     pivot (#357-#360, 2026-08-23). Do not plan from these numbers without
+     re-censusing the current stack (board-size.sh / parity-census.sh). -->
+
 # What is left after #227: two classes, opposite mechanisms, and L1 is 43% of it
 
 Source: the re-gate artifact itself (`/root/www/gzippy-bench/campaign/lever-regate-227/try.json`,

@@ -1,5 +1,20 @@
 # The encoder campaign: state, method, next actions
 
+## ⛔ STATUS 2026-09-03: SUPERSEDED by `docs/plan-2026-09-one-encoder.md`.
+
+This document was written 2026-07-30/08-01 against the PRE-PORT encoder. Since
+then: **the production encoder is the libdeflate port `ldx`** (#357-#360,
+2026-08-23), pick-min is deleted on the unmerged stack, T>1 is bit-spliced
+port fragments, and #363/#364 retire the L6/L7/L3 exceptions with
+byte-identical output. Every count in this doc (200/1320, 165, 96/660,
+223/1320) predates that pivot. **Kept for its §4 falsification records and its
+measured artifacts; do not build any of its “next actions” without checking the
+plan doc and the live board first.** The board was last whole-census-measured
+at `120bfa9c`; `perf/t1-output-cap` resets the board surface and must be
+re-censused before any number here is trusted.
+
+---
+
 Read this before touching the encoder. Written to be picked up cold.
 `CLAUDE.md` has the rules; this has the board, what already failed, and what to do.
 
