@@ -53,6 +53,35 @@ exception-retirement path (#363/#364 template).
 | L4/L5 | *pending pick-min-deletion census* | KNOWN_SAGS (tabular,3)/(binary,3) re-opened L4<L3; L5 may have had pick-min-dependent wins | Phase 3 |
 | L10-12 | our own `parse/ultra` engine | no libdeflate counterpart; Step 3 of the charter; unmatched by any numeric level | untouched |
 
+## 2b. THE BOARD, MEASURED 2026-09-04 — 30 failing of 1,320, down from 200
+
+**MEASURED on the frozen authority box (solvency, AMD Zen2, 4 rivals, 22 files,
+L1-9, T1+T4, commit ee0c1d2c, binary sha 14ce0435..., roundtrip-verified,
+artifact /root/www/gzippy-bench/campaign/size-all-ee0c1d2c/census.json):**
+
+* **TUNE: 660 measured, ZERO bigger, zero roundtrip failures** (also banked as
+  `size-tune-ee0c1d2c`). The pre-pivot residual (85 -> 37 after #227) is gone.
+* **FULL BOARD (TUNE+GATE): 30 failing of 1,320 measured, down from 200 at
+  120bfa9c. 170 cells closed by the pivot; 0 roundtrip failures anywhere.**
+* **The L1 class (was 35 cells, worst +4.6%) and the libdeflate@T4 seam class
+  (was 125 cells = 63% of the board) are BOTH GONE from the size board.**
+* The 30 survivors (fulcrum board --size, ranked): `access.log L5 vs gzip
+  +1.07%` / pigz +0.75%; `dd79_bin6 L2/L3 vs gzip/pigz` up to +0.93%;
+  `minjs.min.js L5` +0.19/+0.16; `data.sqlite L4` +0.13/+0.17;
+  `photo.jpg L1-L3 vs gzip` +0.04%; `weights.safetensors L7-L9`
+  +0.00-0.02%; `access.log L3 vs libdeflate +0.42%` (the far-len3 machinery
+  still on the legacy arm - #364's target); `movie.mp4 L6 vs libdeflate
+  +0.0008%`.
+* Concentration: L2-L5 gzip-cadence band plus dd79_bin6/access.log. Worst
+  margin on the board is +1.07%. These are Phase 3's named targets.
+
+NOTE: phase 2 (L1-in-ldx) targeted a class the census shows GONE - the
+pre-census L1 idea aimed at the legacy igzip parser whose deficit the board
+never saw again after the pivot. Re-derive necessity before building it;
+the 30 named cells above are the priority order now. Phase 1 (state carry)
+still has wall-axis value (T>1 codegen/tiering) but its SIZE premise is
+superseded by the same census.
+
 ## 3. Phase 1 — exact state carry: T>1 becomes T1 bytes, the seam class dies by construction
 
 **Mechanism.** Today each parallel chunk is compressed independently with a
