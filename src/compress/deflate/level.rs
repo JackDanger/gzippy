@@ -359,15 +359,19 @@ pub(crate) fn params_baseline(level: u32) -> LevelParams {
     // without a second encode. Measured per-level clause-3 flip counts, one encode,
     // 23-file corpus x {gzip, pigz, libdeflate}:
     //
-    //     L5   params(5) 4 flips   ->  zlib knobs (32, good 8)    2 flips
+    //     L5   params(5) 4 flips   ->  zlib knobs (depth 32 MEASURED in that
+    //                                  sweep, good 8; the SHIPPED depth at
+    //                                  params_inner L5 is 24)         2 flips
     //     L6   params(6) 6 flips   ->  zlib knobs (128, good 8)   2 flips
     //     L7   params(7) 4 flips   ->  (256, good 32)             2 flips
     //
-    // and the new depths are monotone in level (16 < 32 < 128 < 256 < 300), which
+    // The SHIPPED depths (params_inner) are monotone in level
+    // (8 < 12 < 24 < 128 < 256 < 300), which
     // `search_effort_is_monotonic_in_level` requires.
     //
-    // `good_match` SHORTENS the walk once a good match is found, so this is a deeper
-    // chain WITH an early exit, not simply more search.
+    // `good_match` SHORTENS the walk once a good match is found (zlib's
+    // good_length semantics), so this is a deeper chain WITH an early exit,
+    // not simply more search.
 
     #[allow(unused_mut)]
     let mut p = params_inner(level);

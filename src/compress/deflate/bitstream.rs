@@ -89,7 +89,13 @@ impl BitWriter {
     /// `add_bits`/`ADD_BITS` in libdeflate requires the caller to flush often
     /// enough that `bitcount + n <= BITBUF_NBITS`. We keep the same LSB-first
     /// packing but auto-flush first whenever the accumulator could not
-    /// otherwise hold `n` more bits, so the primitive is safe for any `n <= 64`.
+    /// otherwise hold `n` more bits. For `n <= 57` every post-flush `bitcount`
+    /// (it is `<= 7`) still leaves the whole value inside the u64, so this is
+    /// the plain path every caller uses. For `n > 57` with a non-empty
+    /// accumulator the value would be truncated by the `<< bitcount` — rather
+    /// than lose the top bits or walk `bitcount` to 64 (whose `flush_bits`
+    /// shift is the exact poison the [`align_to_byte`](Self::align_to_byte)
+    /// razor documents), accumulate bit by bit.
     #[inline]
     pub fn add_bits(&mut self, val: u64, n: u32) {
         debug_assert!(n <= 64, "add_bits n={n} too large for a single word");
@@ -99,6 +105,15 @@ impl BitWriter {
         );
         if self.bitcount + n > BITBUF_NBITS {
             self.flush_bits();
+        }
+        if self.bitcount + n > 64 {
+            // Unreachable for every current caller (n <= 32 codewords, 22-bit
+            // sequences; the test seeding a fresh writer with 63 bits lands
+            // here with bitcount == 0). Cost is header-path only.
+            for i in 0..n {
+                self.add_bits((val >> i) & 1, 1);
+            }
+            return;
         }
         self.bitbuf |= val << self.bitcount;
         self.bitcount += n;
