@@ -137,7 +137,20 @@ pub(crate) fn ht_matchfinder_longest_match(
     let cand0 = mf.hash_tab[s0];
     mf.hash_tab[s0] = cur_pos as MfPos;
     let cand1 = mf.hash_tab[s1];
-    mf.hash_tab[s1] = cand0;
+    // C (libdeflate/lib/ht_matchfinder.h, the BUCKET_SIZE == 2 arm): the
+    // slot-1 demotion (`to_insert = cur_node; hash_tab[hash][1] = to_insert;`)
+    // runs ONLY after the cutoff early-out decides the slot-0 candidate is
+    // still in window (`goto out` fires BEFORE slot-1 is touched). An
+    // unconditional overwrite of slot-1 with the stale slot-0 entry diverges
+    // the TABLE from the vendor whenever slot-0 is out of window: a later
+    // probe hashing this bucket then sees our stale copy where the C kept the
+    // fresher candidate, which can change a match decision and the emitted
+    // bytes on the ht-matched paths. Found by review (vendor-order diff), not
+    // by a failing pin — exactly why the parity oracle runs even at exception
+    // levels.
+    if cand0 > cutoff {
+        mf.hash_tab[s1] = cand0;
+    }
 
     // Check first candidate (cand0)
     if cand0 > cutoff {
