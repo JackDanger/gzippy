@@ -132,13 +132,16 @@ pub fn lz_extend(
     len as u32
 }
 
-/// Prefetch the cache line at `ptr` into L1 for WRITING (port of libdeflate
-/// `prefetchw`, `common_defs.h:260-271`).
+/// Prefetch the cache line at `ptr` into L1 (port of libdeflate `prefetchw`,
+/// `common_defs.h:260-271`).
 ///
 /// Same purity and safety as [`prefetch_read`]: a pure hint that never faults
-/// and mutates nothing. The write/exclusive variant hints that the line will be
-/// stored to next (the hash-bucket update), so the cache can fetch it in an
-/// exclusive state and avoid a later read-for-ownership stall.
+/// and mutates nothing. Per-target reality: x86_64 issues the write/exclusive
+/// hint (`_MM_HINT_ET0`, as the C does); aarch64 deliberately issues the LOAD
+/// hint `pldl1keep` (commit `31f8ca68`, store->load for the ARM head table),
+/// so on ARM the line is NOT fetched exclusive and the old "fetch exclusive /
+/// avoid a later read-for-ownership stall" wording did not describe this code.
+/// Wall-only either way — bytes are untouched at every level.
 // The raw pointer is never dereferenced — both targets below turn it into a
 // pure prfm/prefetch hint — but clippy's not_unsafe_ptr_arg_deref cannot see
 // through the asm! operand.
@@ -167,7 +170,6 @@ pub fn prefetch_write(ptr: *const u8) {
 /// The compiler cannot eliminate this because it's a real function call
 /// with a side effect (the prfm instruction).
 #[cfg(target_arch = "aarch64")]
-#[no_mangle]
 #[inline(never)]
 unsafe extern "C" fn aarch64_prefetch_l1(ptr: *const u8) {
     core::arch::asm!(
