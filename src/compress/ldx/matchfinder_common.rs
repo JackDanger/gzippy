@@ -117,14 +117,20 @@ pub(crate) fn lz_extend(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
-    // PAD CONTRACT, debug-only (parse::BUF_PAD = 16): the SIMD paths below issue
-    // 16-byte unaligned block loads at strptr+len / matchptr+len for len < max_len,
-    // so the highest touched byte is ptr + max_len - 1 + 15. With max_len clamped
-    // by the parser to in_end - in_next and ptr <= in_next, the pad covers it;
-    // these asserts make a future zero-pad caller fail in debug instead of
-    // silently match-positioning into heap bytes it does not own.
-    debug_assert!((strptr + max_len as usize + 15) < buf.len());
-    debug_assert!((matchptr + max_len as usize + 15) < buf.len());
+    // BOUND CONTRACT, debug-only: every load in the paths below is confined to
+    // [ptr, ptr + max_len) — the SIMD block loads are guarded by
+    // `max_len - len >= 16` (SSE) / `>= 4` (NEON word tail), the scalar
+    // fallback keeps its own per-step guards — while the parser clamps
+    // `max_len` to bytes remaining at `strptr` and `matchptr` is an earlier
+    // position. So the highest touched byte is `ptr + max_len - 1`, never
+    // `+15`: an unpadded slice is legal (the production slack-padded route
+    // passes `&buf[..logical_len]`, whose len IS the logical input end).
+    // These asserts make a future caller that breaks either half of that
+    // invariant fail in debug instead of silently matching into heap bytes
+    // it does not own.
+    debug_assert!(strptr + max_len as usize <= buf.len());
+    debug_assert!(matchptr + max_len as usize <= buf.len());
+    debug_assert!(start_len <= max_len);
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[allow(unreachable_code)]
@@ -440,7 +446,7 @@ mod tests {
 
         // A buffer where a match runs for a controlled number of bytes.
         for run in 0..80usize {
-            let mut buf = vec![0u8; 600];
+            let mut buf = vec![0u8; 512];
             // matchptr region at 0, strptr region at 256.
             for i in 0..run {
                 buf[i] = (i % 7) as u8;
@@ -466,7 +472,7 @@ mod tests {
     /// checking a 4-byte sequence equality.
     #[test]
     fn lz_extend_trusts_start_len() {
-        let mut buf = vec![0u8; 400];
+        let mut buf = vec![0u8; 128];
         // Deliberately make the first 4 bytes differ.
         buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
         buf[64..68].copy_from_slice(&[9, 9, 9, 9]);
