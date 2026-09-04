@@ -102,6 +102,36 @@ fn wait_for_ring_space(
     !cancelled.load(Ordering::Acquire)
 }
 
+/// Cancel the run if the enclosing thread unwinds before it finishes its slot
+/// handoff. The scheduler's shutdown story is `cancelled`: both wait helpers
+/// exit on the flag and every loop breaks on it — but only the writer's own
+/// write-error paths wrote the flag, so a PANIC in a worker (before
+/// `mark_ready`) or in the writer (mid-splice) would leave every other thread
+/// spinning forever on a flag nobody would ever set. Guarding each critical
+/// section makes an unwind cancel the whole run (the panic then propagates
+/// normally when the scope joins) instead of wedging it.
+struct CancelOnUnwind<'a> {
+    cancelled: &'a AtomicBool,
+    done: bool,
+}
+
+impl CancelOnUnwind<'_> {
+    /// Handoff completed — do not cancel on the way out.
+    #[inline]
+    fn done(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for CancelOnUnwind<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.done {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 // Safety: Each slot is written by exactly one worker thread, then read by main thread
 // after ready=true. The atomic provides the synchronization.
 unsafe impl Sync for BlockSlot {}
@@ -276,6 +306,14 @@ where
         // Returns the writer so caller can write trailer
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
+            // A panic in the splicer/writer below would strand every worker
+            // blocked in `wait_for_ring_space`; arm the guard so the unwind
+            // cancels the run. (The panic itself propagates when the scope
+            // joins.)
+            let cancel_on_unwind = CancelOnUnwind {
+                cancelled: &cancelled,
+                done: false,
+            };
             // Bit-splice each block's fragment onto one continuous DEFLATE
             // stream. Fragments produced byte-aligned with pad_bits=0 (the
             // `ChunkMeta::ALIGNED` case) degrade to plain in-order
@@ -317,6 +355,7 @@ where
                 write_error.store(true, Ordering::Release);
                 cancelled.store(true, Ordering::Release);
             }
+            cancel_on_unwind.done();
             w
         });
 
@@ -352,8 +391,19 @@ where
         let w = writer_handle.join().unwrap();
 
         if write_error.load(Ordering::Acquire) {
+            // Cancelled (and possibly partially spliced) run: callers return
+            // Err and must skip any per-slot combine loop.
             Err(io::Error::other("write failed"))
         } else {
+            // The Ok contract carries "every block was initialized": the
+            // library layer's CRC combine loop (`assume_init_read` over every
+            // slot) is sound ONLY on the Ok path — assert the precondition
+            // loudly where the counter lives.
+            debug_assert_eq!(
+                blocks_compressed.load(Ordering::Acquire),
+                num_blocks,
+                "Ok returned with unfinished blocks — CRC combine loops would assume_init uninitialized slots"
+            );
             Ok(w)
         }
     });
@@ -419,6 +469,14 @@ fn worker_loop_timed<F>(
             break;
         }
 
+        // If we unwind between claim and mark_ready, this slot never becomes
+        // ready and the writer's wait can only end through `cancelled` — arm
+        // the guard here so the panic cancels the run instead of wedging it.
+        let cancel_on_unwind = CancelOnUnwind {
+            cancelled,
+            done: false,
+        };
+
         // WAIT FOR RING SPACE. This ring position is shared with block
         // `block_idx - window`, so it must not be touched until the writer has
         // spliced and released that block. Acquire pairs with the writer's Release
@@ -466,6 +524,7 @@ fn worker_loop_timed<F>(
 
         // Signal completion
         slot.mark_ready();
+        cancel_on_unwind.done();
     }
 }
 
@@ -509,6 +568,10 @@ where
         // Spawn dedicated writer thread
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
+            let cancel_on_unwind = CancelOnUnwind {
+                cancelled: &cancelled,
+                done: false,
+            };
             for block_idx in 0..num_blocks {
                 let slot = &slots[block_idx % window];
                 if !wait_for_slot_ready(slot, &cancelled) {
@@ -522,6 +585,7 @@ where
                 unsafe { slot.release() };
                 blocks_written.fetch_add(1, Ordering::Release);
             }
+            cancel_on_unwind.done();
             w
         });
 
@@ -536,6 +600,13 @@ where
                     break;
                 }
 
+                // Same panic contract as `worker_loop_timed`: a worker that
+                // unwinds between claim and mark_ready must cancel the run.
+                let cancel_on_unwind = CancelOnUnwind {
+                    cancelled: &cancelled,
+                    done: false,
+                };
+
                 // Wait for ring space (see `compress_parallel`).
                 if !wait_for_ring_space(block_idx, window, &blocks_written, &cancelled) {
                     break;
@@ -549,6 +620,7 @@ where
                 let output = unsafe { slot.data_mut() };
                 compress_fn(block, output);
                 slot.mark_ready();
+                cancel_on_unwind.done();
             });
         }
 
@@ -666,6 +738,65 @@ mod tests {
         assert!(
             result.is_err(),
             "writer failure must be returned, not deadlock"
+        );
+    }
+
+    /// A worker panic must cancel the run (so the writer's waits and every
+    /// other worker's ring-space spins terminate) and propagate to the caller
+    /// — not wedge inside `thread::scope` with fragments already on the fd.
+    #[test]
+    fn worker_panic_cancels_and_propagates_instead_of_wedging() {
+        let input = vec![0x5A; 128 * 1024];
+        let result = std::panic::catch_unwind(|| {
+            compress_parallel(
+                &input,
+                1024,
+                2,
+                Vec::new(),
+                |_idx, _block, _dict, _is_last, _out| {
+                    panic!("synthetic worker failure");
+                    #[allow(unreachable_code)]
+                    ChunkMeta::ALIGNED
+                },
+            )
+        });
+        assert!(
+            result.is_err(),
+            "a panicking worker must cancel the run and propagate, not wedge"
+        );
+    }
+
+    /// Symmetry: a panic in the writer's splice path must cancel the workers
+    /// waiting for ring space and propagate, not wedge. (Stress: the closure
+    /// panics late enough that other workers are well past preamble.)
+    #[test]
+    fn writer_panic_cancels_and_propagates_instead_of_wedging() {
+        struct PanicWriter;
+        impl std::io::Write for PanicWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                panic!("synthetic writer failure")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = vec![0x5A; 128 * 1024];
+        let result = std::panic::catch_unwind(|| {
+            compress_parallel(
+                &input,
+                1024,
+                2,
+                PanicWriter,
+                |_idx, block, _dict, _is_last, out| {
+                    out.clear();
+                    out.extend_from_slice(block);
+                    ChunkMeta::ALIGNED
+                },
+            )
+        });
+        assert!(
+            result.is_err(),
+            "a panicking writer must cancel the run and propagate, not wedge"
         );
     }
 

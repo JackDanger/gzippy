@@ -99,8 +99,12 @@ fn chunks_per_thread() -> usize {
 }
 
 /// Ceiling on the thread-aware chunk size for L1-L5. Chunks are buffered in
-/// flight, so this is an RSS bound (D2), not a performance knob: at T16, 8 MiB
-/// per chunk is ~128 MiB of in-flight payload, the most this is willing to spend.
+/// flight, so this is an RSS bound (D2), not a performance knob. The reorder
+/// window holds `(threads + 2)` slots of `~1.1 x chunk + 1 KiB` each
+/// (`reorder_window_for`), so at T16 with 8 MiB chunks the ring is ~161 MiB,
+/// NOT the ~128 MiB a threads-only reading of this constant suggests (and
+/// ~300 MiB at T32). That is the deliberate ceiling; the per-slot product is
+/// visible in the compress_parallel debug print.
 const MAX_T_AWARE_BLOCK_SIZE_L1_5: usize = 8 * 1024 * 1024;
 /// L6+ ONLY. `baabae9a` measured 8MB->2MB at L6 (10/16 -> 11/16 T4 L6 wall cells,
 /// zero size regression) and shipped it as a GLOBAL constant — a cross-level
@@ -608,8 +612,11 @@ impl PipelinedGzEncoder {
 
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(block);
-                // SAFETY: each slot is written by exactly one worker (block_idx
-                // is claimed atomically) before all threads join.
+                // SAFETY: `compress_parallel` returns Ok only when every block
+                // was compressed (its debug_assert pins that invariant where
+                // the counter lives); the `?` below skips this combine loop on
+                // any cancelled/failed run, because a claimed-but-unfinished
+                // slot would leave `crc_parts` entries uninitialized.
                 unsafe {
                     *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
                 }
@@ -620,7 +627,9 @@ impl PipelinedGzEncoder {
         // Combine CRCs in order.
         let mut combined_hasher = crc32fast::Hasher::new();
         for part in &crc_parts {
-            // SAFETY: every slot was initialized by its worker above.
+            // SAFETY: compressor_parallel reported no error, so every block's
+            // worker ran to completion (see the debug_assert in
+            // `compress_parallel`) — every slot here is initialized.
             let hasher = unsafe { (*part.0.get()).assume_init_read() };
             combined_hasher.combine(&hasher);
         }
