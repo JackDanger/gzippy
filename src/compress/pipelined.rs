@@ -318,15 +318,21 @@ impl PipelinedGzEncoder {
     }
 
     /// Emit the established whole-stream gzip encoding with the caller's
-    /// header. Levels 0-9 use the raw libdeflate port without an input copy;
-    /// levels 10-12 delegate to the existing near-optimal whole-stream route.
+    /// header. Levels routed to the libdeflate port (`level_uses_ldx`) use it
+    /// without an input copy; every other level delegates to the production T1
+    /// encoder so the four exception levels (L1/L3/L6/L7, the ledger-won
+    /// routing) cannot leak port bytes to library callers. Codex review of
+    /// this branch named the leak: `PipelinedGzEncoder::new(level, 1)` at L6
+    /// emitted 322,110 B where the ledger-won byte stream is 304,252 B.
     /// The minimal-header case is byte-for-byte identical to
-    /// `libdeflate-gzip -c`; file metadata may intentionally differ.
+    /// `libdeflate-gzip -c` at the port levels; file metadata may
+    /// intentionally differ.
     fn compress_exact_to_writer<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
-        if self.compression_level <= 9 {
+        let level = self.compression_level;
+        if level <= 9 && crate::compress::deflate::level_uses_ldx(level) {
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
-            if !crate::compress::ldx::compress_into(self.compression_level, data, &mut body) {
+            if !crate::compress::ldx::compress_into(level, data, &mut body) {
                 return Err(io::Error::other(
                     "libdeflate port does not support this level",
                 ));
@@ -337,10 +343,10 @@ impl PipelinedGzEncoder {
             return Ok(data.len() as u64);
         }
 
-        // The L10-L12 near-optimal route already owns the exact T1 stream.
-        // Reframe only its ten-byte header for named file output; DEFLATE and
-        // trailer remain untouched.
-        let gzip = crate::compress::deflate::encode_gzip_bytes_to_vec(data, self.compression_level);
+        // Every other level (the four exception levels and 10-12) delegates to
+        // the production T1 whole-stream encoder — the bytes the per-label
+        // ledger and the pins were graded on.
+        let gzip = crate::compress::deflate::encode_gzip_bytes_to_vec(data, level);
         writer.write_all(&self.gzip_header_bytes())?;
         writer.write_all(&gzip[10..])?;
         Ok(data.len() as u64)

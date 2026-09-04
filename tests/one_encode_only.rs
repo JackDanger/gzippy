@@ -24,6 +24,7 @@
 //! missed.
 
 use gzippy::compress::deflate::{encode_census, encode_gzip_bytes_to_vec};
+use gzippy::compress::pipelined::PipelinedGzEncoder;
 use std::sync::{Mutex, MutexGuard};
 
 /// The census is process-global, and `cargo test` runs test fns on separate threads.
@@ -137,4 +138,48 @@ fn the_port_is_the_production_encoder_for_levels_0_through_9() {
          needs a measured receipt in `level_uses_ldx` before it is added here.\n",
         failures.join("\n  ")
     );
+}
+
+/// The LIBRARY T1 route must emit the same bytes the CLI production encoder
+/// does, at every level 0-9. Codex's review of the structure slice named the
+/// leak: `PipelinedGzEncoder::new(level, 1).compress_exact_to_writer` called
+/// `ldx::compress_into` at every level without consulting `level_uses_ldx`,
+/// so a library caller at L6 got port bytes (322,110 B on the text fixture)
+/// where the ledger-won production bytes are 304,252 B — the pick-min win
+/// silently forfeited one lib route at a time.
+///
+/// This compares against `encode_gzip_bytes_to_vec`'s ten-byte header +
+/// trailer too: the production T1 bytes include the flat-XFL contract
+/// (`16de4ed6`), while the port levels carry the vendor XFL form — which is
+/// what makes the two bodies identical-but-headers-different at some levels.
+/// Compare DEFLATE BODIES, not the whole stream.
+#[test]
+fn the_1_processor_emits_production_bytes_at_every_level() {
+    let _guard = census_lock();
+    // 1 MiB so the grid is multi-block at every level; fixtures::generate is
+    // too small to exercise pick-free routing past the passthrough cap.
+    let data = gzippy::fixtures::generate_sized("text", 1 << 20);
+    for level in 0..=9u32 {
+        let expected = encode_gzip_bytes_to_vec(&data, level);
+        let mut actual = Vec::new();
+        let mut encoder = PipelinedGzEncoder::new(level, 1);
+        encoder.set_minimal_gzip_header(true);
+        encoder
+            .compress_buffer_pure(&data, &mut actual)
+            .expect("pipeline T1 encode");
+        // The pipeline's minimal header is byte-identical to the production
+        // T1 route's header on this branch (both flat-XFL); if they go
+        // non-identical, this assert names the level and both lengths so the
+        // next reader does not binary-search routing.
+        if !(expected[10..expected.len() - 8] == actual[10..actual.len() - 8]
+            && expected[..10] == actual[..10])
+        {
+            panic!(
+                "L{level}: library T1 route emitted different bytes from the production \
+                 T1 route: production {} B vs pipeline {} B",
+                expected.len(),
+                actual.len()
+            );
+        }
+    }
 }

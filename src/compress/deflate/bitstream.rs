@@ -801,3 +801,68 @@ mod tests {
         assert_eq!(w.finish(), ref_out);
     }
 }
+
+/// The seam the campaign actually depends on: a fragment ending UNALIGNED
+/// (3 live bits) whose successor fragment is a REAL stored block carrying
+/// data (not the opaque-tail test above). The splicer must emit the
+/// empty-stored sync seam BEFORE the stored fragment so the decoder reads
+/// LEN/NLEN byte-aligned — the exact byte expectation was derived by
+/// codex's review of the structure slice; before this test existed, a
+/// seam regression would have decoded garbage that neither the fixtures
+/// (single-chunk) nor the opaque-tail seam test could see.
+#[test]
+fn splicer_seam_before_real_stored_fragment_is_exact() {
+    let expected = {
+        let mut w = BitWriter::new();
+        // 3 arbitrary live bits from fragment A's tail: 101.
+        w.add_bits(0b101, 3);
+        // The seam fragment B must ride in on: BFINAL=0, BTYPE=00, align,
+        // LEN=0, NLEN=0xFFFF (the empty stored carrier, byte-aligned).
+        w.add_bits(0, 1);
+        w.add_bits(0, 2);
+        w.align_to_byte();
+        w.write_u16_le(0);
+        w.write_u16_le(!0);
+        // Fragment B: a REAL final stored block — BFINAL=1, BTYPE=00,
+        // align, LEN=1, NLEN=0xFFFE, 0xAB.
+        w.add_bits(1, 1);
+        w.add_bits(0, 2);
+        w.align_to_byte();
+        w.write_u16_le(1);
+        w.write_u16_le(!(1u16));
+        w.write_aligned_bytes(&[0xAB]);
+        w.finish()
+    };
+    let spliced = {
+        let mut out = Vec::new();
+        let mut sp = BitSplicer::new();
+        // Fragment A: three unaligned live bits, no alignment need.
+        let (lead, pad) = {
+            let mut w = BitWriter::new();
+            w.add_bits(0b101, 3);
+            w.finish_unaligned()
+        };
+        sp.splice_to(
+            &mut out,
+            &lead,
+            ChunkMeta {
+                pad_bits: pad,
+                needs_alignment: false,
+            },
+        )
+        .unwrap();
+        // Fragment B: the stored block ALONE — BFINAL byte (BTYPE=00 and the
+        // 5 alignment bits live in the same byte), LEN=1, NLEN=!1, payload.
+        // The splicer emits the empty-stored seam itself when the metadata
+        // says the fragment needs alignment; this is the exact requirement.
+        let stored_frag: Vec<u8> = vec![0x01, 0x01, 0x00, 0xFE, 0xFF, 0xAB];
+        sp.splice_to(&mut out, &stored_frag, ChunkMeta::ALIGNED)
+            .unwrap();
+        sp.finish(&mut out).unwrap();
+        out
+    };
+    assert_eq!(
+        spliced, expected,
+        "stored-block fragment seam bytes are exact — decoder correctness at real fragment boundaries"
+    );
+}

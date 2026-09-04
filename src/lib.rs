@@ -30,7 +30,9 @@
 //!   entry point).
 //! - **`threads > 1`**: [`PipelinedGzEncoder`] (`compress_buffer_pure`) —
 //!   a pure parallel encoder whose output is byte-identical across thread
-//!   counts.
+//!   counts at the 4 small frozen parity fixtures; on real multi-chunk
+//!   inputs, thread count may change bytes (it always decodes to the same
+//!   original, which is the only bar)
 //!
 //! gzippy's own "GZ" multi-block format ([`ParallelGzEncoder`]) still
 //! exists and is still decompressible (see below), but it is not reachable
