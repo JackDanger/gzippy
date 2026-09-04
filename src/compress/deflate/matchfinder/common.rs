@@ -139,6 +139,10 @@ pub fn lz_extend(
 /// and mutates nothing. The write/exclusive variant hints that the line will be
 /// stored to next (the hash-bucket update), so the cache can fetch it in an
 /// exclusive state and avoid a later read-for-ownership stall.
+// The raw pointer is never dereferenced — both targets below turn it into a
+// pure prfm/prefetch hint — but clippy's not_unsafe_ptr_arg_deref cannot see
+// through the asm! operand.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline(always)]
 pub fn prefetch_write(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
