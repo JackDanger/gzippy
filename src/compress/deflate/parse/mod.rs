@@ -18,13 +18,12 @@
 
 use super::bitstream::BitWriter;
 use super::block_split::{BlockSplitStats, MIN_BLOCK_LENGTH};
-use super::encode_types::{BlockRole, HeaderBudget, InputMode};
+use super::encode_types::{BlockRole, HeaderBudget};
 use super::huffman::{
     build_dynamic_header, make_huffman_code, make_huffman_code_exact_into, make_huffman_code_into,
     CodeScratch, DynamicHeader, HeaderScratch, HuffmanCode,
 };
 use super::level::{LevelParams, Strategy};
-use super::matchfinder::hc::WINDOW_SIZE;
 use super::tables::{
     length_slot, offset_slot, static_litlen_freqs, static_offset_freqs,
     DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN, DEFLATE_BLOCKTYPE_STATIC_HUFFMAN, DEFLATE_END_OF_BLOCK,
@@ -700,16 +699,21 @@ pub(super) fn compress(
     }
 }
 
-// ---- resumable (streaming) parse state ----
+// ---- resumable parse state ----
 
-/// Everything a parser must carry from one streaming chunk to the next.
+/// Everything a parser carries across its `run` call(s): the pooled matchfinder,
+/// the base offset its stored positions are relative to, the carried hash values,
+/// and the FAST (L1) strategy's head-table state.
 ///
-/// The whole-buffer entry points build this fresh per call, so their behaviour
-/// is unchanged. The streaming encoder keeps ONE across the whole file, which
-/// is what makes streamed output byte-identical to whole-buffer output: match
-/// choices depend on the matchfinder's accumulated chains, so a matchfinder
-/// rebuilt per chunk would make different choices at every seam even though
-/// every candidate it could legally reference is within the 32 KiB window.
+/// The whole-buffer entry points build this fresh per call.
+///
+/// NOTE (2026-08-30): the single-pass STREAMING encoder that kept ONE of these
+/// across the whole file was deleted — `ldx` is the production T1 parser for
+/// L0-L9 (whole-buffer by construction) and L10-12 has no resumable runner, so
+/// no production level can stream. The `run_resumable` functions below remain
+/// live as the implementation of the whole-buffer `run` (which calls them once
+/// in Drain mode). A true streaming T1 API needs a resumable `ldx` port; that
+/// is the named open work item, and the contract lives in `src/lib.rs`.
 pub(super) struct ParseState {
     pub mf: crate::compress::deflate::matchfinder::hc::PooledHc,
     /// Base offset the matchfinder's stored positions are relative to.
@@ -720,13 +724,6 @@ pub(super) struct ParseState {
     /// `fast::run_resumable`'s closing comment.
     pub in_base: usize,
     pub next_hashes: [u32; 2],
-    /// The FAST (L1) strategy's carried state (head tables + block gates),
-    /// created lazily by `fast::run_resumable` on its first call. `None` for
-    /// every other strategy — they carry their state in `mf` above.
-    pub fast: Option<fast::FastResume>,
-    /// Uncompressed input length when known. L1 ultra-sparse mid-block tier
-    /// arms only once this reaches [`fast::L1_SPARSE_LARGE_INPUT_MIN_BYTES`].
-    pub input_total_len: usize,
 }
 
 impl ParseState {
@@ -737,226 +734,7 @@ impl ParseState {
             }),
             in_base: 0,
             next_hashes: [0u32; 2],
-            fast: None,
-            input_total_len: 0,
         }
-    }
-
-    // Used by the sliding-buffer streaming loop, which lands next; the
-    // resumable parsers above are the half of that change that could be
-    // verified independently (whole-buffer output byte-identical, full suite
-    // green), so it is committed separately rather than as one large diff.
-    #[allow(dead_code)]
-    /// Largest amount the caller may shift buffer contents down by while
-    /// keeping at least one full window of history behind `in_base`.
-    ///
-    /// Returns a multiple of [`WINDOW_SIZE`], because the matchfinder stores
-    /// each position as `pos - in_base` and slides in exact window steps: a
-    /// shift that is not a whole number of windows would leave `in_next -
-    /// in_base` outside `0..WINDOW_SIZE` and corrupt every chain index.
-    pub fn max_shift(&self) -> usize {
-        self.in_base.saturating_sub(WINDOW_SIZE)
-    }
-
-    #[allow(dead_code)]
-    /// Tell the state the caller moved buffer contents down by `shift` bytes.
-    ///
-    /// O(1) and lossless: stored nodes are offsets from `in_base`, so
-    /// decrementing `in_base` by the same amount leaves every
-    /// `in_base + node` pointing at the same BYTE in the moved buffer. No
-    /// table rebase, no chain rebuild. `shift` must come from
-    /// [`max_shift`](Self::max_shift).
-    pub fn shift_down(&mut self, shift: usize) {
-        debug_assert_eq!(shift % WINDOW_SIZE, 0, "shift must be whole windows");
-        debug_assert!(shift <= self.in_base, "shift would push in_base negative");
-        self.in_base -= shift;
-        // The FAST tables store absolute positions (not `pos - in_base`), so
-        // they need a real rebase sweep — once per multi-megabyte slide.
-        if let Some(f) = self.fast.as_mut() {
-            f.rebase(shift);
-        }
-    }
-}
-
-/// Bytes that must be available past a block's start before the streaming
-/// encoder may begin that block.
-///
-/// [`choose_max_block_end`] consults `in_end` ONLY when fewer than
-/// `SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH` bytes remain; above that it
-/// returns `block_begin + SOFT_MAX_BLOCK_LENGTH` regardless. So a streaming
-/// chunk that always has at least this much input in hand makes exactly the
-/// same block-boundary decisions as a whole-buffer encode — the seam becomes
-/// invisible instead of forcing a short block. The same margin also keeps
-/// `adjust_max_and_nice_len` from clamping match lengths near the buffer end,
-/// since it exceeds `DEFLATE_MAX_MATCH_LEN` by three orders of magnitude.
-pub(super) const STREAM_BLOCK_LOOKAHEAD: usize = SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH;
-
-/// Whether `level`'s strategy has a resumable runner, so the streaming encoder
-/// can carry one matchfinder across chunks and emit byte-identical output.
-///
-/// "Byte-identical" here means identical to OUR OWN whole-buffer output at the
-/// same level — the T>1 == T1 invariant. It does NOT mean identical to
-/// libdeflate's, and must never be read that way.
-pub(crate) fn level_has_resumable_parser(level: u32) -> bool {
-    // A level that runs WHOLE-BUFFER PICK-MIN cannot stream. The streaming
-    // parse is ONE arm; the whole-buffer path runs two and keeps the smaller,
-    // so streaming such a level does not merely reorder blocks — it emits a
-    // DIFFERENT, LARGER stream than the same input passed as a file. That
-    // violates this module's own rule ("a level streams only when its output
-    // is PROVABLY unaffected by streaming") and the contract it cites
-    // ("being at-least-as-small at the level the user typed").
-    //
-    // This is the SAME reasoning that already excludes L1 below; it was simply
-    // never generalised to the other pick-min levels when they landed.
-    //
-    // MEASURED on main e888ac9f, 23-file corpus x L4-L7, T1, size only:
-    // piping cost 5,429,807 B = 0.6377% larger, up to 2.535% at L4
-    // (minjs.min.js). Per-level on engine.wasm: L4 +9,528 B, L5 +1,085,
-    // L6 +754, L7 +70; L3/L8/L9 byte-identical (they run no pick-min).
-    if super::level_uses_t1_zlib_pick_min(level) || super::level_uses_t1_mmap_pick_min(level) {
-        return false;
-    }
-    let strategy = super::level::params(level).strategy;
-    if matches!(
-        strategy,
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
-    ) {
-        return true;
-    }
-    // `Strategy::Fast` (L1) streams via `fast::run_resumable` in tune builds
-    // only. Shipped L1 runs mmap pick-min (`deflate_one_shot_t1_l1_pick_min`),
-    // which is whole-buffer only — the resumable fast path would diverge from
-    // `encode_gzip_slack_padded_to_vec` and mmap pick-min
-    // (`tests/streaming_identity.rs`).
-    #[cfg(not(feature = "l1-tune"))]
-    if matches!(strategy, Strategy::Fast) {
-        return false;
-    }
-    false
-}
-
-/// Greedy/Lazy/Lazy2 only — the T>1 stateful path uses `parse_resumable` with
-/// `params_parallel`, which must not be applied to L1's parallel fast knobs.
-pub(crate) fn level_uses_stateful_t4(level: u32) -> bool {
-    matches!(
-        super::level::params(level).strategy,
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
-    )
-}
-
-/// Resume a parse over `buf[from..in_end]` using caller-owned `state`.
-///
-/// See `greedy::run_resumable` for the `consume_all` / `is_last` distinction
-/// and why the lookahead margin keeps block boundaries identical to a
-/// whole-buffer encode. Returns the position after the last complete block.
-/// Callers must check [`level_has_resumable_parser`] first; other strategies
-/// panic rather than silently emitting a differently-shaped stream.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn parse_resumable(
-    buf: &[u8],
-    state: &mut ParseState,
-    from: usize,
-    in_end: usize,
-    params: &LevelParams,
-    role: BlockRole,
-    input_mode: InputMode,
-    budget: super::encode_types::HeaderBudget,
-    bw: &mut BitWriter,
-) -> usize {
-    let statics = StaticCodes::get();
-    match params.strategy {
-        // Same const arguments as `parse()`'s whole-buffer `Strategy::Fast`
-        // arm (block length / dynamic emitter / insert depth); `params`
-        // carries nothing the fast parser reads. Default builds only — see
-        // `level_has_resumable_parser` for why `l1-tune` never routes here.
-        // REACH DISPATCH, same as `compress`'s whole-buffer arm — one branch
-        // per resumable call selecting a whole monomorphization of the L1
-        // parser, not a per-position runtime test. This is the arm T1's
-        // STREAMING path takes, so it is where the two record-file cells
-        // (`libdeflate:{access.log,ecoli.fastq}:L1:T1:size`) are actually won.
-        #[cfg(not(feature = "l1-tune"))]
-        Strategy::Fast => {
-            if params.fast_dense_interior_insert {
-                if params.fast_gzip_primary {
-                    fast::run_resumable::<true, true>(
-                        buf,
-                        state,
-                        from,
-                        in_end,
-                        params,
-                        statics,
-                        bw,
-                        role,
-                        input_mode,
-                        fast::FAST_BLOCK_LENGTH,
-                        true,
-                        budget,
-                    )
-                } else {
-                    fast::run_resumable::<true, false>(
-                        buf,
-                        state,
-                        from,
-                        in_end,
-                        params,
-                        statics,
-                        bw,
-                        role,
-                        input_mode,
-                        fast::FAST_BLOCK_LENGTH,
-                        true,
-                        budget,
-                    )
-                }
-            } else if params.fast_gzip_primary {
-                fast::run_resumable::<false, true>(
-                    buf,
-                    state,
-                    from,
-                    in_end,
-                    params,
-                    statics,
-                    bw,
-                    role,
-                    input_mode,
-                    fast::FAST_BLOCK_LENGTH,
-                    true,
-                    budget,
-                )
-            } else {
-                fast::run_resumable::<false, false>(
-                    buf,
-                    state,
-                    from,
-                    in_end,
-                    params,
-                    statics,
-                    bw,
-                    role,
-                    input_mode,
-                    fast::FAST_BLOCK_LENGTH,
-                    true,
-                    budget,
-                )
-            }
-        }
-        Strategy::Greedy => greedy::run_resumable(
-            buf, state, from, in_end, params, statics, bw, role, input_mode, budget,
-        ),
-        Strategy::Lazy | Strategy::Lazy2 => lazy::run_resumable(
-            buf,
-            state,
-            from,
-            in_end,
-            params,
-            statics,
-            bw,
-            matches!(params.strategy, Strategy::Lazy2),
-            role,
-            input_mode,
-            budget,
-        ),
-        other => unreachable!("parse_resumable called for non-resumable strategy {other:?}"),
     }
 }
 
@@ -1177,10 +955,8 @@ fn bsr32(x: u32) -> u32 {
 ///   a span is `start + k*65535` either way; eager just writes each piece as
 ///   soon as its bytes cannot change.
 /// * **Bounded carry** — the pending remainder is <= 65,535 bytes, so the
-///   streaming path ([`fast::run_resumable`]) can carry it across input
-///   refills in `FastResume` (keeping streamed L1 byte-identical to the
-///   whole-buffer encoder, the invariant `tests/streaming_identity.rs` pins)
-///   while the slide only has to retain a bounded window of unemitted input.
+///   final `flush` always has a sub-block to carry BFINAL and the coalescer
+///   never holds more than one maximal sub-block of unemitted input.
 #[derive(Default)]
 pub(super) struct StoredCoalescer {
     /// Absolute offset in `buf` of the pending remainder's first byte.
@@ -1226,28 +1002,6 @@ impl StoredCoalescer {
         debug_assert!(self.len <= super::MAX_STORED_SUBBLOCK);
         super::emit_stored_block(bw, &buf[self.start..self.start + self.len], is_final);
         self.len = 0;
-    }
-
-    /// Whether a remainder is pending (streaming: it must survive the slide).
-    pub(super) fn is_pending(&self) -> bool {
-        self.len > 0
-    }
-
-    /// Absolute buffer offset of the pending remainder (meaningless when
-    /// [`Self::is_pending`] is false).
-    pub(super) fn pending_start(&self) -> usize {
-        self.start
-    }
-
-    /// The caller slid `buf` down by `shift` bytes; keep the pending
-    /// remainder pointing at the same bytes. The slide contract
-    /// ([`fast::run_resumable`]'s `in_base` accounting) guarantees the
-    /// remainder is retained, so `start` cannot underflow.
-    pub(super) fn rebase(&mut self, shift: usize) {
-        if self.len > 0 {
-            debug_assert!(shift <= self.start, "slide discarded a pending stored span");
-            self.start -= shift;
-        }
     }
 }
 

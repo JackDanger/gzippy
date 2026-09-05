@@ -81,9 +81,14 @@ gzippy = "0.8"
 let compressed = gzippy::compress(&data, 6)?;
 let restored = gzippy::decompress(&compressed)?;
 
-// Explicit threads, or streaming without buffering the whole input:
+// Explicit worker count (parallel; buffers the whole input):
 let out = gzippy::compress_with_threads(&data, 6, 4)?;
-let n = gzippy::compress_to_writer(reader, writer, 6)?;
+
+// ⚠ Buffers the entire input — like every compression entry point in this
+// crate today (the production encoder is whole-buffer; see `gzippy::compress_to_writer`).
+// Peak memory is `input + output`. Single-threaded, because the parallel
+// encoder is also whole-buffer and just spends more memory:
+let n1 = gzippy::compress_to_writer(reader, writer, 6)?;
 ```
 
 `decompress_to_writer` streams the other direction. Full API: `cargo doc --open`.
