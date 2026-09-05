@@ -81,10 +81,11 @@ doc. This is recorded as owner-directed, not silently reinterpreted.
 all that terrible two-encode machinery. Aim for the right solution. We can take a <1%
 hit to compression size but we will not lose on wall clock under any conditions." The
 three rules now lock together: **ONE ENCODE PER INPUT is absolute** (pick-min stays
-deleted; no two-encode min returns, ever); **WALL NEVER LOSES** (a wall regression is a
-conviction under any circumstances — clauses 3/5/7's cross-layout machinery
-unchanged); **compression size may spend <= 1% per cell** (authorized spend, priced by
-clause 5/6's machinery, itemized — > 1% convicts; size FLIPS still convict). The
+deleted; no two-encode min returns, ever); **WALL NEVER LOSES** (a wall pass -> fail
+FLIP is a conviction, always; wall EROSIONS still walk clause 5's existing
+cross-layout machinery and margin floor unchanged); **compression size may spend <= 1%
+per cell** (authorized spend, priced by clause 5/6's machinery, itemized — > 1% convicts;
+size FLIPS still convict). The
 promotion rule's clause-5/6 amendment with the full receipts lives in
 `docs/promotion-rule.md` (the 2026-09-05 entry). Two-encode pick-min machinery MUST
 NOT be rebuilt to dodge it: the margin ceiling replaces the masked spend with honest

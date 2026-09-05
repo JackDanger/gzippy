@@ -47,9 +47,11 @@ redesign).*
 > **Struck 2026-08-10.** The flat budget convicted on single-layout lottery rolls and
 > priced margin at zero. It survives below only for thin-margin cells.
 
-The rule now has two parts, both applying to **wall** cells only — size cells are exact
-integers and unchanged: a size erosion or size flip convicts directly, no confirmation
-involved.
+The rule now has two parts, both applying to **wall** cells only — for size cells,
+see the 2026-09-05 amendment below (their 2026-08-10 direct-conviction sentence is
+**struck by the owner's 2026-09-05 directive**: a per-cell size erosion **<= 1%** on
+a passing cell is now an authorized spend; > 1% and pass -> fail size flips still
+convict).
 
 *Size spend, amended 2026-09-05 (owner directive, verbatim receipt):* *"We can take a
 <1% hit to compression size but we will not lose on wall clock under any conditions."*
