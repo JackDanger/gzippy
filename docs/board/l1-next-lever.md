@@ -1,3 +1,8 @@
+<!-- 2026-09-03: SUPERSEDED by docs/plan-2026-09-one-encoder.md. Kept as a
+     measured receipt; its commit and its encoder topology predate the ldx
+     pivot (#357-#360, 2026-08-23). Do not plan from these numbers without
+     re-censusing the current stack (board-size.sh / parity-census.sh). -->
+
 # The next lever: L1 synthesis gated T>1 — prerequisites, arithmetic, and the trap
 
 Written 2026-08-01 as a HANDOFF, not a result. Nothing here has been measured
