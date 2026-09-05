@@ -51,6 +51,18 @@ The rule now has two parts, both applying to **wall** cells only — size cells 
 integers and unchanged: a size erosion or size flip convicts directly, no confirmation
 involved.
 
+*Size spend, amended 2026-09-05 (owner directive, verbatim receipt):* *"We can take a
+<1% hit to compression size but we will not lose on wall clock under any conditions."*
+— a per-cell size erosion **<= 1%** on a passing cell is an authorized spend, priced at
+clause-6 harm exactly like an authorized wall margin-spend (excluded from residual
+harm, itemized on the clause-6 line — never silent); **> 1% convicts**. Size flips
+(pass -> fail) still convict directly: 1% of a tie is not a pass. The one-encode law
+(2026-08-23) stands absolute — the authorized spend exists precisely because delete
+pick-min removes the per-file two-encode min that used to mask margin spends; the
+size budget is its replacement pricing, not a new lever to spend twice. Wall rules in
+this clause are unchanged: every wall erosion beyond budget still requires
+cross-layout CONFIRMED-REAL, and clause 3 remains absolute.
+
 *Convictions require cross-layout confirmation.* A beyond-budget wall erosion suspect —
 and a wall pass -> fail flip that survives clause 3's existing 3x-n re-measure — only
 convicts after the cross-layout confirm machinery (`fulcrum layout confirm`, auto-run by
