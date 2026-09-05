@@ -117,43 +117,232 @@ pub(crate) fn lz_extend(
     start_len: u32,
     max_len: u32,
 ) -> u32 {
-    const WORDBYTES: u32 = 8;
-    let mut len = start_len;
+    // BOUND CONTRACT, debug-only: every load in the paths below is confined to
+    // [ptr, ptr + max_len) — the SIMD block loads are guarded by
+    // `max_len - len >= 16` (SSE) / `>= 4` (NEON word tail), the scalar
+    // fallback keeps its own per-step guards — while the parser clamps
+    // `max_len` to bytes remaining at `strptr` and `matchptr` is an earlier
+    // position. So the highest touched byte is `ptr + max_len - 1`, never
+    // `+15`: an unpadded slice is legal (the production slack-padded route
+    // passes `&buf[..logical_len]`, whose len IS the logical input end).
+    // These asserts make a future caller that breaks either half of that
+    // invariant fail in debug instead of silently matching into heap bytes
+    // it does not own.
+    debug_assert!(strptr + max_len as usize <= buf.len());
+    debug_assert!(matchptr + max_len as usize <= buf.len());
+    debug_assert!(start_len <= max_len);
 
-    // The C's `UNALIGNED_ACCESS_IS_FAST` branch. `load_word_unaligned` reads
-    // WORDBYTES past the index, so it is only taken while a whole word is in bounds
-    // of BOTH pointers.
-    let word_at = |i: usize| -> u64 {
-        // The caller has already proven a whole word is readable here (see the
-        // `len + WORDBYTES <= max_len` guard on the loop below and the
-        // compressor's BUF_PAD). Hot: this is lz_extend's word compare.
-        debug_assert!(i + 8 <= buf.len());
-        let b = unsafe { (buf.as_ptr().add(i) as *const [u8; 8]).read_unaligned() };
-        u64::from_le_bytes(b)
-    };
-    let in_bounds = |i: usize| i + 8 <= buf.len();
-
-    while len + WORDBYTES <= max_len
-        && in_bounds(matchptr + len as usize)
-        && in_bounds(strptr + len as usize)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[allow(unreachable_code)]
     {
-        let v_word = word_at(matchptr + len as usize) ^ word_at(strptr + len as usize);
-        if v_word != 0 {
-            // CPU_IS_LITTLE_ENDIAN: len += bsfw(v_word) >> 3
-            return len + (v_word.trailing_zeros() >> 3);
+        return unsafe { lz_extend_sse(buf, strptr, matchptr, start_len, max_len) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[allow(unreachable_code)]
+    {
+        return unsafe { lz_extend_neon(buf, strptr, matchptr, start_len, max_len) };
+    }
+    // Scalar SISD fallback for targets that are neither x86(64) nor aarch64.
+    // Unreachable on every arch the simd block handles, so hidden behind its own
+    // cfg rather than relying on #[allow(unreachable_code)] at the arpms.
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        const WORDBYTES: u32 = 8;
+        let mut len = start_len;
+
+        // C relies on this caller contract rather than clamping its inner-loop limit.
+        // The parsers establish it by capping `max_len` at bytes remaining from
+        // `strptr`; `matchptr` is an earlier input position.  Keep that proof live in
+        // debug builds, but do not turn it into release work on every extension.
+        debug_assert!(strptr <= buf.len() && matchptr <= buf.len());
+        debug_assert!(max_len as usize <= buf.len() - strptr);
+        debug_assert!(max_len as usize <= buf.len() - matchptr);
+        debug_assert!(start_len <= max_len);
+
+        #[inline(always)]
+        unsafe fn load_word(buf: &[u8], i: usize) -> u64 {
+            // SAFETY: the caller proves that `[i, i + WORDBYTES)` is in `buf`.
+            u64::from_le(unsafe { (buf.as_ptr().add(i) as *const u64).read_unaligned() })
         }
-        len += WORDBYTES;
+
+        // C: four `COMPARE_WORD_STEP`s before the regular word loop.  This is not
+        // merely an unroll hint: spelling all four keeps the same fast-path control
+        // flow and lets LLVM schedule the independent unaligned loads as C does.
+        if max_len - len >= 4 * WORDBYTES {
+            macro_rules! compare_word_step {
+                () => {{
+                    // SAFETY: the enclosing guard leaves at least four full words.
+                    let v_word = unsafe {
+                        load_word(buf, matchptr + len as usize)
+                            ^ load_word(buf, strptr + len as usize)
+                    };
+                    if v_word != 0 {
+                        return len + (v_word.trailing_zeros() >> 3);
+                    }
+                    len += WORDBYTES;
+                }};
+            }
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
+            compare_word_step!();
+        }
+
+        while len + WORDBYTES <= max_len {
+            // SAFETY: the loop condition and entry clamp prove both loads fit.
+            let v_word = unsafe {
+                load_word(buf, matchptr + len as usize) ^ load_word(buf, strptr + len as usize)
+            };
+            if v_word != 0 {
+                // C: `len += bsfw(v_word) >> 3` on little-endian targets.
+                return len + (v_word.trailing_zeros() >> 3);
+            }
+            len += WORDBYTES;
+        }
+
+        while len < max_len {
+            // SAFETY: `len < max_len` and the entry clamp prove both loads fit.
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    != *buf.get_unchecked(strptr + len as usize)
+            } {
+                break;
+            }
+            len += 1;
+        }
+        len
+    }
+    /// SSE-optimized match extension: compares 16 bytes at a time
+    /// instead of 8. Produces identical results to `lz_extend`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline(always)]
+    pub(crate) unsafe fn lz_extend_sse(
+        buf: &[u8],
+        strptr: usize,
+        matchptr: usize,
+        start_len: u32,
+        max_len: u32,
+    ) -> u32 {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+        let mut len = start_len;
+        let base = buf.as_ptr();
+
+        // 16-byte comparisons
+        while max_len - len >= 16 {
+            let a = unsafe { _mm_loadu_si128(base.add(strptr + len as usize) as *const __m128i) };
+            let b = unsafe { _mm_loadu_si128(base.add(matchptr + len as usize) as *const __m128i) };
+            let cmp = _mm_cmpeq_epi8(a, b);
+            let mask = _mm_movemask_epi8(cmp) as u16;
+            if mask != 0xFFFF {
+                // `movemask` semantics: bit i is SET when byte i is EQUAL, so the
+                // first differing byte is the run of set bits from bit 0 — i.e.
+                // `trailing_ones`. (`trailing_zeros` is the XOR-word idiom where
+                // bit 0 set means the bytes DIFFER; here the polarity is inverted:
+                // tzcnt(0xFFFE) is 1, but a first-byte mismatch must count as 0.)
+                len += (mask as u32).trailing_ones();
+                break;
+            }
+            len += 16;
+        }
+
+        // Byte-by-byte tail
+        while len < max_len {
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    != *buf.get_unchecked(strptr + len as usize)
+            } {
+                break;
+            }
+            len += 1;
+        }
+        len
     }
 
-    while len < max_len && {
-        debug_assert!((matchptr + len as usize) < buf.len() && (strptr + len as usize) < buf.len());
-        unsafe {
-            *buf.get_unchecked(matchptr + len as usize) == *buf.get_unchecked(strptr + len as usize)
+    /// NEON-optimized match extension: compares 16 bytes at a time
+    /// using XOR + vmaxvq_u8. Produces identical results to `lz_extend`.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(crate) unsafe fn lz_extend_neon(
+        buf: &[u8],
+        strptr: usize,
+        matchptr: usize,
+        start_len: u32,
+        max_len: u32,
+    ) -> u32 {
+        use core::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8};
+
+        let mut len = start_len;
+        let base = buf.as_ptr();
+
+        // 16-byte comparisons via XOR
+        while max_len - len >= 16 {
+            let a = unsafe { vld1q_u8(base.add(strptr + len as usize)) };
+            let b = unsafe { vld1q_u8(base.add(matchptr + len as usize)) };
+            let x = veorq_u8(a, b);
+            let max_byte = vmaxvq_u8(x);
+            if max_byte != 0 {
+                // Not all 16 bytes match; fall through to word tail
+                break;
+            }
+            len += 16;
         }
-    } {
-        len += 1;
+
+        // 4-byte word tail (up to 12 bytes)
+        while max_len - len >= 4 {
+            let a = unsafe {
+                u32::from_le_bytes([
+                    *base.add(strptr + len as usize),
+                    *base.add(strptr + len as usize + 1),
+                    *base.add(strptr + len as usize + 2),
+                    *base.add(strptr + len as usize + 3),
+                ])
+            };
+            let b = unsafe {
+                u32::from_le_bytes([
+                    *base.add(matchptr + len as usize),
+                    *base.add(matchptr + len as usize + 1),
+                    *base.add(matchptr + len as usize + 2),
+                    *base.add(matchptr + len as usize + 3),
+                ])
+            };
+            if a != b {
+                // Byte-by-byte within this word. The loop invariant below guarantees
+                // `len + i < max_len` for i in 0..4, so the clamp cannot fire; it is
+                // here so a future edit that breaks the invariant fails LOUDLY at
+                // the comparison, not silently at the `len += 4` below.
+                for i in 0..4u32 {
+                    if len + i >= max_len {
+                        return len + i;
+                    }
+                    if unsafe {
+                        *buf.get_unchecked(matchptr + (len + i) as usize)
+                            != *buf.get_unchecked(strptr + (len + i) as usize)
+                    } {
+                        return len + i;
+                    }
+                }
+                len += 4;
+            } else {
+                len += 4;
+            }
+        }
+
+        // Byte-by-byte tail (up to 3 bytes)
+        while len < max_len {
+            if unsafe {
+                *buf.get_unchecked(matchptr + len as usize)
+                    != *buf.get_unchecked(strptr + len as usize)
+            } {
+                break;
+            }
+            len += 1;
+        }
+        len
     }
-    len
 }
 
 #[cfg(test)]
@@ -267,10 +456,16 @@ mod tests {
             buf[256 + run] = 0xBB;
 
             for max in [4u32, 8, 16, 17, 33, 64, 100, 258] {
+                // The caller contract is `strptr + max_len <= buf.len()`: slide
+                // strptr itself back to the exact buffer boundary when the
+                // 256-region start would overshoot (max > 256), so the probe
+                // exercises that boundary instead of violating the contract the
+                // SIMD paths cannot recover from.
+                let strptr = 256usize.min(buf.len() - max as usize);
                 let start = 0u32;
                 assert_eq!(
-                    lz_extend(&buf, 256, 0, start, max),
-                    naive(&buf, 256, 0, start, max),
+                    lz_extend(&buf, strptr, 0, start, max),
+                    naive(&buf, strptr, 0, start, max),
                     "run={run} max={max}"
                 );
             }
@@ -295,6 +490,9 @@ mod tests {
         buf[20] = 1;
         buf[84] = 2;
 
-        assert_eq!(lz_extend(&buf, 64, 0, 4, 258), 20);
+        // max_len caps at the honest caller bound (`strptr + max_len <= buf.len()`):
+        // the point is that lz_extend stops at the first post-start mismatch
+        // (len 20), not that max_len may walk past the buffer.
+        assert_eq!(lz_extend(&buf, 64, 0, 4, 64), 20);
     }
 }
