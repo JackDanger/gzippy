@@ -1,9 +1,11 @@
 //! Route assertions for the T1 FILE mmap path — EXECUTED, not inferred.
 //!
 //! The route under test: T1 file inputs above the 128 KiB mmap threshold take
-//! `PureT1Mmap` (whole-buffer-equivalent parse over a read-only mmap,
-//! `deflate::encode_gzip_unpadded_slice_to_writer`), while non-seekable T1
-//! inputs (stdin/pipes) keep the streaming `PureT1` route. The route name is
+//! `PureT1Mmap` (parse over a read-only mmap, `deflate::encode_gzip_unpadded_slice_to_writer`),
+//! while non-seekable T1 inputs (stdin/pipes) keep the `PureT1` route (read-to-end
+//! into a Vec, then the same whole-buffer parse). Both routes are whole-buffer —
+//! `ldx` is whole-buffer by construction — the difference is the input's home.
+//! The route name is
 //! printed by `compress::route::emit` at the call site of the encoder that
 //! actually runs (`GZIPPY_DEBUG=1`), so these tests observe the executed path
 //! rather than re-deriving the routing table from source — the same Gate-4
@@ -77,7 +79,8 @@ fn t1_file_to_stdout_takes_the_mmap_route_and_matches_stdin_bytes() {
         let file_gz = file_run.get_output().stdout.clone();
         assert_eq!(roundtrip(&file_gz), data, "L{level}: file-route roundtrip");
 
-        // PIPE stdin: must keep the streaming PureT1 route...
+        // PIPE stdin: must keep the whole-buffer PureT1 route (read-to-end
+        // into a Vec, then the same parse).
         let stdin_run = gzippy()
             .args([&format!("-{level}"), "-p1", "-c"])
             .write_stdin(data.clone())
@@ -94,7 +97,7 @@ fn t1_file_to_stdout_takes_the_mmap_route_and_matches_stdin_bytes() {
         assert_eq!(
             file_gz,
             stdin_run.get_output().stdout,
-            "L{level}: mmap (file) and streaming (stdin) outputs differ"
+            "L{level}: mmap (file) and Vec (stdin) outputs differ"
         );
     }
 }
@@ -127,6 +130,9 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     let cgz = stdout_run.get_output().stdout.clone();
     assert_eq!(
         &cgz[..10],
+        // Minimal header per this project's contract: XFL=0x00 flat (see
+        // `minimal_gzip_header`); b28e96f3 briefly pinned the vendor's habit
+        // value (0x04) here and that is what this assertion used to carry.
         &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
     );
     assert_eq!(
@@ -151,11 +157,11 @@ fn t1_in_place_file_flow_takes_the_mmap_route() {
     );
 }
 
-/// Files at or below the 128 KiB threshold keep the streaming route — the
-/// threshold is shared with the T>1 mmap gate, and this pins which side of it
-/// each route owns.
+/// Files at or below the 128 KiB threshold keep the read-to-end `PureT1`
+/// route (no mmap) — the threshold is shared with the T>1 mmap gate, and
+/// this pins which side of it each route owns.
 #[test]
-fn t1_small_file_keeps_the_streaming_route() {
+fn t1_small_file_keeps_the_read_to_end_route() {
     let data = corpus(64 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("small.bin");

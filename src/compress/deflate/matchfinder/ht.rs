@@ -472,7 +472,7 @@ impl HtMatchfinder {
             if cur_node <= cutoff {
                 break 'four;
             }
-            let mut match_pos = in_base_now + cur_node as usize;
+            let mut match_pos = in_base_now.wrapping_add_signed(cur_node as isize);
 
             // --- entry 1: shift entry 0 down into it, unconditionally ---
             // libdeflate copies entry 0 into entry 1 even when `nice_len` is reached
@@ -489,7 +489,7 @@ impl HtMatchfinder {
                     if cur_node <= cutoff || best_len >= nice_len {
                         break 'four;
                     }
-                    match_pos = in_base_now + cur_node as usize;
+                    match_pos = in_base_now.wrapping_add_signed(cur_node as isize);
                     // Pre-screen: the same 4-byte head AND the 4 bytes ending at the
                     // incumbent's last matched byte. A candidate failing either
                     // cannot beat `best_len`, so it is rejected without extending.
@@ -507,7 +507,7 @@ impl HtMatchfinder {
                     if cur_node <= cutoff {
                         break 'four;
                     }
-                    match_pos = in_base_now + cur_node as usize;
+                    match_pos = in_base_now.wrapping_add_signed(cur_node as isize);
                     if load_u32(base, match_pos) == seq {
                         best_len = lz_extend(buf, in_next, match_pos, HT_MIN_MATCH_LEN, max_len);
                         best_match_pos = match_pos;
@@ -529,7 +529,7 @@ impl HtMatchfinder {
         // finder returns) and puts the bit-cost knowledge where the length-3
         // candidate is produced.
         if best_len == 0 && cur_node3 > cutoff {
-            let mp = in_base_now + cur_node3 as usize;
+            let mp = in_base_now.wrapping_add_signed(cur_node3 as isize);
             let off = (in_next - mp) as u32;
             if off <= HT_MAX_LEN3_OFFSET {
                 // SAFETY: `cur_node3 > cutoff` so `mp < in_next` and `mp` points into

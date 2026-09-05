@@ -73,23 +73,6 @@ impl HcLocalCounters {
 pub const HC_HASH3_ORDER: u32 = 15;
 pub const HC_HASH4_ORDER: u32 = 16;
 
-/// How many candidates to walk in the LENGTH-3 chain.
-///
-/// zlib and gzip hash three bytes into their single table and chain it through `prev[]`;
-/// ours was a SINGLETON (one position per 3-byte key). Measured on dd79_bin6 at L2, 64%
-/// of our matches came out of that one-deep table while gzip found 27% MORE matches with
-/// a SHALLOWER 4-byte chain — deepening a 4-byte chain cannot find what a 3-byte chain
-/// finds.
-///
-/// Depth sweep, exact bytes, `-p1` (d=1 reproduces the old singleton byte-for-byte, which
-/// is the control):
-///     dd79_bin6   L2  4,500,757 -> 4,496,288 (d=4)   L3  4,461,737 -> 4,450,433
-///     data.sqlite L2 14,865,280 -> 14,864,898        L3 12,678,753 -> 12,677,986
-///     dickens     L2/L3 UNCHANGED — on text the 4-byte chain already reaches
-///                 `best_len >= 3`, so this path is not taken and costs nothing.
-/// Gains saturate at 4; d=8 is identical or a byte worse.
-pub const HC_HASH3_CHAIN_DEPTH: u32 = 8;
-
 const HASH3_SIZE: usize = 1 << HC_HASH3_ORDER;
 const HASH4_SIZE: usize = 1 << HC_HASH4_ORDER;
 

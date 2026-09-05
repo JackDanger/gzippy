@@ -14,6 +14,7 @@
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::choose_max_block_end;
 use super::compress_greedy::GreedyState;
+use super::far_len3::{FarLen3Gate, FAR_LEN3_MARGIN_EIGHTH_BITS};
 use super::flush::Compressor;
 use super::hc_matchfinder::{hc_matchfinder_longest_match, hc_matchfinder_skip_bytes};
 use super::min_match::{calculate_min_match_len, recalculate_min_match_len};
@@ -68,6 +69,67 @@ fn bsr32(v: u32) -> i32 {
 /// The first recalculation happens 10,000 bytes in; after that the interval becomes the
 /// block's current length, so checks get rarer as the block grows and its literal
 /// statistics stabilise. Greedy never does this — only the lazy parsers do.
+/// L3 over-split split-hold constants — ported 1:1 from the legacy parser
+/// (`src/compress/deflate/parse/mod.rs`): after 8 completed blocks, if the
+/// running average block size is in the 50-65 KB band (the FASTQ over-split
+/// signature) with <= 20 blocks/MiB, arm a split hold for the rest of the
+/// file: non-ultra-sparse blocks are then held to 50 KB before the entropy
+/// split may fire.
+const L3_OVER_SPLIT_LATCH_BLOCKS: u32 = 8;
+const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
+const L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES: usize = 50_000;
+const L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES: usize = 65_000;
+const L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB: u32 = 20;
+
+/// Decide whether to arm the split hold for the rest of the file
+/// (legacy `l3_sparse_split_latch`; `file_start` = 0 for the whole-buffer T1
+/// route).
+#[inline]
+fn l3_sparse_split_latch(
+    guard_mul: u32,
+    blocks_completed: u32,
+    file_start: usize,
+    block_begin: usize,
+) -> bool {
+    if guard_mul == 0 || blocks_completed != L3_OVER_SPLIT_LATCH_BLOCKS {
+        return false;
+    }
+    let bytes = block_begin - file_start;
+    if bytes == 0 {
+        return false;
+    }
+    let prior_avg = bytes / blocks_completed as usize;
+    let blocks_per_mib = blocks_completed.saturating_mul(1_048_576) / bytes as u32;
+    blocks_per_mib <= L3_OVER_SPLIT_MAX_BLOCKS_PER_MIB
+        && prior_avg > L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES
+        && prior_avg < L3_OVER_SPLIT_AVG_BLOCK_MAX_BYTES
+}
+
+/// Ultra-sparse block test (legacy `block_ultra_sparse`): `nseqs*64 <= bytes`
+/// AND `nseqs*M < bytes`. `guard_mul == 0` means disabled.
+#[inline]
+fn block_ultra_sparse(nseqs: usize, bytes_in_block: usize, guard_mul: u32) -> bool {
+    guard_mul > 0
+        && nseqs.saturating_mul(64) <= bytes_in_block
+        && nseqs.saturating_mul(guard_mul as usize) < bytes_in_block
+}
+
+/// Whether adaptive block-split may fire at this position while the L3 split
+/// hold is armed (legacy `sparse_split_active`).
+#[inline]
+fn l3_sparse_split_active(
+    hold_armed: bool,
+    nseqs: usize,
+    bytes_in_block: usize,
+    guard_mul: u32,
+) -> bool {
+    if guard_mul == 0 || !hold_armed {
+        return true;
+    }
+    block_ultra_sparse(nseqs, bytes_in_block, guard_mul)
+        || bytes_in_block >= L3_NON_ULTRA_SPLIT_MIN_BYTES
+}
+
 #[allow(clippy::too_many_arguments)]
 /// C: `deflate_compress_lazy` (:2816) — a plain `static void` that calls
 /// `deflate_compress_lazy_generic(..., false)`.
@@ -76,6 +138,7 @@ fn bsr32(v: u32) -> i32 {
 /// register-allocated functions, each reached through the `c->impl` function
 /// pointer. Collapsing them into one `match` arm, as we did, let LLVM merge both
 /// instantiations (and the greedy and fastest paths) into a single function.
+#[inline(never)]
 pub(crate) fn deflate_compress_lazy(
     c: &mut Compressor,
     p: &mut GreedyState,
@@ -84,6 +147,9 @@ pub(crate) fn deflate_compress_lazy(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
+    far_len3_gate: bool,
+    sparse_split_guard_mul: u32,
 ) {
     deflate_compress_lazy_generic(
         c,
@@ -93,11 +159,15 @@ pub(crate) fn deflate_compress_lazy(
         os,
         max_search_depth,
         nice_match_length,
+        good_match,
+        far_len3_gate,
+        sparse_split_guard_mul,
         false,
     );
 }
 
 /// C: `deflate_compress_lazy2` (:2830) — `deflate_compress_lazy_generic(..., true)`.
+#[inline(never)]
 pub(crate) fn deflate_compress_lazy2(
     c: &mut Compressor,
     p: &mut GreedyState,
@@ -106,6 +176,9 @@ pub(crate) fn deflate_compress_lazy2(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
+    far_len3_gate: bool,
+    sparse_split_guard_mul: u32,
 ) {
     deflate_compress_lazy_generic(
         c,
@@ -115,6 +188,9 @@ pub(crate) fn deflate_compress_lazy2(
         os,
         max_search_depth,
         nice_match_length,
+        good_match,
+        far_len3_gate,
+        sparse_split_guard_mul,
         true,
     );
 }
@@ -128,6 +204,9 @@ pub(crate) fn deflate_compress_lazy_generic(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
+    far_len3_gate: bool,
+    sparse_split_guard_mul: u32,
     lazy2: bool,
 ) {
     let mut in_next: usize = 0;
@@ -136,6 +215,11 @@ pub(crate) fn deflate_compress_lazy_generic(
     let mut max_len: u32 = DEFLATE_MAX_MATCH_LEN;
     let mut nice_len: u32 = core::cmp::min(nice_match_length, max_len);
     let mut next_hashes: [u32; 2] = [0, 0];
+
+    // L3 split-hold state (inert unless sparse_split_guard_mul > 0).
+    let mut blocks_completed = 0u32;
+    let mut split_hold_latched = false;
+    let mut split_hold_decided = false;
 
     p.hc_mf.init();
 
@@ -146,6 +230,19 @@ pub(crate) fn deflate_compress_lazy_generic(
         let mut next_recalc_min_len = in_next + core::cmp::min(in_end - in_next, 10000);
         let mut seq_idx: usize = 0;
 
+        // Decide (once, from the 8th completed block) whether the over-split
+        // hold arms for the rest of the file — legacy `l3_sparse_split_latch`
+        // sequence, verbatim.
+        if !split_hold_decided {
+            if l3_sparse_split_latch(sparse_split_guard_mul, blocks_completed, 0, in_block_begin) {
+                split_hold_latched = true;
+                split_hold_decided = true;
+            } else if blocks_completed > L3_OVER_SPLIT_LATCH_BLOCKS {
+                split_hold_decided = true;
+            }
+        }
+        let hold_armed = sparse_split_guard_mul > 0 && split_hold_latched;
+
         init_block_split_stats(&mut c.split_stats);
         deflate_begin_sequences(c, unsafe { p.sequences.get_unchecked_mut(0) });
         let mut min_len = calculate_min_match_len(
@@ -153,6 +250,10 @@ pub(crate) fn deflate_compress_lazy_generic(
             in_max_block_end - in_next,
             max_search_depth,
         );
+        // Far-len-3 gate: per-block state, recalc on the same widening
+        // cadence as min_len — legacy `lazy.rs` sequence, verbatim.
+        let mut far_len3 = FarLen3Gate::INERT;
+        let mut next_recalc_far_len3 = next_recalc_min_len;
 
         loop {
             // Recalculate the minimum match length if it hasn't been done recently.
@@ -160,6 +261,14 @@ pub(crate) fn deflate_compress_lazy_generic(
                 min_len = recalculate_min_match_len(&c.freqs, max_search_depth);
                 next_recalc_min_len +=
                     core::cmp::min(in_end - next_recalc_min_len, in_next - in_block_begin);
+            }
+            // Refresh the far-len-3 gate on the same cadence (legacy `lazy.rs`).
+            if in_next >= next_recalc_far_len3 {
+                if far_len3_gate {
+                    far_len3 = FarLen3Gate::recalc(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS);
+                }
+                next_recalc_far_len3 +=
+                    core::cmp::min(in_end - next_recalc_far_len3, in_next - in_block_begin);
             }
 
             // Find the longest match at the current position.
@@ -174,13 +283,43 @@ pub(crate) fn deflate_compress_lazy_generic(
                 max_len,
                 nice_len,
                 max_search_depth,
+                good_match,
                 &mut next_hashes,
                 &mut cur_offset,
             );
 
             // Note the threshold is 8192 here, where greedy uses 4096: the lazy parser
             // has already paid for a lookahead, so it is stricter about cheap matches.
-            if cur_len < min_len || (cur_len == DEFLATE_MIN_MATCH_LEN && cur_offset > 8192) {
+            // The L3 sparse-blocks modulate the cutoff to 4096 (legacy `lazy.rs`),
+            // and the far-len-3 cost gate can still accept a refused far len-3
+            // (legacy `far_len3` module). With the knobs off (every level but
+            // the L3 config) this is exactly the original `> 8192` test.
+            if cur_len < min_len
+                || (cur_len == DEFLATE_MIN_MATCH_LEN
+                    && cur_offset > {
+                        if sparse_split_guard_mul > 0
+                            && block_ultra_sparse(
+                                seq_idx,
+                                in_next - in_block_begin,
+                                sparse_split_guard_mul,
+                            )
+                        {
+                            4096
+                        } else {
+                            8192
+                        }
+                    }
+                    && !if far_len3_gate {
+                        far_len3.allows(
+                            cur_offset,
+                            unsafe { *r#in.get_unchecked(in_next) },
+                            unsafe { *r#in.get_unchecked(in_next + 1) },
+                            unsafe { *r#in.get_unchecked(in_next + 2) },
+                        )
+                    } else {
+                        false
+                    })
+            {
                 // No match found. Choose a literal.
                 debug_assert!(in_next < r#in.len());
                 let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
@@ -231,6 +370,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                         max_len,
                         nice_len,
                         max_search_depth >> 1,
+                        good_match,
                         &mut next_hashes,
                         &mut next_offset,
                     );
@@ -265,6 +405,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                             max_len,
                             nice_len,
                             max_search_depth >> 2,
+                            good_match,
                             &mut next_hashes,
                             &mut next_offset,
                         );
@@ -339,10 +480,20 @@ pub(crate) fn deflate_compress_lazy_generic(
                 }
             }
 
-            // Check if it's time to output another block.
+            // Check if it's time to output another block. While the L3 split
+            // hold is armed, the entropy split only fires on ultra-sparse
+            // blocks or blocks that have reached the 50 KB floor
+            // (legacy `continue_block` / `sparse_split_active`).
+            let split_active = l3_sparse_split_active(
+                hold_armed,
+                seq_idx,
+                in_next - in_block_begin,
+                sparse_split_guard_mul,
+            );
             if !(in_next < in_max_block_end
                 && seq_idx < SEQ_STORE_LENGTH
-                && !should_end_block(&mut c.split_stats, in_block_begin, in_next, in_end))
+                && !(split_active
+                    && should_end_block(&mut c.split_stats, in_block_begin, in_next, in_end)))
             {
                 break;
             }
@@ -356,6 +507,8 @@ pub(crate) fn deflate_compress_lazy_generic(
             &p.sequences,
             in_next == in_end,
         );
+
+        blocks_completed += 1;
 
         if in_next == in_end || os.overflow {
             break;

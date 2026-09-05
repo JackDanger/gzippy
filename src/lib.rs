@@ -30,7 +30,9 @@
 //!   entry point).
 //! - **`threads > 1`**: [`PipelinedGzEncoder`] (`compress_buffer_pure`) —
 //!   a pure parallel encoder whose output is byte-identical across thread
-//!   counts.
+//!   counts at the 4 small frozen parity fixtures; on real multi-chunk
+//!   inputs, thread count may change bytes (it always decodes to the same
+//!   original, which is the only bar)
 //!
 //! gzippy's own "GZ" multi-block format ([`ParallelGzEncoder`]) still
 //! exists and is still decompressible (see below), but it is not reachable
@@ -60,7 +62,8 @@ mod backends;
 pub use backends::isal_decompress as isal_decompress_oracle;
 mod cli;
 mod format;
-mod infra;
+#[doc(hidden)]
+pub mod infra;
 mod utils;
 
 #[cfg(test)]
@@ -106,9 +109,13 @@ pub use error::{GzippyError, GzippyResult};
 ///
 /// `level` is clamped to `0..=12` (see the [level table](crate#choosing-a-compression-level)).
 ///
-/// When all CPUs are used and `level` is in 0–5, the output uses gzippy's
-/// parallel "GZ" multi-block format. Use [`compress_with_threads`]`(data, level, 1)`
-/// if you need standard gzip output that any tool can read.
+/// Output is **standard single-member gzip at every level and thread count** — any
+/// tool reads it.
+///
+/// ⭐ This used to claim that all-CPUs + level 0–5 produced a gzippy-only "GZ"
+/// multi-block format. That has not been true for some time: verified 2026-08-23 by
+/// decompressing L0–L5 at `-p4` with stock `gzip -dc` (all six round-trip, one member
+/// each). Owner review flagged it as "stale and internally contradictory".
 pub fn compress(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
     let threads = std::thread::available_parallelism()
         .map(|p| p.get())
@@ -116,25 +123,53 @@ pub fn compress(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
     compress_with_threads(data, level, threads)
 }
 
-/// Compress `data` to gzip format at `level` using exactly `threads` threads.
+/// Compress `data` to gzip format at `level` using up to `threads` compression
+/// workers.
 ///
-/// **`threads = 1`** — standard single-member gzip; decompressible by any tool.
+/// Output is **standard single-member gzip at every level and thread count**.
 ///
-/// **`threads > 1, level 0–5`** — gzippy "GZ" multi-block format; only
-/// decompressible by gzippy (CLI or this library). Faster for large inputs.
+/// # `threads` is a worker count, not a total
 ///
-/// **`threads > 1, level 6–9`** — pipelined single-member gzip; any tool
-/// can decompress.
+/// It is clamped to the available parallelism, and the parallel path additionally
+/// runs a dedicated writer thread, so the process may use `threads + 1`. This
+/// previously read "exactly `threads` threads", which owner review flagged as
+/// untrue — it "oversubscribes a machine already configured with N CPUs".
+///
+/// # `threads > 1` buffers the whole input
+///
+/// The parallel encoder is whole-buffer. Every compression entry point in this
+/// crate buffers the whole input (see [`compress_to_writer`]); the difference
+/// is worker count, not memory.
 pub fn compress_with_threads(data: &[u8], level: u8, threads: usize) -> GzippyResult<Vec<u8>> {
     let mut out = Vec::new();
     compress::compress_bytes(std::io::Cursor::new(data), &mut out, level, threads)?;
     Ok(out)
 }
 
-/// Compress data from `reader` into `writer` at `level` using all available CPUs.
+/// Compress data from `reader` into `writer` at `level`, single-threaded.
 ///
-/// Suitable for large inputs you don't want to buffer entirely in memory. The
-/// same threading and format rules as [`compress`] apply.
+/// # ⚠ THIS BUFFERS THE ENTIRE INPUT
+///
+/// This used to be documented as "genuinely streaming", and that claim was
+/// false: `ldx` (the production T1 parser for L0-9) is whole-buffer by
+/// construction and L10-12 has no resumable parser, so EVERY level reads the
+/// reader to end before emitting a byte. The single-pass streaming machinery
+/// behind the claim was deleted 2026-08-30 once the routing that could have
+/// used it was gone, and this doc now states the actual contract. Peak memory
+/// is `input + output`, same as [`compress_with_threads`] at `threads = 1` —
+/// the only difference this entry point makes is that it uses one worker.
+///
+/// ⭐ OWNER REVIEW, 2026-08-23 — this function used to default to all CPUs
+/// while its own documentation promised "suitable for large inputs you don't
+/// want to buffer entirely in memory". The review is honored in the only way
+/// the current parser set allows: the API is honest about buffering, and a
+/// true streaming T1 path (a resumable `ldx` port) is the named open work
+/// item that will replace this contract.
+///
+/// The buffering contract is pinned — not merely documented — by
+/// `tests/streaming_api_is_honest.rs`, which asserts the first output byte
+/// waits for the last input byte (and that the output round-trips). A future
+/// resumable-ldx change must update that test in the same commit.
 ///
 /// Returns the number of **uncompressed** bytes consumed from `reader`.
 pub fn compress_to_writer<R: std::io::Read, W: std::io::Write + Send>(
@@ -142,15 +177,20 @@ pub fn compress_to_writer<R: std::io::Read, W: std::io::Write + Send>(
     writer: W,
     level: u8,
 ) -> GzippyResult<u64> {
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-    compress_to_writer_with_threads(reader, writer, level, threads)
+    compress_to_writer_with_threads(reader, writer, level, 1)
 }
 
 /// Compress data from `reader` into `writer` at `level` with explicit thread count.
 ///
 /// The same threading and format rules as [`compress_with_threads`] apply.
+///
+/// # ⚠ BUFFERS THE ENTIRE INPUT AT EVERY THREAD COUNT
+///
+/// With more than one thread the parallel encoder reads the reader to end
+/// before emitting any output (workers index the input directly and each
+/// block's dictionary is the preceding 32 KiB). At `threads = 1` it is the
+/// same whole-buffer single-worker path as [`compress_to_writer`]. Peak
+/// memory is `input + O(threads * block_size)`.
 ///
 /// Returns the number of **uncompressed** bytes consumed from `reader`.
 pub fn compress_to_writer_with_threads<R: std::io::Read, W: std::io::Write + Send>(
