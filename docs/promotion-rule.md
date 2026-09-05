@@ -116,8 +116,11 @@ Total improvement on failing cells must exceed **2x the residual harm** on passi
 cells. Residual harm is what the clause-3/5 chains left standing:
 
 * **confirmed-real unaccepted** erosions and flips, charged at their *confirmed* deltas;
-* **size regressions** on passing cells — size is exact, so every positive size delta is
-  real, within the flat budget or not;
+* **size regressions** on passing cells across the authorized **<= 1%** ceiling only —
+  the <= 1% authorized size spend is PRICED (itemized, never silent) and excluded, the
+  same way authorized wall margin-spend is; the 2026-08-11 receipt's point stands in
+  both directions — re-billing an authorized spend turns clause 6 into a
+  flat-budget-in-disguise again (see the 2026-09-05 amendment above);
 * **UNDECIDED wall suspects** at their census deltas, conservatively — missing floor
   coverage or confirm-cap overflow never becomes free.
 

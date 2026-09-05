@@ -269,3 +269,31 @@ paragraph replaced by the state-carry formulation; toolbox `make falsified`
 references replaced by the in-`src/` record search; memory pointer moved to
 `docs/board/`; thread-parity-vs-non-negotiable contradiction resolved by
 recording it as owner-directed (wall-for-size trade, #356 quote, 2026-08-22).
+
+## 9. Status addendum 2026-09-05 — the standing directive and the L2 record
+
+**Owner directive (verbatim):** "I delete the pick-min and all that terrible
+two-encode machinery. Aim for the right solution. We can take a <1% hit to
+compression size but we will not lose on wall clock under any conditions." The
+three rules lock together (full receipts in `CLAUDE.md`'s 2026-09-05 warning box
+and the clause-5/6 amendment in `docs/promotion-rule.md`): one encode per input
+absolute; wall NEVER loses; size may spend <= 1% per cell (> 1% convicts; size
+flips convict).
+
+**Slice status under that law:** #366 (slice 1) and #365 (plan + hardened
+instruments) MERGED. #367 (structure slice: bit-splicing writer, pick-min
+deletion, L2/L4/L5 routing) judged by the frozen box at 36 cells: two failing
+wall cells CLOSED (`gzip:L2:T1` 1.25x -> 0.58x; `pigz:L2:T1`), improvement 3.9x
+vs residual harm, zero roundtrip failures — but NO-SHIP on the pre-amendment
+clause 5 (the verdict's own receipt, thread-posted).
+
+**The L2 margin lever is falsified** (PR #369, both lanes measured to the stop
+rule): the deleted hybrid's 0.27% silesia margin was a PER-FILE pick-min choice
+between two full encodes; the min-3 arm is byte-identical to mine (whole-corpus
+A/B sha 3182904e) and floods synthetic tabular with +7.9% len-3 noise that no
+accept policy (unconditional, slack-gated, absent) can remove — `min_len = 3`
+itself is the spender. One encode must hold both classes; min-4 holds the
+synthetic tie and wins the wall class; that is the shipped shape and the board's
+single-encoder answer. The plan's ticket exchange stays as written above —
+Phase 3 runs under the amended size ceiling, where the L2/L4/L5 ladder repairs
+(zlib-ng `deflate_medium` family, §5) are re-aimed at the named-30 list.

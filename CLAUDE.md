@@ -77,6 +77,19 @@ on one of them, we tie on size" (#356); the stack makes T>1 byte-structure a gat
 property on FOUR FIXTURES ONLY, which sees no real seam. The reconciliation — exact
 state carry as a construction, parity-census as its falsifier — is Phase 1 in the plan
 doc. This is recorded as owner-directed, not silently reinterpreted.
+⚠ AND THE OWNER MOVED AGAIN 2026-09-05, completing that arc: "I delete the pick-min and
+all that terrible two-encode machinery. Aim for the right solution. We can take a <1%
+hit to compression size but we will not lose on wall clock under any conditions." The
+three rules now lock together: **ONE ENCODE PER INPUT is absolute** (pick-min stays
+deleted; no two-encode min returns, ever); **WALL NEVER LOSES** (a wall regression is a
+conviction under any circumstances — clauses 3/5/7's cross-layout machinery
+unchanged); **compression size may spend <= 1% per cell** (authorized spend, priced by
+clause 5/6's machinery, itemized — > 1% convicts; size FLIPS still convict). The
+promotion rule's clause-5/6 amendment with the full receipts lives in
+`docs/promotion-rule.md` (the 2026-09-05 entry). Two-encode pick-min machinery MUST
+NOT be rebuilt to dodge it: the margin ceiling replaces the masked spend with honest
+pricing. Receipt case: PR #367's frozen-box verdict (two L2 wall cells closed, one
+0.27% size tie — exactly this trade).
 
 **STEP 2 — T>1, a separate code path.** A consumer thread plus compression threads
 writing to a shared fd. Fulcrum proves no thread is ever starved and that reads and
