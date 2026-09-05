@@ -32,12 +32,12 @@ aarch64-apple-darwin	make_huffman_code_into	676	gzippy::compress::deflate::huffm
 aarch64-apple-darwin	optimize_and_flush	7060	<gzippy::compress::deflate::parse::near_optimal::Optimizer>::optimize_and_flush
 x86_64-unknown-linux-gnu	MatchFinder>::get_matches	1696	<gzippy::compress::deflate::matchfinder::lzfind::MatchFinder>::get_matches
 x86_64-unknown-linux-gnu	build_dynamic_header	1744	gzippy::compress::deflate::huffman::header::build_dynamic_header
-x86_64-unknown-linux-gnu	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>	11696	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>
-x86_64-unknown-linux-gnu	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>	11968	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>
-x86_64-unknown-linux-gnu	deflate_into	1888	gzippy::compress::deflate::deflate_into
-x86_64-unknown-linux-gnu	emit_block	8496	gzippy::compress::deflate::parse::emit_block
+x86_64-unknown-linux-gnu	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>	10416	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>
+x86_64-unknown-linux-gnu	compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>	10752	<gzippy::compress::pipelined::PipelinedGzEncoder>::compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>
+x86_64-unknown-linux-gnu	deflate_into	2176	gzippy::compress::deflate::deflate_into
+x86_64-unknown-linux-gnu	emit_block	7280	gzippy::compress::deflate::parse::emit_block
 x86_64-unknown-linux-gnu	emit_sequences	2640	gzippy::compress::deflate::parse::emit_sequences
-x86_64-unknown-linux-gnu	greedy::run_resumable	12048	gzippy::compress::deflate::parse::greedy::run_resumable
-x86_64-unknown-linux-gnu	lazy::run_resumable	13776	gzippy::compress::deflate::parse::lazy::run_resumable
+x86_64-unknown-linux-gnu	fastloop_l1_lean::<false, false>	7888	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false, false>
+x86_64-unknown-linux-gnu	fastloop_l1_lean::<false, true>	7744	gzippy::compress::deflate::parse::fast::fastloop_l1_lean::<false, true>
 x86_64-unknown-linux-gnu	make_huffman_code_into	752	gzippy::compress::deflate::huffman::fast::make_huffman_code_into
 x86_64-unknown-linux-gnu	optimize_and_flush	7696	<gzippy::compress::deflate::parse::near_optimal::Optimizer>::optimize_and_flush
