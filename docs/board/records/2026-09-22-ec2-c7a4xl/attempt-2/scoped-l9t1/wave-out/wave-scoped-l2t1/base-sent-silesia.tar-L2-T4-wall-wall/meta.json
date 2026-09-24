@@ -1,0 +1,7 @@
+{
+  "ours_tmpl": "/root/wave-out/wave-scoped-l2t1/arm-8748c20f64d8/target/release/gzippy -{level} -p {threads} -c {input}",
+  "ours_bin": "/root/wave-out/wave-scoped-l2t1/arm-8748c20f64d8/target/release/gzippy",
+  "ours_sha256": "8d0f7cf75ddf8b6d5f6f55c71db1fa0556a141c01304615c59f15d086a04a8c8",
+  "created_unix": 1790181251,
+  "attested": false
+}
