@@ -5,14 +5,26 @@
 #   Ir/B predicts wall on this workload; store counts do not. Re-calibrate
 #   before porting these budgets to a new arch.
 # Pinned on trainer (i7-13700T), gzippy @ tools/ir-budget branch of main 9a253acd.
+# RE-PIN (2026-09-24, post-one-encoder-restructure trunk @ e08e6107):
+#   re-pinned from the trunk's own measured values (cachegrind, valgrind 3.22,
+#   CI runner 'runnervmtr4k5', rustc 1.98.1; corroboration: the banked paired
+#   rows on the campaign box, handoff-2026-09-04 §3.2 — text L1 67.03 there
+#   vs 67.21 here, all 8 cells within 0.3%). The raise is the authorized kind:
+#   paired-wall receipt = the 2026-09-22 EC2 c7a.4xlarge adjudication
+#   (records/2026-09-22-ec2-c7a4xl: improvement 3.2462, residual harm 0.0000)
+#   — the wall did not regress; it improved across 33/36 cells. The old pins
+#   (36.92 text L1 era) predate the one-encoder restructure; main has carried
+#   this red since its own push CI 32636977083.
+#   Recalibration on a dedicated trainer-class box remains the standing item
+#   before these budgets gate anything (still informational, continue-on-error).
 # RATCHET: an optimization re-pins LOWER in its own PR; never raise a budget
 # without a paired-wall receipt showing the wall did not regress.
 fixture	level	ir_per_b
-text	1	36.92
-text	6	148.63
-tabular	1	29.63
-tabular	6	89.21
-binary	1	45.06
-binary	6	102.57
-noise	1	57.50
-noise	6	116.43
+text	1	67.21
+text	6	236.79
+tabular	1	53.62
+tabular	6	106.82
+binary	1	87.65
+binary	6	123.49
+noise	1	117.06
+noise	6	126.35

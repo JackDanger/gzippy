@@ -470,25 +470,6 @@ jobs:
 
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
-      # TEMP (chore/ir-pin-regen): regenerate the absolute-pin table and the
-      # leg-1 goal sheet on this runner, upload as artifacts for the honest
-      # re-pin PR. Remove this block when the re-pin lands on main.
-      - name: Regenerate absolute Ir pins (temp)
-        run: |
-          cargo test --release --test ir_budget print_current -- --ignored --nocapture 2>&1 | tee /tmp/fresh_ir_budget.txt
-          grep -E '^(text|tabular|binary|noise)' /tmp/fresh_ir_budget.txt > fresh_ir_budget.tsv || true
-      - name: Regenerate goal sheet leg 1 (temp)
-        run: |
-          env UPDATE_IR_VS_LDX=1 cargo test --release --test ir_vs_ldx update_ldx_pins -- --ignored --nocapture 2>&1 | tail -4
-      - name: Upload fresh pins
-        uses: actions/upload-artifact@v4
-        with:
-          name: fresh-ir-pins
-          path: |
-            fresh_ir_budget.tsv
-            tests/fingerprints/ir_vs_ldx.tsv
-
-
 
       # TWO STEPS, NOT ONE, AND THIS IS THE POINT.
       #

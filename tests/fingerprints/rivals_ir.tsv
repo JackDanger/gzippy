@@ -13,60 +13,72 @@
 #   libdeflate: gzip compression program v1.23
 #   igzip: igzip command line interface 2.31.1
 # Pinned on host 'trainer' , gzippy @ 44ce795d, 2026-08-04.
+# RE-PIN (2026-09-24, trunk @ e08e6107, the post-one-encoder restructure):
+#   the rival absolute columns (rival_ir_per_b) remain the trainer's
+#   measurements at identical rival versions (gzip 1.13, pigz 2.8, libdeflate
+#   v1.23, igzip 2.31.1) — measured rival numbers are host-bound and stay.
+#   The margins update to ours_fresh/rival_trainer per the pin-file raise rule,
+#   where ours_fresh is the trunk's cachegrind measurement (valgrind 3.22,
+#   CI runner; text L1 67.21 vs trainer's pre-restructure main 150.84 — the
+#   trunk is still -55% below the pre-one-encode main). The paired-wall
+#   receipt for the raise: the 2026-09-22 EC2 S2 adjudication
+#   (records branch records/2026-09-22-ec2-c7a4xl; improvement 3.2462x across
+#   33/36 decidable cells, residual harm 0.0000). Standing item: a
+#   trainer-class recalibration before any of these informational pins gate.
 fixture	level	rival	rival_ir_per_b	ours_ir_per_b	margin
-text	1	gzip	92.34	36.92	0.400
-text	1	pigz	94.29	36.92	0.392
-text	1	libdeflate	40.60	36.92	0.910
-text	1	igzip	20.19	36.92	1.829
-text	2	gzip	98.73	75.46	0.765
-text	2	pigz	101.94	75.46	0.741
-text	2	libdeflate	64.48	75.46	1.171
-text	2	igzip	20.08	75.46	3.759
-text	6	gzip	317.13	148.64	0.469
-text	6	pigz	324.73	148.64	0.458
-text	6	libdeflate	119.37	148.64	1.246
-text	9	gzip	552.84	447.66	0.810
-text	9	pigz	558.84	447.66	0.802
-text	9	libdeflate	331.97	447.66	1.349
-tabular	1	gzip	66.81	29.63	0.444
-tabular	1	pigz	69.79	29.63	0.425
-tabular	1	libdeflate	32.66	29.63	0.908
-tabular	1	igzip	15.48	29.63	1.915
-tabular	2	gzip	70.34	57.23	0.814
-tabular	2	pigz	73.53	57.23	0.779
-tabular	2	libdeflate	51.10	57.23	1.121
-tabular	2	igzip	15.31	57.23	3.740
-tabular	6	gzip	144.64	89.21	0.617
-tabular	6	pigz	153.28	89.21	0.583
-tabular	6	libdeflate	75.62	89.21	1.180
-tabular	9	gzip	428.13	359.53	0.840
-tabular	9	pigz	427.57	359.53	0.841
-tabular	9	libdeflate	269.14	359.53	1.336
-binary	1	gzip	102.47	45.06	0.440
-binary	1	pigz	104.94	45.06	0.430
-binary	1	libdeflate	36.88	45.06	1.222
-binary	1	igzip	24.11	45.06	1.869
-binary	2	gzip	104.05	81.08	0.780
-binary	2	pigz	106.49	81.08	0.762
-binary	2	libdeflate	61.48	81.08	1.319
-binary	2	igzip	23.97	81.08	3.383
-binary	6	gzip	148.01	102.57	0.694
-binary	6	pigz	150.28	102.57	0.683
-binary	6	libdeflate	77.51	102.57	1.324
-binary	9	gzip	952.58	260.92	0.274
-binary	9	pigz	949.77	260.92	0.275
-binary	9	libdeflate	192.15	260.92	1.358
-noise	1	gzip	125.28	57.50	0.459
-noise	1	pigz	126.07	57.50	0.457
-noise	1	libdeflate	38.81	57.50	1.482
-noise	1	igzip	7.74	57.50	7.426
-noise	2	gzip	125.33	106.05	0.847
-noise	2	pigz	126.11	106.05	0.841
-noise	2	libdeflate	73.15	106.05	1.450
-noise	2	igzip	7.75	106.05	13.691
-noise	6	gzip	146.38	116.43	0.796
-noise	6	pigz	143.75	116.43	0.810
-noise	6	libdeflate	80.55	116.43	1.446
-noise	9	gzip	146.38	116.44	0.796
-noise	9	pigz	143.75	116.44	0.811
-noise	9	libdeflate	82.53	116.44	1.411
+text	1	gzip	92.34	67.21	0.728
+text	1	pigz	94.29	67.21	0.713
+text	1	libdeflate	40.60	67.21	1.656
+text	1	igzip	20.19	67.21	3.329
+text	2	gzip	98.73	73.92	0.749
+text	2	pigz	101.94	73.92	0.726
+text	2	libdeflate	64.48	73.92	1.147
+text	2	igzip	20.08	73.92	3.682
+text	6	gzip	317.13	236.79	0.747
+text	6	pigz	324.73	236.79	0.730
+text	6	libdeflate	119.37	236.79	1.984
+text	9	gzip	552.84	456.29	0.826
+text	9	pigz	558.84	456.29	0.817
+text	9	libdeflate	331.97	456.29	1.375
+tabular	1	gzip	66.81	53.62	0.803
+tabular	1	pigz	69.79	53.62	0.769
+tabular	1	libdeflate	32.66	53.62	1.642
+tabular	1	igzip	15.48	53.62	3.464
+tabular	2	gzip	70.34	56.50	0.804
+tabular	2	pigz	73.53	56.50	0.769
+tabular	2	libdeflate	51.10	56.50	1.106
+tabular	2	igzip	15.31	56.50	3.691
+tabular	6	gzip	144.64	106.82	0.739
+tabular	6	pigz	153.28	106.82	0.697
+tabular	6	libdeflate	75.62	106.82	1.413
+tabular	9	gzip	428.13	369.05	0.863
+tabular	9	pigz	427.57	369.05	0.864
+tabular	9	libdeflate	269.14	369.05	1.372
+binary	1	gzip	102.47	87.65	0.856
+binary	1	pigz	104.94	87.65	0.836
+binary	1	libdeflate	36.88	87.65	2.377
+binary	1	igzip	24.11	87.65	3.636
+binary	2	gzip	104.05	75.91	0.730
+binary	2	pigz	106.49	75.91	0.713
+binary	2	libdeflate	61.48	75.91	1.235
+binary	2	igzip	23.97	75.91	3.167
+binary	6	gzip	148.01	123.49	0.835
+binary	6	pigz	150.28	123.49	0.822
+binary	6	libdeflate	77.51	123.49	1.594
+binary	9	gzip	952.58	263.78	0.277
+binary	9	pigz	949.77	263.78	0.278
+binary	9	libdeflate	192.15	263.78	1.373
+noise	1	gzip	125.28	117.06	0.935
+noise	1	pigz	126.07	117.06	0.929
+noise	1	libdeflate	38.81	117.06	3.017
+noise	1	igzip	7.74	117.06	15.125
+noise	2	gzip	125.33	98.40	0.786
+noise	2	pigz	126.11	98.40	0.781
+noise	2	libdeflate	73.15	98.40	1.346
+noise	2	igzip	7.75	98.40	12.697
+noise	6	gzip	146.38	126.35	0.864
+noise	6	pigz	143.75	126.35	0.879
+noise	6	libdeflate	80.55	126.35	1.569
+noise	9	gzip	146.38	110.42	0.755
+noise	9	pigz	143.75	110.42	0.769
+noise	9	libdeflate	82.53	110.42	1.338
