@@ -1,0 +1,40 @@
+sizecensus: pigz silesia.tar L09 T04 -> OK (gzippy=64704746 rival=67666705 ratio=0.9562 src=measured)
+sizecensus: libdeflate silesia.tar L09 T01 -> OK (gzippy=66716171 rival=66716171 ratio=1.0000 src=measured)
+sizecensus: libdeflate silesia.tar L09 T04 -> OK (gzippy=64704746 rival=66716171 ratio=0.9699 src=measured)
+wallcensus: gzip__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5190 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.1952 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.4086 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.1729 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L09__T01 -> VOID (verdict=VOID-aa_bias=0.0006 ratio=0.3639 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.3440 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5983 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.8789 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.4196 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.7048 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.3688 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-a-slower ratio=1.3813 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0697 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4029 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.3782 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.5832 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0164 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.9603 pin_ok=true pin_unmeasurable=false)
+TRY — promotion evaluation over 36 cells (33 decidable on both arms; 3 not)
+  clause 2 OK: arms differ (binary hashes distinct)
+  clause 1 OK: verify — zero roundtrip failures
+  clause 3 OK: no pass->fail flips across 33 decidable cells
+  clause 4 OK: closed failing cell(s): libdeflate:silesia.tar:L9:T4:wall, pigz:silesia.tar:L2:T1:wall
+  clause 5 [margin-floor]: gzip:silesia.tar:L6:T4:wall: census ratio=0.1318 -> ratio=0.1729 (Δ +0.0411 > flat budget 0.0050; winning cell, base <= 0.8); floor screen: Δln +0.2715 vs floor 0.0001 (beyond envelope); margin floor: census post 0.1729 <= min(0.8, 1-3x0.0001) = 0.8000 -> ACCEPTED (margin spent; no confirmation needed — no conviction is possible)
+  clause 5 [size-spend]: libdeflate:silesia.tar:L2:T1:size: census ratio=0.9973 -> ratio=1.0000 (Δ +0.0027 > flat budget 0.0007, <= authorized ceiling 0.0100) -> AUTHORIZED-<=1%-SIZE-SPEND (owner directive 2026-09-05: <1% size hit, wall never loses)
+  clause 5 [margin-floor]: pigz:silesia.tar:L6:T4:wall: census ratio=0.5367 -> ratio=0.7048 (Δ +0.1681 > flat budget 0.0050; winning cell, base <= 0.8); floor screen: Δln +0.2726 vs floor 0.0001 (beyond envelope); margin floor: census post 0.7048 <= min(0.8, 1-3x0.0001) = 0.8000 -> ACCEPTED (margin spent; no confirmation needed — no conviction is possible)
+  clause 5 OK: 2 wall erosion suspect(s) resolved without conviction (2 accepted under the margin floor, 0 acquitted as layout artifact — chains above); 1 size erosion(s) beyond the flat budget are AUTHORIZED-<=1%-SIZE-SPEND (owner directive 2026-09-05)
+  clause 6 OK: improvement 3.2462 vs residual harm 0.0000 (>=2x or no harm; harm = confirmed-real 0.0000 [0] + size 0.0000 [0] + undecided-conservative 0.0000 [0]; excluded as clause-5-priced: accepted margin-spend 0.2093 [2], layout-artifact acquittals 0.0000 [0], sub-budget census drift 0.0000 [0]; authorized size spend <=1% 0.0090 [6])
+  clause 7 OK: all required arch(s) covered: x86_64
+  clause 8 (method): paired interleaved per-pair ratios with stated n; fixed before the run by construction
+  wall margin tiers (band 0.0001 = median layout floor): 11 won-with-margin, 0 knife-edge, 4 failing
+  RE-RUN BEFORE ANY VERDICT:
+    gzip:silesia.tar:L2:T1:wall (base arm VOID — re-measure)
+    gzip:silesia.tar:L9:T1:wall (after arm VOID — re-measure)
+    libdeflate:silesia.tar:L6:T4:wall (base arm VOID — re-measure)
+VERDICT: UNDECIDED — see the RE-RUN list above; never a guess.
+  artifact: /root/wave-out/wave-s2-final/try.json
