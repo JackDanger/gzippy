@@ -250,16 +250,16 @@ fn build_tree(a: &mut [u32], sym_count: usize) {
                     || (*a.get_unchecked(i + 1) & FREQ_MASK) <= (*a.get_unchecked(b) & FREQ_MASK))
             {
                 // Two leaves.
-                new_freq =
-                    (*a.get_unchecked(i) & FREQ_MASK) + (*a.get_unchecked(i + 1) & FREQ_MASK);
+                new_freq = (*a.get_unchecked(i) & FREQ_MASK)
+                    .wrapping_add(*a.get_unchecked(i + 1) & FREQ_MASK);
                 i += 2;
             } else if b + 2 <= e
                 && (i > last_idx
                     || (*a.get_unchecked(b + 1) & FREQ_MASK) < (*a.get_unchecked(i) & FREQ_MASK))
             {
                 // Two non-leaves.
-                new_freq =
-                    (*a.get_unchecked(b) & FREQ_MASK) + (*a.get_unchecked(b + 1) & FREQ_MASK);
+                new_freq = (*a.get_unchecked(b) & FREQ_MASK)
+                    .wrapping_add(*a.get_unchecked(b + 1) & FREQ_MASK);
                 *a.get_unchecked_mut(b) =
                     ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK);
                 *a.get_unchecked_mut(b + 1) =
@@ -267,7 +267,8 @@ fn build_tree(a: &mut [u32], sym_count: usize) {
                 b += 2;
             } else {
                 // One leaf and one non-leaf.
-                new_freq = (*a.get_unchecked(i) & FREQ_MASK) + (*a.get_unchecked(b) & FREQ_MASK);
+                new_freq =
+                    (*a.get_unchecked(i) & FREQ_MASK).wrapping_add(*a.get_unchecked(b) & FREQ_MASK);
                 *a.get_unchecked_mut(b) =
                     ((e as u32) << NUM_SYMBOL_BITS) | (*a.get_unchecked(b) & SYMBOL_MASK);
                 i += 1;

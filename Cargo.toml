@@ -458,6 +458,11 @@ strip = true          # Remove symbols for smaller binary
 [profile.release-syms]
 inherits = "release"
 strip = false
+# Keep DWARF line tables in the non-shipping profiling twin. This does not enable
+# debug assertions or change optimization; it lets perf/callgrind split the large
+# inlined LDX parser symbol back into source locations while preserving release
+# code generation.
+debug = 1
 
 # iai-callgrind requires debug symbols to find its instrumented sentinels;
 # the stripped release profile breaks it. Keep release-grade optimization

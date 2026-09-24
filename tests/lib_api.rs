@@ -18,8 +18,16 @@ fn make_text(n: usize) -> Vec<u8> {
 }
 
 fn make_incompressible(n: usize) -> Vec<u8> {
+    // Wrapping arithmetic: at n = 128 KiB the multiply overflows u64 and the
+    // debug build panics (the test's own 2026-08-30 receipt — red in debug,
+    // green in release, the classic overflow-masked-by-optimization split).
     (0..n)
-        .map(|i| ((i as u64 * 6364136223846793005 + 1442695040888963407) >> 56) as u8)
+        .map(|i| {
+            ((i as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+                >> 56) as u8
+        })
         .collect()
 }
 

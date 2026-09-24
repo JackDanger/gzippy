@@ -132,19 +132,22 @@ pub fn lz_extend(
     len as u32
 }
 
-/// Prefetch the cache line at `ptr` into L1 (port of libdeflate `prefetchw`,
-/// `common_defs.h:260-271`).
+/// Prefetch the cache line at `ptr` into L1 for WRITING (port of libdeflate
+/// `prefetchw`, `common_defs.h:260-271`).
 ///
 /// Same purity and safety as [`prefetch_read`]: a pure hint that never faults
 /// and mutates nothing. Per-target reality: x86_64 issues the write/exclusive
 /// hint (`_MM_HINT_ET0`, as the C does); aarch64 deliberately issues the LOAD
-/// hint `pldl1keep` (commit `31f8ca68`, store->load for the ARM head table),
-/// so on ARM the line is NOT fetched exclusive and the old "fetch exclusive /
-/// avoid a later read-for-ownership stall" wording did not describe this code.
+/// hint `pldl1keep` (commit bbe56823, store->load for the ARM head table), so
+/// on ARM the line is NOT fetched exclusive and the "avoid a later
+/// read-for-ownership stall" wording does not describe this code.
 /// Wall-only either way — bytes are untouched at every level.
-// The raw pointer is never dereferenced — both targets below turn it into a
-// pure prfm/prefetch hint — but clippy's not_unsafe_ptr_arg_deref cannot see
-// through the asm! operand.
+///
+/// SAFETY (for the clippy raw-pointer lint): a prefetch hint is not a
+/// dereference — it cannot fault, cannot read, and touches no architectural
+/// state, for ANY pointer value, dangling or null. The `unsafe` blocks below
+/// exist only because the arch intrinsics are declared unsafe, not because
+/// this call is.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline(always)]
 pub fn prefetch_write(ptr: *const u8) {

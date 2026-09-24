@@ -63,6 +63,21 @@ use tables::DEFLATE_BLOCKTYPE_UNCOMPRESSED;
 /// Largest payload of a single stored (BTYPE=00) sub-block.
 const MAX_STORED_SUBBLOCK: usize = 65535;
 
+#[inline]
+pub(crate) fn minimal_gzip_header(level: u32) -> [u8; 10] {
+    // XFL is metadata, not compression state: this project's contract is the
+    // flat 0x00 that main has always written (see T1_MINIMAL_GZIP_HEADER and
+    // man/gzippy-format.5, which documents XFL 0x00). b28e96f3 briefly set
+    // libdeflate's habit values here (L1 -> 4, L8+ -> 2) to chase byte-for-byte
+    // vendor compatibility — that is the vendor-habit cage the charter names
+    // ("cite a contract, never a vendor's habit"), and the user retracted the
+    // byte-exactness goal outright (2026-08-30: valid gzip is the only bar).
+    // RFC 1952 would have said 2 for -1 and 4 for -0 anyway; either way, not
+    // the vendor's table. Flat 0 it is.
+    let _ = level;
+    [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
+}
+
 /// Output-buffer capacity estimate for a one-shot compress of `len` bytes at
 /// `level`, plus `framing_slack` bytes for whatever header/trailer the caller
 /// adds around the raw DEFLATE stream (gzip header + CRC32 + ISIZE = 18 for
@@ -163,29 +178,6 @@ pub fn encode_deflate_segment_to_sink(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
-        if !parallel
-            && level_uses_t1_zlib_pick_min(level)
-            && is_last
-            && bw.byte_len() == 0
-            && !data.is_empty()
-        {
-            *out = deflate_one_shot_t1_zlib_pick_min(&buf, 0, data.len(), level, true, true);
-            return;
-        }
-        if !parallel
-            && level_uses_t1_mmap_pick_min(level)
-            && is_last
-            && bw.byte_len() == 0
-            && !data.is_empty()
-        {
-            *out = match level {
-                1 => deflate_one_shot_t1_l1_pick_min(data),
-                2 => deflate_one_shot_t1_l2_pick_min(data),
-                4 => deflate_one_shot_t1_l4_pick_min(data),
-                _ => unreachable!(),
-            };
-            return;
-        }
         deflate_into(
             &mut bw,
             &buf,
@@ -350,248 +342,6 @@ pub(crate) fn note_stored_block_emitted() {
     STORED_BLOCK_EMITTED.with(|f| f.set(true));
 }
 
-/// Shared parse core: encode `buf[data_start..in_end]` into `bw`, treating
-/// `buf[..data_start]` as a seeded (but un-emitted) preset-dictionary window.
-///
-/// `buf` MUST carry at least [`parse::BUF_PAD`] trailing bytes past `in_end`
-/// that read as ZERO (the matchfinder's speculative loads reach up to `in_end +
-/// 1`, and the emitted bytes are byte-identical only when those pad bytes are
-/// zero — matches are clamped to `in_end` so the pad never enters the output).
-///
-/// `level == 0` is a genuine STORED-only mode (BTYPE=00 every block, no
-/// matchfinder/Huffman coding at all) — the same contract zlib/pigz/gzip give
-/// `Z_NO_COMPRESSION`/`-0` (gzip(1) and libdeflate-gzip reject `-0` outright;
-/// pigz treats it as stored). This bypasses `level::params`/`parse::compress`
-/// entirely rather than routing through `Strategy::Fast0` (which does real
-/// LZ77 + per-block static-or-stored Huffman coding — see `level.rs`'s
-/// `Strategy::Fast0` doc comment): a real compressor is not "as fast as a
-/// memcpy, at worst as small as stored" the way peers' L0 is, so it can never
-/// win the "at-least-as-fast, at-least-as-small" contract L0 is measured
-/// against. `Strategy::Fast0`/`fast::run::<true>` stay in the tree (still
-/// unit-tested via `level::params(0)`) but are no longer reachable from this
-/// production call path. Levels 1-12 are completely unaffected — this is the
-/// only new branch, guarded on `level == 0` alone.
-///
-/// `sync_flush` controls whether a non-final chunk is closed with a
-/// byte-aligning empty stored block. It is REQUIRED when chunks are encoded
-/// into separate bit streams that are later concatenated (the T>1 path, and
-/// [`encode_deflate_segment_to_sink`]'s contract). It must be OFF for a
-/// single-threaded streaming encoder that keeps ONE continuous `BitWriter`
-/// across chunks: there the chunk seam does not exist in the bitstream at all,
-/// so aligning at it would both waste ~5 bytes per chunk and, more
-/// importantly, make the output depend on the chunk size — destroying
-/// byte-identity with the whole-buffer encoder.
-/// Levels where the T1 whole-buffer path runs zlib pick-min (L5-L7).
-#[inline]
-fn level_uses_t1_zlib_pick_min(level: u32) -> bool {
-    matches!(level, 5..=7)
-}
-
-/// Levels where the T1 mmap pick-min route must match the whole-buffer encoder.
-#[inline]
-fn level_uses_t1_mmap_pick_min(level: u32) -> bool {
-    matches!(level, 1 | 2 | 4)
-}
-
-/// Pick-min helper: the arms run SEQUENTIALLY.
-///
-/// ⚠ THEY USED TO RUN IN PARALLEL, AND THAT WAS A CONTRACT VIOLATION. Every
-/// caller of this function is a `_t1_` path — i.e. the user asked for ONE
-/// thread. Spawning two arms made `-p1` consume ~1.8 cores. Measured on
-/// dickens (median of 7, cpu% via getrusage):
-///
-/// ```text
-/// gzippy -6 -p1   173.3%      pigz -6 -p1     99.6%
-/// gzippy -1 -p1   186.5%      gzip -6         99.5%
-///                             libdeflate -6   99.0%
-/// ```
-///
-/// Every rival uses exactly one core when asked for one thread. Three
-/// consequences, ascending: (1) least-surprise violation (non-negotiable 4);
-/// (2) it VOIDs our own wall cells — fulcrum's pin gate requires cpu% in
-/// [threads*50, threads*160] and correctly refused to certify 148-153%, which
-/// is what NO-SHIPped PR #333 on one undecidable cell; (3) **every T1 wall
-/// comparison we have ever published was taken with ~1.8x the CPU the rival
-/// was allowed.** The pin gate was never the obstacle — it was a working
-/// detector for this, and it had been refusing to certify inflated numbers the
-/// whole time.
-///
-/// OUTPUT IS BYTE-IDENTICAL: both orders pick the same winner by the same
-/// `min` over the same two candidates. Only cpu% and wall move. Verified over
-/// the 23-file corpus x L1-L9 (0 differing cells).
-///
-/// The `anatomy-counters` branch additionally does winner-only counter
-/// attribution (both arms would otherwise double-count into the global
-/// snapshot); that behaviour is unchanged.
-fn pick_min_two_vecs(
-    arm_a: impl FnOnce() -> Vec<u8> + Send,
-    arm_b: impl FnOnce() -> Vec<u8> + Send,
-) -> Vec<u8> {
-    #[cfg(feature = "anatomy-counters")]
-    {
-        use crate::compress::deflate::anatomy_counters::{self, COUNTERS};
-        let baseline = COUNTERS.snapshot();
-        anatomy_counters::reset();
-        let out_a = arm_a();
-        let snap_a = COUNTERS.snapshot();
-        anatomy_counters::reset();
-        let out_b = arm_b();
-        let snap_b = COUNTERS.snapshot();
-        let (out, snap) = if out_b.len() < out_a.len() {
-            (out_b, snap_b)
-        } else {
-            (out_a, snap_a)
-        };
-        COUNTERS.restore(&baseline);
-        COUNTERS.add_snapshot(&snap);
-        out
-    }
-    #[cfg(not(feature = "anatomy-counters"))]
-    {
-        let out_a = arm_a();
-        let out_b = arm_b();
-        if out_b.len() < out_a.len() {
-            out_b
-        } else {
-            out_a
-        }
-    }
-}
-
-/// Pick-min: baseline vs zlib knobs; the two encodes run in parallel so wall
-/// ≈ max(arm) instead of sum(arm) — measured ~2× → ~1.1× on dickens L6 T1.
-fn deflate_one_shot_t1_zlib_pick_min(
-    buf: &[u8],
-    data_start: usize,
-    in_end: usize,
-    level: u32,
-    is_last: bool,
-    sync_flush: bool,
-) -> Vec<u8> {
-    debug_assert!(level_uses_t1_zlib_pick_min(level));
-    let budget = encode_types::HeaderBudget::Lean;
-    let baseline = level::params_baseline(level);
-    let zlib = level::params_zlib_t1(level);
-
-    let encode = |params: &level::LevelParams| -> Vec<u8> {
-        let mut bw = BitWriter::from_vec(Vec::new());
-        parse::compress(
-            buf,
-            data_start,
-            in_end,
-            in_end - data_start,
-            params,
-            is_last,
-            budget,
-            &mut bw,
-        );
-        if !is_last && sync_flush {
-            emit_stored_block(&mut bw, &[], false);
-        }
-        bw.finish()
-    };
-
-    pick_min_two_vecs(|| encode(&baseline), || encode(&zlib))
-}
-
-/// Raw DEFLATE bytes via the mmap-route two-pass resumable parser.
-fn encode_unpadded_deflate_bytes(data: &[u8], params: level::LevelParams) -> Vec<u8> {
-    use encode_types::{BlockRole, HeaderBudget, InputMode};
-
-    let len = data.len();
-    let mut bw = BitWriter::from_vec(Vec::new());
-    let mut state = parse::ParseState::new();
-    state.input_total_len = len;
-    let mut in_next = 0usize;
-
-    if len > INPLACE_TAIL_PAD {
-        let avail = len - INPLACE_TAIL_PAD;
-        in_next = crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                data,
-                &mut state,
-                0,
-                avail,
-                &params,
-                BlockRole::Interior,
-                InputMode::Bounded,
-                HeaderBudget::Lean,
-                &mut bw,
-            )
-        });
-    }
-
-    let shift = state.max_shift();
-    let tail_len = len - shift;
-    let tail_cap = tail_len + INPLACE_TAIL_PAD;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, tail_cap);
-    let mut tbuf = Vec::with_capacity(tail_cap);
-    tbuf.extend_from_slice(&data[shift..]);
-    tbuf.resize(tail_cap, 0);
-    if shift > 0 {
-        state.shift_down(shift);
-        in_next -= shift;
-    }
-    if in_next == tail_len {
-        emit_stored_block(&mut bw, &[], true);
-    } else {
-        crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                &tbuf,
-                &mut state,
-                in_next,
-                tail_len,
-                &params,
-                BlockRole::Final,
-                InputMode::Drain,
-                HeaderBudget::Lean,
-                &mut bw,
-            )
-        });
-    }
-    bw.finish()
-}
-
-/// Pick-min: igzip vs gzip-primary L1 fast path (mmap + whole-buffer).
-fn deflate_one_shot_t1_l1_pick_min(data: &[u8]) -> Vec<u8> {
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(1)),
-        || encode_unpadded_deflate_bytes(data, level::params_l1_gzip_primary()),
-    )
-}
-
-/// Pick-min: libdeflate Greedy vs gzip fast-primary vs gzip-shaped greedy at L2.
-/// Two arms parallel (like L1), third arm sequential — keeps pin-gate at T1.
-fn deflate_one_shot_t1_l2_pick_min(data: &[u8]) -> Vec<u8> {
-    // TWO arms, not three. The `params_l1_gzip_primary` arm was DELETED
-    // 2026-08-21: measured over the full 22-file corpus against gzip, pigz and
-    // libdeflate, it protects ZERO cells. Its only min-win was data.sqlite,
-    // which passes all three rivals by >= 73 KB without it, and it changed the
-    // output on no other file — so tie-cage exposure is nil. Cost removed:
-    // ~36% of L2's T1 encode wall (three arms 10,510 ms -> two arms 6,704 ms,
-    // corpus total).
-    //
-    // NOTE the data.sqlite min-win it used to score was a symptom, not a
-    // service: L2's greedy parse emits 14.8 MB there where the L1 fast path
-    // emits 12.9 MB — the ladder-sag class, reproduced at L2. This arm was
-    // papering over it silently. Fix the sag, do not restore the arm.
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(2)),
-        || encode_unpadded_deflate_bytes(data, level::params_l2_gzip_deflate_fast()),
-    )
-}
-
-/// Pick-min: Greedy vs Lazy at L4 (mmap + whole-buffer).
-fn deflate_one_shot_t1_l4_pick_min(data: &[u8]) -> Vec<u8> {
-    let mut lazy_params = level::params(4);
-    lazy_params.strategy = level::Strategy::Lazy;
-    pick_min_two_vecs(
-        || encode_unpadded_deflate_bytes(data, level::params(4)),
-        || encode_unpadded_deflate_bytes(data, lazy_params),
-    )
-}
-
 fn deflate_into(
     bw: &mut BitWriter,
     buf: &[u8],
@@ -611,6 +361,21 @@ fn deflate_into(
     } else {
         // T>1 spends its parallel wall slack on a stronger parse — see
         // `level::params_parallel`. T1 is untouched.
+        //
+        // RETRATED 2026-08-30 (pre-merge): `61f0f01d` switched L8-L9 T>1 to the
+        // regular parser claiming "the size is unchanged" — the ledger proves
+        // otherwise: the near-optimal per-chunk parse is what made T4 L8-9
+        // SMALLER than T1 (canary: text +23,413 B / tabular +6,503 B /
+        // binary +1,759 B back to the regular parser, flipping binary/tabular/
+        // text L9 T4 from won to lost against gzip/pigz/libdeflate). A won cell
+        // that regresses blocks the merge, so the stronger parse comes back.
+        //
+        // OPEN LEVER (named, with numbers): on the frozen box, near-optimal L9
+        // T>1 measured ~2.5x slower than libdeflate in wall (61f0f01d) while
+        // the regular parser measured 0.58x. Neither gets both axes on L9 T4 —
+        // the lever is a parse BETWEEN them (e.g. near-optimal with a bounded
+        // effort, or a deeper regular search) measured on the size AND wall
+        // boards before it ships.
         let params = if parallel {
             level::params_parallel(level)
         } else {
@@ -656,32 +421,11 @@ pub fn encode_deflate_slack_padded_to_sink(
     level: u32,
     out: &mut Vec<u8>,
 ) {
+    encode_census::legacy_encode();
     assert!(
         buf.len() >= logical_len + INPLACE_TAIL_PAD,
         "encode_deflate_slack_padded_to_sink: buf must carry INPLACE_TAIL_PAD trailing pad bytes"
     );
-    if level_uses_t1_zlib_pick_min(level) && logical_len > 0 {
-        out.extend_from_slice(&deflate_one_shot_t1_zlib_pick_min(
-            buf,
-            0,
-            logical_len,
-            level,
-            true,
-            true,
-        ));
-        return;
-    }
-    if level_uses_t1_mmap_pick_min(level) && logical_len > 0 {
-        let data = &buf[..logical_len];
-        let deflate = match level {
-            1 => deflate_one_shot_t1_l1_pick_min(data),
-            2 => deflate_one_shot_t1_l2_pick_min(data),
-            4 => deflate_one_shot_t1_l4_pick_min(data),
-            _ => unreachable!(),
-        };
-        out.extend_from_slice(&deflate);
-        return;
-    }
     let mut bw = BitWriter::from_vec(std::mem::take(out));
     deflate_into(
         &mut bw,
@@ -772,103 +516,104 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 ///
 /// 10-12 keep our own engine — the exotic ladder has no libdeflate counterpart
 /// and `LdxCompressor::new` returns `None` above 9.
+/// ONE ENCODE PER INPUT — the architectural invariant, COUNTED not asserted.
+///
+/// ⭐ OWNER, 2026-08-23: "Why do we even have pick-min? Isn't that the approach that
+/// drove to parallel implementations which caused us to lose so much wall clock time?
+/// I told you to start with the perfect port of the vendor we're competing against and
+/// then to make optimizations that you could surpass in all cases. ... This project is
+/// named after its speed. Compression can't get worse, but that is strictly secondary."
+///
+/// Whole-buffer pick-min encoded every input TWICE (THREE times at L1) and kept the
+/// smaller result. It cost ~2x CLI wall at every level to defend 0.002-1.95% of size.
+/// It is deleted; `tests/one_encode_only.rs` keeps it deleted.
+///
+/// NOT feature-gated on purpose: one relaxed atomic per whole-file encode is free (it
+/// is per CALL, not per byte), so the guard runs in the DEFAULT test suite. A guard
+/// that only runs under a feature flag is one that gets missed.
+pub mod encode_census {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// One per entry to the libdeflate port (the production encoder).
+    pub static PORT_ENCODES: AtomicU64 = AtomicU64::new(0);
+    /// One per entry to the legacy whole-buffer encoder.
+    pub static LEGACY_ENCODES: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn port_encode() {
+        PORT_ENCODES.fetch_add(1, Relaxed);
+    }
+    #[inline]
+    pub(crate) fn legacy_encode() {
+        LEGACY_ENCODES.fetch_add(1, Relaxed);
+    }
+
+    /// `(port, legacy)` since the last [`reset`].
+    ///
+    /// Read by `tests/one_encode_only.rs`. The bin target cannot see integration
+    /// tests, so `-D dead-code` flags these there; they are the observability surface
+    /// the guard is built on, not dead code.
+    #[allow(dead_code)]
+    pub fn snapshot() -> (u64, u64) {
+        (PORT_ENCODES.load(Relaxed), LEGACY_ENCODES.load(Relaxed))
+    }
+    #[allow(dead_code)]
+    pub fn reset() {
+        PORT_ENCODES.store(0, Relaxed);
+        LEGACY_ENCODES.store(0, Relaxed);
+    }
+}
+
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // THE NON-STREAMING LEVELS ONLY. `ldx` is a WHOLE-BUFFER encoder; the
-    // streaming levels (0, 3, 8, 9 — see `level_streams`) reach the encoder
-    // through a second, chunked route that cannot call it, so routing only
-    // their whole-buffer path here made the two routes disagree.
+    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with FOUR measured
+    // exceptions. Routing L1/L6/L7 to the port was tried on this branch
+    // (`b28e96f3`) and the per-commit ledger gate went red immediately and
+    // stayed red for 45 commits: `won_cells_stay_won` regresses FOUR cells
+    // (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs gzip +12,610 B
+    // / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus` loses the L1 text
+    // cell to pigz (43,980 vs 42,384 = 1.038x). A won cell that regresses is
+    // a regression on a closed cell — the ledger is append-only and is never
+    // edited to fit a result, so the routing comes back.
     //
-    // Caught by `unpadded_slice_is_byte_identical_to_whole_buffer` at
-    // `L3 len=1` — an input below `max_passthrough_size` (55 - 4*level), where
-    // ldx emits a stored block and our streaming path does not. On the real
-    // corpus the two are byte-identical at L0/L3/L8/L9, which is exactly why a
-    // size census could not see this and a same-input route-identity test could.
+    // Each exception is a MEASUREMENT with a named gate, not a preference —
+    // and the good_match ones (L6/L7) collapse the moment the port learns
+    // `good_match` (shorten the chain walk once a match >= good_match is
+    // found; zlib/gzip/pigz all use it, and libdeflate does not implement it).
+    // That is the named follow-up lever (PR #363: port `good_match` INTO ldx,
+    // L6/L7 verified byte-identical 11/11, then retire those two exceptions
+    // one at a time):
     //
-    // Nothing is lost by the restriction: L0/L3/L8/L9 were ALREADY byte-identical
-    // to the port (verified per-byte, not per-size), so they had no gap to close.
-    // Every measured win is at 1/2/4/5/6/7 — the levels that ran pick-min.
+    //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
+    //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
     //
-    // ⚠ L1 IS EXCLUDED, and the exclusion is a MEASUREMENT, not a preference.
-    // Our L1 is NOT libdeflate — it is igzip-derived (`parse/fast.rs`) — and it
-    // BEATS pigz -1 on text, which libdeflate's L1 does not:
+    //   L3  the port has NO len-3/sparse machinery (l3_sparse_split, far_len3 —
+    //       the campaign-winning L3 guards), so port L3 (12, 14) is 1-7% LARGER
+    //       than the legacy L3 (8, 14 + len-3 guards) on the 11-file Mac corpus
+    //       (deterministic, 2026-09-01: tabular +18,886 B = 7.4%, text +6,831 B
+    //       = 2.0%, binary +4,316 B; 2MB+ files same direction) and the running
+    //       solvency try shows it LOSING 11 T1 wall cells vs the legacy L3.
+    //       The legacy L3 is exactly what main ships at T1 L3 (main's own
+    //       receipt: whole-buffer and streaming legacy L3 are byte-identical on
+    //       the real corpus), so the exception restores main's bytes AND wall.
+    //       Retires only when the port learns the len-3 machinery (named lever,
+    //       not good_match).
     //
-    //     text-heavy-2MiB   ours(igzip) <= pigz-1     ldx(libdeflate) 1.038x pigz-1
+    //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
+    //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
+    //         text:L6   vs gzip +12,610 B / vs pigz +12,090 B
+    //       Those cells were won by the ZLIB arm = baseline + `good_match` 8 + chain
+    //       128. Carrying those knobs on the level keeps the cells with ONE encode.
     //
-    // The per-label bar is `<= gzip AND <= pigz AND <= libdeflate AND <= igzip`,
-    // so tying libdeflate is not enough where pigz is smaller. Routing L1 to the
-    // port would take its wall from 3.16x to 1.09x and hand back a pigz cell on
-    // text; `fast_l1_ratio_multi_corpus` catches exactly that. That trade is
-    // tracked in #347 and is the owner's to make, not a thing to silently take.
+    //   L7  follows from L6: the port has no `good_match`, so our L6 is stronger than
+    //       the port's L7 (100, 130) and `ladder_is_monotone_t1` fires (305,775 >
+    //       304,252 on text). L7 keeps the legacy encoder at its own measured-best
+    //       single config (chain 256, `good_match` 32) — monotone, and 2 clause-3 flips
+    //       against 4 for `params(7)`.
     //
-    // ⚠ L6 IS ALSO EXCLUDED, and the LEDGER named it — not a judgement call.
-    // `won_cells_stay_won` fails on the only two cells this lever regresses:
-    //
-    //     binary:L6:T1 vs gzip  ours 651553 > 649939  (+1,614 B)
-    //     binary:L6:T1 vs pigz  ours 651553 > 650666  (+887 B)
-    //     text:L6:T1   vs gzip  ours 322110 > 309500  (+12,610 B)
-    //     text:L6:T1   vs pigz  ours 322110 > 310020  (+12,090 B)
-    //
-    // Mechanism, from the ledger's own axis diff: libdeflate emits FOUR blocks
-    // where our L6 emitted NINETEEN (`blocks_dynamic` -78.9%, `header_bits`
-    // -78.7%) and then gives back more than the 7,816 header bits it saved
-    // (`data_bits` +0.4%, `literals` +0.5%). Our L6 pick-min genuinely beats the
-    // port on these files; this is a real algorithmic difference, not codegen.
-    //
-    // So the port ships where it is at least as good and stands aside where it
-    // is not. L2/L4/L5/L7 port; L1 and L6 keep our encoder pending #347.
-    //
-    // ⚠ AND L7, because the LADDER must stay coherent. With L6 on our encoder
-    // and L7 on the port, `ladder_is_monotone_t1` caught `text` L7 producing
-    // 305,775 B against L6's 304,252 B — asking for MORE compression would have
-    // cost 1,523 bytes. A user typing `-7` after `-6` must not get a worse file.
-    //
-    // THE PORT SHIPS AS A RANGE, NOT A CHECKERBOARD. Mixing encoders across
-    // adjacent levels breaks the ladder even when every individual level is
-    // defensible on its own numbers.
-    //
-    // Final scope: L2, L4, L5 take the port. L1 (beats pigz on text where the
-    // port does not), L6 (ledger: beats gzip AND pigz on binary and text), and
-    // L7 (ladder coherence with L6) keep our encoder. L0/L3/L8/L9 stream and
-    // were ALREADY byte-identical to the port.
-    // ⛔ EMPTY. The port ships at NO level — every candidate was rejected by a gate.
-    //
-    //   L1  fast_l1_ratio_multi_corpus  our igzip-derived L1 BEATS pigz -1 on text;
-    //                                   the port is 1.038x. Bar is <= ALL rivals.
-    //   L6  won_cells_stay_won (LEDGER) port loses text:L6 by 12,610 B to gzip.
-    //   L4/L7  ladder_is_monotone_t1    ported level came out LARGER than the one below.
-    //   L2  perf_shape                  the port carries NO anatomy counters, so routing
-    //                                   L2's T1 path to it zeroes every counter while T>1
-    //                                   keeps our encoder — `parallel_overhead_budget`
-    //                                   then compares live counts against zeros. Porting
-    //                                   a level BLINDS our instruments there, and it buys
-    //                                   1.9x wall on ONE level against 2 lost size cells.
-    //   L0/L3/L8/L9                     stream; ALREADY byte-identical to the port.
-    //
-    // ⭐ THE FINDING: "we run 1.6-4.1x our own port to defend 0.1-2.3% of size, so ship
-    // the port" is HALF TRUE. The 1.6-4.1x is real — and it is the SECOND ENCODE, not the
-    // parameter choices. Our divergences from libdeflate at L1/L4/L6 are REAL WINS the
-    // port loses. The lever that survives is "one encode, our parse" (#356), not "replace
-    // our encoder".
-    //
-    // ⭐ 2026-08-23: TURNED ON for the levels MEASURED byte-identical to production.
-    //
-    // The gate list above is about levels where the port emits DIFFERENT bytes. L0, L8
-    // and L9 are not in that class: `compress_for_diff` is byte-identical to
-    // `encode_deflate_bytes_to_vec` on all 23 corpus files at each of them (0 differ,
-    // 0 refused). Routing them to the port is therefore a ZERO-size change — no cell
-    // can flip, clause 3 is untouched — and it buys the port's codegen on the wall
-    // axis. L3 is excluded because it genuinely differs (23/23 files); the levels that
-    // ran pick-min are excluded because dropping the second arm is a separate,
-    // owner-facing trade (PR #356).
-    //
-    // The route-identity caveat the exclusion was originally written for is real and is
-    // handled by the caller, not here: at or below `ldx::max_passthrough_size(level)`
-    // the port emits a stored block where our streaming path emits fewer bytes (n=1:
-    // ours 3, port 6). Measured across n = 0..=300 on two contents: 46 such inputs at
-    // L8, 38 at L9 — exactly 2 x 23 and 2 x 19, i.e. precisely the threshold and
-    // nothing else. Above the threshold there are ZERO divergences.
-    matches!(level, 0 | 8 | 9)
+    // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
+    // has lied about exactly this three times in this campaign.
+    !matches!(level, 1 | 3 | 6 | 7) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
@@ -877,14 +622,13 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
         let mut out = Vec::with_capacity(cap);
-        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+        out.extend_from_slice(&minimal_gzip_header(level));
 
         // ONE production encoder for 0-9: our libdeflate port.
         // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
         // between the header written above and the CRC/ISIZE written below.
         // Append straight into `out` — no scratch buffer, no zeroing, no copy.
         if !(level_uses_ldx(level)
-            && logical_len > crate::compress::ldx::max_passthrough_size(level)
             && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
         {
             encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
@@ -898,287 +642,21 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
     })
 }
 
-/// Input consumed per streaming iteration: 65535 x 64 = 4_194_240 (~4 MiB).
+/// Compress `reader` into `writer` as a gzip stream at `level`.
 ///
-/// ONE constant for every level, every input and every machine — no detection,
-/// no per-archive tuning. Two measured properties chose it:
-///
-/// * **A multiple of [`MAX_STORED_SUBBLOCK`]**, so at level 0 the stored
-///   sub-block boundaries fall exactly where the whole-buffer encoder puts
-///   them and the streamed output is byte-identical, not merely equivalent.
-/// * **Large enough that forced block boundaries stop costing ratio.** Each
-///   chunk seam ends a DEFLATE block, so smaller chunks cost output size.
-///   Swept over the 21-file corpus x L0-L9, restricted to the 7 files >= 25 MiB
-///   (the ones genuinely multi-chunk at every sweep point), worst-case size
-///   regression versus whole-buffer encoding:
-///     1 MiB 0.0370% | 2 MiB 0.0411% | 4 MiB 0.0189% | 8 MiB 0.0196%
-///   (level 3 excluded — its content detector is separately chunk-sensitive,
-///   see `parse::gated`; that is a property of the detector, not of chunking,
-///   and it is why level 3 does NOT take this path yet.)
-///
-/// 4 MiB is where the ratio cost flattens. Peak RSS is then ~4.3 MB against
-/// gzip's 2.0 MB and libdeflate's 18.0 MB, versus the whole-buffer path's
-/// 2.009x the input size.
-pub const STREAM_CHUNK: usize = MAX_STORED_SUBBLOCK * 64;
-
-/// Single-pass streaming with NO chunk seam in the output.
-///
-/// The plain chunked path calls the parser once per chunk, and each call emits
-/// complete blocks over its own input range — so a block is forced to end at
-/// every seam. That cost real bytes: against libdeflate, at the levels where
-/// our output is otherwise byte-identical, multi-chunk files came out +66 to
-/// +532 bytes larger, which flipped nine tied per-label SIZE cells to failing.
-///
-/// Here ONE [`parse::ParseState`] (matchfinder + `in_base` + `next_hashes`)
-/// and ONE parse position span the whole file. Each pass parses only COMPLETE
-/// blocks that had at least [`parse::STREAM_BLOCK_LOOKAHEAD`] bytes of input
-/// behind them, and carries the unconsumed tail — always under ~305 KB —
-/// into the next refill. That margin is what makes every block-boundary
-/// decision identical to a whole-buffer encode.
-///
-/// Buffer layout is `[history | unconsumed | free]`, and it slides rather than
-/// grows: once more than two windows of history accumulate, contents move down
-/// by a whole number of `WINDOW_SIZE`s and `ParseState::shift_down` decrements
-/// `in_base` by the same amount. Because the matchfinder stores every position
-/// as `pos - in_base`, that is an O(1) pointer-rebase with no table rewrite —
-/// the same trick zlib's sliding window uses.
-fn encode_gzip_single_pass<R: std::io::Read, W: std::io::Write>(
-    reader: &mut R,
-    writer: &mut W,
-    level: u32,
-    stream_chunk: usize,
-    size_hint: Option<usize>,
-) -> std::io::Result<u64> {
-    use std::io::ErrorKind;
-
-    let params = level::params(level);
-    // Room for the most history the slide rule can leave behind (two windows),
-    // the largest tail the parser can decline to consume, one refill, and the
-    // matchfinder's speculative-load pad.
-    let cap = 2 * matchfinder::hc::WINDOW_SIZE
-        + parse::STREAM_BLOCK_LOOKAHEAD
-        + stream_chunk
-        + INPLACE_TAIL_PAD;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, cap);
-    let mut buf = vec![0u8; cap];
-
-    let mut state = parse::ParseState::new();
-    state.input_total_len = size_hint.unwrap_or(0);
-    let mut in_next = 0usize; // parse position, in buffer coordinates
-    let mut avail = 0usize; // valid bytes in buf
-    let mut eof = false;
-    let mut crc = crc32fast::Hasher::new();
-    let mut total: u64 = 0;
-
-    let mut out = Vec::with_capacity(stream_chunk / 2 + 1024);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    let mut bw = BitWriter::from_vec(out);
-
-    // NOTE: no `anatomy_wall_cli!` here. The CLI route in `compress::mod`
-    // already arms that span around this call, and arming a second one nests
-    // it inside the first — both accumulate into `cli_ns`, doubling it and
-    // leaving a `cli residual` of exactly 50%. That is what the first version
-    // of this instrumentation did, and `cli_calls=2` is what gave it away.
-    loop {
-        // Refill. CRC covers exactly the new bytes, while they are still hot in
-        // cache from the read — not a second sweep of the whole input.
-        //
-        // `read_input` and `stream_crc` are SIBLING outer regions, not nested:
-        // timing them separately here keeps the production structure (crc
-        // interleaved with the reads, so each chunk is checksummed while hot)
-        // exactly as it is, while still letting the two costs be told apart.
-        let fill_to = cap - INPLACE_TAIL_PAD;
-        while !eof && avail < fill_to {
-            let r = crate::anatomy_wall_time!(read_input_ns, read_input_calls, {
-                reader.read(&mut buf[avail..fill_to])
-            });
-            match r {
-                Ok(0) => eof = true,
-                Ok(k) => {
-                    crate::anatomy_wall_time!(stream_crc_ns, stream_crc_calls, {
-                        crc.update(&buf[avail..avail + k]);
-                    });
-                    total += k as u64;
-                    avail += k;
-                    state.input_total_len = state.input_total_len.max(total as usize);
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Speculative loads read past the logical end; those bytes must read as
-        // zero for the output to be byte-exact.
-        buf[avail..avail + INPLACE_TAIL_PAD].fill(0);
-
-        // Nothing left to parse. The whole-buffer path guards this inside
-        // `deflate_into` (`in_end == data_start` emits an empty block); calling
-        // the parser directly means guarding it here instead. Without this the
-        // parser starts a block at the buffer end, reads the byte past it, and
-        // walks off — an empty input, or an input whose last byte lands exactly
-        // on a block boundary, panics in `calculate_min_match_len`.
-        if level == 0 {
-            // STORED: no parser, no matchfinder, no history window. Emit whole
-            // 65535-byte sub-blocks and carry the remainder, so boundaries land
-            // exactly where the whole-buffer encoder puts them and the output
-            // is byte-identical. Handling level 0 HERE is what lets ONE
-            // streaming loop serve every streaming level, instead of keeping a
-            // second seam-tolerant loop alive for the one level whose encoding
-            // is a memcpy.
-            let take = if eof {
-                avail - in_next
-            } else {
-                ((avail - in_next) / MAX_STORED_SUBBLOCK) * MAX_STORED_SUBBLOCK
-            };
-            emit_stored_block(&mut bw, &buf[in_next..in_next + take], eof);
-            in_next += take;
-            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-        } else if in_next == avail {
-            if eof {
-                // Close the stream: a zero-length final block carrying BFINAL.
-                emit_stored_block(&mut bw, &[], true);
-                crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-                break;
-            }
-        } else {
-            // The `root` span: the encoder call proper. Fires once per pass
-            // here rather than once per file, so `root_calls` is the pass
-            // count — the inner regions still sum inside it, which is what the
-            // level-1 conservation check needs.
-            in_next = crate::anatomy_wall_root!({
-                parse::parse_resumable(
-                    &buf[..avail + INPLACE_TAIL_PAD],
-                    &mut state,
-                    in_next,
-                    avail,
-                    &params,
-                    if eof {
-                        encode_types::BlockRole::Final
-                    } else {
-                        encode_types::BlockRole::Interior
-                    },
-                    // EOF is the only condition under which the parser must
-                    // consume everything: any earlier pass will be refilled.
-                    if eof {
-                        encode_types::InputMode::Drain
-                    } else {
-                        encode_types::InputMode::Bounded
-                    },
-                    encode_types::HeaderBudget::Lean,
-                    &mut bw,
-                )
-            });
-            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-        }
-
-        if eof {
-            break;
-        }
-
-        // Slide: reclaim everything the matchfinder can no longer reference.
-        // `max_shift` returns a whole number of windows and always leaves one
-        // full window of history behind `in_base`.
-        // Level 0 references nothing behind `in_next`, so everything already
-        // emitted is reclaimable; every other level must leave the matchfinder
-        // a full window, which is what `max_shift` guarantees.
-        let shift = if level == 0 {
-            in_next
-        } else {
-            state.max_shift()
-        };
-        if shift > 0 {
-            buf.copy_within(shift..avail, 0);
-            avail -= shift;
-            in_next -= shift;
-            if level != 0 {
-                state.shift_down(shift);
-            }
-        }
-        debug_assert!(
-            avail < fill_to,
-            "slide must free space or the loop cannot make progress"
-        );
-    }
-
-    let mut tail = bw.finish();
-    tail.extend_from_slice(&crc.finalize().to_le_bytes());
-    tail.extend_from_slice(&(total as u32).to_le_bytes());
-    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
-    Ok(total)
-}
-
-/// Whether `level` may take the single-pass streaming encoder.
-///
-/// THE RULE: a level streams only when its output is PROVABLY unaffected by
-/// streaming. Two ways to earn that, and no third:
-///
-/// * **Level 0** — stored blocks, and [`STREAM_CHUNK`] is a multiple of
-///   [`MAX_STORED_SUBBLOCK`], so sub-block boundaries land exactly where the
-///   whole-buffer encoder puts them.
-/// * **A resumable parser** ([`parse::level_has_resumable_parser`]) — one
-///   matchfinder and one parse position span the file, so block boundaries
-///   come from the block splitter rather than from input refill.
-///
-/// Everything else keeps the whole-buffer path and its memory cost. That is a
-/// deliberate ordering: being at-least-as-small at the level the user typed is
-/// the contract, and peak RSS is not, so a level that cannot yet stream
-/// without growing its output does not stream.
-///
-/// THIS RULE WAS LEARNED THE EXPENSIVE WAY, TWICE. The first streaming
-/// version ran every level through a seamed chunk loop. At L2/4/5/6/7 that
-/// cost +66 to +532 bytes against libdeflate — levels where the buffered path
-/// was EXACTLY byte-identical to it — flipping nine tied per-label SIZE cells.
-/// Those were fixed by making greedy/lazy resumable. Then the SAME defect was
-/// found at L10-12 (NearOptimal, still seamed): +101 to +5944 bytes, six more
-/// passing cells flipped, and they had gone unmeasured because the corpus
-/// sweep only covered L0-L9. Both times the mistake was letting a level onto
-/// the streaming path without a proof that its bytes could not change.
-///
-/// This is a level branch, not content detection — it reads only the number
-/// the user typed. It should shrink by making more parsers resumable (Fast
-/// landed for L1 2026-08-02 via `fast::run_resumable`; NearOptimal for
-/// L10-12 remains), not by relaxing the rule.
-#[inline]
-pub fn level_streams(level: u32) -> bool {
-    level == 0 || parse::level_has_resumable_parser(level)
-}
-
-/// Compress `reader` into `writer` as a gzip stream in ONE pass, holding a
-/// fixed ~1.1 MiB of buffer regardless of input size.
-///
-/// This is the streaming counterpart to [`encode_gzip_slack_padded_to_vec`], which
-/// materializes the whole input in one `Vec` and the whole output in another.
-/// Measured peak RSS of that approach on a 232.2 MiB input was 2.009x the
-/// input at `-0` and input-plus-compressed-size at `-6`, against a flat 2.0 MB
-/// for both gzip and pigz — a difference that stops being a ratio and starts
-/// being a failure once the input approaches available memory.
-///
-/// Three structural properties, in the order they matter:
-///
-/// 1. **One continuous [`BitWriter`] spans every chunk.** Chunks are not
-///    separately-encoded streams that get concatenated, so no sync-flush
-///    marker is needed at the seams (`sync_flush = false`) and the seam leaves
-///    no trace in the output. [`BitWriter::drain_to`] hands off complete bytes
-///    after each chunk while the partial-bit accumulator carries over.
-/// 2. **CRC is folded into the chunk pass**, over data still hot in cache,
-///    instead of a separate monolithic sweep of the whole input. On the
-///    whole-buffer path that sweep measured 29.3 ms on 232 MiB — a third of
-///    the entire `-0` route.
-/// 3. **The history window slides inside one buffer.** Layout is
-///    `[STREAM_HISTORY | STREAM_CHUNK | INPLACE_TAIL_PAD]`; after each chunk
-///    the trailing 32 KiB is `copy_within`'d down to the history slot. The
-///    encoder parses in place and back-references reach into the history
-///    exactly as they would mid-buffer.
-///
-/// The one-byte lookahead exists because DEFLATE must mark the final block
-/// BFINAL *while encoding it*, and "did the reader end exactly on a chunk
-/// boundary" is not knowable otherwise. Reading one byte past a full chunk
-/// answers it; that byte becomes the first byte of the next chunk.
-// The bin target compiles this module tree directly, where these two lib-API
-// entry points have no caller (the CLI routes through the _sized variant);
-// tests/streaming_identity.rs and library consumers use them.
-#[allow(dead_code)]
+/// ⚠ THIS BUFFERS THE WHOLE INPUT. `ldx` (the production T1 parser for L0-9) is
+/// whole-buffer by construction, and L10-12 has no resumable parser, so every
+/// level reads the reader to end before emitting a byte. The single-pass
+/// streaming implementation that this entry point used to carry was deleted
+/// 2026-08-30: it was unreachable for every production level, and keeping it
+/// alive let the "genuinely streaming" doc claim survive for two weeks after
+/// the routing that could have used it was gone. A true streaming T1 API
+/// needs a resumable `ldx` port — that is the named open work item (see
+/// `src/lib.rs`), and until it lands this function is the honest whole-buffer
+/// single-threaded route.
+#[allow(dead_code)] // library API entry point; no in-crate caller (the binary
+                    // routes through `_sized`). Kept public per the module's
+                    // dead-code policy: narrow allow + doc note.
 pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1189,71 +667,22 @@ pub fn encode_gzip_reader_to_writer<R: std::io::Read, W: std::io::Write>(
 
 /// [`encode_gzip_reader_to_writer`] with an optional input-size hint.
 ///
-/// The hint matters only on the whole-buffer FALLBACK levels (see
-/// [`level_streams`] — L10-12 today, plus L1 in an `l1-tune` dev build):
-/// without it, `read_to_end` grows the input buffer by doubling, so an 8 MiB
-/// input touches ~21 MB of fresh anonymous pages — every page a minor fault.
-/// That mechanism was measured at L1 by the L1-streaming falsifier in
-/// tests/anatomy_counters.rs, which went GREEN when `fast::run_resumable`
-/// took L1 off this fallback entirely; the hint remains as the palliative for
-/// the levels still on it. Streaming levels ignore the hint.
+/// The hint sizes the read buffer ONCE up front instead of letting
+/// `read_to_end` grow it by doubling — an 8 MiB input otherwise touches ~21 MB
+/// of fresh anonymous pages (every page a minor fault).
 pub fn encode_gzip_reader_to_writer_sized<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
     size_hint: Option<usize>,
 ) -> std::io::Result<u64> {
-    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, STREAM_CHUNK, size_hint)
-}
-
-/// [`encode_gzip_reader_to_writer`] with the chunk size supplied by the caller.
-///
-/// A MEASUREMENT SEAM, not a tuning knob: production has exactly one chunk
-/// size, [`STREAM_CHUNK`], and no code path lets a user or an environment
-/// variable choose another. It exists because chunk size trades peak memory
-/// against output size (each chunk seam ends a block, and forced block
-/// boundaries cost ratio), and that curve has to be measured to pick the
-/// constant rather than guessed. `chunk` should be a multiple of
-/// [`MAX_STORED_SUBBLOCK`] to keep level 0 byte-identical.
-// The bin target compiles this module tree directly, where these two lib-API
-// entry points have no caller (the CLI routes through the _sized variant);
-// tests/streaming_identity.rs and library consumers use them.
-#[allow(dead_code)]
-pub fn encode_gzip_reader_to_writer_chunked<R: std::io::Read, W: std::io::Write>(
-    reader: &mut R,
-    writer: &mut W,
-    level: u32,
-    chunk: usize,
-) -> std::io::Result<u64> {
-    encode_gzip_reader_to_writer_chunked_sized(reader, writer, level, chunk, None)
-}
-
-fn encode_gzip_reader_to_writer_chunked_sized<R: std::io::Read, W: std::io::Write>(
-    reader: &mut R,
-    writer: &mut W,
-    level: u32,
-    chunk: usize,
-    size_hint: Option<usize>,
-) -> std::io::Result<u64> {
-    if !level_streams(level) {
-        // This level cannot yet stream without changing its bytes (see
-        // `level_streams`). Fall back to the whole-buffer encoder rather than
-        // refusing: the entry point stays TOTAL, so callers — including the
-        // CLI — have exactly one function to call and never a level-dependent
-        // branch of their own. The memory cost is real and is tracked as the
-        // reason to make the remaining parsers resumable, not as an API wart.
-        // Size the buffer ONCE when the caller knows the input length —
-        // `read_to_end` keeps a pre-reserved capacity instead of doubling.
-        let mut input = Vec::with_capacity(size_hint.map_or(0, |h| h + INPLACE_TAIL_PAD));
-        reader.read_to_end(&mut input)?;
-        let logical_len = input.len();
-        input.resize(logical_len + INPLACE_TAIL_PAD, 0);
-        let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
-        writer.write_all(&gz)?;
-        return Ok(logical_len as u64);
-    }
-    let stream_chunk = chunk.max(MAX_STORED_SUBBLOCK);
-    encode_gzip_single_pass(reader, writer, level, stream_chunk, size_hint)
+    let mut input = Vec::with_capacity(size_hint.map_or(0, |h| h + INPLACE_TAIL_PAD));
+    reader.read_to_end(&mut input)?;
+    let logical_len = input.len();
+    input.resize(logical_len + INPLACE_TAIL_PAD, 0);
+    let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
+    writer.write_all(&gz)?;
+    Ok(logical_len as u64)
 }
 
 /// Compress `data[..logical_len]` as one gzip stream, written to `writer`.
@@ -1269,296 +698,72 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     writer: &mut W,
     level: u32,
 ) -> std::io::Result<u64> {
-    use encode_types::{BlockRole, HeaderBudget, InputMode};
     debug_assert!(logical_len <= data.len());
 
-    if !level_streams(level) {
-        // FAST PATH: the caller already gave us the pad, so parse IN PLACE.
-        //
-        // `data` is usually an mmap of the whole input. Copying it just to
-        // append INPLACE_TAIL_PAD zero bytes costs a full memcpy of the file —
-        // 51 MB on monorepo.tar to add 16 bytes. Measured 2026-08-21: our
-        // explicit allocations ran at EXACTLY 1.50x the input on every corpus
-        // file regardless of compressibility (1.0x this copy + 0.5x the output
-        // reservation), and peak RSS at 2.5-2.7x the input.
-        //
-        // When the mapping already carries >= INPLACE_TAIL_PAD readable bytes
-        // past `logical_len` — which `map_with_tail_pad` arranges by mapping
-        // into the final partial page, where the kernel zero-fills past EOF —
-        // those bytes ARE the pad the padded encoder requires, and the copy is
-        // pure waste. `debug_assert` the zero-fill rather than trust it.
-        if data.len() >= logical_len + INPLACE_TAIL_PAD {
-            debug_assert!(
-                data[logical_len..logical_len + INPLACE_TAIL_PAD]
-                    .iter()
-                    .all(|&b| b == 0),
-                "slack bytes past logical_len must read as zero"
-            );
-            let gz = encode_gzip_slack_padded_to_vec(data, logical_len, level);
-            writer.write_all(&gz)?;
-            return Ok(logical_len as u64);
+    // L0 FAST PATH: write stored blocks directly to the writer, no intermediate Vec.
+    // L0 is "stored" (no compression) — just copy the data into gzip blocks.
+    // This avoids the extra copy of the entire input into an output Vec.
+    if level == 0 {
+        writer.write_all(&minimal_gzip_header(0))?;
+        let crc = crc32fast::hash(&data[..logical_len]);
+        if logical_len == 0 {
+            // Empty input: must emit one empty stored block for valid DEFLATE.
+            // BFINAL=1, BTYPE=0, LEN=0, NLEN=0xFFFF (matches deflate_compress_none).
+            writer.write_all(&[0x01, 0x00, 0x00, 0xFF, 0xFF])?;
+        } else {
+            let mut in_next: usize = 0;
+            while in_next < logical_len {
+                let len = core::cmp::min(logical_len - in_next, u16::MAX as usize);
+                let bfinal: u8 = if in_next + len == logical_len { 1 } else { 0 };
+                writer.write_all(&[bfinal])?;
+                writer.write_all(&(len as u16).to_le_bytes())?;
+                writer.write_all(&((len as u16 ^ 0xFFFFu16).to_le_bytes()))?;
+                writer.write_all(&data[in_next..in_next + len])?;
+                in_next += len;
+            }
         }
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&(logical_len as u32).to_le_bytes())?;
+        return Ok(logical_len as u64);
+    }
 
-        // SLOW PATH: no slack available (e.g. the input ends exactly on a page
-        // boundary, so mapping further would fault). Copy once.
-        let cap = logical_len + INPLACE_TAIL_PAD;
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, cap);
-        let mut input = Vec::with_capacity(cap);
-        input.extend_from_slice(data);
-        input.resize(cap, 0);
-        let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
+    // FAST PATH: the caller already gave us the pad, so parse IN PLACE.
+    //
+    // `data` is usually an mmap of the whole input. Copying it just to
+    // append INPLACE_TAIL_PAD zero bytes costs a full memcpy of the file —
+    // 51 MB on monorepo.tar to add 16 bytes. Measured 2026-08-21: our
+    // explicit allocations ran at EXACTLY 1.50x the input on every corpus
+    // file regardless of compressibility (1.0x this copy + 0.5x the output
+    // reservation), and peak RSS at 2.5-2.7x the input.
+    //
+    // When the mapping already carries >= INPLACE_TAIL_PAD readable bytes
+    // past `logical_len` — which `map_with_tail_pad` arranges by mapping
+    // into the final partial page, where the kernel zero-fills past EOF —
+    // those bytes ARE the pad the padded encoder requires, and the copy is
+    // pure waste. `debug_assert` the zero-fill rather than trust it.
+    if data.len() >= logical_len + INPLACE_TAIL_PAD {
+        debug_assert!(
+            data[logical_len..logical_len + INPLACE_TAIL_PAD]
+                .iter()
+                .all(|&b| b == 0),
+            "slack bytes past logical_len must read as zero"
+        );
+        let gz = encode_gzip_slack_padded_to_vec(data, logical_len, level);
         writer.write_all(&gz)?;
         return Ok(logical_len as u64);
     }
 
-    // Past this point NOTHING knows about slack: the streaming encoders below
-    // were written when `data.len()` WAS the logical length and they still
-    // assume it (`crc32fast::hash(data)`, the two-pass tail copy). Re-establish
-    // that contract here, once, instead of threading `logical_len` through
-    // them. Caught by the 22 L9 cells that changed bytes on first build — a
-    // whole-`data` CRC over the pad is a corrupt trailer, not a size delta.
-    let data = &data[..logical_len];
-    let len = logical_len;
-    // INVARIANT: reaching here proves `level_streams(level)`, because the
-    // `!level_streams(level)` block above returns on every path. And
-    // `level_has_resumable_parser` returns false for any level that runs
-    // whole-buffer pick-min — that is the module's stated rule, "a level that
-    // runs WHOLE-BUFFER PICK-MIN cannot stream". So a streaming level NEVER
-    // picks min, and the four dispatches that used to sit here (L5-L7 via the
-    // padded encoder, and L1/L2/L4 via their pick-min wrappers) described a
-    // state the invariant forbids.
-    //
-    // They were not harmless. `level_streams` is DEFINED in terms of the
-    // pick-min predicates, so forcing a predicate false to ablate pick-min
-    // flips those levels to "streaming" and lands them right here — where a
-    // second, unguarded copy of the pick-min dispatch ran it anyway. An
-    // ablation on 2026-08-22 read "L2/L4 pick-min is free and buys nothing"
-    // from exactly that reroute; deleting the arms for real then cost
-    // +612,340 B at L2 and +4,166,271 B at L4 and broke three cells.
-    //
-    // One dispatch site, guarded by the predicate, above. This asserts the
-    // contradiction can no longer be reached silently.
-    debug_assert!(
-        level_streams(level)
-            && !level_uses_t1_zlib_pick_min(level)
-            && !level_uses_t1_mmap_pick_min(level),
-        "streaming tail reached for a pick-min level {level} — the whole-buffer \
-         branch above must have returned"
-    );
-
-    let out_cap = if level == 0 {
-        // Drained per STREAM_CHUNK stored slice below — the output buffer
-        // peaks at one chunk plus its framing instead of input-sized.
-        STREAM_CHUNK + (STREAM_CHUNK / MAX_STORED_SUBBLOCK) * 5 + 1024
-    } else {
-        estimate_output_cap(len, level, 32)
-    };
+    // SLOW PATH: no slack available (e.g. the input ends exactly on a page
+    // boundary, so mapping further would fault). Copy once.
+    let cap = logical_len + INPLACE_TAIL_PAD;
     crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, out_cap);
-    let mut out = Vec::with_capacity(out_cap);
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-    let mut bw = BitWriter::from_vec(out);
-
-    if level == 0 {
-        if len == 0 {
-            emit_stored_block(&mut bw, &[], true);
-            bw.drain_to(writer)?;
-        } else {
-            let mut off = 0usize;
-            while off < len {
-                let end = (off + STREAM_CHUNK).min(len);
-                emit_stored_block(&mut bw, &data[off..end], end == len);
-                crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-                off = end;
-            }
-        }
-    } else {
-        let params = level::params(level);
-        let mut state = parse::ParseState::new();
-        state.input_total_len = len;
-        let mut in_next = 0usize;
-
-        // PASS 1 — the bulk, parsed IN PLACE over the caller's slice. The
-        // logical end handed to the parser is INPLACE_TAIL_PAD short of the
-        // slice end, so `buf.len() >= in_end + BUF_PAD` holds using REAL
-        // bytes as the pad region. Bounded mode never reads it: the parser
-        // stops STREAM_BLOCK_LOOKAHEAD (~305 KB) before `in_end`, and no
-        // read for a parsed position reaches more than a match length past
-        // it — which is also why those non-zero "pad" bytes cannot leak
-        // into any decision (the streamed-equals-whole-buffer proof already
-        // requires that nothing past `in_end` does).
-        if len > INPLACE_TAIL_PAD {
-            let avail = len - INPLACE_TAIL_PAD;
-            in_next = crate::anatomy_wall_root!({
-                parse::parse_resumable(
-                    data,
-                    &mut state,
-                    0,
-                    avail,
-                    &params,
-                    BlockRole::Interior,
-                    InputMode::Bounded,
-                    HeaderBudget::Lean,
-                    &mut bw,
-                )
-            });
-            crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-        }
-
-        // PASS 2 — the tail, through a small padded copy. `max_shift` leaves
-        // the matchfinder its full window (whole-window granularity), so the
-        // copy is [history | unconsumed | zero pad]: at most ~2*WINDOW_SIZE +
-        // STREAM_BLOCK_LOOKAHEAD + INPLACE_TAIL_PAD bytes (~375 KB), never
-        // input-sized. `shift_down` rebases the carried state exactly as the
-        // streaming loop's slide does.
-        let shift = state.max_shift();
-        let tail_len = len - shift;
-        let tail_cap = tail_len + INPLACE_TAIL_PAD;
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, tail_cap);
-        let mut tbuf = Vec::with_capacity(tail_cap);
-        tbuf.extend_from_slice(&data[shift..]);
-        tbuf.resize(tail_cap, 0);
-        if shift > 0 {
-            state.shift_down(shift);
-            in_next -= shift;
-        }
-        if in_next == tail_len {
-            // Only reachable when `data` is empty (pass 1 always leaves the
-            // parser short of `len`): close the stream the way the
-            // whole-buffer encoder's empty branch does.
-            emit_stored_block(&mut bw, &[], true);
-        } else {
-            crate::anatomy_wall_root!({
-                parse::parse_resumable(
-                    &tbuf,
-                    &mut state,
-                    in_next,
-                    tail_len,
-                    &params,
-                    BlockRole::Final,
-                    InputMode::Drain,
-                    HeaderBudget::Lean,
-                    &mut bw,
-                )
-            });
-        }
-        crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-    }
-
-    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
-    let mut tail = bw.finish();
-    tail.extend_from_slice(&crc.to_le_bytes());
-    tail.extend_from_slice(&(len as u32).to_le_bytes());
-    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
-    Ok(len as u64)
-}
-
-/// Gzip-compress `data` with ONE continuous [`ParseState`] and [`BitWriter`].
-/// When `parallel` is true, uses [`level::params_parallel`] and
-/// [`HeaderBudget::Generous`] (the T>1 chunk worker knobs); when false, uses
-/// [`level::params`] and [`HeaderBudget::Lean`] (byte-identical to the T1
-/// streaming encoder on the same input).
-///
-/// The caller must have already written the gzip header; this appends the
-/// DEFLATE body and CRC32/ISIZE trailer.
-pub fn encode_deflate_stateful_to_writer<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-    level: u32,
-    parallel: bool,
-) -> std::io::Result<u64> {
-    use encode_types::{BlockRole, HeaderBudget, InputMode};
-
-    debug_assert!(parse::level_uses_stateful_t4(level));
-
-    let len = data.len();
-    let out_cap = estimate_output_cap(len, level, 32);
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, out_cap);
-    let out = Vec::with_capacity(out_cap);
-    let mut bw = BitWriter::from_vec(out);
-
-    let params = if parallel {
-        level::params_parallel(level)
-    } else {
-        level::params(level)
-    };
-    let budget = if parallel {
-        HeaderBudget::Generous
-    } else {
-        HeaderBudget::Lean
-    };
-    let mut state = parse::ParseState::new();
-    state.input_total_len = len;
-    let mut in_next = 0usize;
-
-    if len > INPLACE_TAIL_PAD {
-        let avail = len - INPLACE_TAIL_PAD;
-        in_next = crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                data,
-                &mut state,
-                0,
-                avail,
-                &params,
-                BlockRole::Interior,
-                InputMode::Bounded,
-                budget,
-                &mut bw,
-            )
-        });
-        crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-    }
-
-    let shift = state.max_shift();
-    let tail_len = len - shift;
-    let tail_cap = tail_len + INPLACE_TAIL_PAD;
-    crate::anatomy_count!(alloc_events);
-    crate::anatomy_count!(alloc_bytes, tail_cap);
-    let mut tbuf = Vec::with_capacity(tail_cap);
-    tbuf.extend_from_slice(&data[shift..]);
-    tbuf.resize(tail_cap, 0);
-    if shift > 0 {
-        state.shift_down(shift);
-        in_next -= shift;
-    }
-    if in_next == tail_len {
-        emit_stored_block(&mut bw, &[], true);
-    } else {
-        crate::anatomy_wall_root!({
-            parse::parse_resumable(
-                &tbuf,
-                &mut state,
-                in_next,
-                tail_len,
-                &params,
-                BlockRole::Final,
-                InputMode::Drain,
-                budget,
-                &mut bw,
-            )
-        });
-    }
-    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { bw.drain_to(writer) })?;
-
-    let crc = crate::anatomy_wall_time!(crc_ns, crc_calls, { crc32fast::hash(data) });
-    let mut tail = bw.finish();
-    tail.extend_from_slice(&crc.to_le_bytes());
-    tail.extend_from_slice(&(len as u32).to_le_bytes());
-    crate::anatomy_wall_time!(write_out_ns, write_out_calls, { writer.write_all(&tail) })?;
-    Ok(len as u64)
-}
-
-/// [`encode_deflate_stateful_to_writer`] with `parallel = true`.
-#[allow(dead_code)]
-pub fn encode_deflate_stateful_parallel_to_writer<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-    level: u32,
-) -> std::io::Result<u64> {
-    encode_deflate_stateful_to_writer(data, writer, level, true)
+    crate::anatomy_count!(alloc_bytes, cap);
+    let mut input = Vec::with_capacity(cap);
+    input.extend_from_slice(data);
+    input.resize(cap, 0);
+    let gz = encode_gzip_slack_padded_to_vec(&input, logical_len, level);
+    writer.write_all(&gz)?;
+    Ok(logical_len as u64)
 }
 
 /// Emit one or more stored (uncompressed, BTYPE=00) blocks covering `data`.
@@ -1857,9 +1062,9 @@ mod inplace_tests {
 mod unpadded_slice_tests {
     use super::*;
 
-    /// Deterministic bytes with tunable redundancy (same generator family as
-    /// tests/streaming_identity.rs): small `period` = compressible, huge
-    /// `period` = literal-dominated.
+    /// Deterministic bytes with tunable redundancy (the standard seam-test
+    /// generator family): small `period` = compressible, huge `period` =
+    /// literal-dominated.
     fn corpus(len: usize, period: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity(len);
         let mut s: u32 = 0x1234_5678;
@@ -1885,14 +1090,12 @@ mod unpadded_slice_tests {
 
     /// The mmap-route encoder must be BYTE-IDENTICAL to the whole-buffer
     /// encoder at every level, on lengths chosen to hit each internal seam:
-    /// empty; below/at/above INPLACE_TAIL_PAD (pass 1 skipped vs. a no-op
-    /// pass 1); below the STREAM_BLOCK_LOOKAHEAD margin (pass 1 runs but
-    /// consumes nothing); just above it (pass 1 emits its first block); and
-    /// large enough that `max_shift` > 0 so pass 2 exercises the state
-    /// rebase. L10-12 cover the padded-copy fallback arm.
+    /// empty; below/at/above INPLACE_TAIL_PAD (in-place fast path vs. the
+    /// copy-once fallback); small (single block); and two multi-hundred-KB
+    /// sizes that run many blocks and several stored sub-blocks at L0.
+    /// L10-12 cover the copy fallback arm.
     #[test]
     fn unpadded_slice_is_byte_identical_to_whole_buffer() {
-        let lookahead = parse::STREAM_BLOCK_LOOKAHEAD;
         let sizes = [
             0usize,
             1,
@@ -1900,8 +1103,7 @@ mod unpadded_slice_tests {
             INPLACE_TAIL_PAD,
             INPLACE_TAIL_PAD + 1,
             4096,
-            lookahead - 1,
-            lookahead + INPLACE_TAIL_PAD + 1,
+            375_000,
             700_000,
         ];
         for &len in &sizes {
@@ -1930,16 +1132,18 @@ mod unpadded_slice_tests {
         }
     }
 
-    /// Multi-megabyte inputs: several fast/lazy blocks in pass 1, a
-    /// guaranteed pass-2 slide, and (at L0) several drain cycles.
+    /// Multi-megabyte inputs: several fast/lazy blocks plus (at L0) several
+    /// stored sub-blocks — big enough to exercise the in-place slack fast
+    /// path and the whole-buffer copy path on the same input.
     #[test]
-    fn unpadded_slice_matches_whole_buffer_on_multi_chunk_inputs() {
-        let data = corpus(STREAM_CHUNK + 100_003, 64);
+    fn unpadded_slice_matches_whole_buffer_on_multi_megabyte_inputs() {
+        // ~4.3 MiB: several blocks at every level, comfortably multi-MB.
+        let data = corpus(4_194_240 + 100_003, 64);
         for level in [0u32, 1, 6] {
             assert_eq!(
                 unpadded(&data, level),
                 encode_gzip_bytes_to_vec(&data, level),
-                "L{level} multi-chunk: unpadded-slice output diverged"
+                "L{level} multi-MB: unpadded-slice output diverged"
             );
         }
     }

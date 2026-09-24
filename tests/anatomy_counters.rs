@@ -461,42 +461,34 @@ fn l0_is_stored_only_and_touches_no_matchfinder() {
 }
 
 // ============================================================================
-// THE L1 STREAMING LEVER'S FALSIFIER — armed RED 2026-08-02, GREEN since
-// `fast::run_resumable` landed (same date): `Strategy::Fast` now streams and
-// this test is the standing memory contract that keeps it streaming.
+// L1 ALLOCATION CONTRACT — L1 must not be a bigger allocator than L6 on the
+// same input.
 //
-// The mechanism, measured 2026-08-02 (both sides, trainer + M1), while RED:
-//   * T1 levels 2-9 stream through resumable parsers: bounded reused buffers
-//     (L6 RSS 8.6 MB on a 12 MB input).
-//   * L1 (`Strategy::Fast`) has no resumable runner, so
-//     `encode_gzip_reader_to_writer_chunked` falls back to `read_to_end` plus
-//     an input-sized padded copy — every 4 KB page of a FRESH anonymous
-//     buffer minor-faults, every run. Counted against the vendor on the same
-//     job: 7,644 minor faults vs libdeflate-gzip's 1,496 at EQUAL ~31 MB RSS
-//     (they mmap; THP is madvise-mode so nobody gets huge pages). The fault
-//     handling is ~11 ms of the 41.5 ms L1/T1 wall gap on trainer.
+// History, for provenance: this test was armed RED 2026-08-02 as the
+// streaming lever's falsifier. At the time, T1 levels 2-9 ran through
+// resumable parsers (bounded reused buffers — L6 RSS 8.6 MB on a 12 MB
+// input) while L1 had NO resumable runner and fell back to `read_to_end`
+// plus an input-sized padded copy; every 4 KB page of that FRESH anonymous
+// buffer minor-faulted (7,644 faults vs libdeflate-gzip's 1,496 at EQUAL
+// ~31 MB RSS on the same job — they mmap; THP is madvise-mode). The fix —
+// `fast::run_resumable` — landed the same day and turned this test GREEN.
 //
-// The fix this test defined DONE for, now shipped: `fast::run_resumable` —
-// lookahead-margin pattern like `greedy::run_resumable`, head tables carried
-// in `ParseState::fast` (`FastResume`) and rebased on slide, the Drain-call
-// `in_end` resolving the final block's clamps — after which `level_streams(1)`
-// is true and L1's allocation profile matches the streaming levels'.
+// That streaming layer was DELETED 2026-08-30: `ldx` is the production T1
+// parser for L0-9 (whole-buffer by construction), L10-12 has no resumable
+// parser, so the single-pass machinery was unreachable for every production
+// level (see `src/compress/deflate/mod.rs`).
 //
-// GREEN CONDITION: L1's allocated bytes on an 8 MiB stdin input are within
-// 2x of L6's on the same input (both stream => both are bounded by the
-// fixed-window arithmetic in `encode_gzip_single_pass`, not by input size).
-// The 2x headroom covers parser-specific table sizes (L1's 256 KB `head` +
-// 128 KB `head3` are counted at `acquire_head_table`), NOT an input-sized
-// buffer: the pre-lever fallback allocated the whole input + input/2
-// reservation and sat ~3x over this bar by construction.
-//
-// Byte-correctness is already pinned elsewhere: `tests/streaming_identity.rs`
-// asserts stream-vs-whole-buffer identity per level, and the fingerprint
-// suite pins L1's output shape. This test is ONLY the memory contract.
+// What this test KEEPS: the memory contract still bites — L1's allocation
+// profile must stay within 2x of L6's on identical input, so a future
+// regression cannot silently grow an L1-only input-sized buffer (the
+// original defect this test was armed for). With both levels whole-buffer,
+// the green condition is simply "both allocate input + output, bounded by
+// the same arithmetic". Byte-correctness is pinned elsewhere (fingerprint
+// suite; `tests/streaming_api_is_honest.rs` roundtrip).
 // ============================================================================
 
 #[test]
-fn l1_streams_with_bounded_buffers() {
+fn l1_allocations_within_2x_of_l6() {
     // Compressible-but-unrepetitive input so no level degenerates to stored.
     let mut data = Vec::with_capacity(8 << 20);
     let mut x: u64 = 0x1157_3417_2026_0802;
@@ -514,8 +506,8 @@ fn l1_streams_with_bounded_buffers() {
     assert!(l6 > 0, "L6 must report alloc_bytes (streaming baseline)");
     assert!(
         l1 <= l6 * 2,
-        "L1 allocated {l1} B vs L6's {l6} B on identical 8 MiB input — the whole-buffer \
-         fallback is still routing (fault mechanism in the block comment above); \
-         DONE means a resumable `fast` runner, not a bigger tolerance"
+        "L1 allocated {l1} B vs L6's {l6} B on identical 8 MiB input — L1 has grown an \
+         input-sized buffer L6 does not have (the defect this test was armed for; see \
+         the block comment above)"
     );
 }

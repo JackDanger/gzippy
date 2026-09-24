@@ -18,17 +18,18 @@
 //! DIFFERENT C function. It is a derivative, not a port, and it must not be diffed
 //! against this file as though it were one.
 //!
-//! The binding FALSIFY record at `src/compress/deflate/parse/mod.rs:540` covers both
-//! prior attempts to route L1 through a ht-style finder: attempt 1 DIED ON SIZE
-//! (clause 3, 7 pass->fail flips) because `fast`'s `head3` length-3 table wins on
-//! BINARIES and `ht_matchfinder` has no length-3 support; attempt 2 (2-way buckets AND
-//! a length-3 table) passed size and died on the T1 WALL at 1.2662x. **Read it before
-//! proposing to route anything from here.** This module is the FAITHFUL C, built so
-//! that a third attempt can at least be measured against the real thing rather than
-//! against a derivative.
+//! Two prior attempts to route L1 through a ht-style finder are on record in git
+//! history: attempt 1 DIED ON SIZE (clause 3, 7 pass->fail flips) because `fast`'s
+//! `head3` length-3 table wins on BINARIES and `ht_matchfinder` has no length-3
+//! support; attempt 2 (2-way buckets AND a length-3 table) passed size and died on
+//! the T1 WALL at 1.2662x. Per the standing rule those records are NOT binding —
+//! re-measure instead of trusting a citation. This module is the FAITHFUL C, built
+//! so that a third attempt can at least be measured against the real thing rather
+//! than against a derivative.
 
 use super::matchfinder_common::{
-    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, MfPos, MATCHFINDER_WINDOW_SIZE,
+    lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
+    MATCHFINDER_WINDOW_SIZE,
 };
 
 /// C: `#define HT_MATCHFINDER_HASH_ORDER 15` (:49)
@@ -94,30 +95,6 @@ impl HtMatchfinder {
 /// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
 /// 1.34x. Matching the vendor's `forceinline`.
 #[inline(always)]
-/// C: `ht_matchfinder_longest_match(...)` (:80)
-///
-/// Returns the best match length (0 if none) and writes the offset to `offset_ret`.
-/// `max_len` must be >= `HT_MATCHFINDER_REQUIRED_NBYTES`.
-///
-/// # The bucket-2 path, and its one deliberate asymmetry
-///
-/// The C's comment on this branch: *"Hand-unrolled version for BUCKET_SIZE == 2. The
-/// logic here also differs slightly in that it copies the first entry to the second
-/// even if nice_len is reached on the first, as this can be slightly faster."*
-///
-/// So the insert into slot 1 happens BEFORE the `nice_len` early-out, unconditionally.
-/// Moving it after — which reads as the obvious cleanup, since the value is unused on
-/// that path — changes what the table holds at every position where a nice-length
-/// match was found, and therefore changes every subsequent match. It is a
-/// table-state divergence, not a dead store.
-///
-/// # The second-candidate guard
-///
-/// Before extending the second candidate the C checks BOTH a 4-byte sequence equality
-/// AND `load_u32(matchptr + best_len - 3) == load_u32(in_next + best_len - 3)` — a
-/// cheap test that the candidate can beat the incumbent at its far end before paying
-/// for `lz_extend`. Dropping it finds the same matches more slowly; keeping it but
-/// getting the `- 3` wrong finds DIFFERENT matches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ht_matchfinder_longest_match(
     mf: &mut HtMatchfinder,
@@ -131,82 +108,109 @@ pub(crate) fn ht_matchfinder_longest_match(
 ) -> u32 {
     let mut best_len: u32 = 0;
     let mut best_matchptr: usize = in_next;
-    let mut cur_pos = (in_next - *in_base) as i32;
+    let mut in_base_local = *in_base;
+    let mut cur_pos = (in_next - in_base_local) as i32;
 
-    // This is assumed throughout this function.
     const _: () = assert!(HT_MATCHFINDER_MIN_MATCH_LEN == 4);
 
     if cur_pos == MATCHFINDER_WINDOW_SIZE {
         mf.slide_window();
-        *in_base += MATCHFINDER_WINDOW_SIZE as usize;
+        in_base_local += MATCHFINDER_WINDOW_SIZE as usize;
         cur_pos = 0;
     }
-    let in_base_v = *in_base;
+    let in_next_ptr = unsafe { buf.as_ptr().add(in_next) };
     let cutoff: MfPos = (cur_pos - MATCHFINDER_WINDOW_SIZE) as MfPos;
 
     let hash = *next_hash;
     const _: () = assert!(HT_MATCHFINDER_REQUIRED_NBYTES == 5);
     *next_hash = lz_hash(load_u32(buf, in_next + 1), HT_MATCHFINDER_HASH_ORDER);
     let seq = load_u32(buf, in_next);
+    prefetchw(unsafe {
+        mf.hash_tab
+            .as_ptr()
+            .add(*next_hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
+    });
 
-    // --- C: the BUCKET_SIZE == 2 hand-unrolled version ---
     let s0 = mf.slot(hash, 0);
     let s1 = mf.slot(hash, 1);
 
-    let mut cur_node = mf.hash_tab[s0];
+    let cand0 = mf.hash_tab[s0];
     mf.hash_tab[s0] = cur_pos as MfPos;
-    if cur_node <= cutoff {
-        *offset_ret = (in_next - best_matchptr) as u32;
-        return best_len;
-    }
-    let mut matchptr = node_ptr(in_base_v, cur_node);
-
-    // C: `to_insert = cur_node; cur_node = mf->hash_tab[hash][1];
-    //     mf->hash_tab[hash][1] = to_insert;`
-    //
-    // Clippy sees a manual swap and suggests `core::mem::swap`. It is one, but the C
-    // spells it as three statements around a named `to_insert`, and the copy to slot 1
-    // happening HERE — before the `nice_len` early-out below — is the branch's one
-    // documented asymmetry. Keeping the three statements keeps that visible.
-    #[allow(clippy::manual_swap, reason = "C: three statements around `to_insert`")]
-    let to_insert = cur_node;
-    #[allow(clippy::manual_swap, reason = "C: three statements around `to_insert`")]
-    {
-        cur_node = mf.hash_tab[s1];
-        mf.hash_tab[s1] = to_insert;
+    let cand1 = mf.hash_tab[s1];
+    // C (libdeflate/lib/ht_matchfinder.h, the BUCKET_SIZE == 2 arm): the
+    // slot-1 demotion (`to_insert = cur_node; hash_tab[hash][1] = to_insert;`)
+    // runs ONLY after the cutoff early-out decides the slot-0 candidate is
+    // still in window (`goto out` fires BEFORE slot-1 is touched). An
+    // unconditional overwrite of slot-1 with the stale slot-0 entry diverges
+    // the TABLE from the vendor whenever slot-0 is out of window: a later
+    // probe hashing this bucket then sees our stale copy where the C kept the
+    // fresher candidate, which can change a match decision and the emitted
+    // bytes on the ht-matched paths. Found by review (vendor-order diff), not
+    // by a failing pin — exactly why the parity oracle runs even at exception
+    // levels.
+    if cand0 > cutoff {
+        mf.hash_tab[s1] = cand0;
     }
 
-    if load_u32(buf, matchptr) == seq {
-        best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
-        best_matchptr = matchptr;
-        if cur_node <= cutoff || best_len >= nice_len {
-            *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
-        }
-        matchptr = node_ptr(in_base_v, cur_node);
-        if load_u32(buf, matchptr) == seq
-            && load_u32(buf, matchptr + best_len as usize - 3)
-                == load_u32(buf, in_next + best_len as usize - 3)
-        {
-            let len = lz_extend(buf, in_next, matchptr, 4, max_len);
-            if len > best_len {
-                best_len = len;
-                best_matchptr = matchptr;
+    // Check first candidate (cand0)
+    if cand0 > cutoff {
+        let matchptr0 = unsafe { in_next_ptr.sub((cur_pos - cand0 as i32) as usize) };
+        if unsafe { load_u32_ptr(matchptr0) } == seq {
+            best_len = unsafe {
+                lz_extend(
+                    buf,
+                    in_next,
+                    matchptr0 as usize - buf.as_ptr() as usize,
+                    4,
+                    max_len,
+                )
+            };
+            best_matchptr = matchptr0 as usize - buf.as_ptr() as usize;
+
+            // Check second candidate (cand1) only if needed
+            if cand1 > cutoff && best_len < nice_len {
+                let matchptr1 = unsafe { in_next_ptr.sub((cur_pos - cand1 as i32) as usize) };
+                if unsafe { load_u32_ptr(matchptr1) } == seq
+                    && unsafe { load_u32_ptr(matchptr1.add(best_len as usize - 3)) }
+                        == load_u32(buf, in_next + best_len as usize - 3)
+                {
+                    let len = unsafe {
+                        lz_extend(
+                            buf,
+                            in_next,
+                            matchptr1 as usize - buf.as_ptr() as usize,
+                            4,
+                            max_len,
+                        )
+                    };
+                    if len > best_len {
+                        best_len = len;
+                        best_matchptr = matchptr1 as usize - buf.as_ptr() as usize;
+                    }
+                }
             }
         }
-    } else {
-        if cur_node <= cutoff {
-            *offset_ret = (in_next - best_matchptr) as u32;
-            return best_len;
-        }
-        matchptr = node_ptr(in_base_v, cur_node);
-        if load_u32(buf, matchptr) == seq {
-            best_len = lz_extend(buf, in_next, matchptr, 4, max_len);
-            best_matchptr = matchptr;
+    }
+
+    // If first candidate didn't match, check second candidate (cand1)
+    if best_len == 0 && cand1 > cutoff {
+        let matchptr1 = unsafe { in_next_ptr.sub((cur_pos - cand1 as i32) as usize) };
+        if unsafe { load_u32_ptr(matchptr1) } == seq {
+            best_len = unsafe {
+                lz_extend(
+                    buf,
+                    in_next,
+                    matchptr1 as usize - buf.as_ptr() as usize,
+                    4,
+                    max_len,
+                )
+            };
+            best_matchptr = matchptr1 as usize - buf.as_ptr() as usize;
         }
     }
 
     *offset_ret = (in_next - best_matchptr) as u32;
+    *in_base = in_base_local;
     best_len
 }
 
@@ -281,25 +285,12 @@ pub(crate) fn ht_matchfinder_skip_bytes(
         }
     }
 
+    prefetchw(unsafe {
+        mf.hash_tab
+            .as_ptr()
+            .add(hash as usize * HT_MATCHFINDER_BUCKET_SIZE)
+    });
     *next_hash = hash;
-}
-
-/// C: `matchptr = &in_base[cur_node];`
-///
-/// **`cur_node` is SIGNED and is routinely negative, so this is signed pointer
-/// arithmetic and not an unsigned add.** After a window slide, `in_base` has advanced
-/// by `MATCHFINDER_WINDOW_SIZE` and every surviving table entry has had the same
-/// amount subtracted, so entries in the older half of the window are negative — and
-/// `cur_node > cutoff` accepts them, because `cutoff` is `cur_pos - WINDOW_SIZE` and
-/// is itself negative.
-///
-/// Writing this as `in_base + cur_node as usize` compiles, works for the whole first
-/// 32 KiB, and then panics (debug) or reads gigabytes out of bounds (release) at the
-/// first slide. It is exactly the bug `matches_stay_valid_across_a_window_slide`
-/// exists to catch, and it did.
-#[inline(always)]
-fn node_ptr(in_base: usize, cur_node: MfPos) -> usize {
-    (in_base as isize + cur_node as isize) as usize
 }
 
 /// C: `load_u32_unaligned` / `get_unaligned_le32`.
@@ -330,6 +321,12 @@ fn load_u32(buf: &[u8], i: usize) -> u32 {
     );
     let p = unsafe { buf.as_ptr().add(i) as *const u32 };
     u32::from_le(unsafe { p.read_unaligned() })
+}
+/// Load a 32-bit LE value from a raw pointer.
+/// SAFETY: the caller guarantees 4 readable bytes at `ptr`.
+#[inline(always)]
+unsafe fn load_u32_ptr(ptr: *const u8) -> u32 {
+    u32::from_le(unsafe { (ptr as *const u32).read_unaligned() })
 }
 
 #[cfg(test)]

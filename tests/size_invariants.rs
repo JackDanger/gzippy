@@ -37,11 +37,14 @@ const LEVELS: std::ops::RangeInclusive<u32> = 0..=9;
 /// A pair listed here that STOPS sagging fails the test with instructions to
 /// delete it, so this list is honest and can only shrink.
 const KNOWN_SAGS: &[(&str, u32)] = &[
-    // The L3->L4 sags on synthetic tabular/binary HEALED by mmap pick-min entry-point
-    // wiring (#330 L4 + #331 encode_gzip_bytes_to_vec / slack-padded paths).
+    // The L3->L4 sags on synthetic tabular/binary were HEALED by mmap pick-min
+    // entry-point wiring (#330 L4 + #331 encode_gzip_bytes_to_vec / slack-padded
+    // paths) — and RE-OPENED when d9418505 deleted pick-min (owner-directed
+    // "one encode per input", 2026-08-23): see the receipt at the bottom of
+    // this list for the measured re-opening.
     // High-level sag on prose: L7 is the best level on `text`.
-    ("text", 7), // L7 305775 -> L8 306342 (+567 B)
-    ("text", 8), // L8 306342 -> L9 306755 (+413 B)
+    ("text", 7), // L7 303147 -> L8 306342 (+3195, measured at tip 26fc4505)
+    ("text", 8), // L8 306342 -> L9 306755 (+413)
     // ("noise", 0) HEALED by the issue #266 fix (stored-span coalescing in
     // `parse::StoredCoalescer`): L1 now emits the same optimal 17-block
     // stored grid as L0 (both 1048679 B). That fix exposed the successor
@@ -65,15 +68,16 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // ("noise", 2) HEALED by the same deletion: L2 and L3 now both emit the
     // 18-block grid (1048684 B), so the sag that used to sit at L2->L3 moved
     // up to L1->L2. Net sag count on `noise` is unchanged at one.
-    // L1 -> L2 on `binary`: 662577 -> 666108 (+3531 B), opened 2026-08-13 by
-    // the L1 MATCH-REACH lever (dense match-interior indexing + the 2-way
-    // bucket shift that the vendor's `ht_matchfinder_skip_bytes` does and we
-    // did not). THE SAG IS L1 GETTING BETTER, NOT L2 GETTING WORSE: L2 is
-    // unchanged at 666,108 B — byte-for-byte what it was before the lever —
-    // while L1 fell from 666,379 to 662,577 (-0.57%) and now beats it.
+    // L1 -> L2 on `binary`: 662577 -> 666112 (+3535 B at tip 26fc4505),
+    // opened 2026-08-13 by the L1 MATCH-REACH lever (dense match-interior
+    // indexing + the 2-way bucket shift that the vendor's
+    // `ht_matchfinder_skip_bytes` does and we did not). THE SAG IS L1 GETTING
+    // BETTER, NOT L2 GETTING WORSE: L2 is unchanged at 666,112 B —
+    // byte-for-byte what it was before the lever — while L1 fell from 666,379
+    // to 662,577 (-0.57%) and now beats it.
     //
     // Healing it means improving L2, which this lever must not touch: L2 on
-    // this fixture sits 4 B under libdeflate-gzip -2 (666,108 vs 666,112),
+    // this fixture sits at libdeflate-gzip -2 exactly (666,112 = 666,112),
     // i.e. inside the tie cage, where clause 3 refuses any flip and
     // `scripts/campaign/tie-guard.sh` is the adjudicator. L2 is also a
     // different parser entirely (Greedy + the hc matchfinder), so the reach
@@ -81,6 +85,23 @@ const KNOWN_SAGS: &[(&str, u32)] = &[
     // rather than fixed, and it must be UNLISTED by whoever closes L2 — the
     // test fails if this pair ever heals, so the list still only shrinks.
     ("binary", 1),
+    // ("tabular", 3) and ("binary", 3) RE-OPENED by d9418505 (pick-min deleted,
+    // 2026-08-23, owner-directed "one encode per input"): the mmap pick-min arm
+    // at L4 (#330/#331 — deflate_one_shot_t1_l4_pick_min) min-ed two encodes at
+    // T1 and masked the L4<L3 inversion; L4 now runs the port alone. Measured
+    // T1, aarch64-apple-darwin, tip 26fc4505 (byte-identical to all four CI
+    // arches — deterministic; see the PR's CI-repair receipts):
+    //   tabular L3 262,033 -> L4 271,505 (+9,472 B, +3.6%)
+    //   binary  L3 661,045 -> L4 663,583 (+2,538 B)
+    // Owned by docs/plan-2026-09-one-encoder.md §5 Phase 3: the L4-greedy <
+    // L3-lazy inversion the pick-min deletion re-opened; the zlib-ng
+    // deflate_medium-family L4 rung is the named vendor-precedented fix, with
+    // `ladder_is_monotone_t1` + `won_cells_stay_won` + census as falsifiers.
+    // Context: this is the price of the measured post-pivot board — 30 failing
+    // of 1,320 measured cells (from 200 at 120bfa9c), TUNE 0/660, zero
+    // roundtrip failures anywhere.
+    ("tabular", 3), // L3 262033 -> L4 271505 (+9472), port-only L4 since d9418505
+    ("binary", 3),  // L3 661045 -> L4 663583 (+2538), port-only L4 since d9418505
 ];
 
 /// Optimal stored framing for an n-byte input: gzip header (10) + trailer (8)

@@ -15,8 +15,7 @@ use super::super::tables::{DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN};
 use super::{
     adjust_max_and_nice_len, bsr32, calculate_min_match_len, choose_max_block_end, continue_block,
     emit_block, far_len3, l3_sparse_split_hold, l3_sparse_split_latch, recalculate_min_match_len,
-    BlockRole, FarLen3Gate, InputMode, ParseState, Sink, StaticCodes, L3_OVER_SPLIT_LATCH_BLOCKS,
-    STREAM_BLOCK_LOOKAHEAD,
+    BlockRole, FarLen3Gate, ParseState, Sink, StaticCodes, L3_OVER_SPLIT_LATCH_BLOCKS,
 };
 
 /// The offset-cost tie-break test shared by lazy and lazy2 (threshold differs).
@@ -73,16 +72,12 @@ pub(super) fn run(
         } else {
             BlockRole::Interior
         },
-        InputMode::Drain,
         budget,
     );
 }
 
-/// [`run`] with the matchfinder state supplied by the caller, so it can span
-/// several calls over a sliding buffer. See `greedy::run_resumable` for why
-/// `consume_all` and `is_last` are independent, and why the
-/// [`STREAM_BLOCK_LOOKAHEAD`] margin makes the chunk seam invisible in the
-/// emitted bytes.
+/// [`run`] with the matchfinder state supplied by the caller. See
+/// `greedy::run_resumable` for the `is_last` / drain contract.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_resumable(
     buf: &[u8],
@@ -94,7 +89,6 @@ pub(super) fn run_resumable(
     bw: &mut BitWriter,
     lazy2: bool,
     role: BlockRole,
-    input_mode: InputMode,
     budget: HeaderBudget,
 ) -> usize {
     let mut sink = Sink::acquire();
@@ -111,9 +105,6 @@ pub(super) fn run_resumable(
     let mut split_hold_decided = false;
 
     loop {
-        if !input_mode.must_drain() && in_end - in_next < STREAM_BLOCK_LOOKAHEAD {
-            return in_next;
-        }
         // Start a new DEFLATE block.
         let block_begin = in_next;
         let in_max_block_end = choose_max_block_end(in_next, in_end);

@@ -1,15 +1,12 @@
 //! Correctness net for the pure-Rust PARALLEL DEFLATE encoder (Increment 6:
 //! `PipelinedGzEncoder::compress_buffer_pure` — the sole production T>1 path).
 //!
-//! The parallel path splits the input on a deterministic, data-length-only
-//! block grid, compresses each chunk independently with the previous chunk's
-//! 32 KiB input tail seeded as a preset dictionary, closes every non-final
-//! chunk with a byte-aligned sync-flush marker, and concatenates the results
-//! into ONE standard single-member gzip stream (header + DEFLATE + combined
-//! CRC32/ISIZE). This module pins:
+//! The T>1 entry point preserves a whole-stream encoder for the supported
+//! levels, so its DEFLATE decisions and gzip member are identical to T1.
+//! The legacy chunk pipeline remains below it for future unsupported levels.
+//! This module pins:
 //!
-//!   1. DETERMINISM — output is byte-identical across thread counts (the grid
-//!      does not depend on `num_threads`).
+//!   1. DETERMINISM — output is byte-identical across thread counts.
 //!   2. 3-ORACLE roundtrip — flate2, libdeflate, and system `gzip -d` all
 //!      reproduce the input byte-exact at L1/L6/L9/L12.
 //!   3. proptest — tiny (<1 chunk), incompressible (each chunk stored-escapes),
@@ -177,57 +174,6 @@ fn sub_chunk_input_valid() {
         for level in [1u32, 9, 12] {
             let gz = compress_pure(&input, level, 4);
             assert_three_oracle(&gz, &input, &format!("subchunk len={len} L{level}"));
-        }
-    }
-}
-
-/// THE BIT-SPLICE SIZE INVARIANT: the spliced T>1 stream is never larger than
-/// the old per-chunk sync-flush construction — the seam bytes are DELETED
-/// (compressible chunks) or re-created only where a stored-block chunk lands
-/// on an unaligned offset (never more often than the old always-on seam).
-///
-/// The reference is built exactly as the pre-splice worker+writer pair did:
-/// same grid, same 32 KiB dictionary, `encode_deflate_segment_to_sink` with
-/// its byte-aligning sync-flush on every non-final chunk, byte concatenation.
-#[test]
-fn spliced_never_larger_than_seamed() {
-    use crate::compress::deflate::encode_deflate_segment_to_sink;
-    use crate::compress::pipelined::pipelined_block_size;
-
-    for &name in crate::fixtures::NAMES {
-        let input = crate::fixtures::generate(name);
-        for level in [1u32, 2, 6, 9] {
-            for threads in [4usize, 8] {
-                let block_size = pipelined_block_size(input.len(), threads, level);
-                let num_blocks = input.len().div_ceil(block_size);
-                let mut seamed_body = Vec::new();
-                for i in 0..num_blocks {
-                    let start = i * block_size;
-                    let end = (start + block_size).min(input.len());
-                    let dict_start = start.saturating_sub(32768);
-                    let mut chunk = Vec::new();
-                    encode_deflate_segment_to_sink(
-                        &input[start..end],
-                        &input[dict_start..start],
-                        level,
-                        i == num_blocks - 1,
-                        &mut chunk,
-                        true,
-                    );
-                    seamed_body.extend_from_slice(&chunk);
-                }
-                let seamed_total = 10 + seamed_body.len() + 8; // header + body + trailer
-
-                let spliced = compress_pure(&input, level, threads);
-                assert!(
-                    spliced.len() <= seamed_total,
-                    "{name} L{level} T{threads}: spliced {} B > seamed {} B — \
-                     bit-splicing must never grow the stream",
-                    spliced.len(),
-                    seamed_total,
-                );
-                assert_three_oracle(&spliced, &input, &format!("{name} L{level} T{threads}"));
-            }
         }
     }
 }

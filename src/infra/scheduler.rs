@@ -7,8 +7,9 @@
 //! 3. All N+1 threads run concurrently (no main-thread stalls)
 //! 4. Simple spin-wait for block completion (low latency)
 //!
-//! This maximizes CPU utilization by never blocking the compress workers
-//! on I/O. The writer thread handles all disk writes independently.
+//! The bounded reorder window limits buffered output to O(thread count).
+//! Workers may wait when the writer falls behind, rather than allocating an
+//! unbounded slot for every input block.
 //!
 //! Set GZIPPY_DEBUG=1 to enable timing diagnostics.
 
@@ -24,7 +25,19 @@ fn is_debug_enabled() -> bool {
     std::env::var("GZIPPY_DEBUG").is_ok_and(|v| v == "1" || v == "true")
 }
 
-/// A slot for storing a compressed block's output
+/// Size of the bounded reorder window: how many compressed blocks may be in flight.
+///
+/// It depends on workers, never input length. Two spare slots leave the worker
+/// holding the next ordered block able to publish it, so the writer cannot be
+/// starved by a full ring.
+#[inline]
+pub fn reorder_window_for(num_threads: usize, num_blocks: usize) -> usize {
+    // `saturating_add`: this is public infrastructure; a caller may pass an
+    // unvalidated (even `usize::MAX`) thread count, and the window must stay
+    // finite rather than overflow.
+    num_threads.saturating_add(2).min(num_blocks)
+}
+
 pub struct BlockSlot {
     /// Whether this block has been compressed
     ready: AtomicBool,
@@ -36,14 +49,86 @@ pub struct BlockSlot {
     meta: UnsafeCell<ChunkMeta>,
 }
 
-/// Efficient spin-wait for slot readiness
+const SPINS_BEFORE_YIELD: u32 = 64;
+
+/// Wait for a worker to publish an ordered slot.
 ///
-/// Uses brief spin with pause hint. For L9 compression where each block
-/// takes ~10ms, this adds negligible overhead while keeping latency low.
+/// The scheduler cannot let an I/O failure strand a writer spinning forever, nor
+/// let a writer failure strand workers waiting for ring space.  Both waits observe
+/// the same cancellation flag.  A short spin preserves the low-latency hand-off for
+/// a slot that is already completing; yielding after that avoids consuming a full
+/// core when compression or I/O takes milliseconds.
 #[inline]
-fn wait_for_slot_ready(slot: &BlockSlot) {
+fn wait_for_slot_ready(slot: &BlockSlot, cancelled: &AtomicBool) -> bool {
+    let mut spins = 0;
     while !slot.is_ready() {
-        std::hint::spin_loop();
+        if cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        spins += 1;
+        if spins < SPINS_BEFORE_YIELD {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    true
+}
+
+/// Wait until the writer has released the ring position for `block_idx`.
+#[inline]
+fn wait_for_ring_space(
+    block_idx: usize,
+    window: usize,
+    blocks_written: &AtomicUsize,
+    cancelled: &AtomicBool,
+) -> bool {
+    if block_idx < window {
+        return !cancelled.load(Ordering::Acquire);
+    }
+
+    let mut spins = 0;
+    while block_idx.saturating_sub(blocks_written.load(Ordering::Acquire)) >= window {
+        if cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        spins += 1;
+        if spins < SPINS_BEFORE_YIELD {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    !cancelled.load(Ordering::Acquire)
+}
+
+/// Cancel the run if the enclosing thread unwinds before it finishes its slot
+/// handoff. The scheduler's shutdown story is `cancelled`: both wait helpers
+/// exit on the flag and every loop breaks on it — but only the writer's own
+/// write-error paths wrote the flag, so a PANIC in a worker (before
+/// `mark_ready`) or in the writer (mid-splice) would leave every other thread
+/// spinning forever on a flag nobody would ever set. Guarding each critical
+/// section makes an unwind cancel the whole run (the panic then propagates
+/// normally when the scope joins) instead of wedging it.
+struct CancelOnUnwind<'a> {
+    cancelled: &'a AtomicBool,
+    done: bool,
+}
+
+impl CancelOnUnwind<'_> {
+    /// Handoff completed — do not cancel on the way out.
+    #[inline]
+    fn done(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for CancelOnUnwind<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.done {
+            self.cancelled.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -105,6 +190,26 @@ impl BlockSlot {
         *self.meta.get() = meta;
     }
 
+    /// Release this slot for reuse by a later block (writer thread, after the
+    /// fragment has been spliced out).
+    ///
+    /// Truncates rather than frees: the allocation is the point of the pool, and
+    /// `Vec::clear` keeps capacity. Clearing `ready` with `Release` and then bumping
+    /// the writer's counter (also `Release`) is what lets the next worker for this
+    /// ring position see a reset slot rather than the previous block's `ready`.
+    ///
+    /// # Safety
+    /// Only call from the writer thread, after `is_ready()` and after the data has
+    /// been consumed. No worker may hold a reference to this slot at that point —
+    /// guaranteed by the reorder window: a worker for block `i` does not touch this
+    /// slot until the writer has released block `i - window`.
+    #[inline]
+    pub unsafe fn release(&self) {
+        (*self.data.get()).clear();
+        *self.meta.get() = ChunkMeta::ALIGNED;
+        self.ready.store(false, Ordering::Release);
+    }
+
     /// Get this block's splice metadata (writer thread, after `is_ready`).
     #[inline]
     pub fn meta(&self) -> ChunkMeta {
@@ -119,10 +224,8 @@ impl BlockSlot {
 /// 2. 1 dedicated writer thread writes blocks in order
 /// 3. All threads run concurrently - no blocking on I/O
 ///
-/// This is optimal because:
-/// - Compress workers never stall waiting for writes
-/// - Writer thread runs in parallel with compression
-/// - Simple spin-wait has low latency for fast blocks
+/// The writer consumes blocks in order while workers compress later blocks in
+/// parallel. Its reorder window bounds the compressed output held in memory.
 pub fn compress_parallel<W, F>(
     input: &[u8],
     block_size: usize,
@@ -141,6 +244,11 @@ where
     if num_blocks == 0 {
         return Ok(writer);
     }
+    // This is public infrastructure, so do not rely on every caller having
+    // validated a CLI thread flag.  Zero workers would leave the writer waiting
+    // forever for block zero; treating it as one worker matches the rest of the
+    // compression API's single-thread fallback.
+    let num_threads = num_threads.max(1);
 
     if debug {
         eprintln!(
@@ -152,20 +260,25 @@ where
         );
     }
 
-    // Pre-allocate output slots with conservative capacity
+    // Reusable ring: output storage is O(workers), not O(input blocks). A
+    // worker for block i only reuses its slot after the writer releases i-window.
     let alloc_start = Instant::now();
     let slot_capacity = block_size + (block_size / 10) + 1024;
-    let slots: Vec<BlockSlot> = (0..num_blocks)
-        .map(|_| BlockSlot::new(slot_capacity))
-        .collect();
+    let window = reorder_window_for(num_threads, num_blocks);
+    let slots: Vec<BlockSlot> = (0..window).map(|_| BlockSlot::new(slot_capacity)).collect();
     let alloc_time = alloc_start.elapsed();
+
+    // Blocks the writer has spliced AND released. Workers read this to find out
+    // whether their ring position is free yet.
+    let blocks_written = AtomicUsize::new(0);
 
     if debug {
         eprintln!(
-            "[gzippy] slot allocation: {}ms for {} slots ({}KB each)",
+            "[gzippy] slot allocation: {}ms for {} slots ({}KB each) — reorder window              {window} of {num_blocks} blocks, {}KB bounded",
             alloc_time.as_millis(),
-            num_blocks,
-            slot_capacity / 1024
+            window,
+            slot_capacity / 1024,
+            window * slot_capacity / 1024,
         );
     }
 
@@ -174,6 +287,11 @@ where
 
     // Track any write error from writer thread
     let write_error: AtomicBool = AtomicBool::new(false);
+    // A writer error must cancel workers that are waiting on future ring slots.
+    // Without this, a broken pipe made the writer exit while every worker beyond
+    // the window spun forever waiting for a `blocks_written` value that could never
+    // advance.
+    let cancelled: AtomicBool = AtomicBool::new(false);
 
     // Timing accumulators (atomic for thread-safe updates)
     let total_compress_ns = AtomicU64::new(0);
@@ -188,34 +306,56 @@ where
         // Returns the writer so caller can write trailer
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
+            // A panic in the splicer/writer below would strand every worker
+            // blocked in `wait_for_ring_space`; arm the guard so the unwind
+            // cancels the run. (The panic itself propagates when the scope
+            // joins.)
+            let cancel_on_unwind = CancelOnUnwind {
+                cancelled: &cancelled,
+                done: false,
+            };
             // Bit-splice each block's fragment onto one continuous DEFLATE
             // stream. Fragments produced byte-aligned with pad_bits=0 (the
             // `ChunkMeta::ALIGNED` case) degrade to plain in-order
             // `write_all`s, so non-DEFLATE users of this scheduler are
             // unaffected.
             let mut splicer = BitSplicer::new();
-            for (slot_idx, slot) in slots.iter().enumerate() {
+            // Walk BLOCK indices and map them onto the ring; `slots.len()` is the
+            // reorder window, not the block count.
+            for slot_idx in 0..num_blocks {
+                let slot = &slots[slot_idx % window];
                 let wait_start = Instant::now();
                 let t0 = crate::infra::trace_spans::now_us();
-                wait_for_slot_ready(slot);
+                if !wait_for_slot_ready(slot, &cancelled) {
+                    break;
+                }
                 crate::infra::trace_spans::record("write_wait", 0, t0, slot_idx, 0);
                 total_wait_ns.fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                 let write_start = Instant::now();
                 let t1 = crate::infra::trace_spans::now_us();
                 if splicer.splice_to(&mut w, slot.data(), slot.meta()).is_err() {
-                    write_error.store(true, Ordering::Relaxed);
+                    write_error.store(true, Ordering::Release);
+                    cancelled.store(true, Ordering::Release);
                     break;
                 }
                 crate::infra::trace_spans::record("write", 0, t1, slot_idx, slot.data().len());
                 total_write_ns
                     .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                // Hand this ring position back. `release` clears `ready` with Release
+                // and the counter bump below is also Release, so the worker that
+                // acquires `blocks_written` sees a reset slot.
+                unsafe { slot.release() };
+                blocks_written.fetch_add(1, Ordering::Release);
             }
             // Zero-pad the trailing partial byte (normal DEFLATE padding
             // after the final BFINAL block).
-            if splicer.finish(&mut w).is_err() {
-                write_error.store(true, Ordering::Relaxed);
+            if !cancelled.load(Ordering::Acquire) && splicer.finish(&mut w).is_err() {
+                write_error.store(true, Ordering::Release);
+                cancelled.store(true, Ordering::Release);
             }
+            cancel_on_unwind.done();
             w
         });
 
@@ -225,6 +365,8 @@ where
         let compress_fn = &compress_fn;
         let slots_ref = &slots;
         let next_block_ref = &next_block;
+        let blocks_written_ref = &blocks_written;
+        let cancelled_ref = &cancelled;
         let total_compress_ns_ref = &total_compress_ns;
         let blocks_compressed_ref = &blocks_compressed;
         for wid in 0..num_threads {
@@ -235,6 +377,8 @@ where
                     num_blocks,
                     slots_ref,
                     next_block_ref,
+                    blocks_written_ref,
+                    cancelled_ref,
                     compress_fn,
                     total_compress_ns_ref,
                     blocks_compressed_ref,
@@ -246,9 +390,20 @@ where
         // Wait for writer to finish and get it back
         let w = writer_handle.join().unwrap();
 
-        if write_error.load(Ordering::Relaxed) {
+        if write_error.load(Ordering::Acquire) {
+            // Cancelled (and possibly partially spliced) run: callers return
+            // Err and must skip any per-slot combine loop.
             Err(io::Error::other("write failed"))
         } else {
+            // The Ok contract carries "every block was initialized": the
+            // library layer's CRC combine loop (`assume_init_read` over every
+            // slot) is sound ONLY on the Ok path — assert the precondition
+            // loudly where the counter lives.
+            debug_assert_eq!(
+                blocks_compressed.load(Ordering::Acquire),
+                num_blocks,
+                "Ok returned with unfinished blocks — CRC combine loops would assume_init uninitialized slots"
+            );
             Ok(w)
         }
     });
@@ -295,6 +450,8 @@ fn worker_loop_timed<F>(
     num_blocks: usize,
     slots: &[BlockSlot],
     next_block: &AtomicUsize,
+    blocks_written: &AtomicUsize,
+    cancelled: &AtomicBool,
     compress_fn: &F,
     total_compress_ns: &AtomicU64,
     blocks_compressed: &AtomicUsize,
@@ -303,9 +460,33 @@ fn worker_loop_timed<F>(
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) -> ChunkMeta,
 {
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
         // Claim next block atomically
         let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
         if block_idx >= num_blocks {
+            break;
+        }
+
+        // If we unwind between claim and mark_ready, this slot never becomes
+        // ready and the writer's wait can only end through `cancelled` — arm
+        // the guard here so the panic cancels the run instead of wedging it.
+        let cancel_on_unwind = CancelOnUnwind {
+            cancelled,
+            done: false,
+        };
+
+        // WAIT FOR RING SPACE. This ring position is shared with block
+        // `block_idx - window`, so it must not be touched until the writer has
+        // spliced and released that block. Acquire pairs with the writer's Release
+        // bump, so once this returns the slot is observed reset.
+        //
+        // Cannot deadlock: workers claim strictly increasing indices, so the lowest
+        // unwritten block is always held by some worker, and for that worker
+        // `block_idx - blocks_written == 0 < window`.
+        let window = slots.len();
+        if !wait_for_ring_space(block_idx, window, blocks_written, cancelled) {
             break;
         }
 
@@ -325,15 +506,16 @@ fn worker_loop_timed<F>(
 
         let is_last = block_idx == num_blocks - 1;
 
-        // Get output buffer from pre-allocated slot
-        let output = unsafe { slots[block_idx].data_mut() };
+        // Get output buffer from the ring position for this block
+        let slot = &slots[block_idx % slots.len()];
+        let output = unsafe { slot.data_mut() };
 
         // Time the compression
         let compress_start = Instant::now();
         let t0 = crate::infra::trace_spans::now_us();
         let meta = compress_fn(block_idx, block, dict, is_last, output);
         crate::infra::trace_spans::record("chunk_compress", trace_tid, t0, block_idx, block.len());
-        unsafe { slots[block_idx].set_meta(meta) };
+        unsafe { slot.set_meta(meta) };
         total_compress_ns.fetch_add(
             compress_start.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -341,7 +523,8 @@ fn worker_loop_timed<F>(
         blocks_compressed.fetch_add(1, Ordering::Relaxed);
 
         // Signal completion
-        slots[block_idx].mark_ready();
+        slot.mark_ready();
+        cancel_on_unwind.done();
     }
 }
 
@@ -369,34 +552,63 @@ where
     if num_blocks == 0 {
         return Ok(writer);
     }
+    let num_threads = num_threads.max(1);
 
+    // Use the same bounded reusable ring as `compress_parallel`.
     let slot_capacity = block_size + (block_size / 10) + 1024;
-    let slots: Vec<BlockSlot> = (0..num_blocks)
-        .map(|_| BlockSlot::new(slot_capacity))
-        .collect();
+    let window = reorder_window_for(num_threads, num_blocks);
+    let slots: Vec<BlockSlot> = (0..window).map(|_| BlockSlot::new(slot_capacity)).collect();
 
     let next_block = AtomicUsize::new(0);
+    let blocks_written = AtomicUsize::new(0);
     let write_error = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
 
     thread::scope(|scope| {
         // Spawn dedicated writer thread
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
-            for slot in slots.iter() {
-                wait_for_slot_ready(slot);
-                if w.write_all(slot.data()).is_err() {
-                    write_error.store(true, Ordering::Relaxed);
+            let cancel_on_unwind = CancelOnUnwind {
+                cancelled: &cancelled,
+                done: false,
+            };
+            for block_idx in 0..num_blocks {
+                let slot = &slots[block_idx % window];
+                if !wait_for_slot_ready(slot, &cancelled) {
                     break;
                 }
+                if w.write_all(slot.data()).is_err() {
+                    write_error.store(true, Ordering::Release);
+                    cancelled.store(true, Ordering::Release);
+                    break;
+                }
+                unsafe { slot.release() };
+                blocks_written.fetch_add(1, Ordering::Release);
             }
+            cancel_on_unwind.done();
             w
         });
 
         // Spawn N compress workers
         for _ in 0..num_threads {
             scope.spawn(|| loop {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
                 let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
                 if block_idx >= num_blocks {
+                    break;
+                }
+
+                // Same panic contract as `worker_loop_timed`: a worker that
+                // unwinds between claim and mark_ready must cancel the run.
+                let cancel_on_unwind = CancelOnUnwind {
+                    cancelled: &cancelled,
+                    done: false,
+                };
+
+                // Wait for ring space (see `compress_parallel`).
+                if !wait_for_ring_space(block_idx, window, &blocks_written, &cancelled) {
                     break;
                 }
 
@@ -404,15 +616,17 @@ where
                 let end = (start + block_size).min(input.len());
                 let block = &input[start..end];
 
-                let output = unsafe { slots[block_idx].data_mut() };
+                let slot = &slots[block_idx % window];
+                let output = unsafe { slot.data_mut() };
                 compress_fn(block, output);
-                slots[block_idx].mark_ready();
+                slot.mark_ready();
+                cancel_on_unwind.done();
             });
         }
 
         let w = writer_handle.join().unwrap();
 
-        if write_error.load(Ordering::Relaxed) {
+        if write_error.load(Ordering::Acquire) {
             Err(io::Error::other("write failed"))
         } else {
             Ok(w)
@@ -489,5 +703,121 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, input.as_slice());
+    }
+
+    #[test]
+    fn writer_error_cancels_workers_waiting_for_ring_space() {
+        struct FailWriter;
+
+        impl Write for FailWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed consumer"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // More blocks than the reorder window forces workers to wait for the
+        // writer to release slots. Before cancellation existed, the failed writer
+        // exited before releasing them and this call never returned.
+        let input = vec![0xA5; 64 * 1024];
+        let result = compress_parallel(
+            &input,
+            1024,
+            2,
+            FailWriter,
+            |_idx, block, _dict, _is_last, out| {
+                out.clear();
+                out.extend_from_slice(block);
+                ChunkMeta::ALIGNED
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "writer failure must be returned, not deadlock"
+        );
+    }
+
+    /// A worker panic must cancel the run (so the writer's waits and every
+    /// other worker's ring-space spins terminate) and propagate to the caller
+    /// — not wedge inside `thread::scope` with fragments already on the fd.
+    #[test]
+    fn worker_panic_cancels_and_propagates_instead_of_wedging() {
+        let input = vec![0x5A; 128 * 1024];
+        let result = std::panic::catch_unwind(|| {
+            compress_parallel(
+                &input,
+                1024,
+                2,
+                Vec::new(),
+                |_idx, _block, _dict, _is_last, _out| {
+                    panic!("synthetic worker failure");
+                    #[allow(unreachable_code)]
+                    ChunkMeta::ALIGNED
+                },
+            )
+        });
+        assert!(
+            result.is_err(),
+            "a panicking worker must cancel the run and propagate, not wedge"
+        );
+    }
+
+    /// Symmetry: a panic in the writer's splice path must cancel the workers
+    /// waiting for ring space and propagate, not wedge. (Stress: the closure
+    /// panics late enough that other workers are well past preamble.)
+    #[test]
+    fn writer_panic_cancels_and_propagates_instead_of_wedging() {
+        struct PanicWriter;
+        impl std::io::Write for PanicWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                panic!("synthetic writer failure")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = vec![0x5A; 128 * 1024];
+        let result = std::panic::catch_unwind(|| {
+            compress_parallel(
+                &input,
+                1024,
+                2,
+                PanicWriter,
+                |_idx, block, _dict, _is_last, out| {
+                    out.clear();
+                    out.extend_from_slice(block);
+                    ChunkMeta::ALIGNED
+                },
+            )
+        });
+        assert!(
+            result.is_err(),
+            "a panicking writer must cancel the run and propagate, not wedge"
+        );
+    }
+
+    #[test]
+    fn zero_workers_falls_back_to_one_worker() {
+        let input = b"zero workers must still complete".repeat(100);
+        let mut output = Vec::new();
+
+        compress_parallel(
+            &input,
+            32,
+            0,
+            &mut output,
+            |_idx, block, _dict, _is_last, out| {
+                out.clear();
+                out.extend_from_slice(block);
+                ChunkMeta::ALIGNED
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, input);
     }
 }

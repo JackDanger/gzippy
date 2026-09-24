@@ -98,16 +98,26 @@ const SUBSTRINGS: &[&str] = &[
     // loops below (the watch went 0-match, exactly the rename event the
     // canary exists to catch — caught 2026-08-08, adjusted here with the
     // pins regenerated in the same commit).
-    // REACH + INTERLEAVED + GZIP_HASH monomorphize `fastloop_l1` (PR #331
-    // gzip-primary pick-min adds the third const generic); pin each outlined
-    // variant the shipped L1 path can call.
-    "fastloop_l1::<false, false, false>",
-    "fastloop_l1::<false, false, true>",
-    "fastloop_l1::<true, false, false>",
+    // greedy::run_resumable / lazy::run_resumable were REMOVED from this
+    // watch list 2026-09-04: the one-encoder stack (PR #367, d9418505 lineage)
+    // deleted the streaming-tail machinery they lived in — resumable parses
+    // existed only for the streaming route whose routing went away with
+    // pick-min (lib.rs's PARSER TRUTH owns the contract now,
+    // tests/streaming_api_is_honest.rs pins it). The canary itself caught it:
+    // both substrings went 0-match at the pin step.
+    // greedy::run_resumable / lazy::run_resumable were REMOVED from this
+    // watch list 2026-09-04: the one-encoder stack (PR #367, d9418505 lineage)
+    // deleted the streaming-tail machinery they lived in — resumable parses
+    // existed only for the streaming route whose routing went away with
+    // pick-min (lib.rs's PARSER TRUTH owns the contract now,
+    // tests/streaming_api_is_honest.rs pins it). The canary itself caught it:
+    // both substrings went 0-match at the pin step.
+    // REACH + INTERLEAVED + GZIP_HASH monomorphized `fastloop_l1` (PR #331
+    // three-way fastloop); those arms were deleted by the same stack, so the
+    // watch now covers exactly what exists: the two `fastloop_l1_lean`
+    // monomorphizations (verified via nm on the release-syms build, 2026-09-04).
     "fastloop_l1_lean::<false, false>",
     "fastloop_l1_lean::<false, true>",
-    "greedy::run_resumable",
-    "lazy::run_resumable",
     "optimize_and_flush",
     "MatchFinder>::get_matches",
     "deflate_into",

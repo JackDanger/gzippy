@@ -140,6 +140,7 @@ pub(crate) fn merge_new_observations(stats: &mut BlockSplitStats) {
 /// on the multiply and not on `cutoff` itself — the sum is then truncated back to
 /// `u32` by the `+=`. Promoting `cutoff` to `u64` throughout would keep bits the C
 /// discards and move block boundaries.
+#[inline(always)]
 pub(crate) fn do_end_block_check(stats: &mut BlockSplitStats, block_length: u32) -> bool {
     if stats.num_observations > 0 {
         // Compute the sum of absolute differences of probabilities. To avoid needing

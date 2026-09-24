@@ -13,7 +13,7 @@
 #   UPDATE_SMALLFILE_PINS=1 cargo test --release --test smallfile_pins
 # tools: gzippy=0.8.0 gzip=gzip 1.14 pigz=pigz 2.8
 fixture	size	level	ours_bytes	gzip_bytes	pigz_bytes
-binary	4096	1	2618	2695	2695
+binary	4096	1	2625	2695	2695
 binary	4096	6	2566	2577	2577
 binary	4096	9	2554	2567	2567
 binary	16384	1	10301	10521	10521
@@ -26,7 +26,7 @@ binary	262144	1	166443	169269	169434
 binary	262144	6	163008	163136	163309
 binary	262144	9	160087	159979	160173
 text	4096	1	1617	1723	1723
-text	4096	6	1610	1597	1597
+text	4096	6	1611	1597	1597
 text	4096	9	1613	1597	1597
 text	16384	1	5872	6359	6359
 text	16384	6	5607	5611	5611

@@ -48,6 +48,7 @@ impl FullLengthCodewords {
 ///
 /// The C's `STATIC_ASSERT(MAX_LITLEN_CODEWORD_LEN + DEFLATE_MAX_EXTRA_LENGTH_BITS
 /// <= 32)` is what makes the packed `u32` safe: 14 + 5 = 19 bits.
+#[inline(always)]
 pub(crate) fn deflate_compute_full_len_codewords(
     out: &mut FullLengthCodewords,
     codes: &DeflateCodes,
