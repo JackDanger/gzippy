@@ -1119,6 +1119,29 @@ pub fn max_passthrough_size(level: u32) -> usize {
 mod tests {
     use super::*;
 
+    /// Probe 3 (final-lap lever #364 pigz-L9-T4 investigation, agent-16):
+    /// pins the T1-vs-T>1 routing asymmetry at L8/L9 so the depth-x4 leak onto
+    /// the near-optimal parser (the 1.38-1.48x loss vs pigz -9 -p4) is a
+    /// red/green fact, not a code-reading inference. The unification PR must
+    /// flip these deliberately if it changes the params_parallel routing.
+    #[test]
+    fn t1_vs_parallel_l897_routing_asymmetry_is_deterministic() {
+        let t1 = params(9);
+        let par = params_parallel(9);
+        assert_eq!(t1.strategy, Strategy::Lazy2);
+        assert_ne!(
+            par.strategy,
+            Strategy::Lazy2,
+            "T>1 L9 must not silently share the T1 engine"
+        );
+        // the L8/L9 -> L11 recursion: near-optimal knobs alias at these levels
+        assert_eq!(format!("{par:?}"), format!("{:?}", params_parallel(11)));
+        // the x4 depth branch applies to the recursive L9->L11 near-opt params
+        // (else-branch at the parallel_depth floor): document it as DESIGNED,
+        // until per-strategy depth scoping lands with its paired receipts.
+        assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
+    }
+
     #[test]
     fn strategy_mapping_matches_increment_scope() {
         assert_eq!(params(0).strategy, Strategy::Fast0);

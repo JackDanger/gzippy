@@ -555,9 +555,15 @@ impl PipelinedGzEncoder {
     /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
     /// that function so the concatenation is one valid DEFLATE stream.
     ///
-    /// The grid ([`pipelined_block_size`]) depends only on `data.len()`, and the
-    /// per-chunk dictionary and compression are deterministic, so the output is
-    /// byte-identical regardless of `num_threads`.
+    /// NOTE (2026-09-25 contract fix): the grid's `target_chunks = threads x
+    /// cpt` makes the chunk layout DEPENDENT on `num_threads` in the
+    /// un-clamped band (clamped levels converge — e.g. silesia.tar L1/L6/L9 —
+    /// but small inputs at L1/L2 do not). The parallel path also parses with
+    /// `level::params_parallel` + `HeaderBudget::Generous`, so its bytes
+    /// intentionally differ from the T1 stream today ("the stronger parallel
+    /// parse", see the RETRACTED-2026-08-30 note below). Byte-parity across
+    /// thread counts is the campaign's open follow-up
+    /// (docs/board/records/2026-09-22-ec2-c7a4xl/FINAL-ADJUDICATION.md).
     fn compress_parallel_pipeline_pure<W: Write + Send>(
         &self,
         data: &[u8],
