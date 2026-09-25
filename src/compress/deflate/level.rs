@@ -423,6 +423,26 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 /// returned unchanged, so T>1 output at those levels is untouched. L8 and L9 are the
 /// exceptions: they take the FULL step up to the near-optimal parser (first branch below).
 pub fn params_parallel(level: u32) -> LevelParams {
+    #[cfg(feature = "ladder-tune")]
+    {
+        // measurement-only hook (the same discipline as params()): GZIPPY_LADDER
+        // overrides the parallel route too, so probe sweeps can bisect depth
+        // and passes on the near-optimal parse (`nearoptimal:100:150:1` etc.).
+        let mut overridden = params_inner(11);
+        ladder_tune::apply(&mut overridden);
+        return overridden;
+    }
+    #[allow(
+        clippy::diverging_sub_expression,
+        unreachable_code,
+        unused_mut,
+        unused_variables
+    )]
+    let default_route: fn(u32) -> LevelParams = |l| default_params_parallel_route(l);
+    default_route(level)
+}
+
+fn default_params_parallel_route(level: u32) -> LevelParams {
     // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
     // routing decision (the map is free to change; CLAUDE.md "Every technique is
     // in scope"), measured in the crown-at-lower-levels study (2026-08-09, M1
@@ -477,7 +497,7 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
     // near-optimal-class wall for worse bytes. Scope stops at L8.
     if level == 8 || level == 9 {
-        return params_parallel(11);
+        return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
     // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
@@ -636,10 +656,13 @@ pub fn params_parallel(level: u32) -> LevelParams {
 pub mod ladder_tune {
     use super::{LevelParams, Strategy};
 
-    /// `GZIPPY_LADDER=<strategy>:<max_search_depth>:<nice_match_length>`,
-    /// e.g. `lazy:12:14`. Absent or unparseable => no override.
-    fn spec() -> Option<(Strategy, u32, u32)> {
-        static S: std::sync::OnceLock<Option<(Strategy, u32, u32)>> = std::sync::OnceLock::new();
+    /// `GZIPPY_LADDER=<strategy>:<max_search_depth>:<nice_match_length>[:<passes>]`,
+    /// e.g. `lazy:12:14` or `nearoptimal:100:150:1`. The 4th field overrides
+    /// `max_optim_passes` on near-optimal params only. Absent or unparseable
+    /// => no override.
+    fn spec() -> Option<(Strategy, u32, u32, Option<u32>)> {
+        static S: std::sync::OnceLock<Option<(Strategy, u32, u32, Option<u32>)>> =
+            std::sync::OnceLock::new();
         *S.get_or_init(|| {
             let raw = std::env::var("GZIPPY_LADDER").ok()?;
             let mut it = raw.split(':');
@@ -654,15 +677,19 @@ pub mod ladder_tune {
             };
             let depth = it.next()?.parse().ok()?;
             let nice = it.next()?.parse().ok()?;
-            Some((strategy, depth, nice))
+            let passes = it.next().and_then(|x| x.parse().ok());
+            Some((strategy, depth, nice, passes))
         })
     }
 
     pub fn apply(p: &mut LevelParams) {
-        if let Some((strategy, depth, nice)) = spec() {
+        if let Some((strategy, depth, nice, passes)) = spec() {
             p.strategy = strategy;
             p.max_search_depth = depth;
             p.nice_match_length = nice;
+            if let Some(passes) = passes {
+                p.near_optimal.max_optim_passes = passes;
+            }
         }
     }
 }

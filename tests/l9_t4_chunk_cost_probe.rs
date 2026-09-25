@@ -28,6 +28,28 @@ use std::time::Instant;
 const CHUNK: usize = 1_800_000;
 const DICT: usize = 32 * 1024;
 
+fn build_corpus() -> Vec<u8> {
+    // non-periodic deterministic corpus: interleave the four frozen fixtures
+    let mut base = Vec::new();
+    for name in gzippy::fixtures::NAMES {
+        base.extend(gzippy::fixtures::generate(name));
+    }
+    let mut cursor = [0usize; 4];
+    let target = CHUNK + DICT + 4096;
+    while base.len() < target {
+        for (i, name) in gzippy::fixtures::NAMES.iter().enumerate() {
+            let piece = gzippy::fixtures::generate(name);
+            let start = cursor[i].min(piece.len());
+            let take = (piece.len() / 8)
+                .max(4096)
+                .min(piece.len().saturating_sub(start));
+            base.extend_from_slice(&piece[start..start + take]);
+            cursor[i] = (start + take) % piece.len().max(1);
+        }
+    }
+    base
+}
+
 fn run(
     label: &str,
     body: &[u8],
@@ -72,80 +94,46 @@ fn run(
     (best, bytes)
 }
 
-#[test]
-#[ignore = "measurement probe — run with --ignored --nocapture"]
-fn l9_t4_chunk_cost_matrix() {
-    // a ~1.9 MB deterministic corpus (the frozen text fixture, extended
-    // cyclically to the production chunk size it carries at silesia.tar/T4)
-    let mut data = gzippy::fixtures::generate("text");
-    if data.is_empty() {
-        data = vec![0x21u8; CHUNK + DICT + 64];
-    }
-    while data.len() < CHUNK + DICT + 4096 {
-        let take = (CHUNK + DICT + 4096 - data.len()).min(data.len());
-        data.extend_from_slice(&data.clone()[..take]);
-    }
-    assert!(
-        data.len() >= CHUNK + DICT,
-        "corpus too small even after extension"
-    );
+#[ignore]
+fn matrix_for(level: u8, parallel: bool, label: &'static str, runs: usize) {
+    let data = build_corpus();
     let body = &data[DICT..DICT + CHUNK];
     let dict = &data[..DICT];
-    let input_total_len = 200 * 1024 * 1024; // production-shaped silesia.tar size
+    run(label, body, dict, level, parallel, 200 * 1024 * 1024, runs);
+}
 
-    let (t_prod, b_prod) = run(
-        "1 production (L9 parallel=true = near-opt@L11, depth400)",
-        body,
-        dict,
-        9,
-        true,
-        input_total_len,
-        5,
-    );
-    let (t_t1, b_t1) = run(
-        "2 T1 engine  (L9 parallel=false = Lazy2 depth600)",
-        body,
-        dict,
-        9,
-        false,
-        input_total_len,
-        5,
-    );
-    let (t_c, b_c) = run(
-        "3 control    (L11 parallel=true, the params_parallel alias)",
-        body,
-        dict,
-        11,
-        true,
-        input_total_len,
-        5,
-    );
-    let (t_c2, b_c2) = run(
-        "4 control    (L11 parallel=false)",
-        body,
-        dict,
-        11,
-        false,
-        input_total_len,
-        3,
-    );
+#[test]
+#[ignore]
+fn prod_l9t4_depth400() {
+    matrix_for(9, true, "1 production (near-opt@L11, depth400)", 5);
+}
 
-    println!("=== matrix ===");
-    println!(
-        "wall(production)/wall(T1 engine): {:.3}  (>=2.5 CONFIRMS the near-opt upgrade as the multiplier)",
-        t_prod / t_t1
-    );
-    println!(
-        "bytes: production {b_prod}  T1-engine {b_t1}  delta = {}",
-        b_prod as i64 - b_t1 as i64
-    );
-    println!(
-        "controls: t(11,true) {:.4}s vs t(9,true) {:.4}s (alias check ~1.0 expected)",
-        t_c, t_prod
-    );
-    println!(
-        "bytes(11,true) {b_c} == bytes(9,true) {b_prod}: {}",
-        b_c == b_prod
-    );
-    let _ = (t_c2, b_c2);
+#[test]
+#[ignore]
+fn t1_engine_lazy2_depth600() {
+    matrix_for(9, false, "2 T1 engine (Lazy2 depth600)", 5);
+}
+
+#[test]
+#[ignore]
+fn l11_alias_check() {
+    matrix_for(11, true, "3 control (L11 parallel=true alias)", 5);
+}
+
+#[test]
+#[ignore]
+fn depth_split_d100() {
+    matrix_for(9, true, "4 nearoptimal:100:150 (depth100 ladder)", 3);
+}
+
+#[test]
+#[ignore]
+fn depth_split_d400_p1() {
+    matrix_for(9, true, "5 nearoptimal:400:150:1 (depth400, passes1)", 3);
+}
+
+#[test]
+#[ignore]
+fn depth_split_d400_p4() {
+    matrix_for(9, true, "6 nearoptimal:400:150:4 (prod alias)", 3);
 }
