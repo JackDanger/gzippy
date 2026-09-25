@@ -1,0 +1,26 @@
+{
+  "rival": "pigz",
+  "corpus": "silesia.tar",
+  "level": 2,
+  "threads": 1,
+  "status": "VOID",
+  "wall_status": "VOID",
+  "wall_verdict": "VOID-aa_bias=0.0010",
+  "wall_class": "VOID",
+  "wall_ratio": 1.31726876085348,
+  "logratio_ci": [
+    0.27453453662731847,
+    0.27658640826342656
+  ],
+  "slower": false,
+  "a_median_ms": 2865.710162,
+  "b_median_ms": 2176.415644,
+  "a_cpu_pct": 100.00564878046791,
+  "b_cpu_pct": 99.98601018863117,
+  "pin_ok": true,
+  "pin_unmeasurable": false,
+  "rival_single_threaded": false,
+  "size_ratio_bonus": 0.9446713780835837,
+  "n": 45,
+  "error": "paired verdict: VOID-aa_bias=0.0010"
+}

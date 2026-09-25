@@ -1,0 +1,26 @@
+{
+  "rival": "pigz",
+  "corpus": "silesia.tar",
+  "level": 6,
+  "threads": 1,
+  "status": "OK",
+  "wall_status": "OK",
+  "wall_verdict": "RESOLVED-b-slower",
+  "wall_class": "WIN",
+  "wall_ratio": 0.41957480671295533,
+  "logratio_ci": [
+    -0.8690501907342154,
+    -0.8679767001885987
+  ],
+  "slower": false,
+  "a_median_ms": 2970.205363,
+  "b_median_ms": 7080.4880729999995,
+  "a_cpu_pct": 99.9990134545853,
+  "b_cpu_pct": 99.98303475949962,
+  "pin_ok": true,
+  "pin_unmeasurable": false,
+  "rival_single_threaded": false,
+  "size_ratio_bonus": 0.9845754539063098,
+  "n": 45,
+  "error": null
+}

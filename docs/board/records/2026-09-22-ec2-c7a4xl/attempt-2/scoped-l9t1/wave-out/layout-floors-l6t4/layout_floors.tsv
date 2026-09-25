@@ -1,0 +1,14 @@
+# fulcrum layout_floors v1
+# ref=s2-fixes/review-1
+# commit=4cd5decafe44f09f52da371924e9a79ced3976a8
+# box=ip-10-50-6-188.ec2.internal
+# date=2026-09-23T06:32:14Z
+# n=25
+# variants=2
+# pristine_bin_sha256=a0a2f899d28ede0303a4ac7c14636e9aa907555de57d10772495847d2f23df0c
+# floor = max |ln(variant_wall/pristine_wall)| across layout variants (sha-distinct binaries, sha-identical outputs).
+# rival is a JOIN KEY for try cell ids — jitter is measured on OUR binary only.
+rival	corpus	level	threads	floor	status	variant_ratios
+gzip	silesia.tar	6	4	0.000104	OK	1.000104,1.000037
+pigz	silesia.tar	6	4	0.000104	OK	1.000104,1.000037
+libdeflate	silesia.tar	6	4	0.000104	OK	1.000104,1.000037

@@ -1,0 +1,7 @@
+{
+  "ours_tmpl": "/root/wave-out/layout-floors-l67t4/layout-6b4818679a4a-v1/target/release/gzippy -{level} -p {threads} -c {input}",
+  "ours_bin": "/root/wave-out/layout-floors-l67t4/layout-6b4818679a4a-v1/target/release/gzippy",
+  "ours_sha256": "59095e2ade4fd65eede011b1ca6573a14590dade7c6d6e5aac76295f91e7b103",
+  "created_unix": 1790266389,
+  "attested": false
+}

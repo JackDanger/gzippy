@@ -1,0 +1,26 @@
+{
+  "rival": "libdeflate",
+  "corpus": "silesia.tar",
+  "level": 6,
+  "threads": 1,
+  "status": "OK",
+  "wall_status": "OK",
+  "wall_verdict": "RESOLVED-a-slower",
+  "wall_class": "LOSS",
+  "wall_ratio": 2.4543294253352017,
+  "logratio_ci": [
+    0.897190537270962,
+    0.8985166175934592
+  ],
+  "slower": true,
+  "a_median_ms": 5289.745043,
+  "b_median_ms": 2155.789699,
+  "a_cpu_pct": 100.00077703730774,
+  "b_cpu_pct": 100.00301823754381,
+  "pin_ok": true,
+  "pin_unmeasurable": false,
+  "rival_single_threaded": false,
+  "size_ratio_bonus": 0.9953119379410236,
+  "n": 45,
+  "error": null
+}

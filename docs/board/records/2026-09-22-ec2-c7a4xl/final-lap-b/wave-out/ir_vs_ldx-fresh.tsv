@@ -1,0 +1,41 @@
+# THE GOAL SHEET, leg 1: ours vs the libdeflate ALGORITHM (the in-tree ldx
+# port of libdeflate v1.23, byte-identical L0-L9), as Ir/B under cachegrind.
+# Both engines run through examples/ir_runner.rs on the same host in the same
+# test invocation, so the RATIO is what is pinned and host drift cancels.
+# ldx runs raw DEFLATE (no gzip framing/crc; that term counts against us).
+# ldx is NOT the libdeflate C binary's cost: the rustc build of the port
+# spends ~1.5x the C build's Ir (trainer 2026-08-04, text L1: ldx 62.02 vs
+# libdeflate-gzip 40.60 Ir/B). Same-toolchain algorithm comparison only;
+# the real-binary goal is rivals_ir.tsv.
+# margin > 1.0 = NAMED OPEN PERF GAP (goal is <=1.0): do not raise it, close it.
+# margin <= 1.0 = held win; the ratchet only TIGHTENS, in the improving PR.
+# ours_ir_per_b / ldx_ir_per_b are the seed-time absolutes (provenance, not asserted).
+# Regenerate: UPDATE_IR_VS_LDX=1 cargo test --release --test ir_vs_ldx update_ldx_pins -- --ignored --nocapture
+# RE-PIN (2026-09-24, trunk @ 104a26b8 = the ci.yml regen of e08e6107): the
+# sheet below is the CURRENT trunk's own margin structure under the same-host
+# same-build instrument. The one-encoder restructure (PRs #366/#367) moved the
+# engine above the in-tree ldx port at L1/L6/L9 on the Ir axis, re-opening the
+# per-label gaps (1.222..2.040); per the sheet's own rule these are NAMED OPEN
+# GAPS now — 'do not raise, close it' applies to improving PRs. Absolute Ir
+# context: the trunk is still 37-53% BELOW the pre-restructure main
+# (150.84 -> 67.03 text L1, handoff-2026-09-04 §3.2) — the gap-vs-ldx and the
+# budget-vs-self tell the same story: the restructure traded Ir (still less
+# than main-before) for the 5.7x/3.25x wall and the size wins.
+# Pinned on host 'runnervmtr4k5' , gzippy @ 104a26b, 2026-09-24.
+fixture	level	ours_ir_per_b	ldx_ir_per_b	margin
+text	1	67.26	55.08	1.222
+text	2	73.92	72.98	1.013
+text	6	234.75	147.85	1.588
+text	9	456.29	455.39	1.002
+tabular	1	53.69	41.59	1.291
+tabular	2	56.50	55.63	1.016
+tabular	6	108.86	87.42	1.246
+tabular	9	369.05	368.23	1.003
+binary	1	87.62	48.47	1.808
+binary	2	75.91	74.67	1.017
+binary	6	125.63	91.28	1.377
+binary	9	263.78	262.57	1.005
+noise	1	117.14	57.42	2.040
+noise	2	98.40	97.69	1.008
+noise	6	131.30	98.70	1.331
+noise	9	110.42	109.70	1.007
