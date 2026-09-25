@@ -6,10 +6,13 @@
 //! discriminate the pigz-L9/T4-loss hypotheses:
 //!
 //! 1. production: `parallel=true, level=9`  → `params_parallel(9)` ≡
-//!    `params_parallel(11)` (near-optimal, depth 400, passes 4).
+//!    `params_parallel(11)` with the trunk's L9 retune: near-optimal, depth
+//!    400-alias knobs, **passes 2** (level.rs `max_optim_passes = 2`).
 //! 2. T1 engine:  `parallel=false, level=9` → `params(9)` (Lazy2, depth 600,
 //!    nice 258 — the ldx-shaped parse the T1 cells ship).
-//! 3. control:    `parallel=true, level=11` (the params alias; must match variant 1).
+//! 3. control:    `parallel=true, level=11` (L11 default knobs, **passes 4** —
+//!    since the retune this NO LONGER aliases variant 1: wall(1)/wall(3)
+//!    now prices the passes 2 vs 4 delta).
 //! 4. control:    `parallel=false, level=11`.
 //!
 //! READS: best-of-k wall via std::time::Instant + output bytes (the size
@@ -19,7 +22,7 @@
 //!   wall(1)/wall(2) >= 2.5  → the near-opt upgrade is the multiplier
 //!                             (agent-16 predicted 3.5-4.5x from 61f0f01d)
 //!   wall(1) ~ wall(2)       → REFUTED; escalate to scheduler phase accounting
-//! The wall(1)/wall(3) control confirms the params alias.
+//!   wall(1)/wall(3)         → the passes-2 retune's own chunk-level price.
 //!
 //! Measurement only (`#[ignore]`), never a regression gate.
 
@@ -142,5 +145,10 @@ fn depth_split_d400_p1() {
 #[test]
 #[ignore]
 fn depth_split_d400_p4() {
-    matrix_for(9, true, "6 nearoptimal:400:150:4 (prod alias)", 3);
+    matrix_for(
+        9,
+        true,
+        "6 nearoptimal:400:150:4 (L11 default, passes 4)",
+        3,
+    );
 }

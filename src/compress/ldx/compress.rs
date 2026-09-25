@@ -120,6 +120,20 @@ pub(crate) struct LdxCompressor {
 impl LdxCompressor {
     /// C: `libdeflate_alloc_compressor_ex` (:3874), for levels 0-9.
     pub(crate) fn new(compression_level: u32) -> Option<Self> {
+        // measurement-only knob (P1 probe, ladder-tune feature, per the sprint plan):
+        // `GZIPPY_LDX_L6=<depth>:<nice>` overrides the L6 (35, 65) pair so the
+        // depth term is bisectable on the port itself. Shipped behavior reads
+        // the match verbatim without the env read.
+        let ldx_l6_override: Option<(u32, u32)> = if cfg!(feature = "ladder-tune") {
+            std::env::var("GZIPPY_LDX_L6").ok().map(|raw| {
+                let mut it = raw.split(':');
+                let depth: u32 = it.next().expect("depth").parse().expect("depth num");
+                let nice: u32 = it.next().expect("nice").parse().expect("nice num");
+                (depth, nice)
+            })
+        } else {
+            None
+        };
         // C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919)
         let mut max_passthrough_size = 55usize.wrapping_sub(compression_level as usize * 4);
         // C: the level -> config map at :3919-3990, ported verbatim for the levels whose
@@ -140,7 +154,7 @@ impl LdxCompressor {
             4 => (16, 30),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
             5 => (16, 30),
-            6 => (35, 65),
+            6 => ldx_l6_override.unwrap_or((35, 65)),
             7 => (100, 130),
             // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
             8 => (300, DEFLATE_MAX_MATCH_LEN),
