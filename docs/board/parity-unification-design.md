@@ -53,36 +53,47 @@ NO-SHIP `pigz:ecoli.fastq:L1:T4:wall` cell). Parity = engine, grid, header
 budget, and flush seams identical across T with per-level params frozen; T1
 stays whole-buffer.
 
-## PR-2 — cross-T parity at the legacy levels (the first landing)
-1. `pipelined_block_size` loses the `by_parallelism` arm: the canonical grid is
-   the serial bound per level — the L6+ 2 MB clamp
-   (`MAX_T_AWARE_BLOCK_SIZE_L6_UP`), the L1–L5 8 MB bound — with chunk count
-   computed from input length only (`ceil(input/grid)`), never from `threads`.
-   This keeps the shipped big-file walls (the 2 MB cap is the measured state)
-   and removes the thread-coupling in one stroke.
-2. Header budget: one source for the legacy chunk path (the T>1 Generous
-   budget retires in favour of whichever the T>1 rows at these levels are
-   already pinned to; no size-spend is authorized here — the census decides,
-   and any cell beyond the tie tolerance blocks the PR).
+## PR-2 — cross-T parity at all pipelined levels (the first landing)
+
+REVISED v3.1 after the second adversarial review (agent-23) + the P4/P4b
+probes (sprint doc): the grid function is GLOBAL — the change is not scoped to
+the legacy-engine rows; the census envelope covers every pipelined level.
+
+1. `pipelined_block_size` anchors `target_chunks = GRID_REF_THREADS × cpt`
+   (the T=4 layout bit-for-bit: `num_threads = 4` reproduces the former arm's
+   exact value), dropping the LIVE thread count. The surviving structure is
+   UNCHANGED and load-bearing: the 512 KiB `MAX_PARALLEL_BLOCK_SIZE` floor,
+   `clamp(MIN, max_block)` (2 MiB L6+ / 8 MiB L1–5), `min(input_len)` and the
+   `SOFT_MAX_BLOCK_LENGTH` alignment (the 2 MiB clamp floor-aligns to
+   **1,800,000**, the number the tests already pin). Any implementer taking
+   "2 MiB" literally without the alignment gets 2,097,152 and changes the
+   silesia cells — do not.
+2. Header budget: the chunk path keeps `HeaderBudget::Generous` at every T>1
+   (keyed on `parallel`, never on T); T1 keeps `Lean`. NOTHING changes bytes
+   here — the freeze is a no-op by construction.
 3. `compress_exact_to_writer` (T1) is untouched. T1 streams keep their
-   whole-buffer whole-stream shape.
-4. Gates rewritten (same commit): `tests/thread_byte_parity.rs` asserts
-   `digest(T2) == digest(T4) == digest(T8) == digest(T16)` across a seam-heavy
-   payload + roundtrip at L1/L3/L6/L7; T1-vs-T(N) moves to the census
-   instrument (size ratios on the real-corpus fixtures within tie tolerance,
-   roundtrip-identity always). The T1 leg of the digests is deleted with the
-   note above as the reason it can never hold.
-5. Pin regen, in the SAME commits as each behavior flip: perf_shape rows for
-   the touched levels (grid change alters per-fixture chunk counts → anatomy
-   rows move), `seam_tax`, `startup_cost` fingerprints; the routing pin
-   `t1_vs_parallel_l897_routing_asymmetry_is_deterministic` is inspected
-   against the new layout (L8/L9 route-reading must still be deterministic —
-   it pins a level.rs decision, not a byte); `one_encode_only` count contract
-   (per-input encodes are unchanged — chunking count is not the pin's arity).
-   `ir_vs_ldx` stays untouched (T1 arms unchanged).
-6. Local gates: size census across the representative corpora at the touched
-   levels (per-cell ≤ tie tolerance), wall microprobe (T4 on dense + binary)
-   before ANY push.
+   whole-buffer whole-stream shape and stay a distinct stream class (digest
+   distinctness is structural; the gate asserts the 0.5% size tie instead).
+   `one_encode_only`'s count contract verified intact (chunk workers do not
+   increment the whole-buffer counters).
+4. Scope claim: cross-`-p` digest parity is asserted for inputs above the
+   L2–L5 routing-escape threshold (102,400 B — `optimal_thread_count` halves
+   tiny `-p2` requests into the T1 whole-buffer encoder; a pre-existing,
+   separately-receipted T-ROUTING rule). The gates derive payloads from
+   `pipelined_block_size`, never hardcode grids.
+5. Wall envelope: T2/T4 identical by construction; T8/T16 measured
+   wall-neutral-or-better on the 32 MB probe (pinned 10–50 ms vs today
+   20–60 ms medians) — the runbook lap re-verifies on c7a with the
+   will-not-regress rule at every (level, T) cell it sweeps.
+   available_parallelism() anchoring was CONSIDERED and REJECTED (per-host
+   pins; T2 big-file fixed-cost overhead — the 0.3 s/chunk ledger class).
+6. Pin regen, in the same commits as the behavior flip:
+   `tests/fingerprints/ours.tsv` + `ours_t4.tsv` (T4/T1 grids unchanged ⇒
+   expect byte-identical pins; regen to PROVE), `perf_shape` rows (grid
+   changes move per-fixture chunk counts in the un-clamped band),
+   `seam_tax`, `startup_cost` (1-byte grid = 128 KiB min either way; empty
+   diff expected), ir_vs_ldx untouched (T1 arms), routing pin
+   `t1_vs_parallel_l897` re-binds with PR-1's retune only.
 
 ## PR-3 — ldx dict-chunk engine at the port levels (deferred, gated)
 Needed for cross-T parity at L0/L2/L4/L5/L8/L9 (T1 is whole-buffer-port there

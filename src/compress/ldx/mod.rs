@@ -222,12 +222,14 @@ pub const DEFLATE_MAX_EXTRA_OFFSET_BITS: u32 = 13;
 /// Compress `input` at `level` through the ported path and return the raw DEFLATE
 /// bytes, or `None` if that level is not ported yet.
 ///
-/// **This is a test/differential entry point, not a shipping one.** It exists so the
+/// **The differential form is oracle-only; the production form is the
+/// pipeline's chunk engine.** `compress_for_diff` exists so the
 /// port's rung-3 gate — byte-for-byte against libdeflate's own
-/// `libdeflate_deflate_compress` — can be run from `examples/ldxdump.rs`. Nothing in
-/// `src/compress/deflate` calls it, and nothing routes here.
+/// `libdeflate_deflate_compress` — can be run from `examples/ldxdump.rs`.
 /// PRODUCTION entry point: compress `input` and APPEND the raw DEFLATE bytes to
-/// `out`, with no scratch buffer and no copy.
+/// `out`, with no scratch buffer and no copy (`compress_into` is routed by
+/// `src/compress/deflate/mod.rs` at the non-exception levels, and the PR-3
+/// dict-chunk extension builds on it).
 ///
 /// [`compress_for_diff`] is the divergence ORACLE and allocates
 /// `vec![0u8; input.len() * 2 + 65536]` — it ZEROES twice the input plus 64 KB on
