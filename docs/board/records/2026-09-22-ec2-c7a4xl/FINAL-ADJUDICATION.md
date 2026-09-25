@@ -42,3 +42,9 @@ Both lever PRs were scoped-adjudicated on this box against the re-pinned trunk (
 - **#364 (far_len3 port)**: on the rebase the byte-identity packaging was already void (14/23 representative files shift at L3); its scoped leg additionally found the targeted libdeflate-wall cells FURTHER away (gap up to 0.2564) plus two local floor gaps making two erosion cells UNDECIDED (a floor is never borrowed). NOT MERGED.
 
 The levers stay parked on their branches with their artifacts and their PR threads carrying the verdicts; the trunk's composition stands as PR #367 + #371 (the S2 SHIP + the Ir re-pin).
+
+## T1-vs-T(N) BYTE-PARITY RECEIPT (final lap, representative real corpus)
+
+The final lap ran the parity-census question directly on silesia.tar (L1/L6/L9 × T2/T4/T8): every parallel stream roundtrips to the identical payload, but the streams are NOT byte-identical to the T1 stream (deflate bodies differ in content and length; gzippy stamps mtime=0 so the header comparison is clean). Local probe on arm64 confirms: T1 vs T4 output differs mid-body and by 1 byte of length, both decode equal.
+
+This is the instrument's first real-corpus measurement of the exact blind spot its own header documents ("the shipped thread-parity test covers only four generated fixtures — the test cannot see a real chunk seam"). Consequence for the campaign's guarantees: the S2 landed promises depended on A-vs-B at the SAME thread count (those receipts hold — 18/18 and lever byte-identities), the byte-parity ACROSS thread counts on the real corpus remains an open follow-up to retire via the parity-census instrument (or by making the parallel path bit-match T1), and the informational budget/parity jobs stay continue-on-error until then.
