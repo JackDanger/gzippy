@@ -1,0 +1,26 @@
+{
+  "rival": "gzip",
+  "corpus": "silesia.tar",
+  "level": 9,
+  "threads": 4,
+  "status": "OK",
+  "wall_status": "OK",
+  "wall_verdict": "RESOLVED-b-slower",
+  "wall_class": "WIN",
+  "wall_ratio": 0.3439765318998914,
+  "logratio_ci": [
+    -1.0687409692654999,
+    -1.065622721048816
+  ],
+  "slower": false,
+  "a_median_ms": 6007.401191999999,
+  "b_median_ms": 17449.788668,
+  "a_cpu_pct": 494.528346708188,
+  "b_cpu_pct": 99.99677466747681,
+  "pin_ok": true,
+  "pin_unmeasurable": false,
+  "rival_single_threaded": true,
+  "size_ratio_bonus": 0.9565000743635347,
+  "n": 45,
+  "error": null
+}

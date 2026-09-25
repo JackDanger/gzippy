@@ -1,0 +1,53 @@
+{
+  "floor_semantics": "max |ln(variant_wall/pristine_wall)| across variants; rival is a join key",
+  "fulcrum_built_epoch": "1790144651",
+  "fulcrum_commit": "d738eaef4585ff831545d007473e33a450afdf6c",
+  "fulcrum_dirty": "false",
+  "provenance": {
+    "box": "ip-10-50-6-188.ec2.internal",
+    "commit": "4cd5decafe44f09f52da371924e9a79ced3976a8",
+    "date": "2026-09-23T06:32:14Z",
+    "n": "25",
+    "pristine_bin_sha256": "a0a2f899d28ede0303a4ac7c14636e9aa907555de57d10772495847d2f23df0c",
+    "ref": "s2-fixes/review-1",
+    "variants": "2"
+  },
+  "rows": [
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00010353278067469727,
+      "level": 6,
+      "rival": "gzip",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.000103538140378,
+        1.0000366476720137
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00010353278067469727,
+      "level": 6,
+      "rival": "pigz",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.000103538140378,
+        1.0000366476720137
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00010353278067469727,
+      "level": 6,
+      "rival": "libdeflate",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.000103538140378,
+        1.0000366476720137
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+wallcensus: gzip__silesia.tar__L07__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.4339 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L07__T04 -> VOID (verdict=VOID-aa_bias=0.0006 ratio=0.1687 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.4190 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.7049 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L07__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.4433 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L07__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.6846 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.3751 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.5829 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L07__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.3115 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L07__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.5099 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L02 T01 -> OK (gzippy=71066342 rival=75116864 ratio=0.9461 src=measured)
+sizecensus: pigz silesia.tar L02 T01 -> OK (gzippy=71066342 rival=75026832 ratio=0.9472 src=measured)
+sizecensus: libdeflate silesia.tar L02 T01 -> OK (gzippy=71066342 rival=71066342 ratio=1.0000 src=measured)
+wallcensus: gzip__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5167 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0642 pin_ok=true pin_unmeasurable=false)
+sizecensus: pigz silesia.tar L02 T04 -> OK (gzippy=70089724 rival=74910087 ratio=0.9357 src=measured)
+wallcensus: gzip__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.1956 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.8817 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4033 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L09 T01 -> OK (gzippy=66716173 rival=67648098 ratio=0.9862 src=measured)
+wallcensus: pigz__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.3695 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0189 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L09 T04 -> OK (gzippy=64704749 rival=67648098 ratio=0.9565 src=measured)
+sizecensus: pigz silesia.tar L09 T04 -> OK (gzippy=64704749 rival=67666708 ratio=0.9562 src=measured)
+wallcensus: libdeflate__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.9533 pin_ok=true pin_unmeasurable=false)
+TRY — promotion evaluation over 39 cells (36 decidable on both arms; 3 not)
+  SCOPED RUN (levels=6,7;threads=1,4): the declared scope was measured in FULL (24 cells, every clause) plus 15 out-of-scope SENTINEL cell(s) (seed 17244490211853440359, deterministic per after-ref) graded for clause-3 pass->fail flips ONLY
+  NOT MEASURED: 9 of 24 out-of-scope cells — out-of-scope EROSION is not judged by this run; the nightly board owns drift
+  clause 2 OK: arms differ (binary hashes distinct)
+  clause 1 OK: verify — zero roundtrip failures
+  scope: 15 out-of-scope SENTINEL cell(s) in this run — graded for clause-3 pass->fail flips ONLY; out-of-scope erosion, progress and harm are NOT judged here (the nightly board owns drift)
+  clause 3 OK: no pass->fail flips across 36 decidable cells
+  clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.6897 -> 0.6867)
+  clause 5 OK: every passing cell inside its erosion budget
+  clause 6 OK: improvement 0.0030 vs residual harm 0.0000 (>=2x or no harm; harm = confirmed-real 0.0000 [0] + size 0.0000 [0] + undecided-conservative 0.0000 [0]; excluded as clause-5-priced: accepted margin-spend 0.0000 [0], layout-artifact acquittals 0.0000 [0], sub-budget census drift 0.0005 [2]; authorized size spend <=1% 0.0000 [0])
+  clause 7 OK: all required arch(s) covered: x86_64
+  clause 8 (method): paired interleaved per-pair ratios with stated n; fixed before the run by construction
+  wall margin tiers (band 0.0002 = median layout floor): 13 won-with-margin, 0 knife-edge, 4 failing
+  RE-RUN BEFORE ANY VERDICT:
+    gzip:silesia.tar:L6:T4:wall (base arm VOID — re-measure)
+    gzip:silesia.tar:L7:T4:wall (after arm VOID — re-measure)
+    pigz:silesia.tar:L7:T1:wall (base arm VOID — re-measure)
+VERDICT: NO-SHIP — clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.6897 -> 0.6867)
+  NEXT ACTION: fix or revert; a failed rule is never rewritten to fit the result.
+  artifact: /root/wave-out/wave-lever1/try.json
+    gzip:silesia.tar:L7:T4:wall (after arm VOID — re-measure)
+    pigz:silesia.tar:L7:T1:wall (base arm VOID — re-measure)
+VERDICT: NO-SHIP — clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.6897 -> 0.6867)
+  NEXT ACTION: fix or revert; a failed rule is never rewritten to fit the result.
+  stored verdict NO-SHIP REPRODUCED under the current rules
+  artifact: /root/wave-out/wave-lever1/try-rescore.json (original untouched)

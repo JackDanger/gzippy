@@ -1,0 +1,51 @@
+sizecensus: libdeflate silesia.tar L03 T04 -> OK (gzippy=68408850 rival=70166934 ratio=0.9749 src=measured)
+wallcensus: gzip__silesia.tar__L03__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5078 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L03__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.1779 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L03__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5677 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L03__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.7765 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L03__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.2564 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L03__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4405 pin_ok=true pin_unmeasurable=false)
+sizecensus: pigz silesia.tar L02 T01 -> OK (gzippy=71066342 rival=75026832 ratio=0.9472 src=measured)
+sizecensus: libdeflate silesia.tar L02 T01 -> OK (gzippy=71066342 rival=71066342 ratio=1.0000 src=measured)
+wallcensus: gzip__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5192 pin_ok=true pin_unmeasurable=false)
+sizecensus: pigz silesia.tar L02 T04 -> OK (gzippy=70089724 rival=74910087 ratio=0.9357 src=measured)
+wallcensus: gzip__silesia.tar__L02__T04 -> VOID (verdict=VOID-aa_bias=0.0010 ratio=0.1963 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4043 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L06__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.3739 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L06 T04 -> OK (gzippy=66965370 rival=68238880 ratio=0.9813 src=measured)
+sizecensus: pigz silesia.tar L06 T04 -> OK (gzippy=66965370 rival=68247457 ratio=0.9812 src=measured)
+wallcensus: libdeflate__silesia.tar__L06__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.5830 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L09 T01 -> OK (gzippy=66716173 rival=67648098 ratio=0.9862 src=measured)
+sizecensus: pigz silesia.tar L09 T01 -> OK (gzippy=66716173 rival=67666708 ratio=0.9860 src=measured)
+wallcensus: libdeflate__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0215 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L09 T04 -> OK (gzippy=64704749 rival=67648098 ratio=0.9565 src=measured)
+wallcensus: pigz__silesia.tar__L09__T04 -> VOID (verdict=VOID-aa_bias=0.0002 ratio=1.3701 pin_ok=true pin_unmeasurable=false)
+TRY — promotion evaluation over 27 cells (25 decidable on both arms; 2 not)
+  SCOPED RUN (levels=3;threads=1,4): the declared scope was measured in FULL (12 cells, every clause) plus 15 out-of-scope SENTINEL cell(s) (seed 15415295449219152825, deterministic per after-ref) graded for clause-3 pass->fail flips ONLY
+  NOT MEASURED: 21 of 36 out-of-scope cells — out-of-scope EROSION is not judged by this run; the nightly board owns drift
+  clause 2 OK: arms differ (binary hashes distinct)
+  clause 1 OK: verify — zero roundtrip failures
+  scope: 15 out-of-scope SENTINEL cell(s) in this run — graded for clause-3 pass->fail flips ONLY; out-of-scope erosion, progress and harm are NOT judged here (the nightly board owns drift)
+  clause 3 OK: no pass->fail flips across 25 decidable cells
+  clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.1604 -> 0.2564)
+  clause 5 [margin-floor]: gzip:silesia.tar:L3:T1:wall: census ratio=0.4687 -> ratio=0.5078 (Δ +0.0391 > flat budget 0.0050; winning cell, base <= 0.8); floor screen: no floor coverage at this coordinate (a floor is NEVER borrowed); confirm: cannot run without this coordinate's floor -> UNDECIDED
+  clause 5 [margin-floor]: pigz:silesia.tar:L3:T1:wall: census ratio=0.5240 -> ratio=0.5677 (Δ +0.0437 > flat budget 0.0050; winning cell, base <= 0.8); floor screen: no floor coverage at this coordinate (a floor is NEVER borrowed); confirm: cannot run without this coordinate's floor -> UNDECIDED
+  clause 5: no CONVICTING erosion (2 of 2 wall suspect(s) UNDECIDED above — not OK; 0 accepted, 0 acquitted)
+  clause 6 FAIL: improvement 0.0000 < 2x residual harm 0.0828 (harm = confirmed-real 0.0000 [0] + size 0.0000 [0] + undecided-conservative 0.0828 [2]; excluded as clause-5-priced: accepted margin-spend 0.0000 [0], layout-artifact acquittals 0.0000 [0], sub-budget census drift 0.0052 [3]; authorized size spend <=1% 0.0000 [0])
+  clause 7 OK: all required arch(s) covered: x86_64
+  clause 8 (method): paired interleaved per-pair ratios with stated n; fixed before the run by construction
+  wall margin tiers (band 0.0002 = median layout floor): 8 won-with-margin, 0 knife-edge, 3 failing
+  RE-RUN BEFORE ANY VERDICT:
+    gzip:silesia.tar:L2:T4:wall (after arm VOID — re-measure)
+    pigz:silesia.tar:L9:T4:wall (after arm VOID — re-measure)
+    gzip:silesia.tar:L3:T1:wall: run `fulcrum layout calibrate` at exactly this (corpus, level, threads) and re-run try with --layout-floors before any verdict
+    pigz:silesia.tar:L3:T1:wall: run `fulcrum layout calibrate` at exactly this (corpus, level, threads) and re-run try with --layout-floors before any verdict
+VERDICT: NO-SHIP — clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.1604 -> 0.2564)
+  NEXT ACTION: fix or revert; a failed rule is never rewritten to fit the result.
+  artifact: /root/wave-out/wave-lever2/try.json
+    gzip:silesia.tar:L3:T1:wall: run `fulcrum layout calibrate` at exactly this (corpus, level, threads) and re-run try with --layout-floors before any verdict
+    pigz:silesia.tar:L3:T1:wall: run `fulcrum layout calibrate` at exactly this (corpus, level, threads) and re-run try with --layout-floors before any verdict
+VERDICT: NO-SHIP — clause 4 FAIL: no failing cell closed and fail-gap did not drop >=1% (0.1604 -> 0.2564)
+  NEXT ACTION: fix or revert; a failed rule is never rewritten to fit the result.
+  stored verdict NO-SHIP REPRODUCED under the current rules
+  artifact: /root/wave-out/wave-lever2/try-rescore.json (original untouched)

@@ -1,0 +1,89 @@
+{
+  "floor_semantics": "max |ln(variant_wall/pristine_wall)| across variants; rival is a join key",
+  "fulcrum_built_epoch": "1790265804",
+  "fulcrum_commit": "d738eaef4585ff831545d007473e33a450afdf6c",
+  "fulcrum_dirty": "false",
+  "provenance": {
+    "box": "ip-10-50-6-104.ec2.internal",
+    "commit": "6b4818679a4ad29656a6e802c242544f39cc0a86",
+    "date": "2026-09-24T16:18:56Z",
+    "n": "25",
+    "pristine_bin_sha256": "79859dd81fe52464978b85bd552bc67630feed2ce639aad088e3264aa9fe45f3",
+    "ref": "origin/lever/ldx-good-match",
+    "variants": "2"
+  },
+  "rows": [
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00026377827811314763,
+      "level": 6,
+      "rival": "gzip",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        0.9999302532335471,
+        1.0002638130706623
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00016367938296929933,
+      "level": 7,
+      "rival": "gzip",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.0001636927791704,
+        1.0001494309203767
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00026377827811314763,
+      "level": 6,
+      "rival": "pigz",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        0.9999302532335471,
+        1.0002638130706623
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00016367938296929933,
+      "level": 7,
+      "rival": "pigz",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.0001636927791704,
+        1.0001494309203767
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00026377827811314763,
+      "level": 6,
+      "rival": "libdeflate",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        0.9999302532335471,
+        1.0002638130706623
+      ]
+    },
+    {
+      "corpus": "silesia.tar",
+      "floor": 0.00016367938296929933,
+      "level": 7,
+      "rival": "libdeflate",
+      "status": "OK",
+      "threads": 4,
+      "variant_ratios": [
+        1.0001636927791704,
+        1.0001494309203767
+      ]
+    }
+  ]
+}
