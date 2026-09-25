@@ -29,6 +29,13 @@ const CHUNK: usize = 1_800_000;
 const DICT: usize = 32 * 1024;
 
 fn build_corpus() -> Vec<u8> {
+    if let Ok(path) = std::env::var("PROBE_CORPUS") {
+        // real-corporus mode: the file must be at least DICT + CHUNK + 4096
+        if let Ok(bytes) = std::fs::read(&path) {
+            return bytes;
+        }
+    }
+
     // non-periodic deterministic corpus: interleave the four frozen fixtures
     let mut base = Vec::new();
     for name in gzippy::fixtures::NAMES {
