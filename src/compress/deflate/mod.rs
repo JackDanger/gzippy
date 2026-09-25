@@ -566,7 +566,7 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with FOUR measured
+    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with THREE measured
     // exceptions. Routing L1/L6/L7 to the port was tried on this branch
     // (`b28e96f3`) and the per-commit ledger gate went red immediately and
     // stayed red for 45 commits: `won_cells_stay_won` regresses FOUR cells
@@ -575,6 +575,28 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     // cell to pigz (43,980 vs 42,384 = 1.038x). A won cell that regresses is
     // a regression on a closed cell — the ledger is append-only and is never
     // edited to fit a result, so the routing comes back.
+    //
+    // L3 RETIRED 2026-09-02 (this branch): the port learned the len-3
+    // machinery — `ldx/far_len3.rs` (the per-block cost gate: accept a far
+    // len-3 match only when it beats the three literals it replaces) plus
+    // the 224x sparse-blocks split-hold modulator, wired into
+    // `ldx/compress_lazy.rs`'s lazy loop 1:1 with the legacy `parse/lazy.rs`
+    // call sequence, with L3 routed to the lazy parser (libdeflate's L3 is
+    // greedy; our measured L3 win is lazy + these guards, config (12, 14) —
+    // origin/main's exact L3 LevelParams, depth 12 NOT the branch's 8:
+    // `37cb96c7`'s wall tweak is a lost regression the port does not
+    // inherit). Deterministic sizes, 11-file local corpus, vs origin/main's
+    // L3 (the incumbent the board grades against): ALL 11 FILES
+    // BYTE-IDENTICAL (dovi/incompressible/logs/markup/monorepo/movie/nasa/
+    // photo/purestored/silesia/weights, this branch, 2026-09-02) — the two
+    // lazy parsers agree byte-for-byte at equal configs, exactly as at L6/L7.
+    // Zero cells can flip. The first attempt at this lever measured a 25-36 KB
+    // gap; it was one broken `bsr32` in the gate's fixed-point log2
+    // (`leading_zeros().trailing_zeros()` instead of `31 - leading_zeros()`),
+    // which both overflowed on small blocks and priced the gate's costs
+    // wrong. With the correct bsr the port reproduces the incumbent exactly.
+    // Wall: directional M1 interleaved, at parity (0.86-1.11x per file); the
+    // adjudicating wall leg is the solvency `fulcrum try` on this branch.
     //
     // Each exception is a MEASUREMENT with a named gate, not a preference —
     // and the good_match ones (L6/L7) collapse the moment the port learns
@@ -586,18 +608,6 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //
     //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
     //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
-    //
-    //   L3  the port has NO len-3/sparse machinery (l3_sparse_split, far_len3 —
-    //       the campaign-winning L3 guards), so port L3 (12, 14) is 1-7% LARGER
-    //       than the legacy L3 (8, 14 + len-3 guards) on the 11-file Mac corpus
-    //       (deterministic, 2026-09-01: tabular +18,886 B = 7.4%, text +6,831 B
-    //       = 2.0%, binary +4,316 B; 2MB+ files same direction) and the running
-    //       solvency try shows it LOSING 11 T1 wall cells vs the legacy L3.
-    //       The legacy L3 is exactly what main ships at T1 L3 (main's own
-    //       receipt: whole-buffer and streaming legacy L3 are byte-identical on
-    //       the real corpus), so the exception restores main's bytes AND wall.
-    //       Retires only when the port learns the len-3 machinery (named lever,
-    //       not good_match).
     //
     //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
     //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
@@ -613,7 +623,7 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times in this campaign.
-    !matches!(level, 1 | 3 | 6 | 7) && level <= 9
+    !matches!(level, 1 | 6 | 7) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
