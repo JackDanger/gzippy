@@ -145,5 +145,10 @@ fn depth_split_d400_p1() {
 #[test]
 #[ignore]
 fn depth_split_d400_p4() {
-    matrix_for(9, true, "6 nearoptimal:400:150:4 (L11 default, passes 4)", 3);
+    matrix_for(
+        9,
+        true,
+        "6 nearoptimal:400:150:4 (L11 default, passes 4)",
+        3,
+    );
 }

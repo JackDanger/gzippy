@@ -69,7 +69,11 @@ fn grid_is_thread_free_at_every_pipelined_level() {
             "L{level}: grid collapsed below MIN ({base})"
         );
         assert!(
-            base <= len.min(if level >= 6 { 2 * 1024 * 1024 } else { 8 * 1024 * 1024 }),
+            base <= len.min(if level >= 6 {
+                2 * 1024 * 1024
+            } else {
+                8 * 1024 * 1024
+            }),
             "L{level}: grid above the level cap ({base})"
         );
         for threads in [2usize, 3, 8, 16, 64] {
@@ -91,7 +95,8 @@ fn cross_thread_bytes_are_identical_at_every_level() {
         let reference = encode_at(&data, level, 4);
         assert!(
             matches!(gzippy::decompress(&reference), Ok(back) if back == data),
-            "L{level}: T4 stream must roundtrip");
+            "L{level}: T4 stream must roundtrip"
+        );
         for threads in [2usize, 8, 16] {
             let stream = encode_at(&data, level, threads);
             assert!(
@@ -123,10 +128,11 @@ fn t1_stream_is_a_distinct_class_within_the_size_tie() {
         let t1 = encode_at(&data, level, 1);
         assert!(
             matches!(gzippy::decompress(&t1), Ok(back) if back == data),
-            "L{level}: T1 stream must roundtrip");
+            "L{level}: T1 stream must roundtrip"
+        );
         let t4 = encode_at(&data, level, 4);
-        let seams = (len / gzippy::compress::pipelined::pipelined_block_size(len, 4, level as u32))
-            .max(1);
+        let seams =
+            (len / gzippy::compress::pipelined::pipelined_block_size(len, 4, level as u32)).max(1);
         let slack = (len as f64 * 0.0025).min((seams * 128) as f64).max(1024.0);
         let delta = (t1.len() as i64 - t4.len() as i64).abs();
         assert!(
