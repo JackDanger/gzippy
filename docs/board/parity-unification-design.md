@@ -96,24 +96,39 @@ the legacy-engine rows; the census envelope covers every pipelined level.
    `t1_vs_parallel_l897` re-binds with PR-1's retune only.
 
 ## PR-3 — ldx dict-chunk engine at the port levels (deferred, gated)
-Needed for cross-T parity at L0/L2/L4/L5/L8/L9 (T1 is whole-buffer-port there
-— the shipped engine; T>1 must then run ldx per chunk or the streams' engines
-differ at every port level). The ldx chunk protocol needs, per the review:
-- `is_last` / starting-offset (`data_start`) parameters — BFINAL must be
-  suppressible mid-stream, and only the final chunk takes it.
-- an alignment report for stored blocks (`ChunkMeta{pad_bits,
-  needs_alignment}`-equivalent) so the splice protocol can lock seams, and
-  passthrough keyed on the DATA extent (not the glued length) so tiny chunks
-  take stored blocks instead of tripping the MIN_BLOCK invariant.
-- one glue copy per chunk (dict + data joined) — the "no scratch, no cop"y
-  `compress_into` contract is amended for this API variant only;
-  hc-matchfinder's sliding rebase makes a disjoint two-slice window unsound.
+
+RE-SCOPED v3.1: PR-2's outcome overtakes PR-3's original parity premise.
+Cross-T byte parity at the port levels (L0/L2/L4/L5/L8/L9) already holds —
+the chunk engine is `params_parallel(level)`-driven and level-pure, so T2 ==
+T4 == T8 == T16 there regardless of which engine class the chunk pipeline
+uses (proved empirically, sprint doc P4/P4b). What differs at those levels is
+only the T1-vs-T(N) stream class, which v3 already declares structural.
+
+What remains for PR-3 is therefore an ENGINE-CONSISTENCY project, not a
+parity project: swap the chunk pipeline's parser at the port levels for the
+port's own parse (the deferred L1-in-ldx sprint item), so T1 and T(N) share
+one code path per level-family. Its cost is the near-opt strategy debate's
+evidence wall: the chunk-side Lazy2 shape would move T>1 bytes TOWARD T1's
+(+2.9% on the L9/T4 cell — cap-breaching), while keeping the near-opt means
+keeping the engine difference. NOTHING in the current board demands the
+engine unification for correctness, parity, or any currently-failing cell.
+PR-3 stays deferred UNLESS the lap surfaces a cell whose only lever is
+one-engine ownership; its first gate remains the three-oracle seam probe of
+an `is_last`/`data_start`/alignment-reporting `compress_into`:
+- BFINAL suppressible mid-stream (only the final chunk takes it); passthrough
+  keyed on the DATA extent (not the glued length) so tiny chunks take stored
+  blocks instead of tripping the MIN_BLOCK invariant; an alignment report for
+  stored blocks so the splice protocol can lock seams; and
+- one glue copy per chunk (hc's sliding rebase makes a disjoint two-slice
+  window unsound; the "no scratch, no copy" `compress_into` contract is
+  amended for this API variant only).
 Gates: three-oracle seam probe (roundtrip parity through the oracles at
 `k*grid ± {0..64}`, stored-fragment coverage, passthrough edges), then the
 per-cell census at every touched level before its routing flips, then the
 Ir/budget rows and `ir_vs_ldx` regen on the box.
 This PR does NOT block the lap; its first gate is the probe, landing only if
-the census stays inside the tie tolerance.
+the census stays inside the tie tolerance AND the wall/size ledger shows a
+cell that only one-engine ownership can collect.
 
 ## PR-1 — the wall lap (already staged)
 The frozen-box session adjudicates trunk's passes2 retune vs aa682fcc per
