@@ -6,7 +6,11 @@
 //! The legacy chunk pipeline remains below it for future unsupported levels.
 //! This module pins:
 //!
-//!   1. DETERMINISM — output is byte-identical across thread counts.
+//!   1. DETERMINISM — per-p-T validity is asserted; NOTE (2026-09-25): the
+//!      pins do NOT yet assert byte-identity across thread counts — T(N) emits
+//!      a different (smaller at L8-9) stream than T1 by design (params_parallel
+//!      + Generous headers). Byte-parity unification is the campaign follow-up
+//!      tracked in README records; this pin's claim is stale until then.
 //!   2. 3-ORACLE roundtrip — flate2, libdeflate, and system `gzip -d` all
 //!      reproduce the input byte-exact at L1/L6/L9/L12.
 //!   3. proptest — tiny (<1 chunk), incompressible (each chunk stored-escapes),

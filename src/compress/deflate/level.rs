@@ -423,6 +423,26 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 /// returned unchanged, so T>1 output at those levels is untouched. L8 and L9 are the
 /// exceptions: they take the FULL step up to the near-optimal parser (first branch below).
 pub fn params_parallel(level: u32) -> LevelParams {
+    #[cfg(feature = "ladder-tune")]
+    {
+        // measurement-only hook (the same discipline as params()): GZIPPY_LADDER
+        // overrides the parallel route too, so probe sweeps can bisect depth
+        // and passes on the near-optimal parse (`nearoptimal:100:150:1` etc.).
+        let mut overridden = params_inner(11);
+        ladder_tune::apply(&mut overridden);
+        return overridden;
+    }
+    #[allow(
+        clippy::diverging_sub_expression,
+        unreachable_code,
+        unused_mut,
+        unused_variables
+    )]
+    let default_route: fn(u32) -> LevelParams = |l| default_params_parallel_route(l);
+    default_route(level)
+}
+
+fn default_params_parallel_route(level: u32) -> LevelParams {
     // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
     // routing decision (the map is free to change; CLAUDE.md "Every technique is
     // in scope"), measured in the crown-at-lower-levels study (2026-08-09, M1
@@ -476,8 +496,18 @@ pub fn params_parallel(level: u32) -> LevelParams {
     // added wall (L7: 2.5-4.9x, L6: 2.4-7.3x vs shipped) against T4 board slack
     // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
     // near-optimal-class wall for worse bytes. Scope stops at L8.
-    if level == 8 || level == 9 {
-        return params_parallel(11);
+    if level == 9 {
+        // L9-only retune (per-cell size census 2026-09-25: silesia.tar +0.0061%,
+        // +3,942 B of 64,701,600 — inside the <=1% authorized spend; local chunk
+        // probes: passes1 −28% wall, passes2 −16% for +0.6%, depth a no-op on
+        // dense corpora). Near-opt at matched depth with passes 2. L8 is NOT
+        // retuned (agent-19: silent scope creep) — it keeps the L11-knob route.
+        let mut p = default_params_parallel_route(11);
+        p.near_optimal.max_optim_passes = 2;
+        return p;
+    }
+    if level == 8 {
+        return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
     // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
@@ -636,10 +666,13 @@ pub fn params_parallel(level: u32) -> LevelParams {
 pub mod ladder_tune {
     use super::{LevelParams, Strategy};
 
-    /// `GZIPPY_LADDER=<strategy>:<max_search_depth>:<nice_match_length>`,
-    /// e.g. `lazy:12:14`. Absent or unparseable => no override.
-    fn spec() -> Option<(Strategy, u32, u32)> {
-        static S: std::sync::OnceLock<Option<(Strategy, u32, u32)>> = std::sync::OnceLock::new();
+    /// `GZIPPY_LADDER=<strategy>:<max_search_depth>:<nice_match_length>[:<passes>]`,
+    /// e.g. `lazy:12:14` or `nearoptimal:100:150:1`. The 4th field overrides
+    /// `max_optim_passes` on near-optimal params only. Absent or unparseable
+    /// => no override.
+    fn spec() -> Option<(Strategy, u32, u32, Option<u32>)> {
+        static S: std::sync::OnceLock<Option<(Strategy, u32, u32, Option<u32>)>> =
+            std::sync::OnceLock::new();
         *S.get_or_init(|| {
             let raw = std::env::var("GZIPPY_LADDER").ok()?;
             let mut it = raw.split(':');
@@ -654,15 +687,19 @@ pub mod ladder_tune {
             };
             let depth = it.next()?.parse().ok()?;
             let nice = it.next()?.parse().ok()?;
-            Some((strategy, depth, nice))
+            let passes = it.next().and_then(|x| x.parse().ok());
+            Some((strategy, depth, nice, passes))
         })
     }
 
     pub fn apply(p: &mut LevelParams) {
-        if let Some((strategy, depth, nice)) = spec() {
+        if let Some((strategy, depth, nice, passes)) = spec() {
             p.strategy = strategy;
             p.max_search_depth = depth;
             p.nice_match_length = nice;
+            if let Some(passes) = passes {
+                p.near_optimal.max_optim_passes = passes;
+            }
         }
     }
 }
@@ -1118,6 +1155,44 @@ pub fn max_passthrough_size(level: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Probe 3 (final-lap lever #364 pigz-L9-T4 investigation, agent-16):
+    /// pins the T1-vs-T>1 routing asymmetry at L8/L9 so the depth-x4 leak onto
+    /// the near-optimal parser (the 1.38-1.48x loss vs pigz -9 -p4) is a
+    /// red/green fact, not a code-reading inference. The unification PR must
+    /// flip these deliberately if it changes the params_parallel routing.
+    #[test]
+    fn t1_vs_parallel_l897_routing_asymmetry_is_deterministic() {
+        let t1 = params(9);
+        let par = params_parallel(9);
+        assert_eq!(t1.strategy, Strategy::Lazy2);
+        assert_ne!(
+            par.strategy,
+            Strategy::Lazy2,
+            "T>1 L9 must not silently share the T1 engine"
+        );
+        // 2026-09-25 replacement invariant (the passes-curve + per-cell size
+        // census led to a L9-only passes2 retune): L9 keeps near-opt at matched
+        // depth with passes 2; L8 stays on the L11-knob route (agent-19 task 4:
+        // the retune is level-conditional, not riding the 8/9 recursion).
+        let par8 = params_parallel(8);
+        assert_ne!(
+            format!("{par:?}"),
+            format!("{par8:?}"),
+            "L9 retune is level-conditional"
+        );
+        assert_eq!(
+            par.near_optimal.max_optim_passes, 2,
+            "L9 retune carries passes2"
+        );
+        assert_eq!(
+            par8.near_optimal.max_optim_passes,
+            params_parallel(11).near_optimal.max_optim_passes,
+            "L8 keeps the L11-knob alias"
+        );
+        // the x4 depth branch applies to the recursive L9->L11 near-opt params
+        assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
+    }
 
     #[test]
     fn strategy_mapping_matches_increment_scope() {
