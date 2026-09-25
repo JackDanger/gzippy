@@ -1,0 +1,38 @@
+{
+ "date": "2026-09-25",
+ "command": "python3 scripts of the census: /tmp/gzippy-mainlib (aa682fcc main build) vs /tmp/gzippy-retune (164/604ae0ec sprint build, GZIPPY_LADDER=nearoptimal:400:150:2)",
+ "corpus": "silesia.tar 211,968,000 B (the campaign's board corpus; sil40 remains solvency-only)",
+ "cells": [
+  {
+   "fixture": "silesia.tar",
+   "level": 9,
+   "threads": 4,
+   "main_bytes": 64701600,
+   "retune_bytes": 64705542,
+   "delta_bytes": 3942,
+   "delta_pct": 0.0061,
+   "rival_gzip_bytes": 67648098,
+   "won": true
+  }
+ ],
+ "verdict": "inside the <=1% authorized size spend (clause 5), itemized",
+ "local_support": [
+  {
+   "fixture": "alice.txt",
+   "delta_bytes": 0
+  },
+  {
+   "fixture": "text-1MB.txt",
+   "delta_bytes": 0
+  },
+  {
+   "fixture": "in_chunk.bin (1.8MB mixed)",
+   "delta_bytes": 5,
+   "delta_pct": 0.001
+  },
+  {
+   "fixture": "logs.txt",
+   "delta_bytes": 0
+  }
+ ]
+}
