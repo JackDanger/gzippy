@@ -73,9 +73,36 @@ makes A and B colocate more often than not. Complexity: the grid must be pinned
   parity fix does not need to retire them — those routes are T1-only and the
   parallel pipeline stopped using them after this retune.
 
+## ⚠ CORRECTION (2026-09-25, direct M1 measurement on the real corpus)
+
+The listed L9-T4 cost row is WRONG by ~10x. Direct silesia.tar CLI, trunk
+546dc07d, released build:
+`L1: T4 +0.0021% | L6: T4 −0.34% | L9: T4 −2.91%` (T1 66,715,402 B →
+T4 64,771,367 B at L9). The near-opt@L11-knobs parse buys −2.9% corpus size at
+T4 — consistent with probe 1b's own chunk numbers (+3.5% if reverted) — so:
+- Retiring the near-opt at L9/T>1 (plan step 3) costs ~**+3% size on the whole
+  T4/L9 cell**, NOT +0.29%. It breaches the owner's ≤1% cap and is NOT tendered.
+- The 0.29% figure double-divides (23,413 B/8 MiB *is* 0.279% — treating the
+  same number again as if it were per-1MB). The mixed-corpus corpus dilutes the
+  text-class loss; the text-class chunk cost remains +22,926 B/1.8 MB.
+- CONSEQUENCE: step 3 must be dropped or re-scoped. The viable parity shape is
+  cross-T parity (T2==T4==T8==T16 bit-identical at a pinned grid, keeping each
+  level's T>1 params — the banked passes2 retune stays) with T1 remaining a
+  distinct stream (whole-buffer port), which is exactly the alternative the
+  FINAL-ADJUDICATION names ("retire via the parity-census instrument (or by
+  making the parallel path bit-match T1)"). Bit-matching T1 from the parallel
+  side would additionally need the seam-match hold-back that no option here
+  prices; NOT in this design.
+
 ## Sequencing
 This unification lands AFTER the frozen-box lap adjudicates the passes2 retune —
 the same box session covers both (the retune lap runs first; the unification's
-wall*size lap runs after, on the same box). If the retune ABORTs, the unification
-lands INSTEAD (it contains the strategy revert + the parity unification in one
-PR).
+wall*size lap runs after, on the same box).
+
+REVISED per the correction above: the unification ships the *cross-T parity*
+shape only (pinned grid, shared params per level — steps 1, 2, 4, 5 with step 3
+dropped). If the retune ABORTs at the pigz L9/T4 trigger, the located fail is
+not resolved by reverting the strategy (that now costs +3% size, past the cap);
+the abort adjudication must instead pick between keeping the size (wall loss
+stays) and a NEW wall lever priced under the cap — that pick is the box
+session's job, not this doc's.
