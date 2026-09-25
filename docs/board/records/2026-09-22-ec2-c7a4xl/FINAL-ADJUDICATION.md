@@ -33,3 +33,12 @@ Post-merge (Playbook A): rebase the lever branches #363/#364, run `board-size.sh
 - `attempt-2/wave-s2-final/` — the full try verdict artifact + per-cell JSONs (36 cells)
 - `attempt-2/scoped-l2t1/`, `scoped-l9t1/`, `scoped-l6t4/` — scoped re-measure verdicts + try.json + rescore.json
 - S3 backup: `s3://gzippy-adjudication-20260923/attempt2/i-043ccd7298e2df783/` (versioned, incremental every 4 min — survives any box death)
+
+## LEVER VERDICTS (final lap, box i-01efd2cbe0d160203, dedicated c7a.4xlarge, 2026-09-24/25)
+
+Both lever PRs were scoped-adjudicated on this box against the re-pinned trunk (aa682fcc), with per-box floors, n=45, sentinels, and the fulcrum d738eae rules. **Both are NO-SHIP by their own clause-4 rule** — the promised wall progress against the instrumented rivals did not materialize; the L6/L7 and L3 respective fail-gaps did not close by the required >=1% (lever1: 0.6897 -> 0.6867, -0.3%; lever2: 0.1604 -> 0.2564, worse). Artifacts: `final-lap/wave-out/{lever1,lever2}-verdict.txt` + both `wave-lever*/try{,-rescore}.json` (rescores reproduce the stored verdicts bit-for-bit).
+
+- **#363 (good_match port)**: mechanism fully faithful — 28/28 decidable cells byte-identical between trunk and the port; the wall win the PR promised is absent at this level of the instrumented rival. NOT MERGED.
+- **#364 (far_len3 port)**: on the rebase the byte-identity packaging was already void (14/23 representative files shift at L3); its scoped leg additionally found the targeted libdeflate-wall cells FURTHER away (gap up to 0.2564) plus two local floor gaps making two erosion cells UNDECIDED (a floor is never borrowed). NOT MERGED.
+
+The levers stay parked on their branches with their artifacts and their PR threads carrying the verdicts; the trunk's composition stands as PR #367 + #371 (the S2 SHIP + the Ir re-pin).

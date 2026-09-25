@@ -1,0 +1,275 @@
+{
+ "status": "DIFF",
+ "rows": [
+  {
+   "f": "alice.txt",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "alice.txt",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "alice.txt",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "text-1MB.txt",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "text-1MB.txt",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "text-1MB.txt",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "silesia.tar.xz",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "silesia.tar.xz",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "silesia.tar.xz",
+   "lever": "lever2",
+   "level": 3,
+   "identical": true
+  },
+  {
+   "f": "dickens",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "dickens",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "dickens",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "mozilla",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "mozilla",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "mozilla",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "mr",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "mr",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "mr",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "nci",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "nci",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "nci",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "ooffice",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "ooffice",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "ooffice",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "osdb",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "osdb",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "osdb",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "reymont",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "reymont",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "reymont",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "samba",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "samba",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "samba",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "sao",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "sao",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "sao",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "webster",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "webster",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "webster",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "x-ray",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "x-ray",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "x-ray",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  },
+  {
+   "f": "xml",
+   "lever": "lever1",
+   "level": 6,
+   "identical": true
+  },
+  {
+   "f": "xml",
+   "lever": "lever1",
+   "level": 7,
+   "identical": true
+  },
+  {
+   "f": "xml",
+   "lever": "lever2",
+   "level": 3,
+   "identical": false
+  }
+ ]
+}

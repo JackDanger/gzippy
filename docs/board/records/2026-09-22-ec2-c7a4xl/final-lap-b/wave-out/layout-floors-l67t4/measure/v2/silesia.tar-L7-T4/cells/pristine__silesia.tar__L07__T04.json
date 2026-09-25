@@ -1,0 +1,26 @@
+{
+  "rival": "pristine",
+  "corpus": "silesia.tar",
+  "level": 7,
+  "threads": 4,
+  "status": "OK",
+  "wall_status": "OK",
+  "wall_verdict": "NOISY",
+  "wall_class": "TIE",
+  "wall_ratio": 1.0001494309203767,
+  "logratio_ci": [
+    -0.0005681169315073264,
+    0.0008669564448849935
+  ],
+  "slower": false,
+  "a_median_ms": 1520.7401140000002,
+  "b_median_ms": 1520.960873,
+  "a_cpu_pct": 494.6622330295221,
+  "b_cpu_pct": 494.42199398645874,
+  "pin_ok": true,
+  "pin_unmeasurable": false,
+  "rival_single_threaded": false,
+  "size_ratio_bonus": 1.0,
+  "n": 25,
+  "error": null
+}
