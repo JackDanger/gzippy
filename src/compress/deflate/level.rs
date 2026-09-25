@@ -496,7 +496,17 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // added wall (L7: 2.5-4.9x, L6: 2.4-7.3x vs shipped) against T4 board slack
     // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
     // near-optimal-class wall for worse bytes. Scope stops at L8.
-    if level == 8 || level == 9 {
+    if level == 9 {
+        // L9-only retune (per-cell size census 2026-09-25: silesia.tar +0.0061%,
+        // +3,942 B of 64,701,600 — inside the <=1% authorized spend; local chunk
+        // probes: passes1 −28% wall, passes2 −16% for +0.6%, depth a no-op on
+        // dense corpora). Near-opt at matched depth with passes 2. L8 is NOT
+        // retuned (agent-19: silent scope creep) — it keeps the L11-knob route.
+        let mut p = default_params_parallel_route(11);
+        p.near_optimal.max_optim_passes = 2;
+        return p;
+    }
+    if level == 8 {
         return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
@@ -1161,11 +1171,26 @@ mod tests {
             Strategy::Lazy2,
             "T>1 L9 must not silently share the T1 engine"
         );
-        // the L8/L9 -> L11 recursion: near-optimal knobs alias at these levels
-        assert_eq!(format!("{par:?}"), format!("{:?}", params_parallel(11)));
+        // 2026-09-25 replacement invariant (the passes-curve + per-cell size
+        // census led to a L9-only passes2 retune): L9 keeps near-opt at matched
+        // depth with passes 2; L8 stays on the L11-knob route (agent-19 task 4:
+        // the retune is level-conditional, not riding the 8/9 recursion).
+        let par8 = params_parallel(8);
+        assert_ne!(
+            format!("{par:?}"),
+            format!("{par8:?}"),
+            "L9 retune is level-conditional"
+        );
+        assert_eq!(
+            par.near_optimal.max_optim_passes, 2,
+            "L9 retune carries passes2"
+        );
+        assert_eq!(
+            par8.near_optimal.max_optim_passes,
+            params_parallel(11).near_optimal.max_optim_passes,
+            "L8 keeps the L11-knob alias"
+        );
         // the x4 depth branch applies to the recursive L9->L11 near-opt params
-        // (else-branch at the parallel_depth floor): document it as DESIGNED,
-        // until per-strategy depth scoping lands with its paired receipts.
         assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
     }
 
