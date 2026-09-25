@@ -1,108 +1,128 @@
-# T(N)==T1 byte-parity unification — the design decision (2026-09-25)
+# T(N) byte-parity unification — design decision v3 (2026-09-25)
 
-## The problem
-`-p N` streams differ from T1 bytes because the chunked pipeline (a) chunks with a
-thread-dependent grid in the un-clamped band, (b) runs `level::params_parallel`
-(depth ×4, Generous headers, try_exact_huffman, good_match=0, and at L8/L9 the
-whole near-opt parser) instead of T1's params, (c) restarts matchfinder state at
-seams. All decode-identical; but equal-bytes across -p was the campaign's charter
-hypothesis that this instrument finally measured on the real corpus.
+Ship shape: **cross-T (N>1) bit-parity + T1 as a distinct, census-tied stream**,
+landed as three separable PRs. v3 supersedes v1/v2 after adversarial review
+(agent-22, findings block-by-block) plus a direct silesia.tar measurement that
+killed the v1 cost ledger.
 
-## The decision options (workshop defaults bolded)
+## What changed v1 → v3, and why
 
-**Option A — T1-adopt-the-stronger-parse.** Promote near-opt at L9-T1, Generous
-headers at every T, drop the params_parallel params divergence. Cost: T1 wall
-triples at L9 (measured 2.6x on the chunk probe, banked) — the wall budget isn't
-tendered. Not viable until the T1 wall deficit closes.
+### Withdrawn: exact T1 == T(N) digest parity (v1 plan step 5 / gates)
+The gate file asserted `digest(T1) == digest(T4)`. That is unreachable by
+chunked encoding: whole-stream T1 matches straddle seams (SOFT_MAX blocks may
+run ≤258 B past a boundary; greedy caps `max_len` at the chunk end), so even
+identical params/engine/dict/grid give distinct streams — exactly what
+`records/2026-09-22-ec2-c7a4xl/FINAL-ADJUDICATION.md:48` measured on the real
+corpus. The only route to green is re-routing T1 through the chunked grid
+(= make T1 the serial executor of the pipeline); that is NOT tendered. Pricing:
+T1 wall risk (per-chunk `LdxCompressor::new` ~1.9 MB scratch + glue copies —
+the 2026-08-30 solvency receipt already convicted chunk-count-driven wall at
+big files), T1 byte changes on all levels, staleness of the whole pin stack
+(`one_encode_only` count contract, perf_shape, ir_vs_ldx, startup_cost, tie
+cage). Re-opens it only if the owner raises the size cap above the wall win it
+would need; the cap is currently ≤1% — Tooltip: the charter decides:
+cross-`-p` equal bytes is what the instrument was built to retire.
 
-**Option B — chunked engine per level (machine-identical, wins Sizes)**: put the
-SERIAL route's params into the parallel pipeline (params, Lean budget, no
-try_exact_huffman, level_uses_ldx extended to support (dict, data)). Cost: T4 L8-9
-size reverts (+23,413 B/8 MiB, inside the ≤1% cap with paired-wall), wall wins
-everywhere measured. Requires extending `compress::ldx::compress_into` with a dict
-window — the deferred L1-in-ldx item (sprint plan §7) — as the mechanism.
+### Killed: retiring the near-opt strategy at L9/T>1 (v1 plan step 3)
+Direct silesia.tar on trunk 546dc07d (M1, released CLI):
+`L1 T4 +0.0021% | L6 T4 −0.34% | L9 T4 −2.91%` vs T1.
+Reverting L9/T>1 to Lazy2 = **+2.9% size on the T4/L9 cell** — 10× the v1
+"+23,413 B/8 MiB ≈ +0.29%" row (that row double-divides; 23,413/8 MiB *is*
+0.279%, and the text-class chunk is +22,926 B/1.8 MB = +1.27%). The owner cap
+is ≤1%: the revert is not tendered by ANY bundle. The pigz L9/T4 wall stays
+the named open cell, attacked only where the allowance covers it: the trunk's
+banked passes2 retune (−16% chunk wall at +0.6% size) is exactly that lever,
+and the frozen-box lap adjudicates it (below).
 
-**Option C — the stitched-stream, parallel subconscious**: keep parallel params
-for wall; make only the GLUE identical (framing + emit boundaries pinned to the
-grid seams, synced flushes exactly at seams, and dict seams identical to Serial's
-windows) — which needs grid determinism (Option B's step 2, WITHOUT the params
-unification). Cost: streams stay distinct unless the per-chunk stream boundaries
-coincide with the final block boundaries in both routes. Measured: T4 already
-BLOCK-ALIGNED at silesia-levels (bin/tab/txt body rows stop in one block) — this
-makes A and B colocate more often than not. Complexity: the grid must be pinned
-(canonical T4) so the layout is stable.
+### Accepted: the reviewer's split-bundle (blast-radius control)
+One mega-PR = the clause structure's refuse case. Three PRs, each with its own
+narrow abort and pin envelope.
 
-## Positions from the receipts
-- The per-cell census at silesia.tar is +0.0061% (passes2). The wall win is the
-  thing that matters; bytes-per-cell for these fixtures is firm.
-- The `pigz L9/T4` and `libdeflate L2/T5` cells are the two named LOSSES. Option B
-  reopens both walls toward parity-or-win and keeps size inside the cap. It is the
-  only option where the compressor keeps winning at T4 while the encoder becomes
-  ONE code path per level.
+## Per-level engine ownership (the table v1 lacked)
 
-## The unification plan (Option B-first)
-1. Extend `compress::ldx` to accept a (dict, data) window (the L1-in-ldx sprint
-   item, agent-17's P2 sibling). Unit probe: roundtrip parity through the three
-   oracles at seam offsets k*grid ± {0..64}.
-2. Extend `pipelined_block_size` to drop the parallel-multiplier arm (pin to the
-   canonical serial grid); the grid pin test (thread_byte_parity grid-layout pin)
-   turns green here.
-3. Route `deflate_into`'s parallel=true branch at L8/L9 through the chunked-SERIAL
-   params (params(9) at depth 600, Lean header) and REMOVE the near-opt at T>1.
-   The params_parallel function retires.
-4. The remaining footprint: try_exact_huffman (T1 keeps off; T>1 must switch off
-   in the chunk pipeline for parity), the Generous-vs-Lean header budget (Lean
-   for parity), the seam-state restart (agent-18 §3.4 — accept as the cost of
-   chunking; it is what the byte-identity tolerance covers), and the x4 depth
-   leak (retires with params_parallel).
-5. Byte-parity gates turn green: `tests/thread_byte_parity.rs` at all levels, the
-   grid pin, the seam proptest. `won_cells_stay_won` re-verifies the ledger rows
-   still won (expect +2,258 B stays: L9/T4 size vs gzip still won).
-6. Then: the Ir budgets at the changed cells re-derive (regen UPDATE_IR_VS_LDX),
-   the fingerprint pins regenerate per the retune discipline, and the frozen-box
-   wall lap decides both the parity unification AND the L9 strategy revert in one
-   run + one adjudication.
+| levels | T1 engine | T>1 chunk engine | v3 parity PR |
+|---|---|---|---|
+| L1, L3, L6, L7 | legacy (`level_uses_ldx` exceptions) | legacy (`params_parallel` level class) | PR-2 |
+| L0, L2, L4, L5, L8, L9 | ldx port whole-buffer | pipelined legacy today | PR-3 (ldx dict-chunk) |
 
-## The costs we accept (ledger rows come itemized)
-- L9-T4 size: +23,413 B/8 MiB (the banked pre-restructure row) — the pinned near-opt
-  upgrade's size win is what we are trading for the parity + the 0.58x wall.
-- The x4 depth multiplier's byte savings at WHAT contributed — witness: the depth
-  split measured a no-op on dense corpora; the multiplier only mattered at depth
-  400 near-opt — it retires with the strategy.
-- The L1/L3/L6/L7 legacy-route exclusions stay UNLESS the evidence demands; the
-  parity fix does not need to retire them — those routes are T1-only and the
-  parallel pipeline stopped using them after this retune.
+PR-2 touches ONLY the first row. Its params-source rule: at each of those
+levels the T>1 chunk params stay **the level's current T>1 params** (NOT the
+T1 set — at L1 that means `apply_l1_fast_parallel_knobs`; do NOT import the
+T1-only `apply_l1_match_reach_t1_knobs`, whose T4 pairing is the adjudicated
+NO-SHIP `pigz:ecoli.fastq:L1:T4:wall` cell). Parity = engine, grid, header
+budget, and flush seams identical across T with per-level params frozen; T1
+stays whole-buffer.
 
-## ⚠ CORRECTION (2026-09-25, direct M1 measurement on the real corpus)
+## PR-2 — cross-T parity at the legacy levels (the first landing)
+1. `pipelined_block_size` loses the `by_parallelism` arm: the canonical grid is
+   the serial bound per level — the L6+ 2 MB clamp
+   (`MAX_T_AWARE_BLOCK_SIZE_L6_UP`), the L1–L5 8 MB bound — with chunk count
+   computed from input length only (`ceil(input/grid)`), never from `threads`.
+   This keeps the shipped big-file walls (the 2 MB cap is the measured state)
+   and removes the thread-coupling in one stroke.
+2. Header budget: one source for the legacy chunk path (the T>1 Generous
+   budget retires in favour of whichever the T>1 rows at these levels are
+   already pinned to; no size-spend is authorized here — the census decides,
+   and any cell beyond the tie tolerance blocks the PR).
+3. `compress_exact_to_writer` (T1) is untouched. T1 streams keep their
+   whole-buffer whole-stream shape.
+4. Gates rewritten (same commit): `tests/thread_byte_parity.rs` asserts
+   `digest(T2) == digest(T4) == digest(T8) == digest(T16)` across a seam-heavy
+   payload + roundtrip at L1/L3/L6/L7; T1-vs-T(N) moves to the census
+   instrument (size ratios on the real-corpus fixtures within tie tolerance,
+   roundtrip-identity always). The T1 leg of the digests is deleted with the
+   note above as the reason it can never hold.
+5. Pin regen, in the SAME commits as each behavior flip: perf_shape rows for
+   the touched levels (grid change alters per-fixture chunk counts → anatomy
+   rows move), `seam_tax`, `startup_cost` fingerprints; the routing pin
+   `t1_vs_parallel_l897_routing_asymmetry_is_deterministic` is inspected
+   against the new layout (L8/L9 route-reading must still be deterministic —
+   it pins a level.rs decision, not a byte); `one_encode_only` count contract
+   (per-input encodes are unchanged — chunking count is not the pin's arity).
+   `ir_vs_ldx` stays untouched (T1 arms unchanged).
+6. Local gates: size census across the representative corpora at the touched
+   levels (per-cell ≤ tie tolerance), wall microprobe (T4 on dense + binary)
+   before ANY push.
 
-The listed L9-T4 cost row is WRONG by ~10x. Direct silesia.tar CLI, trunk
-546dc07d, released build:
-`L1: T4 +0.0021% | L6: T4 −0.34% | L9: T4 −2.91%` (T1 66,715,402 B →
-T4 64,771,367 B at L9). The near-opt@L11-knobs parse buys −2.9% corpus size at
-T4 — consistent with probe 1b's own chunk numbers (+3.5% if reverted) — so:
-- Retiring the near-opt at L9/T>1 (plan step 3) costs ~**+3% size on the whole
-  T4/L9 cell**, NOT +0.29%. It breaches the owner's ≤1% cap and is NOT tendered.
-- The 0.29% figure double-divides (23,413 B/8 MiB *is* 0.279% — treating the
-  same number again as if it were per-1MB). The mixed-corpus corpus dilutes the
-  text-class loss; the text-class chunk cost remains +22,926 B/1.8 MB.
-- CONSEQUENCE: step 3 must be dropped or re-scoped. The viable parity shape is
-  cross-T parity (T2==T4==T8==T16 bit-identical at a pinned grid, keeping each
-  level's T>1 params — the banked passes2 retune stays) with T1 remaining a
-  distinct stream (whole-buffer port), which is exactly the alternative the
-  FINAL-ADJUDICATION names ("retire via the parity-census instrument (or by
-  making the parallel path bit-match T1)"). Bit-matching T1 from the parallel
-  side would additionally need the seam-match hold-back that no option here
-  prices; NOT in this design.
+## PR-3 — ldx dict-chunk engine at the port levels (deferred, gated)
+Needed for cross-T parity at L0/L2/L4/L5/L8/L9 (T1 is whole-buffer-port there
+— the shipped engine; T>1 must then run ldx per chunk or the streams' engines
+differ at every port level). The ldx chunk protocol needs, per the review:
+- `is_last` / starting-offset (`data_start`) parameters — BFINAL must be
+  suppressible mid-stream, and only the final chunk takes it.
+- an alignment report for stored blocks (`ChunkMeta{pad_bits,
+  needs_alignment}`-equivalent) so the splice protocol can lock seams, and
+  passthrough keyed on the DATA extent (not the glued length) so tiny chunks
+  take stored blocks instead of tripping the MIN_BLOCK invariant.
+- one glue copy per chunk (dict + data joined) — the "no scratch, no cop"y
+  `compress_into` contract is amended for this API variant only;
+  hc-matchfinder's sliding rebase makes a disjoint two-slice window unsound.
+Gates: three-oracle seam probe (roundtrip parity through the oracles at
+`k*grid ± {0..64}`, stored-fragment coverage, passthrough edges), then the
+per-cell census at every touched level before its routing flips, then the
+Ir/budget rows and `ir_vs_ldx` regen on the box.
+This PR does NOT block the lap; its first gate is the probe, landing only if
+the census stays inside the tie tolerance.
+
+## PR-1 — the wall lap (already staged)
+The frozen-box session adjudicates trunk's passes2 retune vs aa682fcc per
+`docs/board/retune-wall-lap-runbook.md` (pigz:silesia.tar:L9:T4:wall trigger).
+Revised fallback struct: the v1 "revert to Lazy2 pair-for-pair" leg is dead by
+the cap; if ABORT fires, the adjudicated fallback is keep-size + accept the
+wall cell + open a NEW wall lever under the cap (the lever hunt is the box
+session's brief).
+
+## Stale-comment sweeps owed (review minors)
+- `src/compress/ldx/mod.rs:225-228`: "test/differential entry point, not a
+  shipping one … nothing routes here" — wrong since the production routing
+  landed; amend to "the port's output entry point; chunked regime also uses
+  the dict-chunk API below when PR-3 lands".
+- `docs/board/sprint-2026-09-25.md` §P2 reference to "sprint plan §7" — the
+  deferred L1-in-ldx item is tracked here (PR-3), not in a nonexistent §7.
+- `docs/board/sprint-2026-09-25.md` line 11's `level.rs:539` citation →
+  `level.rs:560-570` on this branch.
 
 ## Sequencing
-This unification lands AFTER the frozen-box lap adjudicates the passes2 retune —
-the same box session covers both (the retune lap runs first; the unification's
-wall*size lap runs after, on the same box).
-
-REVISED per the correction above: the unification ships the *cross-T parity*
-shape only (pinned grid, shared params per level — steps 1, 2, 4, 5 with step 3
-dropped). If the retune ABORTs at the pigz L9/T4 trigger, the located fail is
-not resolved by reverting the strategy (that now costs +3% size, past the cap);
-the abort adjudication must instead pick between keeping the size (wall loss
-stays) and a NEW wall lever priced under the cap — that pick is the box
-session's job, not this doc's.
+Box lap first (PR-1's adjudication) — it is already staged and SSO-gated.
+PR-2 lands from microbench + census receipts AFTER the lap's trunk-shifted
+pins re-bind. PR-3 lands per its own gates, independently.
