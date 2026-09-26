@@ -349,6 +349,14 @@ define_counters!(
     // the block-count lever is argued from. Previously INFERRED at ~350 B/header from the
     // seam accounting; this counter replaces the inference.
     dynamic_header_bits_total,
+    // Lever-#3 probe (2026-09-25): `prev_block_used_only_literals` decides the
+    // next block's `min_match_len` (near_optimal.rs:572-576). If it never
+    // flips TRUE on real corpora, block-parallel optimize_and_flush is
+    // byte-identical by evidence, not argument (the freshness chain has
+    // nothing to deliver). `near_opt_only_literals_blocks` counts TRUE
+    // returns; `near_opt_flush_blocks` counts every flush, for the rate.
+    near_opt_flush_blocks,
+    near_opt_only_literals_blocks,
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,

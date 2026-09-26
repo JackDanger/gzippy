@@ -464,6 +464,14 @@ impl Optimizer {
             None,
         );
 
+        // Lever-#3 freshness-chain probe (2026-09-25): the flip rate of the
+        // only-literals selection that feeds the NEXT block's
+        // `min_match_len`. feature-off builds compile both to zero bytes.
+        crate::anatomy_count!(near_opt_flush_blocks);
+        if used_only_literals {
+            crate::anatomy_count!(near_opt_only_literals_blocks);
+        }
+
         used_only_literals
     }
 }
