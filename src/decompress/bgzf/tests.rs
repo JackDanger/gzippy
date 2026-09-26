@@ -1,2156 +1,1254 @@
-//! BGZF (Block GZIP Format) Parallel Decompression
-//!
-//! BGZF files have independent blocks with embedded size markers, allowing
-//! perfect parallelism with zero lock contention.
-//!
-//! ## Strategy
-//!
-//! 1. Parse BGZF headers to find all block boundaries and output sizes (ISIZE)
-//! 2. Pre-allocate entire output buffer based on sum of ISIZE values
-//! 3. Decompress blocks in parallel, writing directly to pre-calculated offsets
-//! 4. Single write of complete output
-//!
-//! ## Performance Target: 4000+ MB/s with 14 threads
-//!
-//! With single-threaded inflate at 10700 MB/s and no lock contention,
-//! theoretical max is ~150,000 MB/s. Memory bandwidth limits us to ~4000-5000 MB/s.
+use super::*;
+use crate::assert_slices_eq;
 
-#![allow(clippy::needless_range_loop)]
+// ── STAGE-2 routing predicate (§1.2): greedy-LPT `fast_path_ok`. Feed
+//    synthetic member distributions and assert the fast (member-per-worker)
+//    vs chunked (within-member) route. ─────────────────────────────────────
 
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[allow(unused_imports)]
-use crate::decompress::two_level_table::{FastBits, TurboBits, TwoLevelTable};
-
-/// BGZF block information
-#[derive(Debug, Clone)]
-pub(crate) struct BgzfBlock {
-    /// Byte offset of block start in compressed data
-    start: usize,
-    /// Total block length (including header and trailer)
-    length: usize,
-    /// Uncompressed size (from ISIZE trailer)
-    isize: u32,
-    /// Output offset (calculated during planning)
-    output_offset: usize,
-    /// Byte offset of raw deflate data within the block (past gzip header)
-    deflate_start: usize,
+/// Build a `BgzfBlock` from (compressed_length, isize); the fields the
+/// predicate reads. Offsets are irrelevant to the schedule sim.
+fn mm(length: usize, isize: u32) -> BgzfBlock {
+    BgzfBlock {
+        start: 0,
+        length,
+        isize,
+        output_offset: 0,
+        deflate_start: 0,
+    }
 }
 
-/// Parse all BGZF blocks from compressed data
-fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
-    let mut blocks = Vec::new();
-    let mut offset = 0;
-    let mut output_offset = 0;
+#[test]
+fn fast_path_ok_balanced_many_members() {
+    // 40 balanced members (mm_many) at T8 ⇒ LPT makespan ≈ ideal ⇒ fast.
+    let members: Vec<_> = (0..40).map(|_| mm(1_000_000, 3_000_000)).collect();
+    assert!(fast_path_ok(&members, 8));
+    assert!(fast_path_ok(&members, 16));
+}
 
-    while offset + 18 < data.len() {
-        // Check gzip magic
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
-            break;
-        }
+#[test]
+fn fast_path_ok_single_dominant_member_rejected() {
+    // mm_uneven: 3 tiny + 1 dominant ⇒ dominant ≫ half the total ⇒ chunked.
+    let members = vec![
+        mm(50_000, 150_000),
+        mm(50_000, 150_000),
+        mm(50_000, 150_000),
+        mm(9_000_000, 27_000_000),
+    ];
+    assert!(!fast_path_ok(&members, 4));
+    assert!(!fast_path_ok(&members, 8));
+}
 
-        // Must have FEXTRA flag
-        if data[offset + 3] & 0x04 == 0 {
-            break;
-        }
+#[test]
+fn fast_path_ok_fewer_members_than_workers_rejected() {
+    // few-large: 3 balanced members but T8 ⇒ workers idle ⇒ chunked.
+    let members = vec![
+        mm(3_000_000, 9_000_000),
+        mm(3_000_000, 9_000_000),
+        mm(3_000_000, 9_000_000),
+    ];
+    assert!(!fast_path_ok(&members, 8));
+    // ...but at T2 the same three saturate the pool ⇒ fast.
+    assert!(fast_path_ok(&members, 2));
+}
 
-        // Get XLEN
-        if offset + 12 > data.len() {
-            break;
-        }
-        let xlen = u16::from_le_bytes([data[offset + 10], data[offset + 11]]) as usize;
-        if offset + 12 + xlen > data.len() {
-            break;
-        }
+#[test]
+fn fast_path_ok_adversarial_two_huge_many_tiny_rejected() {
+    // Many members but two huge ones must share a worker at T8 ⇒ makespan
+    // ≫ ideal ⇒ chunked (the scalar-threshold blind spot [R1-#8]).
+    let mut members: Vec<_> = (0..30).map(|_| mm(100_000, 300_000)).collect();
+    members.push(mm(8_000_000, 24_000_000));
+    members.push(mm(8_000_000, 24_000_000));
+    assert!(!fast_path_ok(&members, 8));
+}
 
-        // Find GZ subfield with block size
-        let extra_start = offset + 12;
-        let extra_field = &data[extra_start..extra_start + xlen];
-        let mut block_size = None;
-        let mut pos = 0;
+#[test]
+fn fast_path_ok_stored_dense_member_counted_by_output() {
+    // A stored (incompressible-then-stored) member: tiny share of Σcompressed
+    // but its DECODE cost tracks its large output. The isize blend lifts its
+    // cost so it is not mis-scheduled as trivial. Two such stored-dense
+    // members that would each dominate by output ⇒ rejected at T4.
+    let members = vec![
+        mm(2_100_000, 2_000_000), // ~stored: ratio ≈ 1
+        mm(2_100_000, 2_000_000),
+        mm(500_000, 4_000_000), // highly compressible, small input
+        mm(500_000, 4_000_000),
+    ];
+    // Global ratio is dragged up by the compressible members; the stored
+    // members' output-based cost keeps the schedule balanced here → fast at T2.
+    assert!(fast_path_ok(&members, 2));
+}
 
-        while pos + 4 <= extra_field.len() {
-            let subfield_id = &extra_field[pos..pos + 2];
-            let subfield_len =
-                u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
+/// Helper to compare byte slices with concise error output
+fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
+    if actual == expected {
+        return;
+    }
+    let first_diff = actual
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .find(|(_, (a, b))| a != b)
+        .map(|(i, _)| i);
 
-            if subfield_id == b"GZ" {
-                if subfield_len == 4 && pos + 8 <= extra_field.len() {
-                    // New 4-byte format (supports blocks > 64KB)
-                    let size = u32::from_le_bytes([
-                        extra_field[pos + 4],
-                        extra_field[pos + 5],
-                        extra_field[pos + 6],
-                        extra_field[pos + 7],
-                    ]) as usize;
-                    if size > 0 {
-                        block_size = Some(size);
+    let mut msg = format!("\n{} - byte mismatch:\n", context);
+    msg.push_str(&format!(
+        "  lengths: actual={}, expected={}\n",
+        actual.len(),
+        expected.len()
+    ));
+    if let Some(pos) = first_diff {
+        msg.push_str(&format!("  first diff at byte {}\n", pos));
+        msg.push_str(&format!(
+            "  actual[{}]={:#04x}, expected[{}]={:#04x}\n",
+            pos, actual[pos], pos, expected[pos]
+        ));
+        let start = pos.saturating_sub(10);
+        let end = (pos + 20).min(actual.len()).min(expected.len());
+        if end > start {
+            let actual_ctx: String = actual[start..end]
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
                     }
-                    break;
-                } else if subfield_len == 2 && pos + 6 <= extra_field.len() {
-                    // Legacy 2-byte format (BSIZE-1)
-                    let size_minus_1 =
-                        u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]) as usize;
-                    block_size = Some(size_minus_1 + 1);
-                    break;
+                })
+                .collect();
+            let expected_ctx: String = expected[start..end]
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            msg.push_str(&format!(
+                "  actual  [{}..{}]: \"{}\"\n",
+                start, end, actual_ctx
+            ));
+            msg.push_str(&format!(
+                "  expected[{}..{}]: \"{}\"\n",
+                start, end, expected_ctx
+            ));
+        }
+    }
+    panic!("{}", msg);
+}
+
+// =========================================================================
+// TURBO PATH UNIT TESTS - Debug the optimized decoder
+// =========================================================================
+
+/// Test TurboBits basic operations
+#[test]
+fn test_turbo_bits_basic() {
+    // Simple data: 8 bytes
+    let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+    let mut bits = TurboBits::new(&data);
+
+    // Should have loaded data
+    assert!(bits.has_bits(8), "Should have at least 8 bits");
+
+    // Read first byte
+    let byte1 = bits.read(8);
+    assert_eq!(byte1, 0x12, "First byte should be 0x12");
+
+    // Read second byte
+    bits.ensure(8);
+    let byte2 = bits.read(8);
+    assert_eq!(byte2, 0x34, "Second byte should be 0x34");
+}
+
+/// Test TurboBits align operation
+#[test]
+fn test_turbo_bits_align() {
+    let data = [0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+    let mut bits = TurboBits::new(&data);
+
+    // Read 3 bits
+    let _ = bits.read(3);
+
+    // Align to byte boundary (should skip 5 bits)
+    bits.align();
+
+    // Now read should give second byte
+    bits.ensure(8);
+    let byte = bits.read(8);
+    assert_eq!(byte, 0x12, "After align, should read 0x12");
+}
+
+/// Test turbo inflate with simple literal-only data
+#[test]
+fn test_turbo_inflate_literals() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Simple literals - no back-references
+    let original = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(1)); // Fast = mostly literals
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    eprintln!(
+        "Original: {} bytes, Compressed: {} bytes",
+        original.len(),
+        compressed.len()
+    );
+    eprintln!(
+        "Compressed hex: {:02x?}",
+        &compressed[..compressed.len().min(32)]
+    );
+
+    // Test standard path
+    let mut output_std = vec![0u8; original.len() + 100];
+    let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+    assert_eq!(
+        &output_std[..size_std],
+        &original[..],
+        "Standard path failed"
+    );
+    eprintln!("Standard decoded: {} bytes", size_std);
+
+    // Test turbo path
+    let mut output_turbo = vec![0u8; original.len() + 100];
+    let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
+    eprintln!("Turbo decoded: {} bytes", size_turbo);
+    eprintln!(
+        "Turbo output: {:?}",
+        String::from_utf8_lossy(&output_turbo[..size_turbo])
+    );
+    eprintln!("Expected:     {:?}", String::from_utf8_lossy(original));
+
+    assert_eq!(
+        size_turbo, size_std,
+        "Turbo size mismatch: {} vs {}",
+        size_turbo, size_std
+    );
+    assert_eq!(
+        &output_turbo[..size_turbo],
+        &original[..],
+        "Turbo content mismatch"
+    );
+}
+
+/// Test turbo inflate with repetitive data (back-references)
+#[test]
+fn test_turbo_inflate_rle() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Repetitive data - will use RLE (distance=1)
+    let original = vec![b'X'; 1000];
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Test standard path
+    let mut output_std = vec![0u8; original.len() + 100];
+    let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+    assert_eq!(
+        &output_std[..size_std],
+        &original[..],
+        "Standard path failed"
+    );
+
+    // Test turbo path
+    let mut output_turbo = vec![0u8; original.len() + 100];
+    let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
+
+    assert_eq!(
+        size_turbo, size_std,
+        "Turbo size mismatch: {} vs {}",
+        size_turbo, size_std
+    );
+    assert_eq!(
+        &output_turbo[..size_turbo],
+        &original[..],
+        "Turbo content mismatch"
+    );
+}
+
+/// Test turbo inflate with mixed data (literals + back-references)
+#[test]
+fn test_turbo_inflate_mixed() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Mixed data - pattern that repeats
+    let pattern = b"The quick brown fox jumps over the lazy dog. ";
+    let original: Vec<u8> = pattern.iter().cycle().take(500).copied().collect();
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Test standard path
+    let mut output_std = vec![0u8; original.len() + 100];
+    let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+    assert_bytes_eq(&output_std[..size_std], &original[..], "standard path");
+
+    // Test turbo path
+    let mut output_turbo = vec![0u8; original.len() + 100];
+    let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
+
+    assert_eq!(
+        size_turbo, size_std,
+        "Turbo size mismatch: {} vs {}",
+        size_turbo, size_std
+    );
+    assert_bytes_eq(
+        &output_turbo[..size_turbo],
+        &original[..],
+        "turbo_inflate_mixed",
+    );
+}
+
+/// Debug test: trace through turbo decode to find the bug
+#[test]
+fn test_turbo_decode_trace() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Test with increasing sizes to find where it breaks
+    for size in [8, 10, 12, 16, 20, 24, 26] {
+        let original: Vec<u8> = (b'A'..).take(size).collect();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Standard path
+        let mut output_std = vec![0u8; 100];
+        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+
+        // Turbo path
+        let mut output_turbo = vec![0u8; 100];
+        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
+
+        let match_ok =
+            size_turbo == size_std && output_turbo[..size_turbo] == output_std[..size_std];
+
+        if !match_ok {
+            eprintln!("\n=== MISMATCH at size {} ===", size);
+            eprintln!("Original: {:?}", String::from_utf8_lossy(&original));
+            eprintln!(
+                "Compressed: {} bytes, hex: {:02x?}",
+                compressed.len(),
+                compressed
+            );
+            eprintln!(
+                "Standard: {} bytes, output: {:?}",
+                size_std,
+                String::from_utf8_lossy(&output_std[..size_std])
+            );
+            eprintln!(
+                "Turbo: {} bytes, output: {:?}",
+                size_turbo,
+                String::from_utf8_lossy(&output_turbo[..size_turbo])
+            );
+
+            // Show byte-by-byte comparison
+            for i in 0..size_std.max(size_turbo) {
+                let std_byte = if i < size_std { output_std[i] } else { 0 };
+                let turbo_byte = if i < size_turbo { output_turbo[i] } else { 0 };
+                if std_byte != turbo_byte {
+                    eprintln!(
+                        "  Position {}: std='{}' (0x{:02x}) vs turbo='{}' (0x{:02x})",
+                        i, std_byte as char, std_byte, turbo_byte as char, turbo_byte
+                    );
                 }
             }
-
-            pos += 4 + subfield_len;
-        }
-
-        let length = match block_size {
-            Some(l) if l > 0 && offset + l <= data.len() => l,
-            _ => break,
-        };
-
-        // Read ISIZE from trailer (last 4 bytes of block)
-        let isize = if length >= 8 {
-            let trailer_start = offset + length - 4;
-            u32::from_le_bytes([
-                data[trailer_start],
-                data[trailer_start + 1],
-                data[trailer_start + 2],
-                data[trailer_start + 3],
-            ])
+            panic!("Turbo mismatch at size {}", size);
         } else {
-            0
+            eprintln!("Size {}: OK", size);
+        }
+    }
+}
+
+// =========================================================================
+// ORIGINAL TESTS
+// =========================================================================
+
+#[test]
+fn test_inflate_into() {
+    // Create test data
+    let original = b"Hello, World! This is a test of the BGZF inflate_into function.";
+
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Decompress into pre-allocated buffer
+    let mut output = vec![0u8; original.len()];
+    let actual_size = inflate_into(&compressed, &mut output).unwrap();
+
+    assert_eq!(actual_size, original.len());
+    assert_slices_eq!(&output[..actual_size], &original[..]);
+}
+
+/// Test multi-literal decode correctness with various data patterns
+#[test]
+fn test_multi_literal_correctness() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Test 1: Mostly literals (random-ish data)
+    let original1: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&original1).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut output = vec![0u8; original1.len() + 1000];
+    let size = inflate_into(&compressed, &mut output).unwrap();
+    assert_eq!(size, original1.len(), "Size mismatch for literals-only");
+    assert_eq!(&output[..size], &original1[..], "Content mismatch");
+
+    // Test 2: Highly repetitive (many back-references)
+    let original2: Vec<u8> = "ABCDEFGHIJ".repeat(1000).into_bytes();
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&original2).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut output = vec![0u8; original2.len() + 1000];
+    let size = inflate_into(&compressed, &mut output).unwrap();
+    assert_eq!(size, original2.len(), "Size mismatch for repetitive");
+    assert_eq!(&output[..size], &original2[..], "Content mismatch");
+
+    // Test 3: Mixed patterns
+    let mut original3 = Vec::new();
+    for i in 0..100 {
+        original3.extend_from_slice(&[(i * 7) as u8; 50]);
+        original3.extend_from_slice(b"REPEAT_THIS_STRING_");
+    }
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&original3).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut output = vec![0u8; original3.len() + 1000];
+    let size = inflate_into(&compressed, &mut output).unwrap();
+    assert_eq!(size, original3.len(), "Size mismatch for mixed");
+    assert_eq!(&output[..size], &original3[..], "Content mismatch");
+}
+
+/// Micro-benchmark: decode loop without branching overhead
+/// This shows the theoretical maximum throughput if we eliminate branching
+#[test]
+fn microbench_decode_loop() {
+    use crate::decompress::two_level_table::FastBits;
+
+    // Create synthetic bit stream
+    let data: Vec<u8> = (0..8_000_000u64).map(|i| (i * 7 % 256) as u8).collect();
+
+    // Build a simple LUT with fixed Huffman codes
+    let lens: Vec<u8> = (0..288u16)
+        .map(|i| {
+            if i < 144 {
+                8
+            } else if i < 256 {
+                9
+            } else if i < 280 {
+                7
+            } else {
+                8
+            }
+        })
+        .collect();
+    let lut = crate::decompress::combined_lut::CombinedLUT::build(&lens, &[5u8; 32]).unwrap();
+
+    // Benchmark: tight loop (lookup + consume, no branching)
+    let iterations = 5_000_000u64;
+    let mut sum = 0u64;
+    let mut bits = FastBits::new(&data);
+
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        bits.ensure(12);
+        let entry = lut.decode(bits.buffer());
+        bits.consume(entry.bits_to_skip as u32);
+        sum += entry.symbol_or_length as u64;
+    }
+    let elapsed = start.elapsed();
+    let ops_per_sec = iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+    eprintln!("\n=== Decode Loop Micro-Benchmark ===");
+    eprintln!("Tight loop (no branching): {:.1} M/s", ops_per_sec);
+    eprintln!("Sum (prevent optimization): {}", sum);
+
+    // Key insight: ~1500 M ops/s is possible without branching
+    // Real decode loop is ~1470 M symbols/s (11,773 MB/s)
+    // The 61% gap to libdeflate (18,952 MB/s) is NOT from bit operations
+    // It's from branch overhead in the main decode loop
+}
+
+/// Benchmark inflate_into vs libdeflate
+#[test]
+fn benchmark_inflate_into() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Create 1MB of compressible data (same pattern as fast_inflate benchmark)
+    let original: Vec<u8> = (0..1_000_000)
+        .map(|i| ((i * 7 + i / 100) % 256) as u8)
+        .collect();
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Warm up
+    let mut output = vec![0u8; original.len() + 1000];
+    for _ in 0..3 {
+        let _ = inflate_into(&compressed, &mut output);
+    }
+
+    // Benchmark our implementation
+    let start = std::time::Instant::now();
+    let iterations = 50;
+    for _ in 0..iterations {
+        let _ = inflate_into(&compressed, &mut output);
+    }
+    let our_time = start.elapsed();
+    let our_speed =
+        original.len() as f64 * iterations as f64 / our_time.as_secs_f64() / 1_000_000.0;
+
+    // Benchmark libdeflate
+    let mut libdeflate = libdeflater::Decompressor::new();
+    let mut ld_output = vec![0u8; original.len() + 1000];
+
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = libdeflate.deflate_decompress(&compressed, &mut ld_output);
+    }
+    let ld_time = start.elapsed();
+    let ld_speed = original.len() as f64 * iterations as f64 / ld_time.as_secs_f64() / 1_000_000.0;
+
+    let ratio = our_time.as_secs_f64() / ld_time.as_secs_f64();
+
+    eprintln!("\n=== inflate_into vs libdeflate ===");
+    eprintln!("Our inflate_into: {:.1} MB/s", our_speed);
+    eprintln!("libdeflate:       {:.1} MB/s", ld_speed);
+    eprintln!("Ratio: {:.2}x slower than libdeflate", ratio);
+    eprintln!("Gap to close: {:.0}%", (ratio - 1.0) * 100.0);
+
+    // Verify correctness
+    let size = inflate_into(&compressed, &mut output).unwrap();
+    assert_eq!(size, original.len());
+}
+
+/// Benchmark packed LUT decode vs CombinedLUT  
+#[test]
+fn benchmark_packed_vs_combined() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    // Create 1MB of mixed content data for realistic testing
+    let mut original = Vec::with_capacity(1_000_000);
+    for i in 0..100_000 {
+        // Mix of literals, runs, and varied patterns
+        original.push(((i * 7) % 256) as u8);
+        original.push((i % 256) as u8);
+        if i % 100 == 0 {
+            // Add some runs
+            original.extend(std::iter::repeat_n(b'A', 10));
+        }
+    }
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Warm up by running the full decompression a few times
+    let mut output = vec![0u8; original.len() + 10000];
+    for _ in 0..5 {
+        let _ = inflate_into(&compressed, &mut output);
+    }
+
+    // Benchmark the inflate_into function which uses CombinedLUT
+    let iterations = 100;
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = inflate_into(&compressed, &mut output);
+    }
+    let time = start.elapsed();
+    let speed = original.len() as f64 * iterations as f64 / time.as_secs_f64() / 1_000_000.0;
+
+    eprintln!("\n=== inflate_into (CombinedLUT) Benchmark ===");
+    eprintln!("Output size: {} bytes", original.len());
+    eprintln!("Iterations: {}", iterations);
+    eprintln!("Speed: {:.1} MB/s", speed);
+}
+
+#[test]
+fn test_bgzf_parallel() {
+    // Test with a gzippy-compressed file if available
+    let data = match std::fs::read("benchmark_data/test-gzippy-l1-t14.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("Skipping test - no gzippy test file");
+            return;
+        }
+    };
+
+    // Get expected output from flate2
+    use std::io::Read;
+    let mut expected = Vec::new();
+    let mut decoder = flate2::read::MultiGzDecoder::new(&data[..]);
+    decoder.read_to_end(&mut expected).unwrap();
+
+    // Test our parallel decompressor
+    let mut output = Vec::new();
+    decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
+
+    assert_eq!(output.len(), expected.len(), "Size mismatch");
+
+    // Find first mismatch
+    for (i, (&a, &b)) in output.iter().zip(expected.iter()).enumerate() {
+        if a != b {
+            let start = i.saturating_sub(10);
+            let end = (i + 20).min(output.len());
+            eprintln!(
+                "First mismatch at byte {}: got {:02x} expected {:02x}",
+                i, a, b
+            );
+            eprintln!("Context - ours: {:02x?}", &output[start..end]);
+            eprintln!("Context - expected: {:02x?}", &expected[start..end]);
+            panic!("Content mismatch at byte {}", i);
+        }
+    }
+}
+
+#[test]
+fn benchmark_bgzf_parallel() {
+    let data = match std::fs::read("benchmark_data/test-gzippy-l1-t14.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("Skipping benchmark - no test file");
+            return;
+        }
+    };
+
+    // Get expected size
+    use std::io::Read;
+    let mut expected = Vec::new();
+    let mut decoder = flate2::read::MultiGzDecoder::new(&data[..]);
+    decoder.read_to_end(&mut expected).unwrap();
+    let expected_size = expected.len();
+
+    // Warm up
+    for _ in 0..3 {
+        let mut output = Vec::new();
+        decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
+    }
+
+    // Benchmark
+    let start = std::time::Instant::now();
+    let iterations = 5;
+    for _ in 0..iterations {
+        let mut output = Vec::new();
+        decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
+    }
+    let elapsed = start.elapsed() / iterations;
+    let speed = expected_size as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+    eprintln!("BGZF parallel (8 threads): {:.1} MB/s", speed);
+}
+
+#[test]
+fn test_multi_member_parallel() {
+    // Create a multi-member gzip file programmatically
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+    let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
+    let part3: Vec<u8> = (0..100_000).map(|i| ((i + 100) % 256) as u8).collect();
+
+    // Compress each part separately
+    let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+    encoder1.write_all(&part1).unwrap();
+    let compressed1 = encoder1.finish().unwrap();
+
+    let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+    encoder2.write_all(&part2).unwrap();
+    let compressed2 = encoder2.finish().unwrap();
+
+    let mut encoder3 = GzEncoder::new(Vec::new(), Compression::default());
+    encoder3.write_all(&part3).unwrap();
+    let compressed3 = encoder3.finish().unwrap();
+
+    // Concatenate them (like `cat part1.gz part2.gz part3.gz > multi.gz`)
+    let mut multi = compressed1.clone();
+    multi.extend_from_slice(&compressed2);
+    multi.extend_from_slice(&compressed3);
+
+    assert!(
+        crate::decompress::format::is_likely_multi_member(&multi),
+        "Should detect multi-member"
+    );
+
+    // Get expected output
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    expected.extend_from_slice(&part3);
+
+    // Test our parallel decompressor
+    let mut output = Vec::new();
+    decompress_multi_member_parallel(&multi, &mut output, 4).unwrap();
+
+    assert_eq!(output.len(), expected.len(), "Size mismatch");
+    assert_slices_eq!(output, expected, "Content mismatch");
+}
+
+#[test]
+fn test_multi_member_large() {
+    // Create a larger multi-member test
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    let mut multi = Vec::new();
+    let mut expected = Vec::new();
+    let num_members = 10;
+
+    for i in 0..num_members {
+        let part: Vec<u8> = (0..50_000).map(|j| ((i * 17 + j) % 256) as u8).collect();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&part).unwrap();
+        multi.extend_from_slice(&encoder.finish().unwrap());
+
+        expected.extend_from_slice(&part);
+    }
+
+    assert!(
+        crate::decompress::format::is_likely_multi_member(&multi),
+        "Should detect multi-member"
+    );
+
+    // Test parallel decompressor
+    let mut output = Vec::new();
+    decompress_multi_member_parallel(&multi, &mut output, 8).unwrap();
+
+    assert_eq!(output.len(), expected.len(), "Size mismatch");
+    assert_slices_eq!(output, expected, "Content mismatch");
+}
+
+/// Main decompression benchmark - compares gzippy vs libdeflater crate
+/// Benchmarks raw deflate decompression using the PRODUCTION path (libdeflate C FFI).
+/// This is what inflate_into_pub() delivers — the function used by every production
+/// decode call (BGZF blocks, multi-member members, single-member stream).
+///
+/// Run with: cargo test --release bench_production_inflate -- --nocapture
+#[test]
+fn bench_production_inflate() {
+    let _ = crate::tests::datasets::prepare_datasets();
+
+    let datasets = [
+        (
+            "silesia",
+            "benchmark_data/silesia-gzip.tar.gz",
+            "mixed content",
+        ),
+        (
+            "software",
+            "benchmark_data/software.archive.gz",
+            "source code",
+        ),
+        ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+    ];
+
+    const WARMUP: usize = 3;
+    let iterations: usize = std::env::var("BENCH_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║           GZIPPY DECOMPRESSION BENCHMARK                     ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!(
+        "║  Warmup: {} iterations, Measured: {} iterations              ║",
+        WARMUP, iterations
+    );
+    eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+    for (name, path, desc) in &datasets {
+        let gz = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("⚠ Skipping {} - file not found: {}", name, path);
+                continue;
+            }
         };
 
-        // Deflate data starts after the full gzip header (including optional fields)
-        let mut deflate_start = offset + 12 + xlen;
-        let flags = data[offset + 3];
-        // FNAME: null-terminated filename
-        if flags & 0x08 != 0 {
-            while deflate_start < offset + length && data[deflate_start] != 0 {
-                deflate_start += 1;
-            }
-            deflate_start += 1; // skip null terminator
-        }
-        // FCOMMENT: null-terminated comment
-        if flags & 0x10 != 0 {
-            while deflate_start < offset + length && data[deflate_start] != 0 {
-                deflate_start += 1;
-            }
-            deflate_start += 1;
-        }
-        // FHCRC: 2-byte header CRC
-        if flags & 0x02 != 0 {
-            deflate_start += 2;
-        }
-
-        blocks.push(BgzfBlock {
-            start: offset,
-            length,
-            isize,
-            output_offset,
-            deflate_start,
-        });
-
-        output_offset += isize as usize;
-        offset += length;
-    }
-
-    if blocks.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "No BGZF blocks found",
-        ));
-    }
-
-    Ok(blocks)
-}
-
-/// Inflate directly into a pre-allocated output slice
-///
-/// Decompress raw deflate data using the pure-Rust inflate engine.
-///
-/// This is the key function for zero-copy parallel decompression. The pure-Rust
-/// decoder (`inflate_consume_first`) is stateless — there is no per-call
-/// decompressor to allocate/free — and carries NO C-FFI, so the BGZF /
-/// multi-member decode graph is FFI-free.
-fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    crate::decompress::inflate::consume_first_decode::inflate_consume_first(deflate_data, output)
-}
-
-/// Public version of inflate_into for use by other modules.
-///
-/// Pure-Rust inflate — no C-FFI in the decode graph.
-pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    inflate_into(deflate_data, output)
-}
-
-/// Parallel BGZF decompression returning output as a Vec.
-///
-/// This is the zero-copy path: the output Vec is filled in-place by
-/// parallel threads, then returned directly to the caller without any
-/// intermediate copies.
-pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::Result<Vec<u8>> {
-    let blocks = parse_bgzf_blocks(data)?;
-
-    if blocks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let total_output: usize = blocks.iter().map(|b| b.isize as usize).sum();
-    let output = vec![0u8; total_output];
-
-    let num_blocks = blocks.len();
-    let next_block = AtomicUsize::new(0);
-    let had_error = std::sync::atomic::AtomicBool::new(false);
-
-    use std::cell::UnsafeCell;
-    struct OutputBuffer(UnsafeCell<Vec<u8>>);
-    unsafe impl Sync for OutputBuffer {}
-
-    let output_cell = OutputBuffer(UnsafeCell::new(output));
-
-    std::thread::scope(|scope| {
-        for _ in 0..num_threads.min(num_blocks) {
-            let blocks_ref = &blocks;
-            let next_ref = &next_block;
-            let output_ref = &output_cell;
-            let error_ref = &had_error;
-
-            scope.spawn(move || {
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_blocks {
-                        break;
-                    }
-
-                    let block = &blocks_ref[idx];
-                    let out_size = block.isize as usize;
-                    if out_size == 0 {
-                        continue;
-                    }
-
-                    // Raw deflate: skip gzip header, stop before 8-byte trailer
-                    let deflate_end = block.start + block.length - 8;
-                    let deflate_data = &data[block.deflate_start..deflate_end];
-
-                    // SAFETY: Each block writes to a disjoint region
-                    let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
-                    let out_start = block.output_offset;
-                    let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
-                    };
-
-                    match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_out) if actual_out == out_size => {}
-                        _ => error_ref.store(true, Ordering::Relaxed),
-                    }
-                }
-            });
-        }
-    });
-
-    if had_error.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CRC32 or size mismatch in BGZF block",
-        ));
-    }
-
-    Ok(output_cell.0.into_inner())
-}
-
-/// Parallel BGZF decompression writing to a generic writer.
-///
-/// For single-thread (num_threads=1), uses a streaming path that decompresses
-/// block-by-block into a reusable buffer.
-///
-/// For multi-thread, uses a pipelined architecture:
-///   - N decoder threads pull blocks via atomic counter, decompress into
-///     pooled buffers, and send (block_index, buffer) through a channel
-///   - Main thread receives completed blocks, writes them in order,
-///     and returns buffers to the pool
-///
-/// This avoids allocating the full output (~211MB for silesia) which caused
-/// ~53K page faults and only 2x scaling with 4 threads. The pipeline uses
-/// a small buffer pool (~1MB) and writes blocks as they complete.
-pub fn decompress_bgzf_parallel<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> io::Result<u64> {
-    if num_threads <= 1 {
-        return decompress_bgzf_streaming(data, writer);
-    }
-    decompress_bgzf_pipelined(data, writer, num_threads)
-}
-
-/// Pipelined parallel BGZF: decoder threads + ordered writer.
-///
-/// Buffer pool avoids per-block allocation. Completed blocks are written
-/// in order as they arrive, overlapping I/O with decompression.
-fn decompress_bgzf_pipelined<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> io::Result<u64> {
-    let blocks = parse_bgzf_blocks(data)?;
-    if blocks.is_empty() {
-        return Ok(0);
-    }
-
-    let num_blocks = blocks.len();
-    let max_block_output = blocks.iter().map(|b| b.isize as usize).max().unwrap_or(0);
-
-    // Completed blocks channel: (block_index, decompressed_data)
-    // Bounded to 2*threads so decoders don't race too far ahead of the writer.
-    let channel_cap = num_threads * 2 + 2;
-    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(channel_cap);
-
-    let next_block = AtomicUsize::new(0);
-    let had_error = std::sync::atomic::AtomicBool::new(false);
-    let mut total = 0u64;
-
-    std::thread::scope(|scope| {
-        // Spawn N decoder threads, each with its own reusable buffer
-        for _ in 0..num_threads.min(num_blocks) {
-            let done_tx = done_tx.clone();
-            let blocks_ref = &blocks;
-            let next_ref = &next_block;
-            let error_ref = &had_error;
-
-            scope.spawn(move || {
-                let mut buf = vec![0u8; max_block_output];
-
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_blocks {
-                        break;
-                    }
-
-                    let block = &blocks_ref[idx];
-                    let out_size = block.isize as usize;
-                    if out_size == 0 {
-                        let _ = done_tx.send((idx, Vec::new()));
-                        continue;
-                    }
-
-                    if buf.len() < out_size {
-                        buf.resize(out_size, 0);
-                    }
-
-                    let deflate_end = block.start + block.length - 8;
-                    let deflate_data = &data[block.deflate_start..deflate_end];
-
-                    let actual_out = match inflate_into(deflate_data, &mut buf[..out_size]) {
-                        Ok(n) if n == out_size => n,
-                        Ok(n) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                            n
-                        }
-                        Err(_) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                            0
-                        }
-                    };
-
-                    // Transfer buffer ownership through the channel; swap in a
-                    // fresh capacity-only Vec so the next block has a buffer to
-                    // fill without any copy of the decompressed bytes.
-                    buf.truncate(actual_out);
-                    let send_buf =
-                        std::mem::replace(&mut buf, Vec::with_capacity(max_block_output));
-                    let _ = done_tx.send((idx, send_buf));
-                }
-            });
-        }
-        drop(done_tx); // close channel when all decoders finish
-
-        // Writer: receive completed blocks, write in order.
-        // Blocks may arrive out of order; hold them in a BTreeMap until
-        // the next sequential block is available, then flush.
-        let mut next_to_write = 0usize;
-        let mut pending = std::collections::BTreeMap::<usize, Vec<u8>>::new();
-        let mut write_error: Option<io::Error> = None;
-
-        for (idx, data_vec) in &done_rx {
-            pending.insert(idx, data_vec);
-
-            while let Some(block_data) = pending.remove(&next_to_write) {
-                if write_error.is_none() && !block_data.is_empty() {
-                    if let Err(e) = writer.write_all(&block_data) {
-                        write_error = Some(e);
-                    }
-                    total += block_data.len() as u64;
-                }
-                next_to_write += 1;
-            }
-        }
-    });
-
-    if had_error.load(Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CRC32 or size mismatch in BGZF block",
-        ));
-    }
-
-    Ok(total)
-}
-
-/// Streaming BGZF decompression: decompress one block at a time into a
-/// reusable buffer, write immediately. No full-output-size allocation.
-///
-/// Uses raw deflate decompress with a reused decompressor (skipping both
-/// gzip header re-parsing and decompressor alloc/free per block).
-fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    let blocks = parse_bgzf_blocks(data)?;
-    if blocks.is_empty() {
-        return Ok(0);
-    }
-
-    let max_block_output = blocks.iter().map(|b| b.isize as usize).max().unwrap_or(0);
-    let mut buf = vec![0u8; max_block_output];
-    let mut total = 0u64;
-
-    for block in &blocks {
-        let out_size = block.isize as usize;
-        if out_size == 0 {
+        // Guard against an empty/short benchmark fixture: a gzip member is
+        // a 10-byte header + 8-byte trailer, so anything shorter cannot be
+        // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
+        // On CI runners where the fixture is absent or a stub (observed:
+        // macos-arm64 pure-rust-inflate test job), skip rather than panic.
+        if gz.len() < 18 {
+            eprintln!(
+                "⚠ Skipping {} - fixture too short ({} bytes): {}",
+                name,
+                gz.len(),
+                path
+            );
             continue;
         }
 
-        if out_size > buf.len() {
-            buf.resize(out_size, 0);
+        // Parse gzip header to get raw deflate data
+        let mut pos = 10;
+        let flg = gz[3];
+        if (flg & 0x04) != 0 {
+            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+            pos += 2 + xlen;
         }
-
-        // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE)
-        let deflate_end = block.start + block.length - 8;
-        let deflate_data = &data[block.deflate_start..deflate_end];
-
-        let actual_out = inflate_into(deflate_data, &mut buf[..out_size]).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "deflate decompression failed in BGZF block",
-            )
-        })?;
-
-        writer.write_all(&buf[..actual_out])?;
-        total += actual_out as u64;
-    }
-    Ok(total)
-}
-
-// ============================================================================
-// Multi-Member Parallel Decompression (for pigz-style files)
-// ============================================================================
-
-/// Parse a gzip header starting at `data[offset..]`, returning the byte offset
-/// of the raw deflate data (past the header). Returns None if the header is
-/// malformed or extends past the given `end` bound.
-fn parse_gzip_header(data: &[u8], offset: usize, end: usize) -> Option<usize> {
-    if end - offset < 10 {
-        return None;
-    }
-    let mut ds = offset + 10;
-    let flg = data[offset + 3];
-    if flg & 0x04 != 0 {
-        if ds + 2 > end {
-            return None;
-        }
-        let xlen = u16::from_le_bytes([data[ds], data[ds + 1]]) as usize;
-        ds += 2 + xlen;
-    }
-    if flg & 0x08 != 0 {
-        while ds < end && data[ds] != 0 {
-            ds += 1;
-        }
-        ds += 1;
-    }
-    if flg & 0x10 != 0 {
-        while ds < end && data[ds] != 0 {
-            ds += 1;
-        }
-        ds += 1;
-    }
-    if flg & 0x02 != 0 {
-        ds += 2;
-    }
-    if ds >= end {
-        None
-    } else {
-        Some(ds)
-    }
-}
-
-/// Fast O(N) member boundary scan for multi-member gzip files (pigz-style).
-///
-/// Scans for gzip magic bytes (0x1f 0x8b 0x08) with header validation to find
-/// member boundaries without any decompression. Reads ISIZE from each member's
-/// trailer for output pre-allocation. This replaces the old `scan_member_boundaries_exact`
-/// which fully decompressed every member (doing 2x total work).
-///
-/// Returns None if the data is not multi-member or boundaries look suspicious.
-pub(crate) fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
-    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
-        return None;
-    }
-
-    let header_size = crate::decompress::format::parse_gzip_header_size(data).unwrap_or(10);
-    let mut starts = vec![0usize];
-
-    // SIMD magic-byte search (memchr::memmem) instead of a byte-by-byte linear
-    // scan. This is a T-invariant SERIAL pass over the WHOLE compressed file that
-    // ran BEFORE any parallel dispatch, so on a large compressible-dominant
-    // multi-member stream it was ~50% of the T16 wall (Amdahl). memmem vectorizes
-    // the 3-byte magic search (~10× the byte-loop throughput) for an identical
-    // `starts` list — every candidate is re-validated by the same ISIZE + flag
-    // predicate below, so the output is byte-for-byte unchanged.
-    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
-    let finder = memchr::memmem::Finder::new(GZIP_MAGIC);
-    let mut search_from = header_size + 1;
-    while search_from + 10 < data.len() {
-        let Some(rel) = finder.find(&data[search_from..]) else {
-            break;
-        };
-        let pos = search_from + rel;
-        // Replicate the byte-loop guard exactly: positions whose full 10-byte
-        // header window would run past EOF were never inspected. Matches are
-        // returned left-to-right, so once one crosses that bound every later one
-        // does too — stop.
-        if pos + 10 >= data.len() {
-            break;
-        }
-        if data[pos + 3] & 0xE0 == 0
-            // Validate preceding ISIZE field (same heuristic as is_likely_multi_member).
-            // Filters false positives from stored-block streams where raw bytes appear
-            // verbatim and can accidentally match the gzip magic sequence.
-            && pos >= 4
-            && {
-                let isize = u32::from_le_bytes([
-                    data[pos - 4], data[pos - 3], data[pos - 2], data[pos - 1],
-                ]);
-                isize > 0 && isize <= 1_073_741_824
+        if (flg & 0x08) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
             }
-        {
-            starts.push(pos);
+            pos += 1;
         }
-        search_from = pos + 1;
-    }
-
-    if starts.len() < 2 {
-        return None;
-    }
-
-    let mut members = Vec::with_capacity(starts.len());
-    let mut output_offset = 0usize;
-
-    for i in 0..starts.len() {
-        let start = starts[i];
-        let end = if i + 1 < starts.len() {
-            starts[i + 1]
-        } else {
-            data.len()
-        };
-        let length = end - start;
-
-        if length < 18 {
-            return None;
-        }
-
-        let isize_val =
-            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
-
-        let deflate_start = parse_gzip_header(data, start, end)?;
-
-        members.push(BgzfBlock {
-            start,
-            length,
-            isize: isize_val,
-            output_offset,
-            deflate_start,
-        });
-
-        output_offset += isize_val as usize;
-    }
-
-    // Sanity: total output shouldn't be wildly disproportionate to input
-    if output_offset > data.len().saturating_mul(100) {
-        return None;
-    }
-
-    Some(members)
-}
-
-/// Routing predicate (design §1.2 / [R1-#8]): decide whether the plain
-/// multi-member **member-per-worker** fast path
-/// ([`decompress_multi_member_parallel`]) will keep all `t_eff` workers busy —
-/// i.e. whether the member size distribution is balanced enough that assigning
-/// one whole member per worker approaches the ideal makespan `Σcost / t_eff`.
-///
-/// This replaces two coupled scalar thresholds (`count ≥ K·T && max_share ≤
-/// MARGIN/T`) with a **single-member dominance** test over per-member DECODE
-/// COST: the member-per-worker split can rebalance any distribution EXCEPT one
-/// where a member's cost exceeds roughly one worker's fair share of the total —
-/// that member pins a worker for the whole decode and cannot be sped up by more
-/// workers, whereas the chunked path splits *within* it. On a `false` verdict
-/// the classifier routes the whole file to the chunked path
-/// ([`crate::decompress::DecodePath::MultiMemberChunked`]).
-///
-/// Why the dominance test rather than a literal greedy-LPT makespan-vs-ideal
-/// comparison (design §1.2's first form): indivisible equal members carry an
-/// inherent integer-granularity imbalance (40 members over 16 workers has a
-/// forced 3-vs-2 split = 20% over the *continuous* ideal) that a naive
-/// `makespan ≤ (1+EPS)·(Σcost/T)` test mis-flags as "unbalanced" — it would
-/// reject the design's own canonical `mm_many` fast-path example. Granularity
-/// imbalance is NOT a splittable-dominance problem; only a member exceeding a
-/// worker's share is. The dominance test captures exactly the discriminating
-/// signal and is granularity-robust; it also subsumes the adversarial
-/// "two-huge-members" case (each huge member alone exceeds a worker share). A
-/// residual mis-pick (e.g. 3 medium members on 2 workers, where within-member
-/// chunking could shave the forced 3-vs-2 tail) is only a perf choice between
-/// two *correct* paths [R1-#8] and is bounded by `EPS`.
-///
-/// Cost model (`cost_i`): the member's compressed length, blended up by the
-/// output-size proxy `isize_i / global_ratio` so a stored-dense member (whose
-/// decode cost tracks its OUTPUT, not its tiny compressed input) is not
-/// undercounted. `global_ratio = Σ isize / Σ compressed`. All inputs are
-/// content-derived from the header scan — no host benchmark scar.
-///
-/// This is a **perf routing predicate only**: after per-member CRC32/ISIZE is
-/// equalized across paths, a wrong verdict mis-picks between two *correct*
-/// paths, never between correctness levels. `EPS` is a plain named constant (no
-/// production env knob) locked by the box-side OQ-2 gate.
-///
-/// STAGE-2d: WIRED into `classify_gzip` — a plain multi-member T>1 stream routes
-/// to [`crate::decompress::DecodePath::MultiMemberGrid`] when this returns
-/// `false` (dominant/uneven ⇒ the whole-file chunk grid spreads the dominant
-/// member across all workers) and to `MultiMemberPar` (member-per-worker) when
-/// it returns `true` (numerous + balanced).
-pub(crate) fn fast_path_ok(members: &[BgzfBlock], t_eff: usize) -> bool {
-    /// Slack on a member's cost over one worker's fair share (`Σcost / t_eff`)
-    /// that still counts as "not dominant". Absorbs the integer granularity of
-    /// indivisible members; locked by the OQ-2 schedule-predictor gate (§7).
-    const EPS: f64 = 0.25;
-
-    let t_eff = t_eff.max(1);
-    let n = members.len();
-    // Fewer members than workers ⇒ at least one worker idles ⇒ the fast path
-    // cannot saturate the pool; the chunked path splits within members.
-    if n < t_eff {
-        return false;
-    }
-
-    // global_ratio = Σ isize / Σ compressed (guard against a zero denom).
-    let total_compressed: u128 = members.iter().map(|m| m.length as u128).sum();
-    let total_isize: u128 = members.iter().map(|m| m.isize as u128).sum();
-    if total_compressed == 0 {
-        return false;
-    }
-    // Fixed-point ratio ×256 to avoid float in the per-member blend.
-    let ratio_q8: u128 = (total_isize.saturating_mul(256) / total_compressed).max(1);
-
-    let costs = members.iter().map(|m| {
-        let by_input = m.length as u128;
-        // isize / global_ratio  ==  isize * 256 / ratio_q8
-        let by_output = (m.isize as u128).saturating_mul(256) / ratio_q8;
-        by_input.max(by_output)
-    });
-
-    let mut total_cost: u128 = 0;
-    let mut max_cost: u128 = 0;
-    for c in costs {
-        total_cost += c;
-        if c > max_cost {
-            max_cost = c;
-        }
-    }
-    if total_cost == 0 {
-        return false;
-    }
-
-    // Dominance test: the largest member's cost must not exceed one worker's
-    // fair share (`total_cost / t_eff`) by more than `EPS`. A dominant member
-    // pins a worker and can only be sped up by the within-member chunked path.
-    let ideal = total_cost as f64 / t_eff as f64;
-    (max_cost as f64) <= (1.0 + EPS) * ideal
-}
-
-/// GZ coverage walk: hop member-to-member via the "GZ" FEXTRA subfield's
-/// whole-member size and report whether EVERY member carries the subfield AND
-/// the walk ends exactly at the end of `data`. Only meaningful once
-/// [`crate::decompress::format::has_bgzf_markers`] has fired on member 1.
-///
-/// A pure gzippy-parallel file walks cleanly to `data.len()` → the GZ fast path
-/// ([`decompress_bgzf_parallel`]) is safe. A mixed concatenation (a plain member
-/// lacking the subfield, or a walk that over/undershoots the file end) returns
-/// `false` so the classifier routes the whole file to the cross-member chunked
-/// path deterministically at classify time — never an in-body fallback. [R2-#3]
-pub(crate) fn gz_coverage_is_pure(data: &[u8]) -> bool {
-    let mut offset = 0usize;
-    let mut members = 0usize;
-    // Bound the walk so a hostile size field cannot loop forever; a real
-    // gzippy-parallel file has one member per block (≤ millions, but each step
-    // advances by ≥ 1 header so the file length already bounds it).
-    while offset + 12 <= data.len() {
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b || data[offset + 2] != 0x08 {
-            return false;
-        }
-        // FEXTRA must be present for a GZ member.
-        if data[offset + 3] & 0x04 == 0 {
-            return false;
-        }
-        let member_len = match gz_member_len(data, offset) {
-            Some(l) if l >= 18 => l,
-            _ => return false,
-        };
-        offset = match offset.checked_add(member_len) {
-            Some(o) if o <= data.len() => o,
-            _ => return false,
-        };
-        members += 1;
-    }
-    members >= 1 && offset == data.len()
-}
-
-/// Parse the "GZ" FEXTRA subfield's whole-member compressed length at `start`.
-/// Mirrors the size decode in the BGZF block scan (bgzf.rs:315-351): 4-byte
-/// form = whole-member size, legacy 2-byte form = BSIZE-1. Returns `None` when
-/// the member lacks the subfield or the header is truncated.
-fn gz_member_len(data: &[u8], start: usize) -> Option<usize> {
-    if start + 12 > data.len() {
-        return None;
-    }
-    let xlen = u16::from_le_bytes([data[start + 10], data[start + 11]]) as usize;
-    if start + 12 + xlen > data.len() {
-        return None;
-    }
-    let extra = &data[start + 12..start + 12 + xlen];
-    let mut pos = 0;
-    while pos + 4 <= extra.len() {
-        let id = &extra[pos..pos + 2];
-        let sublen = u16::from_le_bytes([extra[pos + 2], extra[pos + 3]]) as usize;
-        if id == b"GZ" {
-            if sublen == 4 && pos + 8 <= extra.len() {
-                let size = u32::from_le_bytes([
-                    extra[pos + 4],
-                    extra[pos + 5],
-                    extra[pos + 6],
-                    extra[pos + 7],
-                ]) as usize;
-                return if size > 0 { Some(size) } else { None };
-            } else if sublen == 2 && pos + 6 <= extra.len() {
-                let size_minus_1 = u16::from_le_bytes([extra[pos + 4], extra[pos + 5]]) as usize;
-                return Some(size_minus_1 + 1);
+        if (flg & 0x10) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
             }
-            return None;
+            pos += 1;
         }
-        pos += 4 + sublen;
-    }
-    None
-}
-
-/// Zero-copy parallel decompression for multi-member gzip files.
-///
-/// Uses the same approach as BGZF parallel: pre-allocate output, write directly
-/// to disjoint slices. Member boundaries are found by `scan_member_boundaries_fast`
-/// (header-only scan), and each member's deflate body is decoded with the
-/// pure-Rust `inflate_into` (no C-FFI).
-///
-/// This avoids the old approach's issues:
-/// - No intermediate Vec copies (~1GB saved for 503MB output)
-/// - No per-chunk buffer allocation
-/// - Work-stealing across all members for optimal load balancing
-pub fn decompress_multi_member_parallel_to_vec(
-    data: &[u8],
-    num_threads: usize,
-) -> io::Result<Vec<u8>> {
-    let members = scan_member_boundaries_fast(data).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Not a multi-member gzip file or boundary scan failed",
-        )
-    })?;
-
-    let total_output: usize = members.iter().map(|m| m.isize as usize).sum();
-    let output = vec![0u8; total_output];
-
-    let num_members = members.len();
-    let next_member = AtomicUsize::new(0);
-    let had_error = std::sync::atomic::AtomicBool::new(false);
-
-    use std::cell::UnsafeCell;
-    struct OutputBuffer(UnsafeCell<Vec<u8>>);
-    unsafe impl Sync for OutputBuffer {}
-
-    let output_cell = OutputBuffer(UnsafeCell::new(output));
-
-    std::thread::scope(|scope| {
-        for _ in 0..num_threads.min(num_members) {
-            let members_ref = &members;
-            let next_ref = &next_member;
-            let output_ref = &output_cell;
-            let error_ref = &had_error;
-
-            scope.spawn(move || {
-                // scan_member_boundaries_fast already parsed each gzip header and
-                // stored deflate_start, so we decode the raw deflate body directly
-                // via the pure-Rust inflate engine (no C-FFI in the decode graph).
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_members {
-                        break;
-                    }
-
-                    let member = &members_ref[idx];
-                    // deflate_start is absolute offset in data; trailer is 8 bytes (CRC32+ISIZE).
-                    // Defensive bounds (fuzz-found panic, bgzf.rs OOB): a malformed member from
-                    // scan_member_boundaries_fast on crafted input can carry length < 8,
-                    // deflate_start > deflate_end, or deflate_end past the buffer — slicing
-                    // `data[deflate_start..deflate_end]` then panics ("slice index starts at N
-                    // but ends at M"). For any VALID member deflate_start <= start+length-8 <=
-                    // data.len(), so these guards are byte-transparent; a bad member flags the
-                    // error and is skipped (the had_error check below turns it into a terminal
-                    // Err, matching the inflate-failure arm).
-                    let deflate_end = match member.start.checked_add(member.length) {
-                        Some(end)
-                            if member.length >= 8
-                                && end - 8 >= member.deflate_start
-                                && end - 8 <= data.len() =>
-                        {
-                            end - 8
-                        }
-                        _ => {
-                            error_ref.store(true, Ordering::Relaxed);
-                            continue;
-                        }
-                    };
-                    let deflate_data = &data[member.deflate_start..deflate_end];
-
-                    // SAFETY: Each member writes to a disjoint region. Defensive bounds: a
-                    // malformed member's output_offset/isize could point past the output
-                    // buffer; `from_raw_parts_mut` past the allocation is UB. Valid members
-                    // satisfy output_offset + isize <= output.len() (the buffer is sized to the
-                    // sum of member ISIZEs), so this guard is byte-transparent.
-                    let out_total = unsafe { (*output_ref.0.get()).len() };
-                    let out_start = member.output_offset;
-                    let out_size = member.isize as usize;
-                    if out_start
-                        .checked_add(out_size)
-                        .is_none_or(|e| e > out_total)
-                    {
-                        error_ref.store(true, Ordering::Relaxed);
-                        continue;
-                    }
-                    let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
-                    let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
-                    };
-
-                    match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_out) if actual_out == out_size => {}
-                        _ => error_ref.store(true, Ordering::Relaxed),
-                    }
-                }
-            });
+        if (flg & 0x02) != 0 {
+            pos += 2;
         }
-    });
 
-    if had_error.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Decompression error in multi-member parallel",
-        ));
-    }
+        let deflate = &gz[pos..gz.len() - 8];
+        let expected_size = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
 
-    Ok(output_cell.0.into_inner())
-}
-
-/// Parallel decompression for multi-member gzip files (pigz-style output).
-///
-/// Delegates to `decompress_multi_member_parallel_to_vec` for zero-copy parallel,
-/// then writes the result. Falls back to sequential for single-member files.
-pub fn decompress_multi_member_parallel<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> io::Result<u64> {
-    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Not a gzip file",
-        ));
-    }
-
-    let output = decompress_multi_member_parallel_to_vec(data, num_threads)?;
-    let len = output.len() as u64;
-    writer.write_all(&output)?;
-    Ok(len)
-}
-
-// ============================================================================
-// Single-Member Parallel Decompression (rapidgzip strategy)
-// ============================================================================
-//
-// For single-member gzip files, we use a two-phase approach:
-// 1. Sequential first pass: decode and record block boundaries + windows
-// 2. Parallel second pass: re-decode each segment using windows as dictionaries
-//
-// This provides speedup when the file is large enough to amortize the overhead.
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::assert_slices_eq;
-
-    // ── STAGE-2 routing predicate (§1.2): greedy-LPT `fast_path_ok`. Feed
-    //    synthetic member distributions and assert the fast (member-per-worker)
-    //    vs chunked (within-member) route. ─────────────────────────────────────
-
-    /// Build a `BgzfBlock` from (compressed_length, isize); the fields the
-    /// predicate reads. Offsets are irrelevant to the schedule sim.
-    fn mm(length: usize, isize: u32) -> BgzfBlock {
-        BgzfBlock {
-            start: 0,
-            length,
-            isize,
-            output_offset: 0,
-            deflate_start: 0,
-        }
-    }
-
-    #[test]
-    fn fast_path_ok_balanced_many_members() {
-        // 40 balanced members (mm_many) at T8 ⇒ LPT makespan ≈ ideal ⇒ fast.
-        let members: Vec<_> = (0..40).map(|_| mm(1_000_000, 3_000_000)).collect();
-        assert!(fast_path_ok(&members, 8));
-        assert!(fast_path_ok(&members, 16));
-    }
-
-    #[test]
-    fn fast_path_ok_single_dominant_member_rejected() {
-        // mm_uneven: 3 tiny + 1 dominant ⇒ dominant ≫ half the total ⇒ chunked.
-        let members = vec![
-            mm(50_000, 150_000),
-            mm(50_000, 150_000),
-            mm(50_000, 150_000),
-            mm(9_000_000, 27_000_000),
-        ];
-        assert!(!fast_path_ok(&members, 4));
-        assert!(!fast_path_ok(&members, 8));
-    }
-
-    #[test]
-    fn fast_path_ok_fewer_members_than_workers_rejected() {
-        // few-large: 3 balanced members but T8 ⇒ workers idle ⇒ chunked.
-        let members = vec![
-            mm(3_000_000, 9_000_000),
-            mm(3_000_000, 9_000_000),
-            mm(3_000_000, 9_000_000),
-        ];
-        assert!(!fast_path_ok(&members, 8));
-        // ...but at T2 the same three saturate the pool ⇒ fast.
-        assert!(fast_path_ok(&members, 2));
-    }
-
-    #[test]
-    fn fast_path_ok_adversarial_two_huge_many_tiny_rejected() {
-        // Many members but two huge ones must share a worker at T8 ⇒ makespan
-        // ≫ ideal ⇒ chunked (the scalar-threshold blind spot [R1-#8]).
-        let mut members: Vec<_> = (0..30).map(|_| mm(100_000, 300_000)).collect();
-        members.push(mm(8_000_000, 24_000_000));
-        members.push(mm(8_000_000, 24_000_000));
-        assert!(!fast_path_ok(&members, 8));
-    }
-
-    #[test]
-    fn fast_path_ok_stored_dense_member_counted_by_output() {
-        // A stored (incompressible-then-stored) member: tiny share of Σcompressed
-        // but its DECODE cost tracks its large output. The isize blend lifts its
-        // cost so it is not mis-scheduled as trivial. Two such stored-dense
-        // members that would each dominate by output ⇒ rejected at T4.
-        let members = vec![
-            mm(2_100_000, 2_000_000), // ~stored: ratio ≈ 1
-            mm(2_100_000, 2_000_000),
-            mm(500_000, 4_000_000), // highly compressible, small input
-            mm(500_000, 4_000_000),
-        ];
-        // Global ratio is dragged up by the compressible members; the stored
-        // members' output-based cost keeps the schedule balanced here → fast at T2.
-        assert!(fast_path_ok(&members, 2));
-    }
-
-    /// Helper to compare byte slices with concise error output
-    fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
-        if actual == expected {
-            return;
-        }
-        let first_diff = actual
-            .iter()
-            .zip(expected.iter())
-            .enumerate()
-            .find(|(_, (a, b))| a != b)
-            .map(|(i, _)| i);
-
-        let mut msg = format!("\n{} - byte mismatch:\n", context);
-        msg.push_str(&format!(
-            "  lengths: actual={}, expected={}\n",
-            actual.len(),
-            expected.len()
-        ));
-        if let Some(pos) = first_diff {
-            msg.push_str(&format!("  first diff at byte {}\n", pos));
-            msg.push_str(&format!(
-                "  actual[{}]={:#04x}, expected[{}]={:#04x}\n",
-                pos, actual[pos], pos, expected[pos]
-            ));
-            let start = pos.saturating_sub(10);
-            let end = (pos + 20).min(actual.len()).min(expected.len());
-            if end > start {
-                let actual_ctx: String = actual[start..end]
-                    .iter()
-                    .map(|&b| {
-                        if b.is_ascii_graphic() || b == b' ' {
-                            b as char
-                        } else {
-                            '.'
-                        }
-                    })
-                    .collect();
-                let expected_ctx: String = expected[start..end]
-                    .iter()
-                    .map(|&b| {
-                        if b.is_ascii_graphic() || b == b' ' {
-                            b as char
-                        } else {
-                            '.'
-                        }
-                    })
-                    .collect();
-                msg.push_str(&format!(
-                    "  actual  [{}..{}]: \"{}\"\n",
-                    start, end, actual_ctx
-                ));
-                msg.push_str(&format!(
-                    "  expected[{}..{}]: \"{}\"\n",
-                    start, end, expected_ctx
-                ));
-            }
-        }
-        panic!("{}", msg);
-    }
-
-    // =========================================================================
-    // TURBO PATH UNIT TESTS - Debug the optimized decoder
-    // =========================================================================
-
-    /// Test TurboBits basic operations
-    #[test]
-    fn test_turbo_bits_basic() {
-        // Simple data: 8 bytes
-        let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
-        let mut bits = TurboBits::new(&data);
-
-        // Should have loaded data
-        assert!(bits.has_bits(8), "Should have at least 8 bits");
-
-        // Read first byte
-        let byte1 = bits.read(8);
-        assert_eq!(byte1, 0x12, "First byte should be 0x12");
-
-        // Read second byte
-        bits.ensure(8);
-        let byte2 = bits.read(8);
-        assert_eq!(byte2, 0x34, "Second byte should be 0x34");
-    }
-
-    /// Test TurboBits align operation
-    #[test]
-    fn test_turbo_bits_align() {
-        let data = [0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
-        let mut bits = TurboBits::new(&data);
-
-        // Read 3 bits
-        let _ = bits.read(3);
-
-        // Align to byte boundary (should skip 5 bits)
-        bits.align();
-
-        // Now read should give second byte
-        bits.ensure(8);
-        let byte = bits.read(8);
-        assert_eq!(byte, 0x12, "After align, should read 0x12");
-    }
-
-    /// Test turbo inflate with simple literal-only data
-    #[test]
-    fn test_turbo_inflate_literals() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Simple literals - no back-references
-        let original = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(1)); // Fast = mostly literals
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let mut output = vec![0u8; expected_size + 1024];
 
         eprintln!(
-            "Original: {} bytes, Compressed: {} bytes",
-            original.len(),
-            compressed.len()
+            "┌─ {} ({}) ─────────────────────────────",
+            name.to_uppercase(),
+            desc
         );
         eprintln!(
-            "Compressed hex: {:02x?}",
-            &compressed[..compressed.len().min(32)]
+            "│  Size: {:.1} MB uncompressed",
+            expected_size as f64 / 1_000_000.0
         );
 
-        // Test standard path
-        let mut output_std = vec![0u8; original.len() + 100];
-        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
-        assert_eq!(
-            &output_std[..size_std],
-            &original[..],
-            "Standard path failed"
-        );
-        eprintln!("Standard decoded: {} bytes", size_std);
-
-        // Test turbo path
-        let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
-        eprintln!("Turbo decoded: {} bytes", size_turbo);
-        eprintln!(
-            "Turbo output: {:?}",
-            String::from_utf8_lossy(&output_turbo[..size_turbo])
-        );
-        eprintln!("Expected:     {:?}", String::from_utf8_lossy(original));
-
-        assert_eq!(
-            size_turbo, size_std,
-            "Turbo size mismatch: {} vs {}",
-            size_turbo, size_std
-        );
-        assert_eq!(
-            &output_turbo[..size_turbo],
-            &original[..],
-            "Turbo content mismatch"
-        );
-    }
-
-    /// Test turbo inflate with repetitive data (back-references)
-    #[test]
-    fn test_turbo_inflate_rle() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Repetitive data - will use RLE (distance=1)
-        let original = vec![b'X'; 1000];
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Test standard path
-        let mut output_std = vec![0u8; original.len() + 100];
-        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
-        assert_eq!(
-            &output_std[..size_std],
-            &original[..],
-            "Standard path failed"
-        );
-
-        // Test turbo path
-        let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
-
-        assert_eq!(
-            size_turbo, size_std,
-            "Turbo size mismatch: {} vs {}",
-            size_turbo, size_std
-        );
-        assert_eq!(
-            &output_turbo[..size_turbo],
-            &original[..],
-            "Turbo content mismatch"
-        );
-    }
-
-    /// Test turbo inflate with mixed data (literals + back-references)
-    #[test]
-    fn test_turbo_inflate_mixed() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Mixed data - pattern that repeats
-        let pattern = b"The quick brown fox jumps over the lazy dog. ";
-        let original: Vec<u8> = pattern.iter().cycle().take(500).copied().collect();
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Test standard path
-        let mut output_std = vec![0u8; original.len() + 100];
-        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
-        assert_bytes_eq(&output_std[..size_std], &original[..], "standard path");
-
-        // Test turbo path
-        let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
-
-        assert_eq!(
-            size_turbo, size_std,
-            "Turbo size mismatch: {} vs {}",
-            size_turbo, size_std
-        );
-        assert_bytes_eq(
-            &output_turbo[..size_turbo],
-            &original[..],
-            "turbo_inflate_mixed",
-        );
-    }
-
-    /// Debug test: trace through turbo decode to find the bug
-    #[test]
-    fn test_turbo_decode_trace() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Test with increasing sizes to find where it breaks
-        for size in [8, 10, 12, 16, 20, 24, 26] {
-            let original: Vec<u8> = (b'A'..).take(size).collect();
-
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(&original).unwrap();
-            let compressed = encoder.finish().unwrap();
-
-            // Standard path
-            let mut output_std = vec![0u8; 100];
-            let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
-
-            // Turbo path
-            let mut output_turbo = vec![0u8; 100];
-            let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
-
-            let match_ok =
-                size_turbo == size_std && output_turbo[..size_turbo] == output_std[..size_std];
-
-            if !match_ok {
-                eprintln!("\n=== MISMATCH at size {} ===", size);
-                eprintln!("Original: {:?}", String::from_utf8_lossy(&original));
-                eprintln!(
-                    "Compressed: {} bytes, hex: {:02x?}",
-                    compressed.len(),
-                    compressed
-                );
-                eprintln!(
-                    "Standard: {} bytes, output: {:?}",
-                    size_std,
-                    String::from_utf8_lossy(&output_std[..size_std])
-                );
-                eprintln!(
-                    "Turbo: {} bytes, output: {:?}",
-                    size_turbo,
-                    String::from_utf8_lossy(&output_turbo[..size_turbo])
-                );
-
-                // Show byte-by-byte comparison
-                for i in 0..size_std.max(size_turbo) {
-                    let std_byte = if i < size_std { output_std[i] } else { 0 };
-                    let turbo_byte = if i < size_turbo { output_turbo[i] } else { 0 };
-                    if std_byte != turbo_byte {
-                        eprintln!(
-                            "  Position {}: std='{}' (0x{:02x}) vs turbo='{}' (0x{:02x})",
-                            i, std_byte as char, std_byte, turbo_byte as char, turbo_byte
-                        );
-                    }
-                }
-                panic!("Turbo mismatch at size {}", size);
-            } else {
-                eprintln!("Size {}: OK", size);
-            }
+        // === BENCH: inflate_into_pub() → pure-Rust inflate_consume_first ===
+        // This is the function called for every block in production
+        // (BGZF blocks, multi-member members, single-member inflate);
+        // the libdeflate C FFI it replaced was removed with the decode
+        // FFI graph (see the module doc on inflate_into above).
+        for _ in 0..WARMUP {
+            let _ = inflate_into_pub(deflate, &mut output);
         }
-    }
-
-    // =========================================================================
-    // ORIGINAL TESTS
-    // =========================================================================
-
-    #[test]
-    fn test_inflate_into() {
-        // Create test data
-        let original = b"Hello, World! This is a test of the BGZF inflate_into function.";
-
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Decompress into pre-allocated buffer
-        let mut output = vec![0u8; original.len()];
-        let actual_size = inflate_into(&compressed, &mut output).unwrap();
-
-        assert_eq!(actual_size, original.len());
-        assert_slices_eq!(&output[..actual_size], &original[..]);
-    }
-
-    /// Test multi-literal decode correctness with various data patterns
-    #[test]
-    fn test_multi_literal_correctness() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Test 1: Mostly literals (random-ish data)
-        let original1: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&original1).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut output = vec![0u8; original1.len() + 1000];
-        let size = inflate_into(&compressed, &mut output).unwrap();
-        assert_eq!(size, original1.len(), "Size mismatch for literals-only");
-        assert_eq!(&output[..size], &original1[..], "Content mismatch");
-
-        // Test 2: Highly repetitive (many back-references)
-        let original2: Vec<u8> = "ABCDEFGHIJ".repeat(1000).into_bytes();
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&original2).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut output = vec![0u8; original2.len() + 1000];
-        let size = inflate_into(&compressed, &mut output).unwrap();
-        assert_eq!(size, original2.len(), "Size mismatch for repetitive");
-        assert_eq!(&output[..size], &original2[..], "Content mismatch");
-
-        // Test 3: Mixed patterns
-        let mut original3 = Vec::new();
-        for i in 0..100 {
-            original3.extend_from_slice(&[(i * 7) as u8; 50]);
-            original3.extend_from_slice(b"REPEAT_THIS_STRING_");
-        }
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&original3).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut output = vec![0u8; original3.len() + 1000];
-        let size = inflate_into(&compressed, &mut output).unwrap();
-        assert_eq!(size, original3.len(), "Size mismatch for mixed");
-        assert_eq!(&output[..size], &original3[..], "Content mismatch");
-    }
-
-    /// Micro-benchmark: decode loop without branching overhead
-    /// This shows the theoretical maximum throughput if we eliminate branching
-    #[test]
-    fn microbench_decode_loop() {
-        use crate::decompress::two_level_table::FastBits;
-
-        // Create synthetic bit stream
-        let data: Vec<u8> = (0..8_000_000u64).map(|i| (i * 7 % 256) as u8).collect();
-
-        // Build a simple LUT with fixed Huffman codes
-        let lens: Vec<u8> = (0..288u16)
-            .map(|i| {
-                if i < 144 {
-                    8
-                } else if i < 256 {
-                    9
-                } else if i < 280 {
-                    7
-                } else {
-                    8
-                }
-            })
-            .collect();
-        let lut = crate::decompress::combined_lut::CombinedLUT::build(&lens, &[5u8; 32]).unwrap();
-
-        // Benchmark: tight loop (lookup + consume, no branching)
-        let iterations = 5_000_000u64;
-        let mut sum = 0u64;
-        let mut bits = FastBits::new(&data);
-
+        // Measure
         let start = std::time::Instant::now();
         for _ in 0..iterations {
-            bits.ensure(12);
-            let entry = lut.decode(bits.buffer());
-            bits.consume(entry.bits_to_skip as u32);
-            sum += entry.symbol_or_length as u64;
+            let _ = inflate_into_pub(deflate, &mut output);
         }
+        let production_speed =
+            (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+
+        // === REFERENCE: libdeflater crate direct (no gzippy wrapper overhead) ===
+        // Shows how much wrapper overhead inflate_into_pub adds vs direct call.
+        // Should be within 1-2% — if not, investigate.
+        for _ in 0..WARMUP {
+            libdeflater::Decompressor::new()
+                .deflate_decompress(deflate, &mut output)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            libdeflater::Decompressor::new()
+                .deflate_decompress(deflate, &mut output)
+                .unwrap();
+        }
+        let direct_libdeflate_speed =
+            (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+
+        let overhead_pct = (1.0 - production_speed / direct_libdeflate_speed) * 100.0;
+
+        eprintln!(
+            "│  production (inflate_into_pub):  {:>8.1} MB/s",
+            production_speed
+        );
+        eprintln!(
+            "│  direct libdeflater (reference): {:>8.1} MB/s  (wrapper overhead: {:.1}%)",
+            direct_libdeflate_speed, overhead_pct
+        );
+        eprintln!("│  NOTE: These are raw deflate numbers. CLI throughput is lower due to");
+        eprintln!("│        gzip header parsing, mmap, routing, CRC32, and write I/O.");
+        eprintln!("└────────────────────────────────────────────────\n");
+    }
+}
+
+/// Analyze decompression with detailed statistics
+/// Run with: cargo test --release bench_analyze -- --nocapture
+#[test]
+fn bench_analyze() {
+    use crate::decompress::inflate::consume_first_decode::{
+        get_block_stats, get_cache_stats, get_spec_cache_stats, get_spec_stats,
+        get_table_cache_size, reset_cache_stats,
+    };
+
+    let _ = crate::tests::datasets::prepare_datasets();
+
+    let datasets = [
+        (
+            "silesia",
+            "benchmark_data/silesia-gzip.tar.gz",
+            "mixed content",
+        ),
+        (
+            "software",
+            "benchmark_data/software.archive.gz",
+            "source code",
+        ),
+        ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+    ];
+
+    eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║           GZIPPY DECOMPRESSION ANALYSIS                      ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Block types, cache stats, path usage                        ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+    for (name, path, desc) in &datasets {
+        let gz = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("  Skipping {} - file not found: {}", name, path);
+                continue;
+            }
+        };
+
+        // Guard against an empty/short benchmark fixture: a gzip member is
+        // a 10-byte header + 8-byte trailer, so anything shorter cannot be
+        // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
+        // On CI runners where the fixture is absent or a stub (observed:
+        // macos-arm64 pure-rust-inflate test job), skip rather than panic.
+        if gz.len() < 18 {
+            eprintln!(
+                "⚠ Skipping {} - fixture too short ({} bytes): {}",
+                name,
+                gz.len(),
+                path
+            );
+            continue;
+        }
+
+        // Parse gzip header to get raw deflate data
+        let mut pos = 10;
+        let flg = gz[3];
+        if (flg & 0x04) != 0 {
+            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+            pos += 2 + xlen;
+        }
+        if (flg & 0x08) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x10) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x02) != 0 {
+            pos += 2;
+        }
+
+        let deflate = &gz[pos..gz.len() - 8];
+        let expected_size = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
+
+        let mut output = vec![0u8; expected_size + 1024];
+
+        // Reset stats and decompress
+        reset_cache_stats();
+        let start = std::time::Instant::now();
+        let _ = inflate_into_pub(deflate, &mut output);
         let elapsed = start.elapsed();
-        let ops_per_sec = iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0;
 
-        eprintln!("\n=== Decode Loop Micro-Benchmark ===");
-        eprintln!("Tight loop (no branching): {:.1} M/s", ops_per_sec);
-        eprintln!("Sum (prevent optimization): {}", sum);
+        // Gather stats
+        let block_stats = get_block_stats();
+        let (cache_hits, cache_misses, cache_rate) = get_cache_stats();
+        let (spec_used, spec_fallback) = get_spec_stats();
 
-        // Key insight: ~1500 M ops/s is possible without branching
-        // Real decode loop is ~1470 M symbols/s (11,773 MB/s)
-        // The 61% gap to libdeflate (18,952 MB/s) is NOT from bit operations
-        // It's from branch overhead in the main decode loop
-    }
-
-    /// Benchmark inflate_into vs libdeflate
-    #[test]
-    fn benchmark_inflate_into() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Create 1MB of compressible data (same pattern as fast_inflate benchmark)
-        let original: Vec<u8> = (0..1_000_000)
-            .map(|i| ((i * 7 + i / 100) % 256) as u8)
-            .collect();
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Warm up
-        let mut output = vec![0u8; original.len() + 1000];
-        for _ in 0..3 {
-            let _ = inflate_into(&compressed, &mut output);
-        }
-
-        // Benchmark our implementation
-        let start = std::time::Instant::now();
-        let iterations = 50;
-        for _ in 0..iterations {
-            let _ = inflate_into(&compressed, &mut output);
-        }
-        let our_time = start.elapsed();
-        let our_speed =
-            original.len() as f64 * iterations as f64 / our_time.as_secs_f64() / 1_000_000.0;
-
-        // Benchmark libdeflate
-        let mut libdeflate = libdeflater::Decompressor::new();
-        let mut ld_output = vec![0u8; original.len() + 1000];
-
-        let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = libdeflate.deflate_decompress(&compressed, &mut ld_output);
-        }
-        let ld_time = start.elapsed();
-        let ld_speed =
-            original.len() as f64 * iterations as f64 / ld_time.as_secs_f64() / 1_000_000.0;
-
-        let ratio = our_time.as_secs_f64() / ld_time.as_secs_f64();
-
-        eprintln!("\n=== inflate_into vs libdeflate ===");
-        eprintln!("Our inflate_into: {:.1} MB/s", our_speed);
-        eprintln!("libdeflate:       {:.1} MB/s", ld_speed);
-        eprintln!("Ratio: {:.2}x slower than libdeflate", ratio);
-        eprintln!("Gap to close: {:.0}%", (ratio - 1.0) * 100.0);
-
-        // Verify correctness
-        let size = inflate_into(&compressed, &mut output).unwrap();
-        assert_eq!(size, original.len());
-    }
-
-    /// Benchmark packed LUT decode vs CombinedLUT  
-    #[test]
-    fn benchmark_packed_vs_combined() {
-        use flate2::write::DeflateEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        // Create 1MB of mixed content data for realistic testing
-        let mut original = Vec::with_capacity(1_000_000);
-        for i in 0..100_000 {
-            // Mix of literals, runs, and varied patterns
-            original.push(((i * 7) % 256) as u8);
-            original.push((i % 256) as u8);
-            if i % 100 == 0 {
-                // Add some runs
-                original.extend(std::iter::repeat_n(b'A', 10));
-            }
-        }
-
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Warm up by running the full decompression a few times
-        let mut output = vec![0u8; original.len() + 10000];
-        for _ in 0..5 {
-            let _ = inflate_into(&compressed, &mut output);
-        }
-
-        // Benchmark the inflate_into function which uses CombinedLUT
-        let iterations = 100;
-        let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = inflate_into(&compressed, &mut output);
-        }
-        let time = start.elapsed();
-        let speed = original.len() as f64 * iterations as f64 / time.as_secs_f64() / 1_000_000.0;
-
-        eprintln!("\n=== inflate_into (CombinedLUT) Benchmark ===");
-        eprintln!("Output size: {} bytes", original.len());
-        eprintln!("Iterations: {}", iterations);
-        eprintln!("Speed: {:.1} MB/s", speed);
-    }
-
-    #[test]
-    fn test_bgzf_parallel() {
-        // Test with a gzippy-compressed file if available
-        let data = match std::fs::read("benchmark_data/test-gzippy-l1-t14.gz") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("Skipping test - no gzippy test file");
-                return;
-            }
-        };
-
-        // Get expected output from flate2
-        use std::io::Read;
-        let mut expected = Vec::new();
-        let mut decoder = flate2::read::MultiGzDecoder::new(&data[..]);
-        decoder.read_to_end(&mut expected).unwrap();
-
-        // Test our parallel decompressor
-        let mut output = Vec::new();
-        decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
-
-        assert_eq!(output.len(), expected.len(), "Size mismatch");
-
-        // Find first mismatch
-        for (i, (&a, &b)) in output.iter().zip(expected.iter()).enumerate() {
-            if a != b {
-                let start = i.saturating_sub(10);
-                let end = (i + 20).min(output.len());
-                eprintln!(
-                    "First mismatch at byte {}: got {:02x} expected {:02x}",
-                    i, a, b
-                );
-                eprintln!("Context - ours: {:02x?}", &output[start..end]);
-                eprintln!("Context - expected: {:02x?}", &expected[start..end]);
-                panic!("Content mismatch at byte {}", i);
-            }
-        }
-    }
-
-    #[test]
-    fn benchmark_bgzf_parallel() {
-        let data = match std::fs::read("benchmark_data/test-gzippy-l1-t14.gz") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("Skipping benchmark - no test file");
-                return;
-            }
-        };
-
-        // Get expected size
-        use std::io::Read;
-        let mut expected = Vec::new();
-        let mut decoder = flate2::read::MultiGzDecoder::new(&data[..]);
-        decoder.read_to_end(&mut expected).unwrap();
-        let expected_size = expected.len();
-
-        // Warm up
-        for _ in 0..3 {
-            let mut output = Vec::new();
-            decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
-        }
-
-        // Benchmark
-        let start = std::time::Instant::now();
-        let iterations = 5;
-        for _ in 0..iterations {
-            let mut output = Vec::new();
-            decompress_bgzf_parallel(&data, &mut output, 8).unwrap();
-        }
-        let elapsed = start.elapsed() / iterations;
         let speed = expected_size as f64 / elapsed.as_secs_f64() / 1_000_000.0;
 
-        eprintln!("BGZF parallel (8 threads): {:.1} MB/s", speed);
-    }
-
-    #[test]
-    fn test_multi_member_parallel() {
-        // Create a multi-member gzip file programmatically
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
-        let part3: Vec<u8> = (0..100_000).map(|i| ((i + 100) % 256) as u8).collect();
-
-        // Compress each part separately
-        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
-        encoder1.write_all(&part1).unwrap();
-        let compressed1 = encoder1.finish().unwrap();
-
-        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
-        encoder2.write_all(&part2).unwrap();
-        let compressed2 = encoder2.finish().unwrap();
-
-        let mut encoder3 = GzEncoder::new(Vec::new(), Compression::default());
-        encoder3.write_all(&part3).unwrap();
-        let compressed3 = encoder3.finish().unwrap();
-
-        // Concatenate them (like `cat part1.gz part2.gz part3.gz > multi.gz`)
-        let mut multi = compressed1.clone();
-        multi.extend_from_slice(&compressed2);
-        multi.extend_from_slice(&compressed3);
-
-        assert!(
-            crate::decompress::format::is_likely_multi_member(&multi),
-            "Should detect multi-member"
-        );
-
-        // Get expected output
-        let mut expected = part1.clone();
-        expected.extend_from_slice(&part2);
-        expected.extend_from_slice(&part3);
-
-        // Test our parallel decompressor
-        let mut output = Vec::new();
-        decompress_multi_member_parallel(&multi, &mut output, 4).unwrap();
-
-        assert_eq!(output.len(), expected.len(), "Size mismatch");
-        assert_slices_eq!(output, expected, "Content mismatch");
-    }
-
-    #[test]
-    fn test_multi_member_large() {
-        // Create a larger multi-member test
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-
-        let mut multi = Vec::new();
-        let mut expected = Vec::new();
-        let num_members = 10;
-
-        for i in 0..num_members {
-            let part: Vec<u8> = (0..50_000).map(|j| ((i * 17 + j) % 256) as u8).collect();
-
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&part).unwrap();
-            multi.extend_from_slice(&encoder.finish().unwrap());
-
-            expected.extend_from_slice(&part);
-        }
-
-        assert!(
-            crate::decompress::format::is_likely_multi_member(&multi),
-            "Should detect multi-member"
-        );
-
-        // Test parallel decompressor
-        let mut output = Vec::new();
-        decompress_multi_member_parallel(&multi, &mut output, 8).unwrap();
-
-        assert_eq!(output.len(), expected.len(), "Size mismatch");
-        assert_slices_eq!(output, expected, "Content mismatch");
-    }
-
-    /// Main decompression benchmark - compares gzippy vs libdeflater crate
-    /// Benchmarks raw deflate decompression using the PRODUCTION path (libdeflate C FFI).
-    /// This is what inflate_into_pub() delivers — the function used by every production
-    /// decode call (BGZF blocks, multi-member members, single-member stream).
-    ///
-    /// Run with: cargo test --release bench_production_inflate -- --nocapture
-    #[test]
-    fn bench_production_inflate() {
-        let _ = crate::tests::datasets::prepare_datasets();
-
-        let datasets = [
-            (
-                "silesia",
-                "benchmark_data/silesia-gzip.tar.gz",
-                "mixed content",
-            ),
-            (
-                "software",
-                "benchmark_data/software.archive.gz",
-                "source code",
-            ),
-            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
-        ];
-
-        const WARMUP: usize = 3;
-        let iterations: usize = std::env::var("BENCH_RUNS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║           GZIPPY DECOMPRESSION BENCHMARK                     ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════╣");
         eprintln!(
-            "║  Warmup: {} iterations, Measured: {} iterations              ║",
-            WARMUP, iterations
+            "┌─ {} ({}) ─────────────────────────────",
+            name.to_uppercase(),
+            desc
         );
-        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+        eprintln!("│");
+        eprintln!(
+            "│  Size: {:.2} MB compressed → {:.2} MB uncompressed",
+            deflate.len() as f64 / 1_000_000.0,
+            expected_size as f64 / 1_000_000.0
+        );
+        eprintln!("│  Speed: {:.1} MB/s", speed);
+        eprintln!("│");
 
-        for (name, path, desc) in &datasets {
-            let gz = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => {
-                    eprintln!("⚠ Skipping {} - file not found: {}", name, path);
-                    continue;
-                }
-            };
-
-            // Guard against an empty/short benchmark fixture: a gzip member is
-            // a 10-byte header + 8-byte trailer, so anything shorter cannot be
-            // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
-            // On CI runners where the fixture is absent or a stub (observed:
-            // macos-arm64 pure-rust-inflate test job), skip rather than panic.
-            if gz.len() < 18 {
-                eprintln!(
-                    "⚠ Skipping {} - fixture too short ({} bytes): {}",
-                    name,
-                    gz.len(),
-                    path
-                );
-                continue;
-            }
-
-            // Parse gzip header to get raw deflate data
-            let mut pos = 10;
-            let flg = gz[3];
-            if (flg & 0x04) != 0 {
-                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
-                pos += 2 + xlen;
-            }
-            if (flg & 0x08) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x10) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x02) != 0 {
-                pos += 2;
-            }
-
-            let deflate = &gz[pos..gz.len() - 8];
-            let expected_size = u32::from_le_bytes([
-                gz[gz.len() - 4],
-                gz[gz.len() - 3],
-                gz[gz.len() - 2],
-                gz[gz.len() - 1],
-            ]) as usize;
-
-            let mut output = vec![0u8; expected_size + 1024];
-
+        // Block type breakdown
+        let total_blocks = block_stats.total_blocks();
+        eprintln!("│  BLOCK TYPES ({} total):", total_blocks);
+        if block_stats.stored_blocks > 0 {
+            let pct = block_stats.stored_blocks as f64 / total_blocks as f64 * 100.0;
+            let bytes_pct = block_stats.stored_bytes as f64 / expected_size as f64 * 100.0;
             eprintln!(
-                "┌─ {} ({}) ─────────────────────────────",
-                name.to_uppercase(),
-                desc
+                "│    Stored:   {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                block_stats.stored_blocks, pct, block_stats.stored_bytes, bytes_pct
             );
-            eprintln!(
-                "│  Size: {:.1} MB uncompressed",
-                expected_size as f64 / 1_000_000.0
-            );
-
-            // === BENCH: inflate_into_pub() → pure-Rust inflate_consume_first ===
-            // This is the function called for every block in production
-            // (BGZF blocks, multi-member members, single-member inflate);
-            // the libdeflate C FFI it replaced was removed with the decode
-            // FFI graph (see the module doc on inflate_into above).
-            for _ in 0..WARMUP {
-                let _ = inflate_into_pub(deflate, &mut output);
-            }
-            // Measure
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                let _ = inflate_into_pub(deflate, &mut output);
-            }
-            let production_speed =
-                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
-
-            // === REFERENCE: libdeflater crate direct (no gzippy wrapper overhead) ===
-            // Shows how much wrapper overhead inflate_into_pub adds vs direct call.
-            // Should be within 1-2% — if not, investigate.
-            for _ in 0..WARMUP {
-                libdeflater::Decompressor::new()
-                    .deflate_decompress(deflate, &mut output)
-                    .unwrap();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                libdeflater::Decompressor::new()
-                    .deflate_decompress(deflate, &mut output)
-                    .unwrap();
-            }
-            let direct_libdeflate_speed =
-                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
-
-            let overhead_pct = (1.0 - production_speed / direct_libdeflate_speed) * 100.0;
-
-            eprintln!(
-                "│  production (inflate_into_pub):  {:>8.1} MB/s",
-                production_speed
-            );
-            eprintln!(
-                "│  direct libdeflater (reference): {:>8.1} MB/s  (wrapper overhead: {:.1}%)",
-                direct_libdeflate_speed, overhead_pct
-            );
-            eprintln!("│  NOTE: These are raw deflate numbers. CLI throughput is lower due to");
-            eprintln!("│        gzip header parsing, mmap, routing, CRC32, and write I/O.");
-            eprintln!("└────────────────────────────────────────────────\n");
         }
+        if block_stats.fixed_blocks > 0 {
+            let pct = block_stats.fixed_blocks as f64 / total_blocks as f64 * 100.0;
+            let bytes_pct = block_stats.fixed_bytes as f64 / expected_size as f64 * 100.0;
+            eprintln!(
+                "│    Fixed:    {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                block_stats.fixed_blocks, pct, block_stats.fixed_bytes, bytes_pct
+            );
+        }
+        if block_stats.dynamic_blocks > 0 {
+            let pct = block_stats.dynamic_blocks as f64 / total_blocks as f64 * 100.0;
+            let bytes_pct = block_stats.dynamic_bytes as f64 / expected_size as f64 * 100.0;
+            eprintln!(
+                "│    Dynamic:  {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                block_stats.dynamic_blocks, pct, block_stats.dynamic_bytes, bytes_pct
+            );
+        }
+        eprintln!("│");
+
+        // Cache stats
+        let total_cache = cache_hits + cache_misses;
+        let cache_size = get_table_cache_size();
+        if total_cache > 0 {
+            eprintln!("│  TABLE CACHE:");
+            eprintln!(
+                "│    Hits:     {:>5} ({:.1}%)",
+                cache_hits,
+                cache_rate * 100.0
+            );
+            eprintln!("│    Misses:   {:>5}", cache_misses);
+            eprintln!("│    Unique:   {:>5} fingerprints", cache_size);
+            eprintln!("│");
+        }
+
+        // Specialized decoder stats
+        let total_spec = spec_used + spec_fallback;
+        let (spec_decoders, spec_failed, spec_total_uses, spec_max_uses) = get_spec_cache_stats();
+        if total_spec > 0 {
+            let spec_rate = spec_used as f64 / total_spec as f64 * 100.0;
+            eprintln!("│  DECODE PATH:");
+            eprintln!("│    Specialized: {:>5} ({:.1}%)", spec_used, spec_rate);
+            eprintln!("│    Generic:     {:>5}", spec_fallback);
+            if spec_decoders > 0 || spec_failed > 0 {
+                eprintln!("│  SPEC CACHE:");
+                eprintln!("│    Decoders:  {:>5} unique tables", spec_decoders);
+                eprintln!("│    Failed:    {:>5} (tables too complex)", spec_failed);
+                if spec_decoders > 0 {
+                    let avg_uses = spec_total_uses as f64 / spec_decoders as f64;
+                    eprintln!(
+                        "│    Reuse:     {:>5.1}x avg, {}x max",
+                        avg_uses, spec_max_uses
+                    );
+                }
+            }
+            eprintln!("│");
+        }
+
+        // Archive characteristics summary
+        let dominant_type = if block_stats.dynamic_bytes > block_stats.fixed_bytes
+            && block_stats.dynamic_bytes > block_stats.stored_bytes
+        {
+            "dynamic"
+        } else if block_stats.fixed_bytes > block_stats.stored_bytes {
+            "fixed"
+        } else {
+            "stored"
+        };
+        eprintln!("│  CHARACTERISTICS:");
+        eprintln!("│    Dominant block type: {}", dominant_type);
+        let compression_ratio = deflate.len() as f64 / expected_size as f64;
+        eprintln!(
+            "│    Compression ratio: {:.2}x ({:.1}% of original)",
+            1.0 / compression_ratio,
+            compression_ratio * 100.0
+        );
+
+        eprintln!("└────────────────────────────────────────────────\n");
     }
 
-    /// Analyze decompression with detailed statistics
-    /// Run with: cargo test --release bench_analyze -- --nocapture
-    #[test]
-    fn bench_analyze() {
-        use crate::decompress::inflate::consume_first_decode::{
-            get_block_stats, get_cache_stats, get_spec_cache_stats, get_spec_stats,
-            get_table_cache_size, reset_cache_stats,
-        };
+    // Summary recommendations
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  OPTIMIZATION NOTES                                          ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  - Dynamic blocks: libdeflate-style decode (fastest)         ║");
+    eprintln!("║  - Fixed blocks: need optimization (currently slower)        ║");
+    eprintln!("║  - High cache hit rate: table reuse working                  ║");
+    eprintln!("║  - Low cache hit rate: consider fingerprint tuning           ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+}
 
-        let _ = crate::tests::datasets::prepare_datasets();
+/// Profile time spent in table building vs decoding
+/// Run with: cargo test --release bench_profile -- --nocapture
+#[test]
+fn bench_profile() {
+    use crate::decompress::inflate::consume_first_decode::{get_timing_stats, reset_cache_stats};
 
-        let datasets = [
-            (
-                "silesia",
-                "benchmark_data/silesia-gzip.tar.gz",
-                "mixed content",
-            ),
-            (
-                "software",
-                "benchmark_data/software.archive.gz",
-                "source code",
-            ),
-            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
-        ];
+    let _ = crate::tests::datasets::prepare_datasets();
 
-        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║           GZIPPY DECOMPRESSION ANALYSIS                      ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════╣");
-        eprintln!("║  Block types, cache stats, path usage                        ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+    let datasets = [
+        (
+            "silesia",
+            "benchmark_data/silesia-gzip.tar.gz",
+            "mixed content",
+        ),
+        (
+            "software",
+            "benchmark_data/software.archive.gz",
+            "source code",
+        ),
+        ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+    ];
 
-        for (name, path, desc) in &datasets {
-            let gz = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => {
-                    eprintln!("  Skipping {} - file not found: {}", name, path);
-                    continue;
-                }
-            };
+    eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║           GZIPPY TIMING PROFILE                              ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Breakdown of table building vs decode time                  ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
 
-            // Guard against an empty/short benchmark fixture: a gzip member is
-            // a 10-byte header + 8-byte trailer, so anything shorter cannot be
-            // valid and would panic the `gz[3]` / `gz[len-8]` indexing below.
-            // On CI runners where the fixture is absent or a stub (observed:
-            // macos-arm64 pure-rust-inflate test job), skip rather than panic.
-            if gz.len() < 18 {
-                eprintln!(
-                    "⚠ Skipping {} - fixture too short ({} bytes): {}",
-                    name,
-                    gz.len(),
-                    path
-                );
+    for (name, path, desc) in &datasets {
+        let gz = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("⚠ Skipping {} - file not found: {}", name, path);
                 continue;
             }
-
-            // Parse gzip header to get raw deflate data
-            let mut pos = 10;
-            let flg = gz[3];
-            if (flg & 0x04) != 0 {
-                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
-                pos += 2 + xlen;
-            }
-            if (flg & 0x08) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x10) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x02) != 0 {
-                pos += 2;
-            }
-
-            let deflate = &gz[pos..gz.len() - 8];
-            let expected_size = u32::from_le_bytes([
-                gz[gz.len() - 4],
-                gz[gz.len() - 3],
-                gz[gz.len() - 2],
-                gz[gz.len() - 1],
-            ]) as usize;
-
-            let mut output = vec![0u8; expected_size + 1024];
-
-            // Reset stats and decompress
-            reset_cache_stats();
-            let start = std::time::Instant::now();
-            let _ = inflate_into_pub(deflate, &mut output);
-            let elapsed = start.elapsed();
-
-            // Gather stats
-            let block_stats = get_block_stats();
-            let (cache_hits, cache_misses, cache_rate) = get_cache_stats();
-            let (spec_used, spec_fallback) = get_spec_stats();
-
-            let speed = expected_size as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-
-            eprintln!(
-                "┌─ {} ({}) ─────────────────────────────",
-                name.to_uppercase(),
-                desc
-            );
-            eprintln!("│");
-            eprintln!(
-                "│  Size: {:.2} MB compressed → {:.2} MB uncompressed",
-                deflate.len() as f64 / 1_000_000.0,
-                expected_size as f64 / 1_000_000.0
-            );
-            eprintln!("│  Speed: {:.1} MB/s", speed);
-            eprintln!("│");
-
-            // Block type breakdown
-            let total_blocks = block_stats.total_blocks();
-            eprintln!("│  BLOCK TYPES ({} total):", total_blocks);
-            if block_stats.stored_blocks > 0 {
-                let pct = block_stats.stored_blocks as f64 / total_blocks as f64 * 100.0;
-                let bytes_pct = block_stats.stored_bytes as f64 / expected_size as f64 * 100.0;
-                eprintln!(
-                    "│    Stored:   {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
-                    block_stats.stored_blocks, pct, block_stats.stored_bytes, bytes_pct
-                );
-            }
-            if block_stats.fixed_blocks > 0 {
-                let pct = block_stats.fixed_blocks as f64 / total_blocks as f64 * 100.0;
-                let bytes_pct = block_stats.fixed_bytes as f64 / expected_size as f64 * 100.0;
-                eprintln!(
-                    "│    Fixed:    {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
-                    block_stats.fixed_blocks, pct, block_stats.fixed_bytes, bytes_pct
-                );
-            }
-            if block_stats.dynamic_blocks > 0 {
-                let pct = block_stats.dynamic_blocks as f64 / total_blocks as f64 * 100.0;
-                let bytes_pct = block_stats.dynamic_bytes as f64 / expected_size as f64 * 100.0;
-                eprintln!(
-                    "│    Dynamic:  {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
-                    block_stats.dynamic_blocks, pct, block_stats.dynamic_bytes, bytes_pct
-                );
-            }
-            eprintln!("│");
-
-            // Cache stats
-            let total_cache = cache_hits + cache_misses;
-            let cache_size = get_table_cache_size();
-            if total_cache > 0 {
-                eprintln!("│  TABLE CACHE:");
-                eprintln!(
-                    "│    Hits:     {:>5} ({:.1}%)",
-                    cache_hits,
-                    cache_rate * 100.0
-                );
-                eprintln!("│    Misses:   {:>5}", cache_misses);
-                eprintln!("│    Unique:   {:>5} fingerprints", cache_size);
-                eprintln!("│");
-            }
-
-            // Specialized decoder stats
-            let total_spec = spec_used + spec_fallback;
-            let (spec_decoders, spec_failed, spec_total_uses, spec_max_uses) =
-                get_spec_cache_stats();
-            if total_spec > 0 {
-                let spec_rate = spec_used as f64 / total_spec as f64 * 100.0;
-                eprintln!("│  DECODE PATH:");
-                eprintln!("│    Specialized: {:>5} ({:.1}%)", spec_used, spec_rate);
-                eprintln!("│    Generic:     {:>5}", spec_fallback);
-                if spec_decoders > 0 || spec_failed > 0 {
-                    eprintln!("│  SPEC CACHE:");
-                    eprintln!("│    Decoders:  {:>5} unique tables", spec_decoders);
-                    eprintln!("│    Failed:    {:>5} (tables too complex)", spec_failed);
-                    if spec_decoders > 0 {
-                        let avg_uses = spec_total_uses as f64 / spec_decoders as f64;
-                        eprintln!(
-                            "│    Reuse:     {:>5.1}x avg, {}x max",
-                            avg_uses, spec_max_uses
-                        );
-                    }
-                }
-                eprintln!("│");
-            }
-
-            // Archive characteristics summary
-            let dominant_type = if block_stats.dynamic_bytes > block_stats.fixed_bytes
-                && block_stats.dynamic_bytes > block_stats.stored_bytes
-            {
-                "dynamic"
-            } else if block_stats.fixed_bytes > block_stats.stored_bytes {
-                "fixed"
-            } else {
-                "stored"
-            };
-            eprintln!("│  CHARACTERISTICS:");
-            eprintln!("│    Dominant block type: {}", dominant_type);
-            let compression_ratio = deflate.len() as f64 / expected_size as f64;
-            eprintln!(
-                "│    Compression ratio: {:.2}x ({:.1}% of original)",
-                1.0 / compression_ratio,
-                compression_ratio * 100.0
-            );
-
-            eprintln!("└────────────────────────────────────────────────\n");
-        }
-
-        // Summary recommendations
-        eprintln!("╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║  OPTIMIZATION NOTES                                          ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════╣");
-        eprintln!("║  - Dynamic blocks: libdeflate-style decode (fastest)         ║");
-        eprintln!("║  - Fixed blocks: need optimization (currently slower)        ║");
-        eprintln!("║  - High cache hit rate: table reuse working                  ║");
-        eprintln!("║  - Low cache hit rate: consider fingerprint tuning           ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
-    }
-
-    /// Profile time spent in table building vs decoding
-    /// Run with: cargo test --release bench_profile -- --nocapture
-    #[test]
-    fn bench_profile() {
-        use crate::decompress::inflate::consume_first_decode::{
-            get_timing_stats, reset_cache_stats,
         };
 
-        let _ = crate::tests::datasets::prepare_datasets();
-
-        let datasets = [
-            (
-                "silesia",
-                "benchmark_data/silesia-gzip.tar.gz",
-                "mixed content",
-            ),
-            (
-                "software",
-                "benchmark_data/software.archive.gz",
-                "source code",
-            ),
-            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
-        ];
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║           GZIPPY TIMING PROFILE                              ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════╣");
-        eprintln!("║  Breakdown of table building vs decode time                  ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
-
-        for (name, path, desc) in &datasets {
-            let gz = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => {
-                    eprintln!("⚠ Skipping {} - file not found: {}", name, path);
-                    continue;
-                }
-            };
-
-            // Parse gzip header
-            let mut pos = 10;
-            let flg = gz[3];
-            if (flg & 0x04) != 0 {
-                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
-                pos += 2 + xlen;
-            }
-            if (flg & 0x08) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x10) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x02) != 0 {
-                pos += 2;
-            }
-
-            let deflate = &gz[pos..gz.len() - 8];
-            let expected_size = u32::from_le_bytes([
-                gz[gz.len() - 4],
-                gz[gz.len() - 3],
-                gz[gz.len() - 2],
-                gz[gz.len() - 1],
-            ]) as usize;
-
-            let mut output = vec![0u8; expected_size + 1024];
-
-            // Reset stats and run decompression
-            reset_cache_stats();
-
-            let start = std::time::Instant::now();
-            let _ = inflate_into_pub(deflate, &mut output);
-            let total_time = start.elapsed();
-
-            let timing = get_timing_stats();
-
-            let total_nanos = total_time.as_nanos() as f64;
-            let table_pct = timing.table_build_nanos as f64 / total_nanos * 100.0;
-            let decode_pct = timing.decode_nanos as f64 / total_nanos * 100.0;
-            let other_pct = 100.0 - table_pct - decode_pct;
-
-            let avg_table_us = if timing.table_build_count > 0 {
-                timing.table_build_nanos as f64 / timing.table_build_count as f64 / 1000.0
-            } else {
-                0.0
-            };
-            let avg_decode_us = if timing.decode_count > 0 {
-                timing.decode_nanos as f64 / timing.decode_count as f64 / 1000.0
-            } else {
-                0.0
-            };
-
-            eprintln!(
-                "┌─ {} ({}) ─────────────────────────────",
-                name.to_uppercase(),
-                desc
-            );
-            eprintln!(
-                "│  Size: {:.1} MB, Total time: {:.1}ms",
-                expected_size as f64 / 1_000_000.0,
-                total_time.as_secs_f64() * 1000.0
-            );
-            eprintln!("│");
-            eprintln!("│  TIME BREAKDOWN:");
-            eprintln!(
-                "│    Table building: {:>6.1}ms ({:>5.1}%) - {} tables, {:.1}µs avg",
-                timing.table_build_nanos as f64 / 1_000_000.0,
-                table_pct,
-                timing.table_build_count,
-                avg_table_us
-            );
-            eprintln!(
-                "│    Decoding:       {:>6.1}ms ({:>5.1}%) - {} blocks, {:.1}µs avg",
-                timing.decode_nanos as f64 / 1_000_000.0,
-                decode_pct,
-                timing.decode_count,
-                avg_decode_us
-            );
-            eprintln!(
-                "│    Other/overhead: {:>6.1}ms ({:>5.1}%)",
-                (total_nanos - timing.table_build_nanos as f64 - timing.decode_nanos as f64)
-                    / 1_000_000.0,
-                other_pct
-            );
-            eprintln!(
-                "│  Speed: {:.1} MB/s",
-                expected_size as f64 / total_time.as_secs_f64() / 1_000_000.0
-            );
-            eprintln!("└────────────────────────────────────────────────\n");
+        // Parse gzip header
+        let mut pos = 10;
+        let flg = gz[3];
+        if (flg & 0x04) != 0 {
+            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+            pos += 2 + xlen;
         }
+        if (flg & 0x08) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x10) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x02) != 0 {
+            pos += 2;
+        }
+
+        let deflate = &gz[pos..gz.len() - 8];
+        let expected_size = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
+
+        let mut output = vec![0u8; expected_size + 1024];
+
+        // Reset stats and run decompression
+        reset_cache_stats();
+
+        let start = std::time::Instant::now();
+        let _ = inflate_into_pub(deflate, &mut output);
+        let total_time = start.elapsed();
+
+        let timing = get_timing_stats();
+
+        let total_nanos = total_time.as_nanos() as f64;
+        let table_pct = timing.table_build_nanos as f64 / total_nanos * 100.0;
+        let decode_pct = timing.decode_nanos as f64 / total_nanos * 100.0;
+        let other_pct = 100.0 - table_pct - decode_pct;
+
+        let avg_table_us = if timing.table_build_count > 0 {
+            timing.table_build_nanos as f64 / timing.table_build_count as f64 / 1000.0
+        } else {
+            0.0
+        };
+        let avg_decode_us = if timing.decode_count > 0 {
+            timing.decode_nanos as f64 / timing.decode_count as f64 / 1000.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "┌─ {} ({}) ─────────────────────────────",
+            name.to_uppercase(),
+            desc
+        );
+        eprintln!(
+            "│  Size: {:.1} MB, Total time: {:.1}ms",
+            expected_size as f64 / 1_000_000.0,
+            total_time.as_secs_f64() * 1000.0
+        );
+        eprintln!("│");
+        eprintln!("│  TIME BREAKDOWN:");
+        eprintln!(
+            "│    Table building: {:>6.1}ms ({:>5.1}%) - {} tables, {:.1}µs avg",
+            timing.table_build_nanos as f64 / 1_000_000.0,
+            table_pct,
+            timing.table_build_count,
+            avg_table_us
+        );
+        eprintln!(
+            "│    Decoding:       {:>6.1}ms ({:>5.1}%) - {} blocks, {:.1}µs avg",
+            timing.decode_nanos as f64 / 1_000_000.0,
+            decode_pct,
+            timing.decode_count,
+            avg_decode_us
+        );
+        eprintln!(
+            "│    Other/overhead: {:>6.1}ms ({:>5.1}%)",
+            (total_nanos - timing.table_build_nanos as f64 - timing.decode_nanos as f64)
+                / 1_000_000.0,
+            other_pct
+        );
+        eprintln!(
+            "│  Speed: {:.1} MB/s",
+            expected_size as f64 / total_time.as_secs_f64() / 1_000_000.0
+        );
+        eprintln!("└────────────────────────────────────────────────\n");
     }
 }
 
