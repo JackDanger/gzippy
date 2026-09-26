@@ -1,16 +1,14 @@
 //! Correctness net for the pure-Rust PARALLEL DEFLATE encoder (Increment 6:
 //! `PipelinedGzEncoder::compress_buffer_pure` — the sole production T>1 path).
 //!
-//! The T>1 entry point preserves a whole-stream encoder for the supported
-//! levels, so its DEFLATE decisions and gzip member are identical to T1.
-//! The legacy chunk pipeline remains below it for future unsupported levels.
-//! This module pins:
+//! The T>1 entry point is the CANONICAL CHUNK GRID (thread-free,
+//! `GRID_REF_THREADS = 4`): its bytes are identical at every `-p N`, N >= 2
+//! (`tests/thread_byte_parity.rs` pins the digests at every level), while T1
+//! remains a distinct whole-buffer stream class (the FINAL-ADJUDICATION's
+//! own receipt: matches straddle what would be seams). This module pins:
 //!
-//!   1. DETERMINISM — per-p-T validity is asserted; NOTE (2026-09-25): the
-//!      pins do NOT yet assert byte-identity across thread counts — T(N) emits
-//!      a different (smaller at L8-9) stream than T1 by design (params_parallel
-//!      + Generous headers). Byte-parity unification is the campaign follow-up
-//!      tracked in README records; this pin's claim is stale until then.
+//!   1. DETERMINISM — per-p-T validity is asserted; byte-identity ACROSS
+//!      thread counts is asserted by the parity gates, not duplicated here.
 //!   2. 3-ORACLE roundtrip — flate2, libdeflate, and system `gzip -d` all
 //!      reproduce the input byte-exact at L1/L6/L9/L12.
 //!   3. proptest — tiny (<1 chunk), incompressible (each chunk stored-escapes),
