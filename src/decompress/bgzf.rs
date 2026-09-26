@@ -3680,10 +3680,11 @@ mod tests {
                 expected_size as f64 / 1_000_000.0
             );
 
-            // === PRODUCTION PATH: inflate_into_pub() → libdeflate C FFI ===
-            // This is THE function called for every block in production:
-            //   BGZF blocks, multi-member members, single-member inflate.
-            // Warmup
+            // === BENCH: inflate_into_pub() → pure-Rust inflate_consume_first ===
+            // This is the function called for every block in production
+            // (BGZF blocks, multi-member members, single-member inflate);
+            // the libdeflate C FFI it replaced was removed with the decode
+            // FFI graph (see the module doc on inflate_into above).
             for _ in 0..WARMUP {
                 let _ = inflate_into_pub(deflate, &mut output);
             }

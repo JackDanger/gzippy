@@ -3300,12 +3300,11 @@ mod tests {
 
     /// EXPERIMENTAL pure-Rust inflate benchmark on silesia.
     ///
-    /// IMPORTANT: inflate_consume_first() is NOT the production path.
-    /// Production uses inflate_into_pub() → libdeflate C FFI.
-    /// Use bench_production_inflate (in bgzf.rs) for production numbers.
-    ///
-    /// This bench exists to track progress of the experimental pure-Rust decoder.
-    /// When this consistently exceeds inflate_into_pub() speed, we'll switch production.
+    /// NOTE (2026-09-26): inflate_consume_first() IS the production path —
+    /// the libdeflate C FFI it replaced was removed with the decode FFI
+    /// graph (bgzf.rs's inflate_into / inflate_into_pub doc). This bench
+    /// outlived its premise; kept for the historical progress line it
+    /// carries (it was the instrument that justified the switch).
     ///
     /// Run with: cargo test --release bench_cf_silesia -- --nocapture
     #[test]
