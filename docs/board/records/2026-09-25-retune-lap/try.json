@@ -1,0 +1,628 @@
+{
+  "adjudication": {
+    "clause6": {
+      "confirmed_real": 0.0,
+      "confirmed_real_cells": 0,
+      "excluded_acquitted": 0.0,
+      "excluded_acquitted_cells": 0,
+      "excluded_margin_spend": 0.0,
+      "excluded_margin_spend_cells": 0,
+      "excluded_size_spend": 0.0020126361451964225,
+      "excluded_size_spend_cells": 2,
+      "excluded_sub_budget": 0.0020033578546972686,
+      "excluded_sub_budget_cells": 3,
+      "harm": 0.0,
+      "improvement": 0.002593198236079619,
+      "size": 0.0,
+      "size_cells": 0,
+      "undecided": 0.0,
+      "undecided_cells": 0
+    },
+    "clauses": [
+      "clause 2 OK: arms differ (binary hashes distinct)",
+      "clause 1 OK: verify — zero roundtrip failures",
+      "clause 3 OK: no pass->fail flips across 15 decidable cells",
+      "clause 4 OK: fail-gap 0.0700 -> 0.0674 (-3.7%)",
+      "clause 5 OK: every passing cell inside its erosion budget",
+      "clause 6 OK: improvement 0.0026 vs residual harm 0.0000 (>=2x or no harm; harm = confirmed-real 0.0000 [0] + size 0.0000 [0] + undecided-conservative 0.0000 [0]; excluded as clause-5-priced: accepted margin-spend 0.0000 [0], layout-artifact acquittals 0.0000 [0], sub-budget census drift 0.0020 [3]; authorized size spend <=1% 0.0020 [2])",
+      "clause 7 OK: all required arch(s) covered: x86_64",
+      "clause 8 (method): paired interleaved per-pair ratios with stated n; fixed before the run by construction"
+    ],
+    "failed_clause": null,
+    "layout_undecided": [],
+    "rerun": [
+      "libdeflate:silesia.tar:L9:T1:wall (after arm VOID — re-measure)"
+    ]
+  },
+  "after": {
+    "bin_sha": "112ead7630fcd99bb6a102dde905b32f42bc4bcc381a01a98a8cf393962693ae",
+    "commit": "a29b87b753510f63774e1ea776dfd0c5cf32fe98",
+    "git_ref": "trunk"
+  },
+  "arch": "x86_64",
+  "archs_required": [
+    "x86_64"
+  ],
+  "base": {
+    "bin_sha": "a0a2f899d28ede0303a4ac7c14636e9aa907555de57d10772495847d2f23df0c",
+    "commit": "aa682fccc1d788a57672105e094e86b402e7a30c",
+    "git_ref": "base"
+  },
+  "cells": [
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9460772376114978,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9460772376114978,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "gzip",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        -0.658817274791064,
+        -0.6577284068018691
+      ],
+      "after_failing": false,
+      "after_ratio": 0.5177447903791005,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -0.656202593741922,
+        -0.6553109325326734
+      ],
+      "base_failing": false,
+      "base_ratio": 0.5190491166843605,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "gzip",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.933075920157407,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.933075920157407,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "gzip",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        -1.633692411522303,
+        -1.632204266466519
+      ],
+      "after_failing": false,
+      "after_ratio": 0.19535275806583619,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -1.6346386178264447,
+        -1.6330353831841038
+      ],
+      "base_failing": false,
+      "base_ratio": 0.19517923270277746,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "gzip",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9862340613430496,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9862340613430496,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "gzip",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        -1.0091058338766865,
+        -1.0031637083352989
+      ],
+      "after_failing": false,
+      "after_ratio": 0.3656294935186522,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -1.0101901790339656,
+        -1.0094990890046907
+      ],
+      "base_failing": false,
+      "base_ratio": 0.36427557120655735,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "gzip",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9574994179747004,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9565000743635347,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "gzip",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        -1.3109288670170114,
+        -1.3103106625892715
+      ],
+      "after_failing": false,
+      "after_ratio": 0.2696528832199308,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -1.0667385230484197,
+        -1.0657704743708827
+      ],
+      "base_failing": false,
+      "base_ratio": 0.34429566526550043,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "gzip",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 1.0,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 1.0,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "libdeflate",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        0.06436354923807404,
+        0.06604589818547595
+      ],
+      "after_failing": true,
+      "after_ratio": 1.0673775195055217,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        0.06684933453163437,
+        0.06841322847378241
+      ],
+      "base_failing": true,
+      "base_ratio": 1.0699707177416014,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "libdeflate",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9862576574752878,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9862576574752878,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "libdeflate",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        -0.9101840827948984,
+        -0.9088569088498033
+      ],
+      "after_failing": false,
+      "after_ratio": 0.4027172823631038,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -0.9112005649580589,
+        -0.9102053195034664
+      ],
+      "base_failing": false,
+      "base_ratio": 0.4022413721835601,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "libdeflate",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 1.0,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 1.0,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "libdeflate",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        0.01958567385648721,
+        0.020511976782352243
+      ],
+      "after_failing": false,
+      "after_ratio": 1.0202511528991098,
+      "after_status": "VOID",
+      "axis": "wall",
+      "base_ci": [
+        0.015261173394131137,
+        0.01585656552394559
+      ],
+      "base_failing": true,
+      "base_ratio": 1.0156805388622459,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "libdeflate",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9708642760429319,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9698509835089012,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "libdeflate",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        -0.28536406179533474,
+        -0.2847199027742499
+      ],
+      "after_failing": false,
+      "after_ratio": 0.7519826837054978,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        -0.04102437183088244,
+        -0.04054057599383385
+      ],
+      "base_failing": false,
+      "base_ratio": 0.9600379405332926,
+      "base_status": "OK",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "libdeflate",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9472123891469862,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "pigz",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        -0.5151052725130336,
+        -0.5136457023238556
+      ],
+      "after_failing": false,
+      "after_ratio": 0.597873857798708,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "pigz",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9356513862092504,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "pigz",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        -0.13048068825481837,
+        -0.12926109674471672
+      ],
+      "after_failing": false,
+      "after_ratio": 0.8782088069453031,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 2,
+      "rival": "pigz",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9859527370218485,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "pigz",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        -0.993611982415771,
+        -0.9924213223846106
+      ],
+      "after_failing": false,
+      "after_ratio": 0.37045746231596655,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "pigz",
+      "threads": 1
+    },
+    {
+      "after_ci": [
+        null,
+        null
+      ],
+      "after_failing": false,
+      "after_ratio": 0.9572262902412642,
+      "after_status": "OK",
+      "axis": "size",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "pigz",
+      "threads": 4
+    },
+    {
+      "after_ci": [
+        0.07852691958281534,
+        0.07946033077599883
+      ],
+      "after_failing": true,
+      "after_ratio": 1.082197423233906,
+      "after_status": "OK",
+      "axis": "wall",
+      "base_ci": [
+        null,
+        null
+      ],
+      "base_failing": false,
+      "base_ratio": null,
+      "base_status": "RIVAL-UNAVAILABLE",
+      "corpus": "silesia.tar",
+      "in_scope": true,
+      "level": 9,
+      "rival": "pigz",
+      "threads": 4
+    }
+  ],
+  "clause5_margin_floor": {
+    "confirm_cap": 12,
+    "confirms": {},
+    "overflow": [],
+    "rule": "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size erosions within 1% are authorized spend (owner directive 2026-09-05: <1% size hit, wall never loses); size erosions >1% and size flips convict directly",
+    "skipped": null
+  },
+  "fulcrum_built_epoch": "1790349913",
+  "fulcrum_commit": "d738eaef4585ff831545d007473e33a450afdf6c",
+  "fulcrum_dirty": "false",
+  "layout_floors": {
+    "cells_in_file": 3,
+    "median_floor": 0.002191,
+    "path": "/root/wave-out/layout-floors-l9t4/layout_floors.tsv",
+    "semantics": "floors feed the margin floor (min(0.80, 1-3*floor)) and the confirm boundary; a missing coordinate is UNDECIDED, never borrowed",
+    "suspects_undecided": []
+  },
+  "levels": [
+    2,
+    9
+  ],
+  "margin_tiers": {
+    "band": 0.002191,
+    "band_source": "median layout floor",
+    "failing": [
+      "libdeflate:silesia.tar:L2:T1:wall (ratio=1.0674)"
+    ],
+    "knife_edge": [],
+    "won_with_margin": [
+      "gzip:silesia.tar:L2:T1:wall (ratio=0.5177)",
+      "gzip:silesia.tar:L2:T4:wall (ratio=0.1954)",
+      "gzip:silesia.tar:L9:T1:wall (ratio=0.3656)",
+      "gzip:silesia.tar:L9:T4:wall (ratio=0.2697)",
+      "libdeflate:silesia.tar:L2:T4:wall (ratio=0.4027)",
+      "libdeflate:silesia.tar:L9:T4:wall (ratio=0.7520)"
+    ]
+  },
+  "method": "paired interleaved per-pair ratios (wallcensus/paired engine); size exact-integer roundtrip-VOIDed",
+  "n": 45,
+  "scope": null,
+  "threads": [
+    1,
+    4
+  ],
+  "verdict": "UNDECIDED",
+  "verify_failures": 0,
+  "wall_flip_confirmation": null
+}
