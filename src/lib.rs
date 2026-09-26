@@ -207,8 +207,10 @@ pub fn compress_to_writer_with_threads<R: std::io::Read, W: std::io::Write + Sen
 /// Decompress a gzip stream using all available CPUs.
 ///
 /// Automatically selects the best path — parallel bgzf, parallel
-/// multi-member, ISA-L single-member, or libdeflate one-shot — based on
-/// the input format and available hardware.
+/// multi-member, or the pure-Rust streaming decoder — based on
+/// the input format and available hardware (the decode-FFI graph — ISA-L
+/// single-member, libdeflate one-shot — was removed with Increment 7's
+/// pure-Rust decode rule).
 ///
 /// **Non-gzip input:** returns `Ok(Vec::new())`.
 pub fn decompress(data: &[u8]) -> GzippyResult<Vec<u8>> {
@@ -270,8 +272,10 @@ pub fn decompress_to_writer_with_threads<W: std::io::Write + Send>(
 
 /// Compress `data` to raw DEFLATE (RFC 1951) at `level` — no gzip header or trailer.
 ///
-/// `level` is clamped to `0..=12`. Uses the same backend hierarchy as [`compress`]:
-/// ISA-L SIMD on x86_64 for levels 0–3, then libdeflate one-shot for all levels.
+/// `level` is clamped to `0..=12`. Routes through the same pure-Rust DEFLATE
+/// engine as [`compress`] (Increment 7: the sole production path at every
+/// level; the ISA-L / libdeflate C-FFI backends are oracle-only and off the
+/// routing graph).
 ///
 /// Use this when the framing (CRC32, size) is handled by the caller, for example
 /// when embedding deflate streams in ZIP, 7z, or zlib containers.
@@ -281,8 +285,9 @@ pub fn compress_raw(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
 
 /// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer expected.
 ///
-/// Uses libdeflate for speed, growing the output buffer as needed. Falls back to
-/// a flate2/zlib-ng streaming decoder if the output exceeds 1 GiB.
+/// Pure-Rust (`inflate_consume_first`) with a growing output buffer — NO C-FFI
+/// (the libdeflate / flate2 fallbacks described by earlier revisions of this
+/// doc were removed with the decode-FFI graph).
 ///
 /// Returns an error if `data` is not valid DEFLATE.
 pub fn decompress_raw(data: &[u8]) -> GzippyResult<Vec<u8>> {

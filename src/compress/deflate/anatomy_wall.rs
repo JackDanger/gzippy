@@ -284,6 +284,48 @@ pub fn reset() {
     WALL.reset();
 }
 
+/// Thread-local suppression for the emit_block sub-regions
+/// (`huffman_table`/`huffman_encode`) while a near-opt flush span is active
+/// on this thread: the flush region CONTAINS those sub-times, so counting
+/// both would double-book (the conservation check's exact failure class —
+/// caught live by `near_opt_regions_nonzero_and_conserved_at_l11`).
+///
+/// The near-opt flush sets this only inside its own wrapper; the parallel
+/// flush workers are separate threads, each with a fresh `false`.
+#[cfg(feature = "anatomy-wall")]
+thread_local! {
+    static NEAR_OPT_FLUSH_ACTIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The `anatomy_wall_time!` macro's guard: `true` while this thread is inside
+/// its near-opt flush wrapper.
+#[cfg(feature = "anatomy-wall")]
+pub fn near_opt_flushing() -> bool {
+    NEAR_OPT_FLUSH_ACTIVE.with(|c| c.get())
+}
+
+/// Set/clear the near-opt flush suppression on THIS thread around a body.
+/// The near-opt flush's two call sites use one RAII guard each (serial and
+/// pooled worker paths share the same per-thread flag semantics — a thread's
+/// flag is fresh in every worker).
+#[cfg(feature = "anatomy-wall")]
+pub struct NearOptFlushGuard;
+
+#[cfg(feature = "anatomy-wall")]
+impl NearOptFlushGuard {
+    pub fn enter() -> Self {
+        NEAR_OPT_FLUSH_ACTIVE.with(|c| c.set(true));
+        Self
+    }
+}
+
+#[cfg(feature = "anatomy-wall")]
+impl Drop for NearOptFlushGuard {
+    fn drop(&mut self) {
+        NEAR_OPT_FLUSH_ACTIVE.with(|c| c.set(false));
+    }
+}
+
 /// Conservation check: the named regions plus the derived RESIDUAL must
 /// reconcile to the root span. Since RESIDUAL is *defined* as `root_ns -
 /// named_region_ns()`, this can only fail one way: the named regions
@@ -370,19 +412,31 @@ macro_rules! anatomy_wall_time {
     ($region:ident, $calls:ident, $body:block) => {{
         #[cfg(feature = "anatomy-wall")]
         {
-            let __anatomy_wall_start = ::std::time::Instant::now();
-            let __anatomy_wall_ret = $body;
-            let __anatomy_wall_elapsed = __anatomy_wall_start.elapsed().as_nanos() as u64;
-            $crate::compress::deflate::anatomy_wall::WALL
-                .$region
-                .fetch_add(
-                    __anatomy_wall_elapsed,
-                    ::std::sync::atomic::Ordering::Relaxed,
-                );
-            $crate::compress::deflate::anatomy_wall::WALL
-                .$calls
-                .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-            __anatomy_wall_ret
+            // Near-opt flush-span suppression (lever-0 conservation fix):
+            // when one thread's flush wrapper is active, the emit_block
+            // regions it CALLS (huffman_table/huffman_encode) would
+            // double-count wall time into two named regions (the flush span
+            // already CONTAINS them). One thread-local per worker; the
+            // near-opt flush entry/exit toggles it; every other parser stays
+            // unaffected. The suppressed sub-time remains inside the flush
+            // region's own total (documented, not lost).
+            if !$crate::compress::deflate::anatomy_wall::near_opt_flushing() {
+                let __anatomy_wall_start = ::std::time::Instant::now();
+                let __anatomy_wall_ret = $body;
+                let __anatomy_wall_elapsed = __anatomy_wall_start.elapsed().as_nanos() as u64;
+                $crate::compress::deflate::anatomy_wall::WALL
+                    .$region
+                    .fetch_add(
+                        __anatomy_wall_elapsed,
+                        ::std::sync::atomic::Ordering::Relaxed,
+                    );
+                $crate::compress::deflate::anatomy_wall::WALL
+                    .$calls
+                    .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+                __anatomy_wall_ret
+            } else {
+                $body
+            }
         }
         #[cfg(not(feature = "anatomy-wall"))]
         {
