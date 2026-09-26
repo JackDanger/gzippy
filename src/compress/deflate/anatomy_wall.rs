@@ -284,21 +284,24 @@ pub fn reset() {
     WALL.reset();
 }
 
-/// Thread-local suppression for the emit_block sub-regions
-/// (`huffman_table`/`huffman_encode`) while a near-opt flush span is active
-/// on this thread: the flush region CONTAINS those sub-times, so counting
-/// both would double-book (the conservation check's exact failure class —
-/// caught live by `near_opt_regions_nonzero_and_conserved_at_l11`).
-///
-/// The near-opt flush sets this only inside its own wrapper; the parallel
-/// flush workers are separate threads, each with a fresh `false`.
-///
-/// Feature-off builds carry an EMPTY no-op flag (the call sites in
-/// `near_optimal.rs::run` run under every feature set; the near-opt timer
-/// macro's own cfg compiles the whole accounting out anyway, so the flag has
-/// nothing to gate). Keeping the type total avoids feature-gated call sites
-/// in the hot parser body.
+// Thread-local suppression for the emit_block sub-regions
+// (`huffman_table`/`huffman_encode`) while a near-opt flush span is active
+// on this thread: the flush region CONTAINS those sub-times, so counting
+// both would double-book (the conservation check's exact failure class —
+// caught live by `near_opt_regions_nonzero_and_conserved_at_l11`).
+//
+// The near-opt flush sets this only inside its own wrapper; the parallel
+// flush workers are separate threads, each with a fresh `false`.
+//
+// Feature-off builds carry an EMPTY no-op flag (the call sites in
+// `near_optimal.rs::run` run under every feature set; the near-opt timer
+// macro's own cfg compiles the whole accounting out anyway, so the flag has
+// nothing to gate). Keeping the type total avoids feature-gated call sites
+// in the hot parser body. (The doc lives below, on the flag itself — rustc
+// 1.98 rejects `///` on the macro invocation as an unused doc comment.)
 thread_local! {
+    /// See this module's suppression comment above: true while the
+    /// near-opt flush wrapper owns this thread's flush span.
     static NEAR_OPT_FLUSH_ACTIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
@@ -323,7 +326,6 @@ pub fn near_opt_flushing() -> bool {
 pub struct NearOptFlushGuard;
 
 impl NearOptFlushGuard {
-    #[must_use]
     pub fn enter() -> Self {
         #[cfg(feature = "anatomy-wall")]
         NEAR_OPT_FLUSH_ACTIVE.with(|c| c.set(true));
