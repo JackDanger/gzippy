@@ -70,7 +70,7 @@ path = "src/main.rs"
 # zlib-ng one-shot single-member path and the ISA-L FFI decode path have been
 # removed. (C-FFI remains ONLY for COMPRESSION — ISA-L/libdeflate/zlib-ng — and
 # behind dev/test code as differential oracles.)
-default = ["pure-rust-inflate"]
+default = ["pure-rust-inflate", "near-opt-parallel-flush"]
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 # NO-OP since Increment 7. Historically this gated the pure-Rust DEFLATE encoder
 # onto the T1/T>1 routing alongside the C-FFI backends. As of Inc7 the pure-Rust
