@@ -985,16 +985,30 @@ mod parallel_flush {
             let frag = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_job(core, &mut opt, job, statics)
             }))
-            .unwrap_or_else(|_| Fragment {
-                // A panicking flush leaves its slot EMPTY-sized: the
-                // write-back then produces a stream that the
-                // byte-identity tests reject loudly instead of the
-                // process hanging on a poisoned pipeline. (In release
-                // builds `panic = "abort"` takes the process first.)
-                bytes: Vec::new(),
-                pad_bits: 0,
-                stored: false,
-                used_only_literals: false,
+            .unwrap_or_else(|_| {
+                // A panicking flush must not hang its successors: the
+                // increment below posts a POISONED entry into the
+                // flush→flush chain (zero costs — the next flush then
+                // computes *something*, and the empty fragment above makes
+                // the whole-chunk stream a LOUD mismatch the byte-identity
+                // tests reject), where `run_job`'s own post would have
+                // been skipped.
+                core.exited
+                    .lock()
+                    .unwrap()
+                    .insert(index, DeflateCosts::default());
+                core.exited_cv.notify_all();
+                Fragment {
+                    // A panicking flush leaves its slot EMPTY-sized: the
+                    // write-back then produces a stream that the
+                    // byte-identity tests reject loudly instead of the
+                    // process hanging on a poisoned pipeline. (In release
+                    // builds `panic = "abort"` takes the process first.)
+                    bytes: Vec::new(),
+                    pad_bits: 0,
+                    stored: false,
+                    used_only_literals: false,
+                }
             });
             {
                 let mut results = core.results.lock().unwrap();
