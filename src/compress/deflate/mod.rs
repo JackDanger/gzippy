@@ -342,6 +342,25 @@ pub(crate) fn note_stored_block_emitted() {
     STORED_BLOCK_EMITTED.with(|f| f.set(true));
 }
 
+/// Cold reset hook for [`STORED_BLOCK_EMITTED`] — the `near-opt-parallel-flush`
+/// flush workers use it around their per-block emit (each flush job resets on
+/// ITS thread, reads after emitting, and the dispatcher relays a `true` result
+/// onto the chunk thread via [`note_stored_block_emitted`]; see
+/// `parse::near_optimal::parallel_flush`).
+#[cfg(feature = "near-opt-parallel-flush")]
+#[inline]
+pub(crate) fn clear_stored_block_emitted() {
+    STORED_BLOCK_EMITTED.with(|f| f.set(false));
+}
+
+/// Cold read hook for [`STORED_BLOCK_EMITTED`] (see
+/// [`clear_stored_block_emitted`]).
+#[cfg(feature = "near-opt-parallel-flush")]
+#[inline]
+pub(crate) fn stored_block_emitted_on_this_thread() -> bool {
+    STORED_BLOCK_EMITTED.with(|f| f.get())
+}
+
 fn deflate_into(
     bw: &mut BitWriter,
     buf: &[u8],

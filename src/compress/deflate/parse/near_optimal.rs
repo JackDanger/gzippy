@@ -464,6 +464,14 @@ impl Optimizer {
             None,
         );
 
+        // Lever-#3 freshness-chain probe (2026-09-25): the flip rate of the
+        // only-literals selection that feeds the NEXT block's
+        // `min_match_len`. feature-off builds compile both to zero bytes.
+        crate::anatomy_count!(near_opt_flush_blocks);
+        if used_only_literals {
+            crate::anatomy_count!(near_opt_only_literals_blocks);
+        }
+
         used_only_literals
     }
 }
@@ -501,21 +509,643 @@ fn build_all_literals_codes(block: &[u8]) -> PathCodes {
     build_codes(litlen_freqs, [0u32; DEFLATE_NUM_OFFSET_SYMS])
 }
 
+// ── `near-opt-parallel-flush` test/observability surface ────────────────────
+// Thin re-exports of the `parallel_flush` module's probe accessors at THIS
+// module's top level so `parse::near_opt_flush_probe` can name them (the
+// module itself stays private to the near-optimal parser).
+
+// The whole block is allowed dead: its only non-test caller is nothing (the
+// integration tests drive it; see the probe re-export in parse/mod.rs).
+
+#[cfg(feature = "near-opt-parallel-flush")]
+#[allow(dead_code)]
+pub(super) fn parallel_flush_writes() -> u64 {
+    parallel_flush::parallel_flush_writes()
+}
+
+#[cfg(feature = "near-opt-parallel-flush")]
+#[allow(dead_code)]
+pub(super) fn set_force_serial(v: bool) {
+    parallel_flush::set_force_serial(v);
+}
+
+#[cfg(feature = "near-opt-parallel-flush")]
+#[allow(dead_code)]
+pub(super) fn stale_flag_fired() -> bool {
+    parallel_flush::stale_flag_fired()
+}
+
+#[cfg(feature = "near-opt-parallel-flush")]
+#[allow(dead_code)]
+pub(super) fn set_stale_flag_for_tests(v: bool) {
+    parallel_flush::set_stale_flag_for_tests(v);
+}
+
+// ===========================================================================
+// LEVER #3 — block-parallel `optimize_and_flush` (feature
+// `near-opt-parallel-flush`, DEFAULT OFF). Docs/board/sprint-2026-09-25.md,
+// "Lever ledger" row 3.
+// ===========================================================================
+
+/// The flush-dispatch instrument for [`run`] (feature-gated; compiles to
+/// nothing without `near-opt-parallel-flush`).
+///
+/// ## What leaves the chunk's serial critical path
+///
+/// Today's per-internal-block shape is [bt FILL: per-position cache + split
+/// stats] → [`optimize_and_flush`] → [next block's fill], all on one thread.
+/// Lever-0's conserved split prices the flush share at 52.9% of the 3 MB chunk
+/// (13 blocks: fill 104.1 ms / flush 117.7 ms). With this feature on, the fill
+/// thread keeps producing and hands each completed block's flush sub-phase
+/// (the DP refinement passes + per-candidate Huffman construction + block
+/// emission) to a pool of `min(2, num_cpus - 1)` worker threads; the chunk's
+/// own thread only fills, snapshots, and — at chunk end — repacks the finished
+/// fragments into `bw` IN BLOCK ORDER (see `Dispatcher::finish_and_write`).
+///
+/// ## The carriers contract (verified against this file)
+///
+/// `optimize_and_flush`'s inputs are all FILL-produced: the block's byte
+/// range; its cached bt matches — `opt.match_cache[0..cache_end]`, which for
+/// EVERY block starts at index 0 (a non-rewind flush leaves `cache_ptr == 0`,
+/// and a rewind flush copies the rewound tail back to index 0 before the next
+/// fill); the merged `match_len_freqs`; the final `split_stats`; the previous
+/// block's `prev_observations`/`prev_num_observations` (a pure copy of block
+/// N-1's end-of-fill stats, taken after the previous flush but not BY it);
+/// `params`/`statics` (shared immutable inputs); `is_first`/`is_final`.
+///
+/// **One input is NOT fill-produced, and the mission's carrier list omits
+/// it**: `self.costs` at flush entry. For every non-first block,
+/// `set_initial_costs` runs `adjust_costs`, which BLENDS the entering cost
+/// model toward the block's default costs (`costs.rs:320-348` —
+/// `adjust_impl` reads the current `self.literal[i]` / `self.length[len]` /
+/// `self.offset_slot[slot]` values), and that entering value is the previous
+/// flush's EXIT state (`optimize_and_flush`'s (d) selection leaves
+/// `self.costs` set from the chosen path's code lengths, `:409-428`). The
+/// b5281a96 spike cleared the freshness chain's OTHER carrier
+/// (`prev_block_used_only_literals`, 0 flips / 47 flushes); this one is
+/// structural — it carries data on every similar-block pair, i.e. exactly on
+/// the campaign corpora. Two flushes of the same chunk therefore cannot run
+/// CONCURRENTLY and stay byte-exact.
+///
+/// The design is consequently the pipelined shape the lever itself names:
+/// flush N runs concurrently with fill N+1 (and with other chunks' fills in
+/// the T>1 dispatcher), with the flushes THEMSELVES chained in block order.
+/// Consecutive flushes on this chain cost the chunk
+/// ≈ one last-flush tail, matching the ledger's projected ~0.60-0.75x chunk
+/// wall; the flush share does NOT divide by the worker count, and this
+/// module documents why instead of silently producing shifted bytes.
+///
+/// ## Writeback (mission contract #3)
+///
+/// Each flush runs into its own `BitWriter::from_vec(Vec::new())` and reports
+/// `finish_unaligned()`'s `(bytes, pad_bits)` — the per-block pending state.
+/// `finish_and_write` takes the results IN BLOCK ORDER and appends them to the
+/// real `bw` through `BitWriter::append_fragment`, which shifts the stream's
+/// accumulated partial byte across the fragment (and, for the only fragment
+/// family that needs it, a block whose emission chose STORED — which
+/// byte-aligns relative to its own start — replays the serial writer's own
+/// 3-bit header + `align_to_byte` + verbatim tail). The concatenation is
+/// bit-identical to one writer having produced the whole chunk, pinned whole-
+/// chunk by `tests/l9_t4_chunk_cost_probe.rs::parallel_flush_*` on the probe
+/// corpus and the four campaign corpora.
+///
+/// ## The stale-flag guard (mission contract #4)
+///
+/// `finish_and_write` tallies the chunk's `used_only_literals` returns —
+/// exactly the condition behind the `near_opt_flush_blocks` /
+/// `near_opt_only_literals_blocks` counters (which keep firing, from the
+/// workers, as process-wide atomics). A nonzero tally logs to stderr ONCE per
+/// process and latches a static veto that routes every subsequent chunk
+/// (any near-optimal `run` in this process) to the plain serial loop. The
+/// zero-flip finding means the latch never fires on the benchmarks; the
+/// within-chunk dispatch order cannot retro-fit the boolean into block N+1's
+/// `min_match_len` anyway — that one-block drift is what the guard
+/// quarantines rather than what it can repair, which is exactly why the
+/// count must stand at chunk end.
+///
+/// ## Deviation from the mission's thread-shape letter
+///
+/// The mission says "std::thread scope". The pool uses plain
+/// `std::thread::spawn` + `JoinHandle`s joined at write-back, with fully
+/// owned jobs (block bytes + cache-region copies, `LevelParams` copied into
+/// the job — it is `Copy`). Sharing `&buf`/`&LevelParams` through a
+/// `thread::scope` closure would have required moving the entire ~300-line
+/// fill loop inside the scope body (reindenting every line of the hot loop
+/// the feature must not touch); owned jobs keep the fill loop untouched
+/// (mission constraint #6) at the cost of one bounded snapshot copy per
+/// flushed block (~1.3 MB typical, worst case ~6 MB at the match-cache
+/// overflow cap). Teardown is deterministic all the same: dispatch never
+/// leaks a worker; `finish_and_write` joins every handle before returning.
+///
+/// ## The anatomy instruments under this feature
+///
+/// `anatomy_wall_time!(near_opt_flush_ns, ...)`: the dispatched flushes never
+/// enter it (their work is off the fill thread by construction — an
+/// instrument run must not report the same wall twice, serial or parallel).
+/// The serial timer sites are untouched. The flip counters DO fire from the
+/// pool workers. This module's own `WRITES` counter is the test/observability
+/// surface that distinguishes "the pool actually engaged" from a feature-off
+/// build — a byte-identity test whose parallel arm silently ran serial would
+/// otherwise pass vacuously.
+#[cfg(feature = "near-opt-parallel-flush")]
+mod parallel_flush {
+    use super::*;
+
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Process-wide stale-flag latch (mission contract #4): a chunk whose
+    /// parallelized flushes used the only-literals strategy vetoes the pool
+    /// for the rest of the process. The b5281a96 finding (0 flips across 47
+    /// flushes) means this never fires on the campaign corpora.
+    static STALE_FLAG: AtomicBool = AtomicBool::new(false);
+    /// One-shot stderr note for the first latch (mission contract #4: log
+    /// once per process, not once per chunk).
+    static STALE_FLAG_LOGGED: AtomicBool = AtomicBool::new(false);
+    /// Test/observability toggle: force the pool off regardless of CPU count
+    /// or the stale flag, without a second build. Same rationale as the
+    /// repo's other measurement-feature surfaces (`probe::enable`/`take`,
+    /// `encode_census::reset`): the byte-identity probe needs BOTH arms of
+    /// the same binary, and no env var may pick an encode path in a
+    /// production build (CLAUDE.md non-negotiable #3) — this static exists
+    /// only under the default-off feature.
+    static FORCE_SERIAL: AtomicBool = AtomicBool::new(false);
+    /// Number of pools that completed a write-back (test/observability; see
+    /// the module doc — an identity test must prove its parallel arm ran).
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+
+    /// `min(2, cpus - 1)` extra flush workers (mission contract #2). A
+    /// single-CPU host gets 0 and never spawns the pool (pure serial bytes
+    /// fall out of the `None` arm).
+    fn worker_count() -> usize {
+        num_cpus::get().saturating_sub(1).min(2)
+    }
+
+    /// Whether this `run` should engage the pool (feature on, no stale flag,
+    /// no test override, at least one worker).
+    pub(super) fn engaged() -> bool {
+        !FORCE_SERIAL.load(Relaxed) && !STALE_FLAG.load(Relaxed) && worker_count() > 0
+    }
+
+    // ── test/observability surface (`parse` re-exports this block) ──
+    // (allowed dead: driven from the integration tests through the
+    // `near_optimal::` re-exports, never from the binary)
+
+    /// Probe accessors, re-exported by `parse::near_opt_flush_probe` for the
+    /// integration tests. Private to this module otherwise.
+    #[allow(dead_code)]
+    pub(super) fn parallel_flush_writes() -> u64 {
+        WRITES.load(Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn note_parallel_flush_write() {
+        WRITES.fetch_add(1, Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn set_force_serial(v: bool) {
+        FORCE_SERIAL.store(v, Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn stale_flag_fired() -> bool {
+        STALE_FLAG.load(Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn set_stale_flag_for_tests(v: bool) {
+        // Never log from a test-driven write: the one-shot stderr note is for
+        // real chunks only (the test asserts the LATCH, not the print).
+        STALE_FLAG_LOGGED.store(true, Relaxed);
+        STALE_FLAG.store(v, Relaxed);
+    }
+
+    // ── job + result plumbing ──
+
+    /// A finished block fragment, ready for in-order write-back.
+    struct Fragment {
+        /// `finish_unaligned`'s bytes: complete bytes, then the final partial
+        /// byte zero-padded under `pad_bits`.
+        bytes: Vec<u8>,
+        /// High bits of the fragment's LAST byte that are padding (0..=7).
+        pad_bits: u8,
+        /// The block's emission chose STORED (at least one BTYPE=00
+        /// sub-block): the fragment byte-aligns relative to its own start
+        /// and must be written back through the alignment replay, never
+        /// plain bit-shifting. Relayed onto the chunk thread for
+        /// `STORED_BLOCK_EMITTED` (the T>1 splicer's tripwire lives in a
+        /// thread-local set by the emitting thread).
+        stored: bool,
+        /// The flush's only-literals decision — the per-chunk stale-flag
+        /// tally (the runtime guard's condition).
+        used_only_literals: bool,
+    }
+
+    /// One flushable block: every input `optimize_and_flush` needs,
+    /// snapshotted at dispatch (see the module doc's carriers audit).
+    struct Job {
+        index: usize,
+        /// `buf[block_begin .. block_begin + block_length]` copied — the two
+        /// consumers that read raw bytes (`build_all_literals_codes` and the
+        /// emit's literal runs) must see the fill instant's bytes.
+        block: Vec<u8>,
+        /// `opt.match_cache[0..cache_end]`: the block's bt match headers +
+        /// matches, ALWAYS starting at index 0 (see the module doc).
+        cache_region: Vec<LzMatch>,
+        /// The merged approximate match-length histogram at block end.
+        match_len_freqs: Vec<u32>,
+        split_stats: BlockSplitStats,
+        prev_observations: [u32; NUM_OBSERVATION_TYPES],
+        prev_num_observations: u32,
+        is_first: bool,
+        is_final: bool,
+        params: LevelParams,
+    }
+
+    /// Shared worker state: the FIFO job queue (bounded at the worker count —
+    /// the block-order chain, below, makes a deeper backlog pure memory), the
+    /// per-index result slots, and this chunk's flush→flush exit-cost mailbox
+    /// (keyed by flushed-index; the chain is per-chunk because chunks of the
+    /// T>1 dispatcher run concurrently and each starts a fresh cost chain).
+    struct Core {
+        queue: Mutex<Queue>,
+        queue_cv: Condvar,
+        results: Mutex<Vec<Option<Fragment>>>,
+        results_cv: Condvar,
+        /// `exited[k]` = the cost model block `k`'s flush LEFT. Job `k+1`'s
+        /// worker parks on this key (and consumes it) before optimizing.
+        exited: Mutex<BTreeMap<usize, DeflateCosts>>,
+        exited_cv: Condvar,
+    }
+
+    struct Queue {
+        jobs: VecDeque<Job>,
+        open: bool,
+    }
+
+    /// The flush pool. Created per `run`; workers spawn lazily on the first
+    /// dispatch and join in `finish_and_write` (see the module doc's
+    /// thread-shape note).
+    pub(super) struct Dispatcher {
+        workers: usize,
+        statics: &'static StaticCodes,
+        budget: HeaderBudget,
+        core: Arc<Core>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+        spawned: bool,
+        /// Ordinal of the next dispatched block (the result-slot index).
+        next_index: usize,
+    }
+
+    impl Dispatcher {
+        /// A dispatcher, or `None` when the pool must not run: `min(2,
+        /// cpus-1) == 0` (a single-CPU host has no spare flush worker), the
+        /// test/observability override is on, or the stale-flag guard has
+        /// latched a previous chunk's only-literals flip. For every `None`
+        /// the serial arms of the flush sites below run byte-identical to
+        /// today's code — the structural no-op the contract requires.
+        pub(super) fn maybe_new(
+            statics: &'static StaticCodes,
+            budget: HeaderBudget,
+        ) -> Option<Self> {
+            if !engaged() {
+                return None;
+            }
+            Some(Dispatcher {
+                workers: worker_count(),
+                statics,
+                budget,
+                core: Arc::new(Core {
+                    queue: Mutex::new(Queue {
+                        jobs: VecDeque::new(),
+                        open: true,
+                    }),
+                    queue_cv: Condvar::new(),
+                    results: Mutex::new(Vec::new()),
+                    results_cv: Condvar::new(),
+                    exited: Mutex::new(BTreeMap::new()),
+                    exited_cv: Condvar::new(),
+                }),
+                handles: Vec::new(),
+                spawned: false,
+                next_index: 0,
+            })
+        }
+
+        /// Hand one completed block's flush to the pool: the dispatcher
+        /// snapshots every FILL-produced input at this instant (the fill will
+        /// overwrite the match-cache region and zero the freqs immediately
+        /// after) and pushes the job. Blocks are pushed in fill order and the
+        /// workers process them as a chained pipeline (each flush parks on
+        /// its predecessor's exit costs), so the queue bound of `workers` is
+        /// enough: the third-and-later pending flushes would sit on their
+        /// chain slot anyway.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn snapshot_and_dispatch(
+            &mut self,
+            block: Vec<u8>,
+            cache_region: Vec<LzMatch>,
+            match_len_freqs: Vec<u32>,
+            split_stats: BlockSplitStats,
+            prev_observations: [u32; NUM_OBSERVATION_TYPES],
+            prev_num_observations: u32,
+            is_first: bool,
+            is_final: bool,
+            params: LevelParams,
+        ) {
+            let index = self.next_index;
+            self.next_index += 1;
+            let job = Job {
+                index,
+                block,
+                cache_region,
+                match_len_freqs,
+                split_stats,
+                prev_observations,
+                prev_num_observations,
+                is_first,
+                is_final,
+                params,
+            };
+            if !self.spawned {
+                self.spawned = true;
+                for _ in 0..self.workers {
+                    let core = Arc::clone(&self.core);
+                    let (statics, budget) = (self.statics, self.budget);
+                    self.handles.push(std::thread::spawn(move || {
+                        flush_worker(&core, statics, budget)
+                    }));
+                }
+            }
+            {
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                debug_assert!(
+                    results.len() == index,
+                    "near-opt parallel flush: results registered out of order"
+                );
+                results.push(None);
+            }
+            {
+                let mut queue = self
+                    .core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Backpressure: hold the fill thread while the queue is at
+                // capacity. The chain means each queued flush's predecessor
+                // is already in a worker's hands, so this parks only during
+                // real contention.
+                while queue.jobs.len() >= self.workers {
+                    queue = self.core.queue_cv.wait(queue).unwrap();
+                }
+                queue.jobs.push_back(job);
+            }
+            self.core.queue_cv.notify_one();
+        }
+
+        /// Close the queue, wait for every dispatched flush, join the
+        /// workers, then write the finished fragments into `bw` in block
+        /// order. Returns the chunk's only-literals count (the guard's
+        /// condition).
+        pub(super) fn finish_and_write(mut self, bw: &mut BitWriter) -> usize {
+            {
+                let mut queue = self
+                    .core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                queue.open = false;
+            }
+            self.core.queue_cv.notify_all();
+            {
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while results.iter().any(std::option::Option::is_none) {
+                    results = self.core.results_cv.wait(results).unwrap();
+                }
+            }
+            for handle in self.handles.drain(..) {
+                let _ = handle.join();
+            }
+            let mut flips = 0usize;
+            {
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for slot in results.iter_mut() {
+                    let frag = slot.take().expect("all slots filled before write-back");
+                    // RELAY the stored tripwire onto the chunk thread: the
+                    // emission ran here, but `STORED_BLOCK_EMITTED` (and the
+                    // T>1 splicer that reads it) belongs to the thread that
+                    // ran `run`.
+                    if frag.stored {
+                        super::super::super::note_stored_block_emitted();
+                    }
+                    if frag.used_only_literals {
+                        flips += 1;
+                    }
+                    bw.append_fragment(&frag.bytes, frag.pad_bits, frag.stored);
+                }
+            }
+            note_parallel_flush_write();
+            if flips > 0 {
+                // Mission contract #4: the runtime guard. The zero-flip
+                // finding makes this unreachable on the campaign corpora;
+                // when it does fire the process latches to serial.
+                STALE_FLAG.store(true, Relaxed);
+                if !STALE_FLAG_LOGGED.swap(true, Relaxed) {
+                    eprintln!(
+                        "gzippy: near-optimal parallel flush guard tripped \
+                         ({flips} only-literals flushes in one chunk) -- \
+                         falling back to the serial optimize_and_flush for the \
+                         rest of this process"
+                    );
+                }
+            }
+            flips
+        }
+    }
+
+    /// One flush worker: pull jobs FIFO, wait on the chain, run the EXACT
+    /// serial `optimize_and_flush` into a private writer, record the
+    /// fragment in this job's slot.
+    fn flush_worker(core: &Core, statics: &'static StaticCodes, budget: HeaderBudget) {
+        // One pooled Optimizer per worker: the serial Optimizer's exact shape
+        // (match cache, DP node table, cost model, sink, header/code
+        // scratch), reused across blocks of every chunk this worker serves.
+        // Nothing in it survives a flush that the next flush reads EXCEPT
+        // `costs` — which the chain re-seeds per job (see `run_job`).
+        let mut opt = Optimizer::new(budget);
+        loop {
+            let job = {
+                let mut queue = core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    if let Some(job) = queue.jobs.pop_front() {
+                        core.queue_cv.notify_all();
+                        break job;
+                    }
+                    if !queue.open {
+                        return;
+                    }
+                    queue = core.queue_cv.wait(queue).unwrap();
+                }
+            };
+            let index = job.index;
+            let frag = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_job(core, &mut opt, job, statics)
+            }))
+            .unwrap_or_else(|_| {
+                // A panicking flush must not hang its successors: the
+                // increment below posts a POISONED entry into the
+                // flush→flush chain (zero costs — the next flush then
+                // computes *something*, and the empty fragment above makes
+                // the whole-chunk stream a LOUD mismatch the byte-identity
+                // tests reject), where `run_job`'s own post would have
+                // been skipped.
+                core.exited
+                    .lock()
+                    .unwrap()
+                    .insert(index, DeflateCosts::default());
+                core.exited_cv.notify_all();
+                Fragment {
+                    // A panicking flush leaves its slot EMPTY-sized: the
+                    // write-back then produces a stream that the
+                    // byte-identity tests reject loudly instead of the
+                    // process hanging on a poisoned pipeline. (In release
+                    // builds `panic = "abort"` takes the process first.)
+                    bytes: Vec::new(),
+                    pad_bits: 0,
+                    stored: false,
+                    used_only_literals: false,
+                }
+            });
+            {
+                let mut results = core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                results[index] = Some(frag);
+            }
+            core.results_cv.notify_all();
+        }
+    }
+
+    /// The flush itself: identical inputs, identical call, only the writer
+    /// is this block's private `BitWriter`.
+    fn run_job(core: &Core, opt: &mut Optimizer, job: Job, statics: &StaticCodes) -> Fragment {
+        // The costs carrier the carrier list omitted (see the module doc):
+        // block N's entering cost model is block N-1's exit state; block 0
+        // enters with the fresh Optimizer's zero costs, i.e. exactly what the
+        // serial run's fresh `Optimizer` holds. For every index > 0 the
+        // worker has already parked on (and consumed) the predecessor's
+        // exit entry before this call.
+        if job.index > 0 {
+            park_on_exit_costs(core, opt, job.index);
+        }
+        opt.match_cache[..job.cache_region.len()].copy_from_slice(&job.cache_region);
+        opt.match_len_freqs.copy_from_slice(&job.match_len_freqs);
+        // Per-flush stored tripwire on THIS thread: reset-read around the
+        // emit, relayed at write-back.
+        super::super::super::clear_stored_block_emitted();
+        let mut w = BitWriter::from_vec(Vec::new());
+        let used_only_literals = opt.optimize_and_flush(
+            &job.block,
+            0,
+            job.block.len(),
+            job.cache_region.len(),
+            job.is_first,
+            job.is_final,
+            &job.params,
+            statics,
+            &job.split_stats,
+            &job.prev_observations,
+            job.prev_num_observations,
+            &mut w,
+        );
+        // Chain: post this flush's EXIT state where job index+1's worker
+        // will find it. Serial `run` just leaves `opt.costs` in place for the
+        // next block; the pipelined worker does the same thing through the
+        // mailbox (the pooled Optimizer's costs are re-seeded at every job
+        // entry, so nothing else in it matters across jobs).
+        record_exit_costs(core, job.index, opt.costs.clone());
+        let (bytes, pad_bits) = w.finish_unaligned();
+        Fragment {
+            bytes,
+            pad_bits,
+            stored: super::super::super::stored_block_emitted_on_this_thread(),
+            used_only_literals,
+        }
+    }
+
+    /// Block `index > 0` parks here until block `index - 1`'s worker posts
+    /// the exited cost model (index key `k` = the mode LEAVING flush `k`):
+    /// the flush→flush chain the carriers audit found. FIFO queue discipline
+    /// guarantees the predecessor was popped before this job.
+    fn park_on_exit_costs(core: &Core, opt: &mut Optimizer, index: usize) {
+        let mut exited = core
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !exited.contains_key(&(index - 1)) {
+            exited = core.exited_cv.wait(exited).unwrap();
+        }
+        if let Some(costs) = exited.remove(&(index - 1)) {
+            opt.costs = costs;
+        }
+    }
+
+    /// Post the flushed block's exited cost model where block `index+1`'s
+    /// worker will consume it (and wake it).
+    fn record_exit_costs(core: &Core, index: usize, costs: DeflateCosts) {
+        core.exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(index, costs);
+        core.exited_cv.notify_all();
+    }
+}
+
 /// Near-optimal driver. Compresses `buf[data_start..in_end]` into DEFLATE blocks
 /// appended to `bw` (a preset dictionary in `buf[..data_start]` is seeded into
 /// the matchfinder but not coded). Port of `deflate_compress_near_optimal`.
+///
+/// `statics` is `&'static` because the pool workers outlive this call's frame
+/// (`near-opt-parallel-flush` flush workers; every other use is reference
+/// sharing, unchanged). The only caller builds it from the process-wide
+/// `OnceLock`, so this widening is free.
 pub(super) fn run(
     buf: &[u8],
     data_start: usize,
     in_end: usize,
     params: &LevelParams,
-    statics: &StaticCodes,
+    statics: &'static StaticCodes,
     bw: &mut BitWriter,
     is_last: bool,
     budget: HeaderBudget,
 ) {
     let mut opt = Box::new(Optimizer::new(budget));
     let mut bt_mf = BtMatchfinder::new();
+
+    // LEVER #3 (feature `near-opt-parallel-flush`): the flush dispatcher.
+    // `None` without the feature, on a single-CPU host, or after the stale
+    // flag latched — every `None` arm is exactly today's serial code (see the
+    // parallel_flush module doc for the carriers audit and the guard).
+    #[cfg(feature = "near-opt-parallel-flush")]
+    let mut flush_pipe = parallel_flush::Dispatcher::maybe_new(statics, budget);
 
     let depth = params.max_search_depth;
     let mut max_len = MAX_MATCH_LEN;
@@ -746,7 +1376,48 @@ pub(super) fn run(
             let cache_len_rewound = orig_cache_ptr - cache_ptr;
             let block_cache_end = cache_ptr;
 
-            prev_block_used_only_literals =
+            #[cfg(feature = "near-opt-parallel-flush")]
+            let prev_used_only_literals = match flush_pipe.as_mut() {
+                // LEVER #3 dispatch: hand the flush sub-phase to a pool
+                // worker with fill-instant snapshots of every carrier; the
+                // only chunk-visible boolean result (the only-literals
+                // backedge) is ASSUMED false here — the b5281a96 zero-flip
+                // finding makes the assumption true on the campaign corpora,
+                // and finish_and_write's chunk-end guard is what keeps it
+                // honest (see the parallel_flush module doc).
+                Some(pipe) => {
+                    pipe.snapshot_and_dispatch(
+                        buf[in_block_begin..in_block_end].to_vec(),
+                        opt.match_cache[..block_cache_end].to_vec(),
+                        opt.match_len_freqs.clone(),
+                        split_stats.clone(),
+                        prev_observations,
+                        prev_num_observations,
+                        is_first,
+                        false,
+                        *params,
+                    );
+                    false
+                }
+                None => crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    opt.optimize_and_flush(
+                        buf,
+                        in_block_begin,
+                        block_length,
+                        block_cache_end,
+                        is_first,
+                        false,
+                        params,
+                        statics,
+                        &split_stats,
+                        &prev_observations,
+                        prev_num_observations,
+                        bw,
+                    )
+                }),
+            };
+            #[cfg(not(feature = "near-opt-parallel-flush"))]
+            let prev_used_only_literals =
                 crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
                     opt.optimize_and_flush(
                         buf,
@@ -763,6 +1434,7 @@ pub(super) fn run(
                         bw,
                     )
                 });
+            prev_block_used_only_literals = prev_used_only_literals;
 
             // Move the rewound tail back to the start of the cache.
             opt.match_cache
@@ -793,7 +1465,45 @@ pub(super) fn run(
                 &mut opt.match_len_freqs,
                 &mut new_match_len_freqs,
             );
-            prev_block_used_only_literals =
+
+            #[cfg(feature = "near-opt-parallel-flush")]
+            let prev_used_only_literals = match flush_pipe.as_mut() {
+                // LEVER #3 dispatch (final-branch): same contract as the
+                // rewind branch above. `is_final` is known at dispatch (it
+                // only depends on the fill's own position).
+                Some(pipe) => {
+                    pipe.snapshot_and_dispatch(
+                        buf[in_block_begin..in_next].to_vec(),
+                        opt.match_cache[..cache_ptr].to_vec(),
+                        opt.match_len_freqs.clone(),
+                        split_stats.clone(),
+                        prev_observations,
+                        prev_num_observations,
+                        is_first,
+                        is_final,
+                        *params,
+                    );
+                    false
+                }
+                None => crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    opt.optimize_and_flush(
+                        buf,
+                        in_block_begin,
+                        block_length,
+                        cache_ptr,
+                        is_first,
+                        is_final,
+                        params,
+                        statics,
+                        &split_stats,
+                        &prev_observations,
+                        prev_num_observations,
+                        bw,
+                    )
+                }),
+            };
+            #[cfg(not(feature = "near-opt-parallel-flush"))]
+            let prev_used_only_literals =
                 crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
                     opt.optimize_and_flush(
                         buf,
@@ -810,6 +1520,7 @@ pub(super) fn run(
                         bw,
                     )
                 });
+            prev_block_used_only_literals = prev_used_only_literals;
 
             cache_ptr = 0;
             save_stats(
@@ -831,6 +1542,16 @@ pub(super) fn run(
         if in_next == in_end {
             break;
         }
+    }
+
+    // LEVER #3 writeback: consume the finished flush buffers IN BLOCK ORDER,
+    // joining the pool. The dispatch order plus this in-order repack (with
+    // `BitWriter::append_fragment`'s bit-exact pending-byte shifting) is what
+    // makes the parallel chunk byte-identical to the serial chunk; the
+    // returned flip tally is the runtime guard it applies for later chunks.
+    #[cfg(feature = "near-opt-parallel-flush")]
+    if let Some(pipe) = flush_pipe.take() {
+        pipe.finish_and_write(bw);
     }
 }
 

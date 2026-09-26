@@ -59,6 +59,45 @@ mod greedy;
 #[cfg(feature = "split-recall")]
 pub mod split_recall;
 use far_len3::FarLen3Gate;
+
+/// Test/observability handle for the near-optimal flush-dispatch instrument
+/// (feature `near-opt-parallel-flush`, DEFAULT OFF; this module compiles to
+/// nothing without it). Follows the repo's measurement-feature surface
+/// precedent (`probe::enable`/`take`, `encode_census::reset`): the
+/// byte-identity and wall probes need BOTH arms of the same binary, and
+/// production paths are not allowed to pick an encode route by env var
+/// (CLAUDE.md non-negotiable #3) — these functions exist only to drive and
+/// verify the in-process probes; no production call site reads them.
+#[cfg(feature = "near-opt-parallel-flush")]
+pub mod near_opt_flush_probe {
+    /// Force the pool off for subsequent near-optimal runs (the serial arm;
+    /// byte-identical to today's shape by construction).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn set_force_serial_flush(v: bool) {
+        super::near_optimal::set_force_serial(v);
+    }
+    /// Number of pools that completed a write-back so far — the probe's
+    /// witness that its parallel arm actually engaged (a silently-serial arm
+    /// would make a byte-identity check pass vacuously).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn parallel_flush_writes() -> u64 {
+        super::near_optimal::parallel_flush_writes()
+    }
+    /// Whether the stale-flag guard has latched (the only-literals flip
+    /// finding); asserted NON-fired by the identity probes.
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn stale_flag_fired() -> bool {
+        super::near_optimal::stale_flag_fired()
+    }
+    /// Test-only latch/wiper for the guard's FALLBACK half (a real flip is
+    /// corpus-dependent and the measured zero-flip finding says it never
+    /// fires on the campaign corpora; this proves what happens to chunks
+    /// AFTER a latch).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn set_stale_flag_for_tests(v: bool) {
+        super::near_optimal::set_stale_flag_for_tests(v);
+    }
+}
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
 /// REOPEN it rests on.

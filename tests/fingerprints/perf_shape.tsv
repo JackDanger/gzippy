@@ -110,6 +110,7 @@ binary	9	huffman_make_code_calls	14	72
 binary	9	literals_emitted	574565	566935
 binary	9	match_length_bytes_total	474011	481641
 binary	9	matches_emitted	25270	26825
+binary	9	near_opt_flush_blocks	0	4
 noise	1	blocks_emitted_stored	17	18
 noise	1	fast_hash_computations	1050269	1148499
 noise	1	fast_head_table_reads	1048607	1048579
@@ -189,6 +190,8 @@ noise	9	huffman_make_code_calls	14	48
 noise	9	literals_emitted	1047230	1048576
 noise	9	match_length_bytes_total	1346	0
 noise	9	matches_emitted	446	0
+noise	9	near_opt_flush_blocks	0	4
+noise	9	near_opt_only_literals_blocks	0	4
 tabular	1	bitstream_flush_word_calls	159250	159556
 tabular	1	blocks_emitted_dynamic	16	18
 tabular	1	dynamic_header_bits_total	4003	4390
@@ -284,6 +287,7 @@ tabular	9	huffman_make_code_calls	14	96
 tabular	9	literals_emitted	132856	122221
 tabular	9	match_length_bytes_total	915720	926355
 tabular	9	matches_emitted	71318	74040
+tabular	9	near_opt_flush_blocks	0	6
 text	1	bitstream_flush_word_calls	209759	209753
 text	1	blocks_emitted_dynamic	16	18
 text	1	dynamic_header_bits_total	7629	8488
@@ -380,3 +384,4 @@ text	9	huffman_make_code_calls	14	78
 text	9	literals_emitted	60363	13270
 text	9	match_length_bytes_total	988213	1035306
 text	9	matches_emitted	112068	126437
+text	9	near_opt_flush_blocks	0	5

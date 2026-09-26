@@ -149,6 +149,38 @@ anatomy-wall = []
 # call sites compile to nothing. Prints one `BLOCKCOST ...` line per emitted block
 # to stderr. Measurement-output only — no env var, no behaviour change.
 block-cost-probe = []
+# LEVER #3 (docs/board/sprint-2026-09-25.md "Lever ledger", row 3): run the
+# near-optimal parser's per-block `optimize_and_flush` sub-phase OFF the chunk's
+# serial critical path, so the measured flush share (lever-0's conserved split:
+# 13 blocks / 3 MB = fill 104.1 ms / flush 117.7 ms, 52.9% of the chunk) overlaps
+# the fill of the next block instead of serializing behind it. With the feature
+# off, every dispatch site, the flush-worker pool, the fragment append path and
+# the stale-flag guard compile to nothing — the serial shape is bit-for-bit
+# today's shape. With it on, `near_optimal::run` spawns min(2, cpus-1) flush
+# workers; blocks are dispatched to the pool in block order; each flush runs
+# into its own `BitWriter` and the dispatcher repacks the finished fragments
+# IN ORDER with bit-exact pending-bit shifting, so the whole-chunk stream is
+# byte-identical to the serial build (pinned by
+# `tests/l9_t4_chunk_cost_probe.rs::parallel_flush_*`). The flush→flush
+# freshness carriers are chained in block order (the `Optimizer::costs` entry
+# state — the one carrier beyond the boolean backedge; see the
+# `parallel_flush` module doc in near_optimal.rs), the per-chunk
+# only-literals flip tally replays the `near_opt_only_literals_blocks`
+# counter's condition at chunk end and latches a process-wide one-shot veto
+# (log + serial fallback for subsequent chunks) when it ever fires.
+#
+# PROMOTION PRECONDITION (agent-29 review, major 1, recorded): within-chunk
+# byte identity holds ONLY on zero-flip corpora (commit b5281a96 measured
+# 0 flips across 47 flushes on the campaign corpora). A nonzero flip makes
+# that chunk's bytes QUIETLY diverge from both trunk and the post-latch
+# serial fallback until the NEXT chunk boundary — the latch is per-process
+# after the chunk, so a flip means the affected chunk is an audible
+# quarantine, never a byte-identity promise. Closing that hole for flip
+# corpora means serializing the fill→flush chain, i.e. forfeiting the lever;
+# mid-chunk serializability is out of scope by design.
+# DEFAULT OFF: an adjudication-gated lever, not a shipped default — the wall
+# claim rides the probe variant's measured numbers before it can be promoted.
+near-opt-parallel-flush = []
 # ── Bucket-split-oracle session (2026-07-26) ────────────────────────────────
 # The `parse_match` anatomy-wall bucket is FUSED (probe + accept/defer +
 # `Sink::push_*` emission + histogram/stats all inlined in one per-position
