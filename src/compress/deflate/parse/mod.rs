@@ -482,8 +482,6 @@ impl Sink {
     }
 }
 
-/// L1 [`fast::run`] dispatch: `GZIP_HASH` is a const generic, so the mmap
-/// pick-min gzip arm is selected via a runtime branch over two monomorphizations.
 #[allow(clippy::too_many_arguments)]
 fn fast_run_dispatch<const REACH: bool, const INTERLEAVED: bool>(
     gzip_primary: bool,
