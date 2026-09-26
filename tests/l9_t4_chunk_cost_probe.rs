@@ -338,6 +338,17 @@ mod parallel_flush_probes {
                 ser_align, par_align,
                 "{name}: L9-T4 needs_alignment diverged (stored-block detection)"
             );
+            if name == "probe-corpus+noise-tail" {
+                // The reviewer's positivity fix (agent-29 minor 3): the noise
+                // tail exists to price a STORED block into the final
+                // fragment; assert the witness rather than trusting
+                // equality with itself.
+                assert!(
+                    ser_align,
+                    "{name}: the noise tail must still price a stored block \
+                     (else the stored-replay coverage silently stops firing)"
+                );
+            }
             assert_eq!(
                 ser, par,
                 "{name}: L9-T4 chunk stream diverged from the serial reference"

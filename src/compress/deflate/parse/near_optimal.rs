@@ -880,7 +880,11 @@ mod parallel_flush {
                 }
             }
             {
-                let mut results = self.core.results.lock().unwrap();
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 debug_assert!(
                     results.len() == index,
                     "near-opt parallel flush: results registered out of order"
@@ -888,7 +892,11 @@ mod parallel_flush {
                 results.push(None);
             }
             {
-                let mut queue = self.core.queue.lock().unwrap();
+                let mut queue = self
+                    .core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Backpressure: hold the fill thread while the queue is at
                 // capacity. The chain means each queued flush's predecessor
                 // is already in a worker's hands, so this parks only during
@@ -907,12 +915,20 @@ mod parallel_flush {
         /// condition).
         pub(super) fn finish_and_write(mut self, bw: &mut BitWriter) -> usize {
             {
-                let mut queue = self.core.queue.lock().unwrap();
+                let mut queue = self
+                    .core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.open = false;
             }
             self.core.queue_cv.notify_all();
             {
-                let mut results = self.core.results.lock().unwrap();
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 while results.iter().any(std::option::Option::is_none) {
                     results = self.core.results_cv.wait(results).unwrap();
                 }
@@ -922,7 +938,11 @@ mod parallel_flush {
             }
             let mut flips = 0usize;
             {
-                let mut results = self.core.results.lock().unwrap();
+                let mut results = self
+                    .core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for slot in results.iter_mut() {
                     let frag = slot.take().expect("all slots filled before write-back");
                     // RELAY the stored tripwire onto the chunk thread: the
@@ -969,7 +989,10 @@ mod parallel_flush {
         let mut opt = Optimizer::new(budget);
         loop {
             let job = {
-                let mut queue = core.queue.lock().unwrap();
+                let mut queue = core
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 loop {
                     if let Some(job) = queue.jobs.pop_front() {
                         core.queue_cv.notify_all();
@@ -1011,7 +1034,10 @@ mod parallel_flush {
                 }
             });
             {
-                let mut results = core.results.lock().unwrap();
+                let mut results = core
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 results[index] = Some(frag);
             }
             core.results_cv.notify_all();
@@ -1070,7 +1096,10 @@ mod parallel_flush {
     /// the flush→flush chain the carriers audit found. FIFO queue discipline
     /// guarantees the predecessor was popped before this job.
     fn park_on_exit_costs(core: &Core, opt: &mut Optimizer, index: usize) {
-        let mut exited = core.exited.lock().unwrap();
+        let mut exited = core
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while !exited.contains_key(&(index - 1)) {
             exited = core.exited_cv.wait(exited).unwrap();
         }
@@ -1082,7 +1111,10 @@ mod parallel_flush {
     /// Post the flushed block's exited cost model where block `index+1`'s
     /// worker will consume it (and wake it).
     fn record_exit_costs(core: &Core, index: usize, costs: DeflateCosts) {
-        core.exited.lock().unwrap().insert(index, costs);
+        core.exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(index, costs);
         core.exited_cv.notify_all();
     }
 }

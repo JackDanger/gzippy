@@ -168,6 +168,16 @@ block-cost-probe = []
 # only-literals flip tally replays the `near_opt_only_literals_blocks`
 # counter's condition at chunk end and latches a process-wide one-shot veto
 # (log + serial fallback for subsequent chunks) when it ever fires.
+#
+# PROMOTION PRECONDITION (agent-29 review, major 1, recorded): within-chunk
+# byte identity holds ONLY on zero-flip corpora (commit b5281a96 measured
+# 0 flips across 47 flushes on the campaign corpora). A nonzero flip makes
+# that chunk's bytes QUIETLY diverge from both trunk and the post-latch
+# serial fallback until the NEXT chunk boundary — the latch is per-process
+# after the chunk, so a flip means the affected chunk is an audible
+# quarantine, never a byte-identity promise. Closing that hole for flip
+# corpora means serializing the fill→flush chain, i.e. forfeiting the lever;
+# mid-chunk serializability is out of scope by design.
 # DEFAULT OFF: an adjudication-gated lever, not a shipped default — the wall
 # claim rides the probe variant's measured numbers before it can be promoted.
 near-opt-parallel-flush = []
