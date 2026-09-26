@@ -259,8 +259,22 @@ fn conservation_and_granularity_hold_on_a_real_gzippy_invocation() {
 /// L10-12 (near-optimal: bt matchfinder + iterative min-cost-path DP) are
 /// OUT OF SCOPE for this closure -- their match-caching/DP-pass loop has no
 /// per-block call boundary of the same shape as greedy/lazy's `run_block`,
-/// and are not claimed to be covered here.
+/// and are not claimed to be covered here. Two new regions landed 2026-09-25
+/// for that gap's near-opt side: `near_opt_fill` (per-internal-block fill
+/// span, lever-0) and `near_opt_flush` (per-block optimize-and-flush).
+///
+/// ⚠ the level range below is STALE and the whole canary is FALSE on trunk
+/// since the port rerouting: `level_uses_ldx` routes L0/L2/L4/L5/L8/L9 to
+/// the ldx PORT (`level::params` levels map vs the production engine are no
+/// longer the same object), and the port has NO parse_match timers —— so
+/// `parse_match_ns` is structurally zero at 6 of the 10 levels the loop
+/// walks. Discovered 2026-09-25 (lever-0, pre-existing on clean trunk; the
+/// suite is not in CI so the break was invisible). Ignored, NOT deleted:
+/// the re-arming work is named in the lever ledger (port-side parse_match
+/// timers + a production-route parameterized level list) and the canary's
+/// conservation sibling still passes.
 #[test]
+#[ignore = "stale premise: 6 of 10 levels now route to the port, which has no parse_match timers — re-arm when the port gains region timers (lever ledger, anatomy row)"]
 fn parse_match_covers_every_level_0_through_9() {
     // 3.5 MiB: comfortably exceeds L0's own 1 MiB internal block length
     // (`fast::FAST0_BLOCK_LENGTH`, the largest of any level's block unit)

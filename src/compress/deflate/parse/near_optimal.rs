@@ -587,128 +587,136 @@ pub(super) fn run(
         // already trust ("cptr/mi walk match_cache within the forward pass's
         // contiguous write region") — this increment makes the write side that
         // produces that region unchecked too.
-        loop {
-            let remaining = in_end - in_next;
+        //
+        // LIVE SUBJECTION: one `anatomy_wall_time!` per OUTER-loop iteration
+        // wraps the whole inner fill loop (per-internal-block granularity —
+        // the contract; per-position timing is contract-forbidden). The
+        // inner loop's `continue`/`break` both target this loop, which lives
+        // INSIDE the timer's body block, so the accounting stays correct.
+        crate::anatomy_wall_time!(near_opt_fill_ns, near_opt_fill_calls, {
+            loop {
+                let remaining = in_end - in_next;
 
-            // Slide the window forward if needed.
-            if in_next == in_next_slide {
-                bt_mf.slide_window();
-                in_cur_base = in_next;
-                in_next_slide = in_next + remaining.min(WINDOW_SIZE);
-            }
+                // Slide the window forward if needed.
+                if in_next == in_next_slide {
+                    bt_mf.slide_window();
+                    in_cur_base = in_next;
+                    in_next_slide = in_next + remaining.min(WINDOW_SIZE);
+                }
 
-            // Find and cache matches at the current position.
-            let matches_start = cache_ptr;
-            let mut best_len = 0u32;
-            adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
-            if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
-                let n = bt_mf.get_matches(
-                    buf,
-                    in_cur_base,
-                    (in_next - in_cur_base) as isize,
-                    max_len,
-                    nice_len,
-                    depth,
-                    &mut next_hashes,
-                    &mut opt.match_cache[matches_start..],
+                // Find and cache matches at the current position.
+                let matches_start = cache_ptr;
+                let mut best_len = 0u32;
+                adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
+                if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
+                    let n = bt_mf.get_matches(
+                        buf,
+                        in_cur_base,
+                        (in_next - in_cur_base) as isize,
+                        max_len,
+                        nice_len,
+                        depth,
+                        &mut next_hashes,
+                        &mut opt.match_cache[matches_start..],
+                    );
+                    cache_ptr = matches_start + n;
+                    if n > 0 {
+                        // SAFETY: see the soundness invariant above; `cache_ptr - 1
+                        // == matches_start + n - 1` is a slot `get_matches` just
+                        // wrote (`n <= MAX_MATCHES_PER_POS` slots from
+                        // `matches_start`, within the cache's slop capacity).
+                        debug_assert!(cache_ptr - 1 < opt.match_cache.len());
+                        best_len =
+                            unsafe { opt.match_cache.get_unchecked(cache_ptr - 1).length as u32 };
+                    }
+                }
+
+                // Observe a match or literal for the split / cost statistics.
+                if in_next >= next_observation {
+                    if best_len >= min_len {
+                        split_stats.observe_match(best_len);
+                        next_observation = in_next + best_len as usize;
+                        new_match_len_freqs[best_len as usize] += 1;
+                    } else {
+                        split_stats.observe_literal(buf[in_next]);
+                        next_observation = in_next + 1;
+                    }
+                }
+
+                // Write this position's cache header (num matches, literal byte).
+                // SAFETY: see the soundness invariant above (`cache_ptr` bound).
+                debug_assert!(cache_ptr < opt.match_cache.len());
+                unsafe {
+                    let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
+                    hdr.length = (cache_ptr - matches_start) as u16;
+                    hdr.offset = buf[in_next] as u16;
+                }
+                in_next += 1;
+                cache_ptr += 1;
+
+                // Skip the interior of a very long match (don't cache its bytes).
+                if best_len >= MIN_MATCH_LEN && best_len >= nice_len {
+                    let mut skip = best_len - 1;
+                    loop {
+                        let remaining = in_end - in_next;
+                        if in_next == in_next_slide {
+                            bt_mf.slide_window();
+                            in_cur_base = in_next;
+                            in_next_slide = in_next + remaining.min(WINDOW_SIZE);
+                        }
+                        adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
+                        if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
+                            bt_mf.skip_byte(
+                                buf,
+                                in_cur_base,
+                                (in_next - in_cur_base) as isize,
+                                nice_len,
+                                depth,
+                                &mut next_hashes,
+                            );
+                        }
+                        // SAFETY: see the soundness invariant above (`cache_ptr` bound).
+                        debug_assert!(cache_ptr < opt.match_cache.len());
+                        unsafe {
+                            let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
+                            hdr.length = 0;
+                            hdr.offset = buf[in_next] as u16;
+                        }
+                        in_next += 1;
+                        cache_ptr += 1;
+                        skip -= 1;
+                        if skip == 0 {
+                            break;
+                        }
+                    }
+                }
+
+                // Maximum block length or end of input reached?
+                if in_next >= in_max_block_end {
+                    break;
+                }
+                // Match cache overflowed?
+                if cache_ptr >= MATCH_CACHE_LENGTH {
+                    break;
+                }
+                // Not ready to check for a block end (again)?
+                if !split_stats.ready_to_check_block(in_next - in_block_begin, in_end - in_next) {
+                    continue;
+                }
+                // Would ending the block be worthwhile?
+                if split_stats.do_end_block_check((in_next - in_block_begin) as u32) {
+                    change_detected = true;
+                    break;
+                }
+                // Not worthwhile: merge the recent stats and remember this point.
+                merge_stats(
+                    &mut split_stats,
+                    &mut opt.match_len_freqs,
+                    &mut new_match_len_freqs,
                 );
-                cache_ptr = matches_start + n;
-                if n > 0 {
-                    // SAFETY: see the soundness invariant above; `cache_ptr - 1
-                    // == matches_start + n - 1` is a slot `get_matches` just
-                    // wrote (`n <= MAX_MATCHES_PER_POS` slots from
-                    // `matches_start`, within the cache's slop capacity).
-                    debug_assert!(cache_ptr - 1 < opt.match_cache.len());
-                    best_len =
-                        unsafe { opt.match_cache.get_unchecked(cache_ptr - 1).length as u32 };
-                }
+                prev_end_block_check = Some(in_next);
             }
-
-            // Observe a match or literal for the split / cost statistics.
-            if in_next >= next_observation {
-                if best_len >= min_len {
-                    split_stats.observe_match(best_len);
-                    next_observation = in_next + best_len as usize;
-                    new_match_len_freqs[best_len as usize] += 1;
-                } else {
-                    split_stats.observe_literal(buf[in_next]);
-                    next_observation = in_next + 1;
-                }
-            }
-
-            // Write this position's cache header (num matches, literal byte).
-            // SAFETY: see the soundness invariant above (`cache_ptr` bound).
-            debug_assert!(cache_ptr < opt.match_cache.len());
-            unsafe {
-                let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
-                hdr.length = (cache_ptr - matches_start) as u16;
-                hdr.offset = buf[in_next] as u16;
-            }
-            in_next += 1;
-            cache_ptr += 1;
-
-            // Skip the interior of a very long match (don't cache its bytes).
-            if best_len >= MIN_MATCH_LEN && best_len >= nice_len {
-                let mut skip = best_len - 1;
-                loop {
-                    let remaining = in_end - in_next;
-                    if in_next == in_next_slide {
-                        bt_mf.slide_window();
-                        in_cur_base = in_next;
-                        in_next_slide = in_next + remaining.min(WINDOW_SIZE);
-                    }
-                    adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
-                    if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
-                        bt_mf.skip_byte(
-                            buf,
-                            in_cur_base,
-                            (in_next - in_cur_base) as isize,
-                            nice_len,
-                            depth,
-                            &mut next_hashes,
-                        );
-                    }
-                    // SAFETY: see the soundness invariant above (`cache_ptr` bound).
-                    debug_assert!(cache_ptr < opt.match_cache.len());
-                    unsafe {
-                        let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
-                        hdr.length = 0;
-                        hdr.offset = buf[in_next] as u16;
-                    }
-                    in_next += 1;
-                    cache_ptr += 1;
-                    skip -= 1;
-                    if skip == 0 {
-                        break;
-                    }
-                }
-            }
-
-            // Maximum block length or end of input reached?
-            if in_next >= in_max_block_end {
-                break;
-            }
-            // Match cache overflowed?
-            if cache_ptr >= MATCH_CACHE_LENGTH {
-                break;
-            }
-            // Not ready to check for a block end (again)?
-            if !split_stats.ready_to_check_block(in_next - in_block_begin, in_end - in_next) {
-                continue;
-            }
-            // Would ending the block be worthwhile?
-            if split_stats.do_end_block_check((in_next - in_block_begin) as u32) {
-                change_detected = true;
-                break;
-            }
-            // Not worthwhile: merge the recent stats and remember this point.
-            merge_stats(
-                &mut split_stats,
-                &mut opt.match_len_freqs,
-                &mut new_match_len_freqs,
-            );
-            prev_end_block_check = Some(in_next);
-        }
+        });
 
         // Choose the block end + the item sequence, then flush.
         let rewind_end = if change_detected {
@@ -738,20 +746,23 @@ pub(super) fn run(
             let cache_len_rewound = orig_cache_ptr - cache_ptr;
             let block_cache_end = cache_ptr;
 
-            prev_block_used_only_literals = opt.optimize_and_flush(
-                buf,
-                in_block_begin,
-                block_length,
-                block_cache_end,
-                is_first,
-                false,
-                params,
-                statics,
-                &split_stats,
-                &prev_observations,
-                prev_num_observations,
-                bw,
-            );
+            prev_block_used_only_literals =
+                crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    opt.optimize_and_flush(
+                        buf,
+                        in_block_begin,
+                        block_length,
+                        block_cache_end,
+                        is_first,
+                        false,
+                        params,
+                        statics,
+                        &split_stats,
+                        &prev_observations,
+                        prev_num_observations,
+                        bw,
+                    )
+                });
 
             // Move the rewound tail back to the start of the cache.
             opt.match_cache
@@ -782,20 +793,23 @@ pub(super) fn run(
                 &mut opt.match_len_freqs,
                 &mut new_match_len_freqs,
             );
-            prev_block_used_only_literals = opt.optimize_and_flush(
-                buf,
-                in_block_begin,
-                block_length,
-                cache_ptr,
-                is_first,
-                is_final,
-                params,
-                statics,
-                &split_stats,
-                &prev_observations,
-                prev_num_observations,
-                bw,
-            );
+            prev_block_used_only_literals =
+                crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    opt.optimize_and_flush(
+                        buf,
+                        in_block_begin,
+                        block_length,
+                        cache_ptr,
+                        is_first,
+                        is_final,
+                        params,
+                        statics,
+                        &split_stats,
+                        &prev_observations,
+                        prev_num_observations,
+                        bw,
+                    )
+                });
 
             cache_ptr = 0;
             save_stats(
