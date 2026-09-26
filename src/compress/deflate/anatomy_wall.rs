@@ -307,6 +307,7 @@ thread_local! {
 
 /// The `anatomy_wall_time!` macro's guard: `true` while this thread is inside
 /// its near-opt flush wrapper. Always false in feature-off builds.
+#[cfg_attr(not(feature = "anatomy-wall"), allow(dead_code))]
 pub fn near_opt_flushing() -> bool {
     #[cfg(feature = "anatomy-wall")]
     {
