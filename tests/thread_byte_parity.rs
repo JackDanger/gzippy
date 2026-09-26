@@ -87,11 +87,14 @@ fn grid_is_thread_free_at_every_pipelined_level() {
 }
 
 /// The cross-`-p` digest tie at every pipelined level, with roundtrip.
+/// L10–12 included: the audit-wave M3 gap (agent-34) named the missing
+/// range; verified locally on software.archive (1 sha256 per level across
+/// T2/T4/T8) before this loop was widened.
 #[test]
 fn cross_thread_bytes_are_identical_at_every_level() {
     let len = 5_400_773;
     let data = seam_payload(len);
-    for level in 1u8..=9 {
+    for level in 1u8..=12 {
         let reference = encode_at(&data, level, 4);
         assert!(
             matches!(gzippy::decompress(&reference), Ok(back) if back == data),

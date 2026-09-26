@@ -417,6 +417,13 @@ jobs:
           --test anatomy_pins --test anatomy_counters
           --test perf_shape --test startup_cost
 
+      - name: Near-opt parallel-flush byte identity (audit M1 — the feature was
+          previously compiled by no CI flavor; the identity gate pins a
+          0.725x-pooled stream against the serial reference)
+        run: >
+          cargo test --release --features near-opt-parallel-flush
+          --test l9_t4_chunk_cost_probe chunks_are_byte_identical_to_the_serial_stream
+
       - name: Symbol canary (release-syms twin, default features)
         run: |
           cargo build --profile release-syms

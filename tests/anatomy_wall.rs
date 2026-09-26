@@ -336,3 +336,59 @@ fn wall_output_is_absent_from_a_feature_off_style_but_present_here() {
     assert!(w.contains_key("root_ns"));
     assert!(w.contains_key("granularity"));
 }
+
+/// Lever-0's own coverage assertion (audit-wave M4, agent-34's gap): the
+/// `near_opt_fill` / `near_opt_flush` regions are wired but no test named
+/// them. L11 on a real invocation runs the near-optimal parser at T1 (its
+/// only T1 route), so both regions must be NONZERO and the conservation
+/// equation must hold INCLUDING them (residual derived from the full
+/// named-sum, no double-count with the huffman regions — the flush timer
+/// wraps the whole optimize_and_flush whose internal emit_block also runs
+/// its own huffman region timers... verified conserved by the manual M1
+/// run: root 222.6ms = fill 104.1 + flush 117.7 + 0.08 residual, 13 calls
+/// each on the 3 MB log slice).
+#[test]
+fn near_opt_regions_nonzero_and_conserved_at_l11() {
+    let data = mixed_corpus(3_000_000);
+    let (compressed, w) = compress_with_wall(&data, 11);
+
+    let mut decoded = Vec::new();
+    {
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .expect("gzippy stdout must be a valid gzip stream");
+    }
+    assert_eq!(decoded, data, "L11 roundtrip sanity check failed");
+
+    let root_ns = get_num(&w, "root_ns");
+    let fill_ns = get_num(&w, "near_opt_fill_ns");
+    let fill_calls = get_num(&w, "near_opt_fill_calls");
+    let flush_ns = get_num(&w, "near_opt_flush_ns");
+    let flush_calls = get_num(&w, "near_opt_flush_calls");
+    let residual_ns = get_num(&w, "residual_ns");
+    let conserved = get_bool(&w, "conserved");
+
+    assert!(conserved, "L11: conservation must hold");
+    assert!(fill_ns > 0, "L11: near_opt_fill_ns must be nonzero");
+    assert!(flush_ns > 0, "L11: near_opt_flush_ns must be nonzero");
+    assert!(
+        fill_calls > 1 && flush_calls == fill_calls,
+        "L11: both regions are per-internal-block (fill {fill_calls}, flush {flush_calls})"
+    );
+    assert_eq!(
+        root_ns,
+        fill_ns
+            + flush_ns
+            + get_num(&w, "parse_match_ns")
+            + get_num(&w, "huffman_table_ns")
+            + get_num(&w, "huffman_encode_ns")
+            + get_num(&w, "crc_ns")
+            + get_num(&w, "mf_new_ns")
+            + residual_ns,
+        "L11: root_ns must equal the FULL named-region sum + residual (the flush timer \
+         wraps emit_block's callers, so the huffman regions double-book if separate — \
+         their zero here is the conservation receipt that the near-opt path routes its \
+         text emission inside the flush span)"
+    );
+}

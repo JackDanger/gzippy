@@ -110,7 +110,6 @@ fn run(
     (best, bytes)
 }
 
-#[ignore]
 fn matrix_for(level: u8, parallel: bool, label: &'static str, runs: usize) {
     let data = build_corpus();
     let body = &data[DICT..DICT + CHUNK];
@@ -121,7 +120,12 @@ fn matrix_for(level: u8, parallel: bool, label: &'static str, runs: usize) {
 #[test]
 #[ignore]
 fn prod_l9t4_depth400() {
-    matrix_for(9, true, "1 production (near-opt@L11, depth400)", 5);
+    matrix_for(
+        9,
+        true,
+        "1 production (near-opt@L11, depth400, passes2 - the L9 retune)",
+        5,
+    );
 }
 
 #[test]
@@ -133,7 +137,12 @@ fn t1_engine_lazy2_depth600() {
 #[test]
 #[ignore]
 fn l11_alias_check() {
-    matrix_for(11, true, "3 control (L11 parallel=true alias)", 5);
+    matrix_for(
+        11,
+        true,
+        "3 control (L11 default knobs, passes4) - NOT an alias since the L9 passes2 retune: wall(1)/wall(3) prices the passes delta",
+        5,
+    );
 }
 
 #[test]

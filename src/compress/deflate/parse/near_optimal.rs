@@ -1062,6 +1062,10 @@ mod parallel_flush {
         // emit, relayed at write-back.
         super::super::super::clear_stored_block_emitted();
         let mut w = BitWriter::from_vec(Vec::new());
+        // The suppression guard applies to THE POOL's flush workers too: their
+        // emit_block sub-regions must stay silent while the flush region owns
+        // the span (fresh thread => fresh flag; set only around this call).
+        let __flush_guard = crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
         let used_only_literals = opt.optimize_and_flush(
             &job.block,
             0,
@@ -1400,6 +1404,8 @@ pub(super) fn run(
                     false
                 }
                 None => crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    let __flush_guard =
+                        crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
                         in_block_begin,
@@ -1419,6 +1425,8 @@ pub(super) fn run(
             #[cfg(not(feature = "near-opt-parallel-flush"))]
             let prev_used_only_literals =
                 crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    let __flush_guard =
+                        crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
                         in_block_begin,
@@ -1486,6 +1494,8 @@ pub(super) fn run(
                     false
                 }
                 None => crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    let __flush_guard =
+                        crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
                         in_block_begin,
@@ -1505,6 +1515,8 @@ pub(super) fn run(
             #[cfg(not(feature = "near-opt-parallel-flush"))]
             let prev_used_only_literals =
                 crate::anatomy_wall_time!(near_opt_flush_ns, near_opt_flush_calls, {
+                    let __flush_guard =
+                        crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
                         in_block_begin,
