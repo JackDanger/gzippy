@@ -240,6 +240,16 @@ define_wall_regions!(
     // timer per `run()` invocation (never per-position) -- cheapest
     // granularity in this module.
     mf_new_ns / mf_new_calls,
+    // Lever-0 (2026-09-25, agent-27's near-opt anatomy): the near-optimal
+    // parser's chunk wall concentrates where no timer sat — the serial bt
+    // FILL (per-position match-cache writes + split-stat observation) and the
+    // per-block optimize+flush. These two regions split the split for real:
+    // `near_opt_fill` wraps one OUTER-loop iteration's inner fill loop
+    // (per-internal-block granularity, the contract), and `near_opt_flush`
+    // wraps `optimize_and_flush` at both of its call sites (rewind choice
+    // stays residual). Zero output change by construction.
+    near_opt_fill_ns / near_opt_fill_calls,
+    near_opt_flush_ns / near_opt_flush_calls,
     }
     outer {
     // OUTSIDE the encoder call, inside the CLI span. These two exist
