@@ -1,0 +1,47 @@
+wallcensus: pigz__silesia.tar__L02__T04 -> RIVAL-UNAVAILABLE (verdict=- ratio=NaN pin_ok=false pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T01 -> RIVAL-UNAVAILABLE (verdict=- ratio=NaN pin_ok=false pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T04 -> RIVAL-UNAVAILABLE (verdict=- ratio=NaN pin_ok=false pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0700 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4022 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0157 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.9600 pin_ok=true pin_unmeasurable=false)
+sizecensus: gzip silesia.tar L02 T01 -> OK (gzippy=71066341 rival=75116849 ratio=0.9461 src=measured)
+sizecensus: gzip silesia.tar L02 T04 -> OK (gzippy=70089723 rival=75116849 ratio=0.9331 src=measured)
+sizecensus: pigz silesia.tar L02 T01 -> OK (gzippy=71066341 rival=75026828 ratio=0.9472 src=measured)
+sizecensus: pigz silesia.tar L02 T04 -> OK (gzippy=70089723 rival=74910083 ratio=0.9357 src=measured)
+sizecensus: libdeflate silesia.tar L02 T01 -> OK (gzippy=71066341 rival=71066341 ratio=1.0000 src=measured)
+sizecensus: libdeflate silesia.tar L02 T04 -> OK (gzippy=70089723 rival=71066341 ratio=0.9863 src=measured)
+sizecensus: gzip silesia.tar L09 T01 -> OK (gzippy=66716173 rival=67647403 ratio=0.9862 src=measured)
+sizecensus: gzip silesia.tar L09 T04 -> OK (gzippy=64772349 rival=67647403 ratio=0.9575 src=measured)
+sizecensus: pigz silesia.tar L09 T01 -> OK (gzippy=66716173 rival=67666705 ratio=0.9860 src=measured)
+sizecensus: pigz silesia.tar L09 T04 -> OK (gzippy=64772349 rival=67666705 ratio=0.9572 src=measured)
+sizecensus: libdeflate silesia.tar L09 T01 -> OK (gzippy=66716173 rival=66716173 ratio=1.0000 src=measured)
+sizecensus: libdeflate silesia.tar L09 T04 -> OK (gzippy=64772349 rival=66716173 ratio=0.9709 src=measured)
+wallcensus: gzip__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5177 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.1954 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.3656 pin_ok=true pin_unmeasurable=false)
+wallcensus: gzip__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.2697 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.5979 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.8782 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T01 -> OK (verdict=RESOLVED-b-slower ratio=0.3705 pin_ok=true pin_unmeasurable=false)
+wallcensus: pigz__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-a-slower ratio=1.0822 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T01 -> OK (verdict=RESOLVED-a-slower ratio=1.0674 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L02__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.4027 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T01 -> VOID (verdict=VOID-aa_bias=0.0009 ratio=1.0203 pin_ok=true pin_unmeasurable=false)
+wallcensus: libdeflate__silesia.tar__L09__T04 -> OK (verdict=RESOLVED-b-slower ratio=0.7520 pin_ok=true pin_unmeasurable=false)
+TRY — promotion evaluation over 24 cells (15 decidable on both arms; 9 not)
+  clause 2 OK: arms differ (binary hashes distinct)
+  clause 1 OK: verify — zero roundtrip failures
+  clause 3 OK: no pass->fail flips across 15 decidable cells
+  clause 4 OK: fail-gap 0.0700 -> 0.0674 (-3.7%)
+  clause 5 OK: every passing cell inside its erosion budget
+  clause 6 OK: improvement 0.0026 vs residual harm 0.0000 (>=2x or no harm; harm = confirmed-real 0.0000 [0] + size 0.0000 [0] + undecided-conservative 0.0000 [0]; excluded as clause-5-priced: accepted margin-spend 0.0000 [0], layout-artifact acquittals 0.0000 [0], sub-budget census drift 0.0020 [3]; authorized size spend <=1% 0.0020 [2])
+  clause 7 OK: all required arch(s) covered: x86_64
+  clause 8 (method): paired interleaved per-pair ratios with stated n; fixed before the run by construction
+  wall margin tiers (band 0.0022 = median layout floor): 6 won-with-margin, 0 knife-edge, 1 failing
+  RE-RUN BEFORE ANY VERDICT:
+    libdeflate:silesia.tar:L9:T1:wall (after arm VOID — re-measure)
+VERDICT: UNDECIDED — see the RE-RUN list above; never a guess.
+  artifact: /root/wave-out/wave-retune9/try.json
+fulcrum 0.3.0 (d738eaef4585, built 2026-09-25T15:25Z)
+try --rescore: artifact 'cells' do not parse as TryCells: invalid type: null, expected f64

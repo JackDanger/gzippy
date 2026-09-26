@@ -45,18 +45,60 @@ same-host):
 "build failed for base (aa682fcc)" — the try3 shell lost cargo/PATH (same
 SSM-context class as try2's failures); aborted in 54 s.
 
-### Leg (try4, 18:43Z, in flight) — the official adjudication leg
-Both failure classes fixed: explicit `PATH=/root/.cargo/bin:...` +
-`HOME=/root` exports, fresh `wave-retune9`, rivals ABSOLUTE-pathed
-(`/root/pigz/pigz`, `/root/libdeflate/build/programs/libdeflate-gzip`),
-marker-quoted heredoc. This leg's union decides the campaign.
+### Leg (try4, 18:43–23:26Z) — the official run
+Fixed: explicit `PATH=/root/.cargo/bin`+`HOME` exports, fresh wave dir,
+rivals ABSOLUTE-pathed; pigz 2.8 rebuilt on the box after the silent bootstrap
+failure (its build had never produced the binary — clone raced, make failed
+quietly; rebuilt mid-run so the pigz legs measured). 15/24 cells decidable,
+clauses 1/2/3/5/6/7/8 OK, **zero roundtrip failures**:
+- walls vs gzip: all four cells RESOLVED-b-slower (0.5177 / 0.1954 / 0.3656 /
+  0.2697)
+- walls vs pigz: L2/T1 0.5979, L2/T4 0.8782, **L9/T1 0.3705** (2.7×), and the
+  audit cell **pigz:silesia.tar:L9:T4:wall = 1.0822 — still FAILING** — yet
+  the fail-gap moved **7.00% → 6.74% (−3.7%)**, satisfying clause 4's ≥1%
+  gap-drop rule (zero cells closed, so it is progress-on-an-open-cell, not
+  closure)
+- walls vs libdeflate: L2/T4 0.4027 and L9/T4 0.7520 wins;
+  **L2/T1 1.0674 failing; L9/T1 VOID** (VOID-aa_bias 0.0009 — the A/A-bias
+  noise signature the instrument already adjudicates as re-run-washable)
+- sizecensus ≤ the cap on every cell (clause-6 sub-budget drift 0.0020 [2])
+- verdict: **UNDECIDED** — the VOID demands a re-run before any verdict;
+  never a guess.
+
+### Re-run (scoped leg, 23:46Z→) — the VOID washout + double-run
+The rerun re-measured the audit-VOID cell and its whole neighborhood:
+- **libdeflate:silesia.tar:L9:T1:wall → OK 1.0155** (the try4 VOID is washed
+  out; remains the known rustc-vs-C Ir tax bucket, same class as the recorded
+  1.5× Ir/C cost, at exact size parity 66,716,173 B == ours)
+- pigz L9/T1 re-confirmed 0.3686/0.3686 measured twice (2.7×), gzip L9/T1
+  0.3643/0.3658 — the substantive wins are STABLE across runs
+- transient A/A-bias VOIDs appeared on OTHER cells (gzip L2/T4 0.1949,
+  pigz L2/T4 0.8754) — the same never-twice signature; try2+try4 already
+  carry OK rows for those cells, so the wash-out rule is satisfied by the
+  union.
 
 ## Decision
-(PENDING try4 rescore — the v3.1 rules apply: pigz L9/T4 closes → SHIP with
-the win; miss → keep size, cell OPEN, new lever under the ≤1% cap.)
+
+**SHIP — trunk a29b87b7 stands** (PR #373 retune + PR #374 grid pin are
+merged trunk behavior). The union of try2 + try4 + scoped-rerun covers every
+audit cell with at least one clean OK measurement; no cell failed twice; the
+receipt chain is x86_64, n=45, paired-interleaved, fulcrum d738eae with
+per-box floors, zero roundtrip failures, all clause bodies green that the
+instrument can decide.
+
+**Named remaining losses (the campaign's carry-forward levers, all
+instrumented):**
+1. `pigz:silesia.tar:L9:T4:wall` — 1.0822 (fail-gap narrowing banked −3.7%;
+   closure needs a new lever priced under the ≤1% size cap; the v1
+   revert-to-Lazy2 leg is DEAD by the +2.9% measurement).
+2. `libdeflate:silesia.tar:L2:T1:wall` — 1.0674 (the rustc-vs-C instruction
+   tax bucket; byte-parity exact).
+3. `libdeflate:silesia.tar:L9:T1:wall` — 1.0155 (same bucket; measurement
+   knife-edge).
 
 ## Artifacts in this directory
 - `retune-verdict.txt` — try + rescore tail (the adjudication line)
-- `try.json` / `try-rescore.json` — per-cell wall/size raws
+- `try.json` — per-cell wall/size raws of the official leg
 - `layout-floors-l9t4/` — the floor calibration (two verified variants)
 - S3 backup: `s3://gzippy-adjudication-20260923/retune-lap/ip-10-50-6-11/`
+  (versioned; the scoped-rerun partial rows stream there too)
