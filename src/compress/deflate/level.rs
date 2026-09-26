@@ -148,8 +148,6 @@ pub struct LevelParams {
     /// generic at `parse::compress`'s dispatch so the T1 monomorphization
     /// compiles to the pre-lever code, not a runtime-branched hybrid.
     pub fast_interleaved_bucket: bool,
-    /// T1 mmap pick-min only: gzip `MIN_MATCH` 3-byte primary hash. Shipped
-    /// `params(1)` keeps this false; [`params_l1_gzip_primary`] sets it.
     pub fast_gzip_primary: bool,
     /// T>1-only: lazy-peek COST-GATE. Rejects accepted matches whose
     /// estimated bit cost exceeds literals at the same span.
