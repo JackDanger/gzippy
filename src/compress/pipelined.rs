@@ -73,7 +73,7 @@ unsafe impl Sync for CrcSlot {}
 const MAX_PARALLEL_BLOCK_SIZE: usize = 512 * 1024;
 
 /// Smallest parallel chunk for the small-file floor. Keeps tiny inputs split
-/// into a few chunks (a 1MB file becomes ~8×128KB, not one chunk) so the
+/// into a few chunks so the
 /// parallel path still has work to hand out.
 const MIN_PARALLEL_BLOCK_SIZE: usize = 128 * 1024;
 
