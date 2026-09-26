@@ -66,6 +66,8 @@ text	1	literals_emitted_fast	34191
 text	1	match_length_bytes_total	1014385
 text	1	matches_emitted	178076
 text	1	matches_emitted_fast	178076
+text	1	near_opt_flush_blocks	0
+text	1	near_opt_only_literals_blocks	0
 text	2	alloc_bytes	524320
 text	2	alloc_events	1
 text	2	bitstream_flush_word_calls	190171
@@ -117,6 +119,8 @@ text	2	literals_emitted_fast	0
 text	2	match_length_bytes_total	1007024
 text	2	matches_emitted	155225
 text	2	matches_emitted_fast	0
+text	2	near_opt_flush_blocks	0
+text	2	near_opt_only_literals_blocks	0
 text	6	alloc_bytes	524916
 text	6	alloc_events	3
 text	6	bitstream_flush_word_calls	146378
@@ -168,6 +172,8 @@ text	6	literals_emitted_fast	0
 text	6	match_length_bytes_total	1016352
 text	6	matches_emitted	121838
 text	6	matches_emitted_fast	0
+text	6	near_opt_flush_blocks	0
+text	6	near_opt_only_literals_blocks	0
 text	9	alloc_bytes	524320
 text	9	alloc_events	1
 text	9	bitstream_flush_word_calls	149040
@@ -219,6 +225,8 @@ text	9	literals_emitted_fast	0
 text	9	match_length_bytes_total	988213
 text	9	matches_emitted	112068
 text	9	matches_emitted_fast	0
+text	9	near_opt_flush_blocks	0
+text	9	near_opt_only_literals_blocks	0
 tabular	1	alloc_bytes	524621
 tabular	1	alloc_events	2
 tabular	1	bitstream_flush_word_calls	159250
@@ -270,6 +278,8 @@ tabular	1	literals_emitted_fast	83640
 tabular	1	match_length_bytes_total	964936
 tabular	1	matches_emitted	111121
 tabular	1	matches_emitted_fast	111121
+tabular	1	near_opt_flush_blocks	0
+tabular	1	near_opt_only_literals_blocks	0
 tabular	2	alloc_bytes	524320
 tabular	2	alloc_events	1
 tabular	2	bitstream_flush_word_calls	156971
@@ -321,6 +331,8 @@ tabular	2	literals_emitted_fast	0
 tabular	2	match_length_bytes_total	941223
 tabular	2	matches_emitted	99216
 tabular	2	matches_emitted_fast	0
+tabular	2	near_opt_flush_blocks	0
+tabular	2	near_opt_only_literals_blocks	0
 tabular	6	alloc_bytes	524622
 tabular	6	alloc_events	2
 tabular	6	bitstream_flush_word_calls	138780
@@ -372,6 +384,8 @@ tabular	6	literals_emitted_fast	0
 tabular	6	match_length_bytes_total	927255
 tabular	6	matches_emitted	77174
 tabular	6	matches_emitted_fast	0
+tabular	6	near_opt_flush_blocks	0
+tabular	6	near_opt_only_literals_blocks	0
 tabular	9	alloc_bytes	524320
 tabular	9	alloc_events	1
 tabular	9	bitstream_flush_word_calls	134669
@@ -423,6 +437,8 @@ tabular	9	literals_emitted_fast	0
 tabular	9	match_length_bytes_total	915720
 tabular	9	matches_emitted	71318
 tabular	9	matches_emitted_fast	0
+tabular	9	near_opt_flush_blocks	0
+tabular	9	near_opt_only_literals_blocks	0
 binary	1	alloc_bytes	524626
 binary	1	alloc_events	2
 binary	1	bitstream_flush_word_calls	196156
@@ -474,6 +490,8 @@ binary	1	literals_emitted_fast	564669
 binary	1	match_length_bytes_total	483907
 binary	1	matches_emitted	41605
 binary	1	matches_emitted_fast	41605
+binary	1	near_opt_flush_blocks	0
+binary	1	near_opt_only_literals_blocks	0
 binary	2	alloc_bytes	524320
 binary	2	alloc_events	1
 binary	2	bitstream_flush_word_calls	195685
@@ -525,6 +543,8 @@ binary	2	literals_emitted_fast	0
 binary	2	match_length_bytes_total	481864
 binary	2	matches_emitted	42986
 binary	2	matches_emitted_fast	0
+binary	2	near_opt_flush_blocks	0
+binary	2	near_opt_only_literals_blocks	0
 binary	6	alloc_bytes	524626
 binary	6	alloc_events	2
 binary	6	bitstream_flush_word_calls	183433
@@ -576,6 +596,8 @@ binary	6	literals_emitted_fast	0
 binary	6	match_length_bytes_total	479866
 binary	6	matches_emitted	31678
 binary	6	matches_emitted_fast	0
+binary	6	near_opt_flush_blocks	0
+binary	6	near_opt_only_literals_blocks	0
 binary	9	alloc_bytes	524320
 binary	9	alloc_events	1
 binary	9	bitstream_flush_word_calls	177569
@@ -627,6 +649,8 @@ binary	9	literals_emitted_fast	0
 binary	9	match_length_bytes_total	474011
 binary	9	matches_emitted	25270
 binary	9	matches_emitted_fast	0
+binary	9	near_opt_flush_blocks	0
+binary	9	near_opt_only_literals_blocks	0
 noise	1	alloc_bytes	524895
 noise	1	alloc_events	3
 noise	1	bitstream_flush_word_calls	0
@@ -678,6 +702,8 @@ noise	1	literals_emitted_fast	1046087
 noise	1	match_length_bytes_total	2489
 noise	1	matches_emitted	827
 noise	1	matches_emitted_fast	827
+noise	1	near_opt_flush_blocks	0
+noise	1	near_opt_only_literals_blocks	0
 noise	2	alloc_bytes	524320
 noise	2	alloc_events	1
 noise	2	bitstream_flush_word_calls	0
@@ -729,6 +755,8 @@ noise	2	literals_emitted_fast	0
 noise	2	match_length_bytes_total	692
 noise	2	matches_emitted	228
 noise	2	matches_emitted_fast	0
+noise	2	near_opt_flush_blocks	0
+noise	2	near_opt_only_literals_blocks	0
 noise	6	alloc_bytes	524609
 noise	6	alloc_events	2
 noise	6	bitstream_flush_word_calls	0
@@ -780,6 +808,8 @@ noise	6	literals_emitted_fast	0
 noise	6	match_length_bytes_total	1346
 noise	6	matches_emitted	446
 noise	6	matches_emitted_fast	0
+noise	6	near_opt_flush_blocks	0
+noise	6	near_opt_only_literals_blocks	0
 noise	9	alloc_bytes	524320
 noise	9	alloc_events	1
 noise	9	bitstream_flush_word_calls	0
@@ -831,3 +861,5 @@ noise	9	literals_emitted_fast	0
 noise	9	match_length_bytes_total	1346
 noise	9	matches_emitted	446
 noise	9	matches_emitted_fast	0
+noise	9	near_opt_flush_blocks	0
+noise	9	near_opt_only_literals_blocks	0
