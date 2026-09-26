@@ -504,7 +504,8 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// 0)`), so the compressor neither copies the input into a second work buffer
 /// nor builds a separate output buffer. Output is byte-identical to
 /// `encode_gzip_bytes_to_vec(&buf[..logical_len], level)`.
-/// Levels whose production encoder is our own libdeflate port (`compress::ldx`).
+/// (Which engine serves a given level is `level_uses_ldx`'s routing below; the
+/// port-vs-exceptions contract lives with that predicate's receipts.)
 ///
 /// THE PORT IS THE PRODUCT. `ldx` is a per-decision transliteration of
 /// `vendor/libdeflate/lib/deflate_compress.c`; it lived in the tree as a test
