@@ -313,6 +313,126 @@ impl BitWriter {
         self.bitcount = 0;
         (self.out, pad)
     }
+
+    /// Splice one independently-written DEFLATE fragment INTO this stream at
+    /// the current bit position (feature `near-opt-parallel-flush`; the
+    /// near-optimal flush pipeline's write-back — see
+    /// `parse::near_optimal::parallel_flush`).
+    ///
+    /// `bytes`/`pad_bits` are a fragment's `finish_unaligned` pair: the full
+    /// byte sequence a SEPARATE writer produced for exactly one block, plus
+    /// how many high bits of its last byte are zero padding rather than
+    /// stream. `stored` marks the only fragment family that is NOT a pure bit
+    /// string: the block's emission chose BTYPE=00 (one or more sub-blocks —
+    /// see `emit_stored_block`'s loop), so the FRAGMENT's LEN/NLEN/payload
+    /// byte-aligns relative to its own start; the serial writer reached that
+    /// alignment with its own `align_to_byte()` inside
+    /// `write_stored_subblock`, and this replay reproduces those exact bits:
+    /// the fragment's first 3 bits (BFINAL + BTYPE) are appended to the
+    /// pending byte, the stream is aligned, and the rest of the fragment is
+    /// verbatim. Every following sub-block is self-aligning in both shapes,
+    /// so it rides the verbatim tail.
+    ///
+    /// HUFFMAN fragments (dynamic / static / all-literals — everything the
+    /// near-optimal flush can otherwise emit) are pure bit strings, and the
+    /// concatenation is the plain bit-shift `BitSplicer::splice_to` performs
+    /// for unaligned fragments: appending here emits — bit for bit — what a
+    /// single writer would have produced writing the same symbols in the
+    /// same order from the same accumulator state. The shift math is
+    /// transcribed from `BitSplicer::splice_to` IN THIS FILE (the
+    /// test-pinned bit-exact splicer); the surrounding bookkeeping adapts to
+    /// this writer's field names and pending-state invariant (at most
+    /// `BITBUF_NBITS` valid bits, high bits zero).
+    ///
+    /// # Contract
+    /// * the fragments of a stream are spliced in STRICT emit order (the
+    ///   near-optimal dispatcher consumes its slots in block order);
+    /// * `stored` fragments always end byte-aligned (`pad_bits == 0`);
+    /// * the caller must not interleave other writes between fragments.
+    ///
+    /// Byte-identity with the single-writer reference is pinned by
+    /// `tests/l9_t4_chunk_cost_probe.rs::parallel_flush_*` (whole-chunk
+    /// digests, four corpora, two shapes) and by the unit test below, which
+    /// replays `BitSplicer`'s own fragment sweep through this method.
+    #[cfg(feature = "near-opt-parallel-flush")]
+    pub fn append_fragment(&mut self, bytes: &[u8], pad_bits: u8, stored: bool) {
+        debug_assert!(pad_bits < 8);
+        if bytes.is_empty() {
+            debug_assert_eq!(pad_bits, 0, "pad bits on an empty fragment");
+            return;
+        }
+        if stored {
+            debug_assert_eq!(
+                pad_bits, 0,
+                "a stored-block fragment always ends byte-aligned"
+            );
+            // The fragment's byte 0 is [BFINAL 1 bit | BTYPE 2 bits | 5 pad
+            // bits] — the fresh writer's own align_to_byte padded them.
+            self.add_bits((bytes[0] as u64) & 0b111, 3);
+            self.align_to_byte();
+            debug_assert_eq!(self.bitcount, 0);
+            self.out.extend_from_slice(&bytes[1..]);
+            self.bitbuf = 0;
+            self.bitcount = 0;
+            return;
+        }
+        if self.bitcount == 0 {
+            // Byte-aligned fast path: verbatim, keeping the fragment's own
+            // trailing partial byte as this stream's pending state.
+            if pad_bits == 0 {
+                self.out.extend_from_slice(bytes);
+            } else {
+                self.out.extend_from_slice(&bytes[..bytes.len() - 1]);
+                let last = bytes[bytes.len() - 1];
+                let live = 8 - pad_bits as u32;
+                self.bitbuf = (last & ((1u16 << live) - 1) as u8) as u64;
+                self.bitcount = live;
+            }
+            return;
+        }
+        // Shift path — transcribed from `BitSplicer::splice_to` (see this
+        // file): move the whole fragment up by the pending bit count,
+        // OR-ing its first bits into the pending partial byte. DEFLATE is
+        // LSB-first, so "later in the stream" is "higher bit position".
+        let shift = self.bitcount;
+        let inv = 8 - shift;
+        let mut shifted: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut carry = self.bitbuf as u8;
+        // Word-wise shift, 8 bytes per u64 lane (same lane math and same
+        // carry rule as `BitSplicer::splice_to`; see its receipt for why it
+        // is shape-stable and NOT to be rewritten casually).
+        let mut chunks = bytes.chunks_exact(8);
+        for ch in &mut chunks {
+            let lane = u64::from_le_bytes(ch.try_into().unwrap());
+            let word = (lane << shift) | carry as u64;
+            shifted.extend_from_slice(&word.to_le_bytes());
+            carry = (lane >> (64 - shift as u64)) as u8;
+        }
+        for &b in chunks.remainder() {
+            shifted.push(carry | (b << shift));
+            carry = b >> inv;
+        }
+        let total_bits = shift as usize + bytes.len() * 8 - pad_bits as usize;
+        let full = total_bits / 8;
+        let rem = (total_bits % 8) as u32;
+        if full < shifted.len() {
+            debug_assert_eq!(full + 1, shifted.len());
+            debug_assert!(rem > 0);
+            self.out.extend_from_slice(&shifted[..full]);
+            self.bitbuf = (shifted[full] & ((1u16 << rem) - 1) as u8) as u64;
+            self.bitcount = rem;
+        } else {
+            debug_assert_eq!(full, shifted.len());
+            // rem may be 0, in which case carry holds only pad zeros.
+            debug_assert!(rem != 0 || carry == 0);
+            self.out.extend_from_slice(&shifted);
+            self.bitbuf = (carry & ((1u16 << rem) - 1) as u8) as u64;
+            self.bitcount = rem;
+        }
+        if self.bitcount == 0 {
+            self.bitbuf = 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +762,96 @@ mod tests {
                 "pad wrong at {nbits} bits"
             );
         }
+    }
+
+    // ── `append_fragment` (feature `near-opt-parallel-flush`): the near-opt
+    // flush pipeline's writeback primitive must reproduce the single-writer
+    // bitstream, including a fragment whose producer chose STORED. ──
+
+    #[cfg(feature = "near-opt-parallel-flush")]
+    #[test]
+    fn append_fragment_matches_single_writer() {
+        // The same LCG op sweep `splicer_matches_single_writer` drives, then
+        // fragmented the same way: every fragment through append_fragment
+        // into ONE stream must equal the single-writer reference.
+        let ops = splice_ops(0xC0FFEE, 300);
+        let reference = {
+            let mut w = BitWriter::new();
+            for &(v, n) in &ops {
+                w.add_bits(v, n);
+            }
+            w.finish()
+        };
+        for &nfrags in &[1usize, 2, 3, 7, 30, 300] {
+            let per = ops.len().div_ceil(nfrags);
+            let mut stream = BitWriter::new();
+            for frag in ops.chunks(per) {
+                let mut w = BitWriter::new();
+                for &(v, n) in frag {
+                    w.add_bits(v, n);
+                }
+                let (bytes, pad) = w.finish_unaligned();
+                stream.append_fragment(&bytes, pad, false);
+            }
+            let spliced = stream.finish();
+            assert_eq!(
+                spliced, reference,
+                "append_fragment of {nfrags} fragments diverged from the single-writer stream"
+            );
+        }
+    }
+
+    #[cfg(feature = "near-opt-parallel-flush")]
+    #[test]
+    fn append_fragment_stored_replays_serial_alignment() {
+        // A fragment whose producer emitted a STORED block (byte-aligned
+        // relative to its own start), following a fragment that ends mid-byte:
+        // the packed stream must equal the single writer that emitted both
+        // blocks across the same boundary — 3 header bits riding in the
+        // pending byte, then the serial writer's own align + LEN/NLEN/payload,
+        // with the dead pad byte never written.
+        let payload: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let stored_bytes = {
+            let mut w = BitWriter::new();
+            w.add_bits(0, 1); // BFINAL = 0
+            w.add_bits(0, 2); // BTYPE = 00
+            w.align_to_byte();
+            w.write_u16_le(payload.len() as u16);
+            w.write_u16_le(!(payload.len() as u16));
+            w.write_aligned_bytes(payload);
+            w.finish()
+        };
+        let reference = {
+            let mut w = BitWriter::new();
+            for _ in 0..11 {
+                w.add_bits(1, 1); // 11 live bits -> ends at bit offset 3
+            }
+            // The serial writer writes BFINAL+BTYPE to bit offset 14,
+            // aligns, LEN+NLEN+payload — its align pushes bit 14..16:
+            w.add_bits(0, 1);
+            w.add_bits(0, 2);
+            w.align_to_byte();
+            w.write_u16_le(payload.len() as u16);
+            w.write_u16_le(!(payload.len() as u16));
+            w.write_aligned_bytes(payload);
+            w.finish()
+        };
+        // Fragment A: the 11 lead bits alone, ending 3 bits into a byte.
+        let (lead, lead_pad) = {
+            let mut w = BitWriter::new();
+            for _ in 0..11 {
+                w.add_bits(1, 1);
+            }
+            w.finish_unaligned()
+        };
+        assert_eq!(lead_pad, 5);
+        let mut stream = BitWriter::new();
+        stream.append_fragment(&lead, lead_pad, false);
+        // Fragment B: the whole stored block from the FRESH writer's
+        // perspective (byte 0 = BFINAL|BTYPE|pad, then LEN/NLEN/payload).
+        assert_eq!(stored_bytes[0] & 0b111, 0);
+        stream.append_fragment(&stored_bytes, 0, true);
+        assert_eq!(stream.finish(), reference);
     }
 
     #[test]
