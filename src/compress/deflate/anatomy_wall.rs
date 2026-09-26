@@ -292,36 +292,48 @@ pub fn reset() {
 ///
 /// The near-opt flush sets this only inside its own wrapper; the parallel
 /// flush workers are separate threads, each with a fresh `false`.
-#[cfg(feature = "anatomy-wall")]
+///
+/// Feature-off builds carry an EMPTY no-op flag (the call sites in
+/// `near_optimal.rs::run` run under every feature set; the near-opt timer
+/// macro's own cfg compiles the whole accounting out anyway, so the flag has
+/// nothing to gate). Keeping the type total avoids feature-gated call sites
+/// in the hot parser body.
 thread_local! {
     static NEAR_OPT_FLUSH_ACTIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// The `anatomy_wall_time!` macro's guard: `true` while this thread is inside
-/// its near-opt flush wrapper.
-#[cfg(feature = "anatomy-wall")]
+/// its near-opt flush wrapper. Always false in feature-off builds.
 pub fn near_opt_flushing() -> bool {
-    NEAR_OPT_FLUSH_ACTIVE.with(|c| c.get())
+    #[cfg(feature = "anatomy-wall")]
+    {
+        NEAR_OPT_FLUSH_ACTIVE.with(|c| c.get())
+    }
+    #[cfg(not(feature = "anatomy-wall"))]
+    {
+        false
+    }
 }
 
 /// Set/clear the near-opt flush suppression on THIS thread around a body.
 /// The near-opt flush's two call sites use one RAII guard each (serial and
 /// pooled worker paths share the same per-thread flag semantics — a thread's
 /// flag is fresh in every worker).
-#[cfg(feature = "anatomy-wall")]
+#[must_use]
 pub struct NearOptFlushGuard;
 
-#[cfg(feature = "anatomy-wall")]
 impl NearOptFlushGuard {
+    #[must_use]
     pub fn enter() -> Self {
+        #[cfg(feature = "anatomy-wall")]
         NEAR_OPT_FLUSH_ACTIVE.with(|c| c.set(true));
         Self
     }
 }
 
-#[cfg(feature = "anatomy-wall")]
 impl Drop for NearOptFlushGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "anatomy-wall")]
         NEAR_OPT_FLUSH_ACTIVE.with(|c| c.set(false));
     }
 }
