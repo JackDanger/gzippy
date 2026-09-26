@@ -54,8 +54,7 @@ impl ProbeSeq {
 /// One block as the shipped splitter placed it.
 #[derive(Clone, Debug)]
 pub struct ProbeBlock {
-    /// Which parser invocation produced it (pick-min runs several arms, and at
-    /// T>1 several chunks, possibly on different threads).
+    /// Which parser invocation produced it.
     pub run: u64,
     /// Absolute offset of the block's first byte in the parser's input buffer.
     pub start: usize,
