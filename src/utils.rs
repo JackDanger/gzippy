@@ -1,9 +1,5 @@
-#![allow(dead_code)]
-
 use std::fs;
 use std::path::Path;
-
-use crate::error::{GzippyError, GzippyResult};
 
 /// Check whether `GZIPPY_DEBUG` is set. Cached after first call.
 #[inline]
@@ -22,10 +18,6 @@ pub fn preserve_metadata(src: &Path, dst: &Path) {
             let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
         }
     }
-}
-
-pub fn get_file_metadata(path: &Path) -> GzippyResult<fs::Metadata> {
-    fs::metadata(path).map_err(GzippyError::Io)
 }
 
 pub fn detect_format_from_file(path: &Path) -> Option<crate::format::CompressionFormat> {
@@ -76,50 +68,4 @@ pub fn strip_compression_extension(path: &Path) -> std::path::PathBuf {
     }
 
     result
-}
-
-pub fn format_size(size: usize) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = size as f64;
-    let mut unit_idx = 0;
-
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{:.0} {}", size, UNITS[unit_idx])
-    } else {
-        format!("{:.1} {}", size, UNITS[unit_idx])
-    }
-}
-
-pub fn format_percentage(numerator: usize, denominator: usize) -> String {
-    if denominator == 0 {
-        "N/A".to_string()
-    } else {
-        let percentage = (numerator as f64 / denominator as f64) * 100.0;
-        format!("{:.1}%", percentage)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(1536), "1.5 KB");
-        assert_eq!(format_size(1024 * 1024), "1.0 MB");
-    }
-
-    #[test]
-    fn test_format_percentage() {
-        assert_eq!(format_percentage(50, 100), "50.0%");
-        assert_eq!(format_percentage(0, 100), "0.0%");
-        assert_eq!(format_percentage(100, 0), "N/A");
-    }
 }

@@ -57,7 +57,7 @@ mod decompress; // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
 mod backends; // isal, isal_compress, isal_decompress, libdeflate
 
 // ── Threading infrastructure ──────────────────────────────────────────────────
-mod infra; // thread_pool, scheduler, io_thread
+mod infra; // thread_pool, scheduler
 
 // ── Test infrastructure ───────────────────────────────────────────────────────
 #[cfg(test)]

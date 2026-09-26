@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,22 +15,6 @@ impl CompressionFormat {
             "zz" => Some(CompressionFormat::Zlib),
             "zip" => Some(CompressionFormat::Zip),
             _ => None,
-        }
-    }
-
-    pub fn default_extension(&self) -> &'static str {
-        match self {
-            CompressionFormat::Gzip => ".gz",
-            CompressionFormat::Zlib => ".zz",
-            CompressionFormat::Zip => ".zip",
-        }
-    }
-
-    pub fn magic_bytes(&self) -> &'static [u8] {
-        match self {
-            CompressionFormat::Gzip => &[0x1f, 0x8b],
-            CompressionFormat::Zlib => &[0x78],
-            CompressionFormat::Zip => &[0x50, 0x4b, 0x03, 0x04],
         }
     }
 }
