@@ -71,6 +71,8 @@ level	threads	counter	value
 1	1	match_length_bytes_total	0
 1	1	matches_emitted	0
 1	1	matches_emitted_fast	0
+1	1	near_opt_flush_blocks	0
+1	1	near_opt_only_literals_blocks	0
 1	4	alloc_bytes	655636
 1	4	alloc_events	4
 1	4	bitstream_flush_word_calls	2
@@ -122,6 +124,8 @@ level	threads	counter	value
 1	4	match_length_bytes_total	0
 1	4	matches_emitted	0
 1	4	matches_emitted_fast	0
+1	4	near_opt_flush_blocks	0
+1	4	near_opt_only_literals_blocks	0
 6	1	alloc_bytes	291
 6	1	alloc_events	2
 6	1	bitstream_flush_word_calls	2
@@ -173,6 +177,8 @@ level	threads	counter	value
 6	1	match_length_bytes_total	0
 6	1	matches_emitted	0
 6	1	matches_emitted_fast	0
+6	1	near_opt_flush_blocks	0
+6	1	near_opt_only_literals_blocks	0
 6	4	alloc_bytes	535
 6	4	alloc_events	3
 6	4	bitstream_flush_word_calls	2
@@ -224,6 +230,8 @@ level	threads	counter	value
 6	4	match_length_bytes_total	0
 6	4	matches_emitted	0
 6	4	matches_emitted_fast	0
+6	4	near_opt_flush_blocks	0
+6	4	near_opt_only_literals_blocks	0
 9	1	alloc_bytes	32
 9	1	alloc_events	1
 9	1	bitstream_flush_word_calls	0
@@ -275,6 +283,8 @@ level	threads	counter	value
 9	1	match_length_bytes_total	0
 9	1	matches_emitted	0
 9	1	matches_emitted_fast	0
+9	1	near_opt_flush_blocks	0
+9	1	near_opt_only_literals_blocks	0
 9	4	alloc_bytes	276
 9	4	alloc_events	2
 9	4	bitstream_flush_word_calls	2
@@ -326,3 +336,5 @@ level	threads	counter	value
 9	4	match_length_bytes_total	0
 9	4	matches_emitted	0
 9	4	matches_emitted_fast	0
+9	4	near_opt_flush_blocks	1
+9	4	near_opt_only_literals_blocks	0
