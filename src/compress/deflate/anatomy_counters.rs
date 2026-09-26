@@ -260,7 +260,6 @@ macro_rules! define_counters {
         #[cfg(feature = "anatomy-counters")]
         pub static COUNTERS: AnatomyCounters = AnatomyCounters::zero();
 
-        /// Point-in-time counter values for pick-min winner attribution.
         #[cfg(feature = "anatomy-counters")]
         #[derive(Clone, Copy, Debug, Default)]
         pub struct AnatomyCountersSnapshot {
