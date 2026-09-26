@@ -1231,7 +1231,6 @@ const ACCEL_MAX_STEP: usize = 8;
 /// of length >= 4 (its hash keys 4 bytes), coding anything shorter as literals.
 const SHORTEST_MATCH: u32 = 4;
 
-/// gzip `MIN_MATCH` (levels 1-3): 3-byte primary hash for mmap pick-min arm.
 const SHORTEST_MATCH_L1: u32 = 3;
 
 #[inline(always)]
