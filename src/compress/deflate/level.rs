@@ -504,6 +504,14 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         // retuned (agent-19: silent scope creep) — it keeps the L11-knob route.
         let mut p = default_params_parallel_route(11);
         p.near_optimal.max_optim_passes = 2;
+        // d1 LEVER (2026-09-26, lever-ledger row #1): the depth-400 ×4 inside
+        // `default_params_parallel_route` is the L9/T>1 wall multiplier the
+        // fill/flush anatomy priced (lever-0: the bt fill is depth-bound work
+        // under near-opt). Probe-1 measured −11% on fixtures; the local A/B
+        // was flat at depth 100 on the probe corpus — the silesia box leg
+        // decides. Byte receipt: the retune's own receipt ("depth a no-op on
+        // dense corpora") already banked the bytes.
+        p.max_search_depth = 100;
         return p;
     }
     if level == 8 {
