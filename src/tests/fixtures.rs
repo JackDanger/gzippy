@@ -7,7 +7,6 @@
 //! Each fixture set provides:
 //! - `plain`            — raw uncompressed bytes
 //! - `single_member_gz` — flate2 default compression (single gzip member)
-//! - `multi_member_gz`  — 256KB chunks, each a separate gzip member (pigz-style)
 //! - `bgzf_gz`          — gzippy parallel format ("GZ" FEXTRA subfield)
 
 #[cfg(test)]
@@ -22,8 +21,6 @@ mod inner {
     pub struct Fixtures {
         pub plain: Vec<u8>,
         pub single_member_gz: Vec<u8>,
-        #[allow(dead_code)]
-        pub multi_member_gz: Vec<u8>,
         pub bgzf_gz: Vec<u8>,
     }
 
@@ -37,13 +34,6 @@ mod inner {
     pub fn text_10mb() -> &'static Fixtures {
         static CELL: OnceLock<Fixtures> = OnceLock::new();
         CELL.get_or_init(|| build(10 * 1024 * 1024, 67890))
-    }
-
-    /// 1MB of near-random binary (seed 99999) — tests incompressible path.
-    #[allow(dead_code)]
-    pub fn binary_1mb() -> &'static Fixtures {
-        static CELL: OnceLock<Fixtures> = OnceLock::new();
-        CELL.get_or_init(|| build_random(1024 * 1024, 99999))
     }
 
     // ── generators ───────────────────────────────────────────────────────────
@@ -95,17 +85,6 @@ mod inner {
         enc.finish().unwrap()
     }
 
-    fn compress_multi_member_gz(plain: &[u8]) -> Vec<u8> {
-        let chunk = 256 * 1024;
-        let mut out = Vec::new();
-        for c in plain.chunks(chunk) {
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            enc.write_all(c).unwrap();
-            out.extend_from_slice(&enc.finish().unwrap());
-        }
-        out
-    }
-
     fn compress_bgzf_gz(plain: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let header = GzipHeaderInfo::default();
@@ -118,12 +97,10 @@ mod inner {
     fn build(size: usize, seed: u64) -> Fixtures {
         let plain = make_mixed(size, seed);
         let single_member_gz = compress_single_member_gz(&plain);
-        let multi_member_gz = compress_multi_member_gz(&plain);
         let bgzf_gz = compress_bgzf_gz(&plain);
         Fixtures {
             plain,
             single_member_gz,
-            multi_member_gz,
             bgzf_gz,
         }
     }
@@ -132,12 +109,10 @@ mod inner {
     fn build_random(size: usize, seed: u64) -> Fixtures {
         let plain = make_random(size, seed);
         let single_member_gz = compress_single_member_gz(&plain);
-        let multi_member_gz = compress_multi_member_gz(&plain);
         let bgzf_gz = compress_bgzf_gz(&plain);
         Fixtures {
             plain,
             single_member_gz,
-            multi_member_gz,
             bgzf_gz,
         }
     }
