@@ -431,3 +431,233 @@ mod parallel_flush_probes {
         near_opt_flush_probe::set_stale_flag_for_tests(false);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// LEVER #2 / d3 (feature `near-opt-d3-probe`, DEFAULT OFF): the cheap
+// ordered-candidate fill probe. Without the feature this module compiles to
+// nothing and the matrix above + the flush block are the whole file.
+//
+// The probes ride the EXACT production entries (the `matrix_for` shape):
+//   * the L9/T4 chunk shape (`encode_deflate_splice_chunk_to_sink`,
+//     parallel=true, chunk + 32 KiB dict) through BOTH arms of one binary —
+//     the production bt fill (`force-bt` arm, the serial reference) vs the
+//     d3 chain gather (the feature-on default);
+//   * the L9-T4 whole-FILE path (`compress_with_threads(data, 9, 4)`) —
+//     the parallel route end to end, gzip-framed so `gzippy::decompress`
+//     can roundtrip it (the chunk-level splice stream is dict-anchored and
+//     has no standalone decoder).
+//
+// Output bytes DIFFER between the arms by design (cheaper candidate set, not
+// an identical one): each probe reports exact deltas instead of asserting
+// identity, and pins roundtrip validity + run-to-run determinism for both.
+// ─────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "near-opt-d3-probe")]
+mod d3_probes {
+    use super::*;
+    use gzippy::compress::deflate::matchfinder::near_opt_probe::ChainGather;
+    use gzippy::compress::deflate::parse::near_opt_d3_probe;
+
+    /// One production-chunk encode at the `matrix_for` shape (L9, T>1
+    /// splice, chunk + 32 KiB dict, `input_total_len` 200 MiB — the exact
+    /// entry the matrix drives), through the requested fill arm.
+    fn encode_arm(body: &[u8], dict: &[u8], force_bt: bool) -> Vec<u8> {
+        near_opt_d3_probe::set_force_bt(force_bt);
+        let mut out = Vec::with_capacity(body.len() / 2 + 1024);
+        let _meta = gzippy::compress::deflate::encode_deflate_splice_chunk_to_sink(
+            body,
+            dict,
+            9,
+            true,
+            &mut out,
+            true,
+            200 * 1024 * 1024,
+        );
+        near_opt_d3_probe::set_force_bt(false);
+        out
+    }
+
+    /// One full-file L9-T4 encode (the parallel route end to end), through
+    /// the requested fill arm.
+    fn encode_full_arm(data: &[u8], force_bt: bool) -> Vec<u8> {
+        near_opt_d3_probe::set_force_bt(force_bt);
+        let stream = gzippy::compress_with_threads(data, 9, 4).expect("encode should succeed");
+        near_opt_d3_probe::set_force_bt(false);
+        stream
+    }
+
+    /// Bitwise CRC-32 (IEEE) — enough to frame a dict-free chunk stream as
+    /// a single-member gzip for the standard decoder (the chunk-level
+    /// splice stream itself is dict-anchored and has no standalone decoder).
+    fn crc32(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for i in 0..256u32 {
+            let mut c = i;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            table[i as usize] = c;
+        }
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+        }
+        !crc
+    }
+
+    /// Variant 10 of the matrix, `matrix_for`'s shape: the production bt
+    /// fill vs the d3 chain gather at the L9-T4 chunk shape, best-of-5
+    /// each after two warmups, plus the exact deltas. Rows print in the
+    /// matrix's format so they paste alongside variants 1-6.
+    #[test]
+    #[ignore]
+    fn d3_probe_wall_and_bytes_l9t4() {
+        let data = build_corpus();
+        let body = &data[DICT..DICT + CHUNK];
+        let dict = &data[..DICT];
+
+        // Two warmups per arm (the shape `run` uses), then best-of-5.
+        let _ = encode_arm(body, dict, true);
+        let _ = encode_arm(body, dict, false);
+        let mut bt_times = Vec::with_capacity(5);
+        let mut d3_times = Vec::with_capacity(5);
+        let (mut bt_bytes, mut d3_bytes) = (0usize, 0usize);
+        for _ in 0..5 {
+            let t = Instant::now();
+            let out = encode_arm(body, dict, true);
+            bt_times.push(t.elapsed().as_secs_f64());
+            bt_bytes = out.len();
+        }
+        for _ in 0..5 {
+            let t = Instant::now();
+            let out = encode_arm(body, dict, false);
+            d3_times.push(t.elapsed().as_secs_f64());
+            d3_bytes = out.len();
+        }
+        bt_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        d3_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (bt_best, d3_best) = (bt_times[0], d3_times[0]);
+
+        let delta = d3_bytes as i64 - bt_bytes as i64;
+        let pct = delta as f64 / bt_bytes as f64 * 100.0;
+        println!(
+            "10 d3 serial ref (bt fill, depth400, passes2) : best {bt_best:.4}s bytes {bt_bytes}"
+        );
+        println!(
+            "10 d3 chain gather  (same shape)              : best {d3_best:.4}s bytes {d3_bytes} (wall ratio {:.3}x, bytes {:+} B, {:+.2}%)",
+            d3_best / bt_best,
+            delta,
+            pct
+        );
+
+        // Both arms must be deterministic run-to-run, and their
+        // dict-free streams must decode (roundtrip validity). Byte
+        // identity BETWEEN the arms is not asserted — the candidate sets
+        // differ by design, and the exact deltas are the receipt above.
+        for (label, force_bt) in [("bt-fill", true), ("d3-chain", false)] {
+            let once = encode_arm(body, &[], force_bt);
+            let again = encode_arm(body, &[], force_bt);
+            assert_eq!(once, again, "{label}: the fill arm must be deterministic");
+            // Wrap the dict-free chunk stream as a single-member gzip for
+            // the standard decoder.
+            let mut framed = Vec::with_capacity(once.len() + 28);
+            framed.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0x03]);
+            framed.extend_from_slice(&once);
+            framed.extend_from_slice(&crc32(&once).to_le_bytes());
+            framed.extend_from_slice(&(once.len() as u32).to_le_bytes());
+            assert!(
+                matches!(
+                    gzippy::decompress(&framed),
+                    Ok(back) if back == body
+                ),
+                "{label}: the dict-free stream must decode to the body"
+            );
+        }
+    }
+
+    /// The shape-confirmation run (mission deliverable 3's "one run at the
+    /// L9-T4 shape with the parallel path"): ONE whole-file L9-T4 encode on
+    /// each arm, then (a) both streams roundtrip byte-exactly via
+    /// `gzippy::decompress`, (b) the exact delta between them is printed
+    /// (not asserted equal — the candidate sets differ by design), and (c)
+    /// the chain gather's OWN output shape holds at the API level over a
+    /// 80k-position sweep of the probe corpus: strictly-increasing lengths,
+    /// non-decreasing offsets — the DP's trusted layout, carried through.
+    #[test]
+    fn d3_probe_shape_lands_at_l9t4_production() {
+        let data = build_corpus();
+        let body = data[..DICT + CHUNK + 4096].to_vec();
+
+        let bt_stream = encode_full_arm(&body, true);
+        let d3_stream = encode_full_arm(&body, false);
+        assert!(
+            matches!(
+                gzippy::decompress(&d3_stream),
+                Ok(back) if back == body
+            ),
+            "the d3 chain gather must produce a valid L9-T4 stream"
+        );
+        assert!(
+            matches!(
+                gzippy::decompress(&bt_stream),
+                Ok(back) if back == body
+            ),
+            "the force-bt arm must reproduce the production stream"
+        );
+        let delta = d3_stream.len() as i64 - bt_stream.len() as i64;
+        println!(
+            "11 d3 L9-T4 whole-file: force-bt {} B, d3 chain {} B (delta {:+} B, {:+.2}%)",
+            bt_stream.len(),
+            d3_stream.len(),
+            delta,
+            delta as f64 / bt_stream.len() as f64 * 100.0
+        );
+
+        // The layout contract at the API level (the probe's own
+        // side-by-side evidence that the trusted shape carries through).
+        let mut padded = body.clone();
+        padded.resize(body.len() + 16, 0);
+        let mut mf = ChainGather::new();
+        let mut next_hashes = [0u32; 2];
+        let mut lists = 0usize;
+        for pos in 0..80_000 {
+            let remaining = padded.len() - pos;
+            let max_len = 258u32.min(remaining as u32);
+            if max_len < 5 {
+                break;
+            }
+            let mut out = vec![Default::default(); 260];
+            let n = mf.get_matches(
+                &padded,
+                0,
+                pos as isize,
+                max_len,
+                max_len.min(150),
+                100,
+                &mut next_hashes,
+                &mut out,
+            );
+            let mut prev_len = 0u16;
+            let mut prev_off = 0u16;
+            for m in &out[..n] {
+                assert!(
+                    m.length > prev_len,
+                    "pos {pos}: lengths must strictly increase"
+                );
+                if prev_off != 0 {
+                    assert!(m.offset >= prev_off, "pos {pos}: offsets must not decrease");
+                }
+                prev_len = m.length;
+                prev_off = m.offset;
+            }
+            lists += usize::from(n > 0);
+        }
+        assert!(
+            lists > 0,
+            "the chain gather must find matches on the probe corpus"
+        );
+    }
+}
