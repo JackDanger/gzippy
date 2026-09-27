@@ -666,10 +666,11 @@ mod d3_probes {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// LEVER #4 / bt (feature `near-opt-bt-probebudget`, DEFAULT OFF): the
-// per-descent probe-budget arms on the LAST un-priced loss class
-// (pigz:silesia.tar:L9:T4:wall 1.0840). Without the feature this module
-// compiles to nothing.
+// LEVER #4 / bt (feature `near-opt-bt-probebudget`, IN DEFAULT since the
+// 2026-09-27 promotion): the per-descent probe-budget arms that priced the
+// last un-priced loss class (pigz:silesia.tar:L9:T4:wall). The budget is
+// now the shipped parse shape (default 48); `--no-default-features` or a
+// non-default-feature build compiles this module to nothing.
 //
 // Same dual-shape drive as levers #2/#3 above:
 //   * the L9/T4 chunk shape (`matrix_for`'s exact production entry):

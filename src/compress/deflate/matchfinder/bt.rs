@@ -97,7 +97,7 @@ impl BtMatchfinder {
     /// BT_MATCHFINDER_REQUIRED_NBYTES`, `nice_len <= max_len`, `max_depth >= 1`.
     /// `out` must hold at least `nice_len - 2` slots.
     ///
-    /// `probe_budget` (feature `near-opt-bt-probebudget`, DEFAULT OFF):
+    /// `probe_budget` (feature `near-opt-bt-probebudget`, IN DEFAULT since the
     /// a per-descent cap on the descent-loop's probe/iteration count,
     /// threaded from the near_optimal call sites. A descent that exhausts
     /// it exits through the SAME loop-bottom maintenance the depth cap
@@ -203,8 +203,9 @@ impl BtMatchfinder {
     ) -> usize {
         let in_next = (in_base as isize + cur_pos) as usize;
         let mut depth_remaining = max_depth;
-        // LEVER bt-probebudget (feature `near-opt-bt-probebudget`, DEFAULT
-        // OFF): the per-descent probe budget, clamped to at least one probe
+        // LEVER bt-probebudget (feature `near-opt-bt-probebudget`, IN
+        // DEFAULT since the 2026-09-27 promotion; shipped default 48): the
+        // per-descent probe budget, clamped to at least one probe
         // (the same minimum `max_depth >= 1` already carries) and to the
         // walk's depth cap (a budget >= depth is the unrestricted walk).
         // A descent that exhausts it exits through the depth cap's own
