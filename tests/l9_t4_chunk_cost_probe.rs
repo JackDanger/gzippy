@@ -562,12 +562,13 @@ mod d3_probes {
             let again = encode_arm(body, &[], force_bt);
             assert_eq!(once, again, "{label}: the fill arm must be deterministic");
             // Wrap the dict-free chunk stream as a single-member gzip for
-            // the standard decoder.
+            // the standard decoder. CRC32 is over the UNCOMPRESSED body,
+            // ISIZE is the body's length mod 2^32.
             let mut framed = Vec::with_capacity(once.len() + 28);
             framed.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0x03]);
             framed.extend_from_slice(&once);
-            framed.extend_from_slice(&crc32(&once).to_le_bytes());
-            framed.extend_from_slice(&(once.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&crc32(body).to_le_bytes());
+            framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
             assert!(
                 matches!(
                     gzippy::decompress(&framed),

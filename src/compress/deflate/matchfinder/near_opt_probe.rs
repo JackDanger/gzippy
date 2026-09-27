@@ -103,6 +103,15 @@ const TOTAL_LEN: usize = NEXT_OFF + NEXT_LEN;
 /// always holds `>= nice_len - 2 >= 254` slots, so the cap never binds.
 const MAX_CANDIDATES: usize = 64;
 
+/// The probe's own cheapness shape (candidate (a) as the mission states it):
+/// the chain walk's link budget is the DP's "actual read" depth band, NOT the
+/// production bt descent's depth knob. Ledger row 1 (d1) measured the DP's
+/// quality flat from depth 100 on (400 == 100 on this corpus), so the budget
+/// offered here is the mission's own 100-150 band — 150 bridges the two. The
+/// bt arm keeps the production depth untouched; this caps ONLY the chain's
+/// walk (`walk` below: `depth_remaining = max_depth.min(CHAIN_WALK_BUDGET)`).
+pub const CHAIN_WALK_BUDGET: u32 = 150;
+
 /// The chain-walk candidate gatherer.
 ///
 /// `[hash3 2-way | hash4 heads | next links]` in one contiguous
@@ -275,7 +284,11 @@ impl ChainGather {
         // buf.len()`. Every walked `cur_node` points at a STRICTLY EARLIER
         // tree position (cutoff gate) at `<= max_len` extension.
         let mut cur_node = first_link;
-        let mut depth_remaining = max_depth;
+        // The probe's cheapness shape: the chain's link budget is the DP's
+        // "actual read" depth band (see CHAIN_WALK_BUDGET's doc), NOT the
+        // production bt descent's depth knob — the bt arm's depth budget is
+        // untouched.
+        let mut depth_remaining = max_depth.min(CHAIN_WALK_BUDGET);
         while REC && cur_node > cutoff && depth_remaining > 0 {
             let matchptr = (in_base as isize + cur_node as isize) as usize;
             debug_assert!(matchptr < in_next && matchptr + 4 <= buf.len());
@@ -324,6 +337,12 @@ impl ChainGather {
             return n_cand;
         }
         0
+    }
+}
+
+impl Default for ChainGather {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
