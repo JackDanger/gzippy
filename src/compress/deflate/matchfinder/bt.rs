@@ -182,6 +182,12 @@ impl BtMatchfinder {
     ) -> usize {
         let in_next = (in_base as isize + cur_pos) as usize;
         let mut depth_remaining = max_depth;
+        // Lever bt-probebudget probe instrumentation: per-descent iteration
+        // count, recorded at the three exits below under `anatomy-counters`
+        // only (zero bytes in the default build — the anatomy_count!
+        // convention).
+        #[cfg(feature = "anatomy-counters")]
+        let mut descent_probes: u32 = 0;
         let cutoff: i32 = cur_pos as i32 - MATCHFINDER_WINDOW_SIZE;
         let mut n_out = 0usize;
         let mut best_len: u32 = 3;
@@ -261,6 +267,8 @@ impl BtMatchfinder {
             // pure modular arithmetic, holds for any `node`).
             debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
             crate::anatomy_count!(bt_child_table_writes, 2u64);
+            #[cfg(feature = "anatomy-counters")]
+            crate::compress::deflate::anatomy_counters::note_bt_descent(0, REC, false, false);
             unsafe {
                 *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
                 *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;
@@ -292,6 +300,10 @@ impl BtMatchfinder {
             debug_assert!(in_next + (len as usize) <= buf.len());
 
             crate::anatomy_count!(bt_probe_attempts);
+            #[cfg(feature = "anatomy-counters")]
+            {
+                descent_probes += 1;
+            }
             if unsafe {
                 *buf.get_unchecked(matchptr + len as usize)
                     == *buf.get_unchecked(in_next + len as usize)
@@ -321,6 +333,13 @@ impl BtMatchfinder {
                         );
                         crate::anatomy_count!(bt_child_table_reads, 2u64);
                         crate::anatomy_count!(bt_child_table_writes, 2u64);
+                        #[cfg(feature = "anatomy-counters")]
+                        crate::compress::deflate::anatomy_counters::note_bt_descent(
+                            descent_probes,
+                            REC,
+                            true,
+                            false,
+                        );
                         unsafe {
                             let lc = *self.tab.get_unchecked(lc_idx);
                             let rc = *self.tab.get_unchecked(rc_idx);
@@ -380,6 +399,13 @@ impl BtMatchfinder {
             if cur_node <= cutoff || depth_remaining == 0 {
                 debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
                 crate::anatomy_count!(bt_child_table_writes, 2u64);
+                #[cfg(feature = "anatomy-counters")]
+                crate::compress::deflate::anatomy_counters::note_bt_descent(
+                    descent_probes,
+                    REC,
+                    false,
+                    depth_remaining == 0,
+                );
                 unsafe {
                     *self.tab.get_unchecked_mut(pending_lt) = MATCHFINDER_INITVAL;
                     *self.tab.get_unchecked_mut(pending_gt) = MATCHFINDER_INITVAL;
