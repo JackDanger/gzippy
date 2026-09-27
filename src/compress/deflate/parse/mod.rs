@@ -120,6 +120,28 @@ pub mod near_opt_d3_probe {
         super::near_optimal::bt_forced()
     }
 }
+
+/// Test/observability handle for the bt PROBE-BUDGET lever (LEVER #4 / bt,
+/// feature `near-opt-bt-probebudget`, DEFAULT OFF; compiles to nothing
+/// without it — so the default suite never sees the knob). Same
+/// measurement-surface precedent as `near_opt_d3_probe` above: the L9-T4
+/// probe's budget arms (24/48/96/150) all live in ONE binary through this
+/// knob, and no production call site picks an encode route here
+/// (CLAUDE.md non-negotiable #3).
+#[cfg(feature = "near-opt-bt-probebudget")]
+pub mod near_opt_probebudget {
+    /// Set the per-descent probe budget for subsequent near-optimal runs
+    /// (the mission's ABIT=24 is the compiled-in default; arms override).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn set_budget(v: u32) {
+        super::near_optimal::set_probe_budget(v);
+    }
+    /// The current budget (the probe's arm witness).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn budget() -> u32 {
+        super::near_optimal::probe_budget()
+    }
+}
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
 /// REOPEN it rests on.

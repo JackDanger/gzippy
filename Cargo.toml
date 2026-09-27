@@ -209,6 +209,31 @@ near-opt-parallel-flush = []
 # DEFAULT OFF: probe only — the promotion decision (or conviction) rides the
 # measured numbers, never this flag. No env var gates behaviour.
 near-opt-d3-probe = []
+# LEVER #4 / bt-PROBEBUDGET (the last un-priced loss class on the record,
+# pigz:silesia.tar:L9:T4:wall 1.0840; every other lever class there is
+# priced and convicted — d1 depth-100 NO-SHIP 1.0823→1.0840, d2 passes=1
+# slower, d3 chain-gather 2.70x bt wall). Mechanism: the bt descent's
+# per-position visit volume is PRICED (anatomy-counters, the 2026-09-27
+# probe: ~6.7M bt_probe_attempts per input MiB at the production L9/T4
+# shape, mean 6.30/descent — the top 3.7% of descents carry 16.8% of the
+# volume) while a cap on the per-descent probe count is NOT yet measured.
+# Feature-gated `near-opt-bt-probebudget` (DEFAULT OFF): bt_matchfinder's
+# descent loop takes one more cfg'd parameter, `probe_budget` (threaded
+# from the near_optimal call sites, min'd with `max_depth`); the walk
+# continues while budget > 0 AND the len-ladder allows, and a descent that
+# runs out of budget returns the matches found so far — a PREFIX of the
+# record's trusted layout (strictly-increasing lengths, non-decreasing
+# offsets: the walk order is unchanged, only cut; the tree maintenance
+# exits through the SAME loop-bottom writes the depth cap uses). DEFAULT
+# OFF: probe only — the promotion decision (or conviction) rides the
+# measured numbers, never this flag. The in-process measurement surface
+# `gzippy::compress::deflate::parse::near_opt_probebudget::set_budget`
+# drives the arms (24/48/96/150). The compiled-in default is the MEASURED
+# joint winner (48: the 2026-09-27 arms on the FULL silesia.tar at the
+# exact L9-T4 route, best-of-5, priced ABIT 24 at +0.048% size / -9.6%
+# wall, 48 at -0.001% size / -6.3% wall, 96/150 at -0.007%/-0.001% size
+# at -4.8%/-5.2% wall). No env var gates behaviour.
+near-opt-bt-probebudget = []
 # ── Bucket-split-oracle session (2026-07-26) ────────────────────────────────
 # The `parse_match` anatomy-wall bucket is FUSED (probe + accept/defer +
 # `Sink::push_*` emission + histogram/stats all inlined in one per-position

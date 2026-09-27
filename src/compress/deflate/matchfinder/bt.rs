@@ -96,6 +96,17 @@ impl BtMatchfinder {
     /// `bt_matchfinder_get_matches` (`:296-315`). `max_len >=
     /// BT_MATCHFINDER_REQUIRED_NBYTES`, `nice_len <= max_len`, `max_depth >= 1`.
     /// `out` must hold at least `nice_len - 2` slots.
+    ///
+    /// `probe_budget` (feature `near-opt-bt-probebudget`, DEFAULT OFF):
+    /// a per-descent cap on the descent-loop's probe/iteration count,
+    /// threaded from the near_optimal call sites. A descent that exhausts
+    /// it exits through the SAME loop-bottom maintenance the depth cap
+    /// uses (pending child slots emptied; the unvisited subtree
+    /// abandoned exactly as the depth cap abandons one), so the recorded
+    /// list is a PREFIX of the unrestricted walk's list — strictly-
+    /// increasing lengths, non-decreasing offsets preserved by
+    /// construction; only its tail is cut. Must be `>= 1` (clamped);
+    /// values >= `max_depth` are the unrestricted walk (inert).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn get_matches(
@@ -106,6 +117,7 @@ impl BtMatchfinder {
         max_len: u32,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] probe_budget: u32,
         next_hashes: &mut [u32; 2],
         out: &mut [LzMatch],
     ) -> usize {
@@ -116,13 +128,18 @@ impl BtMatchfinder {
             max_len,
             nice_len,
             max_depth,
+            #[cfg(feature = "near-opt-bt-probebudget")]
+            probe_budget,
             next_hashes,
             out,
         )
     }
 
     /// Advance the matchfinder one byte without recording matches
-    /// (`bt_matchfinder_skip_byte`, `:323-340`).
+    /// (`bt_matchfinder_skip_byte`, `:323-340`). `probe_budget` under
+    /// `near-opt-bt-probebudget` budgets the skip descent the same way (see
+    /// [`get_matches`]); the skip path records no candidates, so the cap
+    /// only re-roots the tree shallower.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn skip_byte(
@@ -132,6 +149,7 @@ impl BtMatchfinder {
         cur_pos: isize,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] probe_budget: u32,
         next_hashes: &mut [u32; 2],
     ) {
         crate::anatomy_count!(bt_positions_skipped);
@@ -143,6 +161,8 @@ impl BtMatchfinder {
             nice_len,
             nice_len,
             max_depth,
+            #[cfg(feature = "near-opt-bt-probebudget")]
+            probe_budget,
             next_hashes,
             &mut [],
         );
@@ -177,11 +197,20 @@ impl BtMatchfinder {
         max_len: u32,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] probe_budget: u32,
         next_hashes: &mut [u32; 2],
         out: &mut [LzMatch],
     ) -> usize {
         let in_next = (in_base as isize + cur_pos) as usize;
         let mut depth_remaining = max_depth;
+        // LEVER bt-probebudget (feature `near-opt-bt-probebudget`, DEFAULT
+        // OFF): the per-descent probe budget, clamped to at least one probe
+        // (the same minimum `max_depth >= 1` already carries) and to the
+        // walk's depth cap (a budget >= depth is the unrestricted walk).
+        // A descent that exhausts it exits through the depth cap's own
+        // loop-bottom site below.
+        #[cfg(feature = "near-opt-bt-probebudget")]
+        let mut probe_budget_left = probe_budget.min(max_depth).max(1);
         // Lever bt-probebudget probe instrumentation: per-descent iteration
         // count, recorded at the three exits below under `anatomy-counters`
         // only (zero bytes in the default build — the anatomy_count!
@@ -396,7 +425,23 @@ impl BtMatchfinder {
             }
 
             depth_remaining -= 1;
-            if cur_node <= cutoff || depth_remaining == 0 {
+            // Both caps pool into ONE exit (the maintenance below — pending
+            // child slots emptied, the unvisited subtree abandoned — is
+            // byte-identical for either cap; a budget cut exits exactly
+            // where the depth cap does). Exactly one of the two arms
+            // compiles; the budget arm decrements its counter per probe.
+            let walk_exhausted;
+            #[cfg(feature = "near-opt-bt-probebudget")]
+            {
+                probe_budget_left -= 1;
+                walk_exhausted =
+                    cur_node <= cutoff || depth_remaining == 0 || probe_budget_left == 0;
+            }
+            #[cfg(not(feature = "near-opt-bt-probebudget"))]
+            {
+                walk_exhausted = cur_node <= cutoff || depth_remaining == 0;
+            }
+            if walk_exhausted {
                 debug_assert!(pending_lt < self.tab.len() && pending_gt < self.tab.len());
                 crate::anatomy_count!(bt_child_table_writes, 2u64);
                 #[cfg(feature = "anatomy-counters")]
@@ -480,6 +525,8 @@ mod tests {
                     max_len,
                     nl,
                     max_depth,
+                    #[cfg(feature = "near-opt-bt-probebudget")]
+                    max_depth, // inert: the unrestricted walk is this contract
                     &mut next_hashes,
                     &mut out,
                 );

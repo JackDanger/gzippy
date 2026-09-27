@@ -559,6 +559,40 @@ pub(super) fn bt_forced() -> bool {
     crate::compress::deflate::matchfinder::near_opt_probe::bt_forced()
 }
 
+// ── `near-opt-bt-probebudget` knob (LEVER #4 / bt, the probe-budget class) ──
+// The per-descent probe budget's in-process measurement surface, the same
+// `set_force_bt` precedent: `run` reads it once per run and threads it into
+// every bt descent via the cfg'd parameter (see `bt.rs`'s get_matches);
+// `parse::near_opt_probebudget::set_budget` drives the arms for the L9-T4
+// probe's side-by-side walls. The compiled-in default is the MEASURED
+// joint winner from the 2026-09-27 arms (FULL silesia.tar 202 MiB at the
+// exact L9-T4 route, best-of-5): the mission's e.g. ABIT 24 binds hardest
+// (anatomy probe: 3.68% of descents / 16.8% of descent probe-volume lives
+// beyond it) but pays +31,130 B (+0.048%); 48 pays −745 B (−0.001%,
+// byte-clean vs the inert arm, which IS production byte-for-byte) for
+// −6.3% wall; 96/150 priced −4,619 B/−844 B at −4.8%/−5.2% wall. 48
+// closes the wall cell with the LOWEST size-board risk, so it is the
+// candidate default a promotion would carry. text-1MB binds at neither
+// (mean 3.30 probes/descent, zero descents over 24) — the lever prices
+// only on repeat-heavy corpora, exactly the named-loss corpus class. No
+// production call site reads this and the whole surface compiles to
+// nothing without the feature.
+#[cfg(feature = "near-opt-bt-probebudget")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "near-opt-bt-probebudget")]
+static BT_PROBE_BUDGET: AtomicU32 = AtomicU32::new(48);
+
+#[cfg(feature = "near-opt-bt-probebudget")]
+#[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+pub(super) fn set_probe_budget(v: u32) {
+    BT_PROBE_BUDGET.store(v, Ordering::Relaxed);
+}
+
+#[cfg(feature = "near-opt-bt-probebudget")]
+pub(super) fn probe_budget() -> u32 {
+    BT_PROBE_BUDGET.load(Ordering::Relaxed)
+}
+
 // ===========================================================================
 // LEVER #3 — block-parallel `optimize_and_flush` (feature
 // `near-opt-parallel-flush`, DEFAULT OFF). Docs/board/sprint-2026-09-25.md,
@@ -1257,6 +1291,13 @@ pub(super) fn run(
 
     let depth = params.max_search_depth;
 
+    // LEVER bt-probebudget: the per-descent probe budget, read once per run
+    // (the knob is process-wide; feature-on arm drives only). Inert at the
+    // depth winding: a budget >= depth is the unrestricted walk, and when
+    // the feature is off this local and the cfg'd parameters do not exist.
+    #[cfg(feature = "near-opt-bt-probebudget")]
+    let bt_probe_budget = probe_budget();
+
     // ChunkFillState: the block loop's loop-carried fill locals, hoisted
     // into one struct (audit §E3 / item #8). Construct BEFORE the dict pass
     // — `next_hashes` and the window indices must flow into the seeding
@@ -1283,6 +1324,8 @@ pub(super) fn run(
                 (fill.in_next - fill.in_cur_base) as isize,
                 nl,
                 depth,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                bt_probe_budget,
                 &mut fill.next_hashes,
             );
         }
@@ -1345,6 +1388,8 @@ pub(super) fn run(
                         fill.max_len,
                         fill.nice_len,
                         depth,
+                        #[cfg(feature = "near-opt-bt-probebudget")]
+                        bt_probe_budget,
                         &mut fill.next_hashes,
                         &mut opt.match_cache[matches_start..],
                     );
@@ -1402,6 +1447,8 @@ pub(super) fn run(
                                 (fill.in_next - fill.in_cur_base) as isize,
                                 fill.nice_len,
                                 depth,
+                                #[cfg(feature = "near-opt-bt-probebudget")]
+                                bt_probe_budget,
                                 &mut fill.next_hashes,
                             );
                         }
