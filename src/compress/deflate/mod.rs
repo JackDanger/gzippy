@@ -619,21 +619,41 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //       Retires only when the port learns the len-3 machinery (named lever,
     //       not good_match).
     //
-    //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
-    //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
-    //         text:L6   vs gzip +12,610 B / vs pigz +12,090 B
-    //       Those cells were won by the ZLIB arm = baseline + `good_match` 8 + chain
-    //       128. Carrying those knobs on the level keeps the cells with ONE encode.
+    //   L6  RETIRED (PR #363 follow-up, 2026-09-27): the port now carries the
+    //       zlib knob pair itself (`hc_matchfinder_longest_match` takes
+    //       `good_match`; port L6 = chain 128 / nice 65 / good 8) and is
+    //       BYTE-IDENTICAL to the legacy arm at L6/L7 (11/11 files on the
+    //       branch's probe corpus) and on the canonical 21-member corpus at
+    //       levels 1-9 (189/189 cells, the census record's follow-up). One
+    //       encoder, byte-equal output, and the port's wall is the cheaper
+    //       arm (its in-process data was 1.07x libdeflate vs the legacy
+    //       arm's 1.4-4.1x).
     //
-    //   L7  follows from L6: the port has no `good_match`, so our L6 is stronger than
-    //       the port's L7 (100, 130) and `ladder_is_monotone_t1` fires (305,775 >
-    //       304,252 on text). L7 keeps the legacy encoder at its own measured-best
-    //       single config (chain 256, `good_match` 32) — monotone, and 2 clause-3 flips
-    //       against 4 for `params(7)`.
+    //   L7  RETIRED (same receipt set): port L7 = chain 256 / nice 130 /
+    //       good 32 == legacy L7 bytes; the monotone ladder holds with the
+    //       port carrying the pair (the old L6-dips-below-L7 inversion went
+    //       away when both sides gained `good_match`).
+    //
+    // STILL EXCEPTIONS (each its own named gate, both rerouted to #364-family levers):
+    //
+    //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
+    //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
+    //
+    //   L3  the port has NO len-3/sparse machinery (l3_sparse_split, far_len3 —
+    //       the campaign-winning L3 guards), so port L3 (12, 14) is 1-7% LARGER
+    //       than the legacy L3 (8, 14 + len-3 guards) on the 11-file Mac corpus
+    //       (deterministic, 2026-09-01: tabular +18,886 B = 7.4%, text +6,831 B
+    //       = 2.0%, binary +4,316 B; 2MB+ files same direction) and the running
+    //       solvency try shows it LOSING 11 T1 wall cells vs the legacy L3.
+    //       The legacy L3 is exactly what main ships at T1 L3 (main's own
+    //       receipt: whole-buffer and streaming legacy L3 are byte-identical on
+    //       the real corpus), so the exception restores main's bytes AND wall.
+    //       Retires only when the port learns the len-3 machinery (named lever,
+    //       not good_match).
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times in this campaign.
-    !matches!(level, 1 | 3 | 6 | 7) && level <= 9
+    !matches!(level, 1 | 3) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
