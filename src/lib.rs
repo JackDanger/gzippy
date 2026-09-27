@@ -92,7 +92,13 @@ pub mod coz_probe;
 pub mod decompress;
 #[doc(hidden)]
 pub mod error;
+// Measurement/pin surfaces (audit item #10): these generate the fixture
+// corpus and holdout pins for tests — NOT product API. doc(hidden) keeps
+// in-crate/example/test users compiling while rustdoc stops advertising
+// them (per the crate's own semver-policy comment above).
+#[doc(hidden)]
 pub mod fixtures;
+#[doc(hidden)]
 pub mod holdout;
 
 // ── Stable public surface ─────────────────────────────────────────────────────
