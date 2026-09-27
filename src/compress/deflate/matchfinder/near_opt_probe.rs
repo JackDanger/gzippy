@@ -20,7 +20,8 @@
 //!     rolling-hash update — on repeat-heavy content the interior walk bt pays
 //!     a full depth-capped descent for costs the chain a link write;
 //!   * the candidate gather walks the chain head first (most recent) up to
-//!     `max_depth` links, re-extending each same-hash4 candidate
+//!     the gather walk caps at `CHAIN_WALK_BUDGET` links (≤ `max_depth`; the
+//!     mission's own 100-150 "actual read" band), re-extending each same-hash4 candidate
 //!     word-at-a-time with [`lz_extend`], recording every length-improving
 //!     candidate — the same record-on-improvement policy bt's descent uses.
 //!
