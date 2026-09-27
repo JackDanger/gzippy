@@ -151,6 +151,15 @@ fn won_cells_stay_won() {
 
 /// Layer 2: the mechanism snapshot. Any output change shows up as a per-axis
 /// diff; intentional changes regenerate the pin in the same PR.
+///
+/// The pins are the DEFAULT-flavor shapes: since the bt-probebudget
+/// promotion (PR #403) the default feature set changes the encoder bytes
+/// on two fixture cells (binary:L9:T4, tabular:L9:T4). The CI leg that
+/// builds `--no-default-features --features pure-rust-inflate` (the
+/// decode-flavor stress test) therefore computes the PRE-promotion shapes,
+/// so grading it against these pins would fail on flavor, not mechanism.
+/// Byte pins live in the default-flavor runs only.
+#[cfg(feature = "near-opt-bt-probebudget")]
 #[test]
 fn fingerprints_match_pins() {
     let pinned_tsv = std::fs::read_to_string("tests/fingerprints/ours.tsv")
