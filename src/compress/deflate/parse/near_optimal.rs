@@ -1141,6 +1141,92 @@ mod parallel_flush {
     }
 }
 
+/// The block loop's loop-carried fill state of [`run`], hoisted verbatim from
+/// the ~13 stack locals it used to thread across DEFLATE blocks
+/// (audit-2026-09-26 §E3 / ranked plan item #8; docs/board/audit-2026-09-26.md).
+/// A FIELD HOIST, not a redesign: every field is one pre-hoist local — same
+/// name, same initial value, same update sites — so the fill loop, the flush
+/// sites, and the lever-0 anatomy regions behave exactly as before.
+///
+/// The struct is what makes the flush-overlap shared-state surface readable:
+/// under `near-opt-parallel-flush`, what flush k must see from fill k is
+/// precisely the fields the `snapshot_and_dispatch` sites copy out
+/// (`split_stats`, the `prev_*` pair, plus the `Optimizer`-side
+/// `match_cache[..cache_ptr]` / `match_len_freqs` regions) — a reader lists
+/// fields, not variables. Deliberately NOT hoisted: the bt matchfinder
+/// (`fill_mf`, [`NearOptFill`]) and the [`Optimizer`] stay where they are.
+struct ChunkFillState {
+    /// Matchfinder window bookkeeping (indices into `buf`): the current
+    /// window's base, the global walk cursor, and where the next slide
+    /// fires (`in_next + remaining.min(WINDOW_SIZE)`).
+    in_cur_base: usize,
+    in_next: usize,
+    in_next_slide: usize,
+    /// bt rolling-hash seeds (`[hash3, hash4]`): the chain state each
+    /// `get_matches` / `skip_byte` advances, carried from the dict-seeding
+    /// pass through every block.
+    next_hashes: [u32; 2],
+    /// Write cursor into `opt.match_cache` (state in `opt`, cursor here):
+    /// zeroed at init, walked forward per position, walked BACK to the
+    /// chosen end at a rewind (then compacted to `cache_len_rewound`), or
+    /// reset to 0 at a straight block end.
+    cache_ptr: usize,
+    /// The current block's split / end-block-check observations
+    /// (`deflate_near_optimal_init_stats` zero state), compacted
+    /// (`clear_old_observations`) or reset at each block end.
+    split_stats: BlockSplitStats,
+    /// Per-position match-length frequencies since the last `merge_stats`
+    /// fold into `opt.match_len_freqs`; zeroed after every merge.
+    new_match_len_freqs: Vec<u32>,
+    /// The previous block's ingest stats as the flush entered it —
+    /// `optimize_and_flush`'s `prev_observations` / `prev_num_observations`
+    /// carriers, pushed through `save_stats` after every flush. This pair is
+    /// the flush's own shared input surface (snapshot-and-dispatch copies it
+    /// verbatim under `near-opt-parallel-flush`).
+    prev_observations: [u32; NUM_OBSERVATION_TYPES],
+    prev_num_observations: u32,
+    /// Whether the previous flush fell back to an only-literals block
+    /// (raises the next block's `min_len`); the parallel dispatch arm
+    /// ASSUMES false — the b5281a96 zero-flip finding plus the
+    /// `STALE_FLAG` runtime guard keep the assumption honest.
+    prev_block_used_only_literals: bool,
+    /// Match-length caps, adjusted in place per position by
+    /// `adjust_max_and_nice_len` and carried across positions and blocks.
+    max_len: u32,
+    nice_len: u32,
+    /// Start of the current DEFLATE block in `buf`; set to the post-dict
+    /// pass cursor here and moved to the (possibly rewound) block end at
+    /// every block flush.
+    in_block_begin: usize,
+}
+
+impl ChunkFillState {
+    /// Fresh state at `run` entry: the pre-hoist initializers verbatim —
+    /// window cursors at 0, hash seeds zeroed, the first slide point
+    /// `in_end.min(WINDOW_SIZE)`, a fresh stats/freqs zero-block (the
+    /// `deflate_near_optimal_init_stats` shape: `split_stats` /
+    /// `new_match_len_freqs` zero; the Optimizer's `match_len_freqs` is
+    /// zeroing itself in `Optimizer::new`), `nice_len` capped by
+    /// `MAX_MATCH_LEN`.
+    fn new(in_end: usize, params: &LevelParams) -> Self {
+        ChunkFillState {
+            in_cur_base: 0usize,
+            in_next: 0usize,
+            in_next_slide: in_end.min(WINDOW_SIZE),
+            next_hashes: [0u32; 2],
+            cache_ptr: 0usize,
+            split_stats: BlockSplitStats::new(),
+            new_match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
+            prev_observations: [0u32; NUM_OBSERVATION_TYPES],
+            prev_num_observations: 0u32,
+            prev_block_used_only_literals: false,
+            max_len: MAX_MATCH_LEN,
+            nice_len: params.nice_match_length.min(MAX_MATCH_LEN),
+            in_block_begin: 0usize,
+        }
+    }
+}
+
 /// Near-optimal driver. Compresses `buf[data_start..in_end]` into DEFLATE blocks
 /// appended to `bw` (a preset dictionary in `buf[..data_start]` is seeded into
 /// the matchfinder but not coded). Port of `deflate_compress_near_optimal`.
@@ -1170,61 +1256,52 @@ pub(super) fn run(
     let mut flush_pipe = parallel_flush::Dispatcher::maybe_new(statics, budget);
 
     let depth = params.max_search_depth;
-    let mut max_len = MAX_MATCH_LEN;
-    let mut nice_len = params.nice_match_length.min(max_len);
-    let mut next_hashes = [0u32; 2];
 
-    // Matchfinder window bookkeeping (indices into `buf`).
-    let mut in_cur_base = 0usize;
-    let mut in_next = 0usize;
-    let mut in_next_slide = in_end.min(WINDOW_SIZE);
+    // ChunkFillState: the block loop's loop-carried fill locals, hoisted
+    // into one struct (audit §E3 / item #8). Construct BEFORE the dict pass
+    // — `next_hashes` and the window indices must flow into the seeding
+    // loop below and out into the block loop with the seeding pass's
+    // updates intact.
+    let mut fill = ChunkFillState::new(in_end, params);
 
     // Seed a preset dictionary (untested in this increment; dict is always empty
     // here). Insert positions [0, data_start) into the bt tree without coding.
-    while in_next < data_start {
-        let remaining = in_end - in_next;
-        if in_next == in_next_slide {
+    while fill.in_next < data_start {
+        let remaining = in_end - fill.in_next;
+        if fill.in_next == fill.in_next_slide {
             fill_mf.slide_window();
-            in_cur_base = in_next;
-            in_next_slide = in_next + remaining.min(WINDOW_SIZE);
+            fill.in_cur_base = fill.in_next;
+            fill.in_next_slide = fill.in_next + remaining.min(WINDOW_SIZE);
         }
         let mut ml = MAX_MATCH_LEN;
-        let mut nl = nice_len;
+        let mut nl = fill.nice_len;
         adjust_max_and_nice_len(&mut ml, &mut nl, remaining);
         if ml >= BT_MATCHFINDER_REQUIRED_NBYTES {
             fill_mf.skip_byte(
                 buf,
-                in_cur_base,
-                (in_next - in_cur_base) as isize,
+                fill.in_cur_base,
+                (fill.in_next - fill.in_cur_base) as isize,
                 nl,
                 depth,
-                &mut next_hashes,
+                &mut fill.next_hashes,
             );
         }
-        in_next += 1;
+        fill.in_next += 1;
     }
 
-    let mut in_block_begin = in_next;
-    let mut split_stats = BlockSplitStats::new();
-    let mut new_match_len_freqs = vec![0u32; MAX_MATCH_LEN as usize + 1];
-    let mut prev_observations = [0u32; NUM_OBSERVATION_TYPES];
-    let mut prev_num_observations = 0u32;
-    let mut prev_block_used_only_literals = false;
-
-    // deflate_near_optimal_init_stats: split_stats + match_len_freqs already zero.
-    let mut cache_ptr = 0usize;
+    fill.in_block_begin = fill.in_next;
 
     loop {
         // Starting a new DEFLATE block.
-        let in_max_block_end = choose_max_block_end(in_block_begin, in_end);
+        let in_max_block_end = choose_max_block_end(fill.in_block_begin, in_end);
         let mut prev_end_block_check: Option<usize> = None;
         let mut change_detected = false;
-        let mut next_observation = in_next;
+        let mut next_observation = fill.in_next;
 
-        let min_len = if prev_block_used_only_literals {
+        let min_len = if fill.prev_block_used_only_literals {
             MAX_MATCH_LEN + 1
         } else {
-            calculate_min_match_len(&buf[in_block_begin..in_max_block_end], depth)
+            calculate_min_match_len(&buf[fill.in_block_begin..in_max_block_end], depth)
         };
 
         // ## Soundness invariant (unchecked `match_cache` writes — forward fill)
@@ -1247,95 +1324,96 @@ pub(super) fn run(
         // INSIDE the timer's body block, so the accounting stays correct.
         crate::anatomy_wall_time!(near_opt_fill_ns, near_opt_fill_calls, {
             loop {
-                let remaining = in_end - in_next;
+                let remaining = in_end - fill.in_next;
 
                 // Slide the window forward if needed.
-                if in_next == in_next_slide {
+                if fill.in_next == fill.in_next_slide {
                     fill_mf.slide_window();
-                    in_cur_base = in_next;
-                    in_next_slide = in_next + remaining.min(WINDOW_SIZE);
+                    fill.in_cur_base = fill.in_next;
+                    fill.in_next_slide = fill.in_next + remaining.min(WINDOW_SIZE);
                 }
 
                 // Find and cache matches at the current position.
-                let matches_start = cache_ptr;
+                let matches_start = fill.cache_ptr;
                 let mut best_len = 0u32;
-                adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
-                if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
+                adjust_max_and_nice_len(&mut fill.max_len, &mut fill.nice_len, remaining);
+                if fill.max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
                     let n = fill_mf.get_matches(
                         buf,
-                        in_cur_base,
-                        (in_next - in_cur_base) as isize,
-                        max_len,
-                        nice_len,
+                        fill.in_cur_base,
+                        (fill.in_next - fill.in_cur_base) as isize,
+                        fill.max_len,
+                        fill.nice_len,
                         depth,
-                        &mut next_hashes,
+                        &mut fill.next_hashes,
                         &mut opt.match_cache[matches_start..],
                     );
-                    cache_ptr = matches_start + n;
+                    fill.cache_ptr = matches_start + n;
                     if n > 0 {
                         // SAFETY: see the soundness invariant above; `cache_ptr - 1
                         // == matches_start + n - 1` is a slot `get_matches` just
                         // wrote (`n <= MAX_MATCHES_PER_POS` slots from
                         // `matches_start`, within the cache's slop capacity).
-                        debug_assert!(cache_ptr - 1 < opt.match_cache.len());
-                        best_len =
-                            unsafe { opt.match_cache.get_unchecked(cache_ptr - 1).length as u32 };
+                        debug_assert!(fill.cache_ptr - 1 < opt.match_cache.len());
+                        best_len = unsafe {
+                            opt.match_cache.get_unchecked(fill.cache_ptr - 1).length as u32
+                        };
                     }
                 }
 
                 // Observe a match or literal for the split / cost statistics.
-                if in_next >= next_observation {
+                if fill.in_next >= next_observation {
                     if best_len >= min_len {
-                        split_stats.observe_match(best_len);
-                        next_observation = in_next + best_len as usize;
-                        new_match_len_freqs[best_len as usize] += 1;
+                        fill.split_stats.observe_match(best_len);
+                        next_observation = fill.in_next + best_len as usize;
+                        fill.new_match_len_freqs[best_len as usize] += 1;
                     } else {
-                        split_stats.observe_literal(buf[in_next]);
-                        next_observation = in_next + 1;
+                        fill.split_stats.observe_literal(buf[fill.in_next]);
+                        next_observation = fill.in_next + 1;
                     }
                 }
 
                 // Write this position's cache header (num matches, literal byte).
                 // SAFETY: see the soundness invariant above (`cache_ptr` bound).
-                debug_assert!(cache_ptr < opt.match_cache.len());
+                debug_assert!(fill.cache_ptr < opt.match_cache.len());
                 unsafe {
-                    let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
-                    hdr.length = (cache_ptr - matches_start) as u16;
-                    hdr.offset = buf[in_next] as u16;
+                    let hdr = opt.match_cache.get_unchecked_mut(fill.cache_ptr);
+                    hdr.length = (fill.cache_ptr - matches_start) as u16;
+                    hdr.offset = buf[fill.in_next] as u16;
                 }
-                in_next += 1;
-                cache_ptr += 1;
+                fill.in_next += 1;
+                fill.cache_ptr += 1;
 
                 // Skip the interior of a very long match (don't cache its bytes).
-                if best_len >= MIN_MATCH_LEN && best_len >= nice_len {
+                if best_len >= MIN_MATCH_LEN && best_len >= fill.nice_len {
                     let mut skip = best_len - 1;
                     loop {
-                        let remaining = in_end - in_next;
-                        if in_next == in_next_slide {
+                        let remaining = in_end - fill.in_next;
+                        if fill.in_next == fill.in_next_slide {
                             fill_mf.slide_window();
-                            in_cur_base = in_next;
-                            in_next_slide = in_next + remaining.min(WINDOW_SIZE);
+                            fill.in_cur_base = fill.in_next;
+                            fill.in_next_slide = fill.in_next + remaining.min(WINDOW_SIZE);
                         }
-                        adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
-                        if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
+                        adjust_max_and_nice_len(&mut fill.max_len, &mut fill.nice_len, remaining);
+                        if fill.max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
                             fill_mf.skip_byte(
                                 buf,
-                                in_cur_base,
-                                (in_next - in_cur_base) as isize,
-                                nice_len,
+                                fill.in_cur_base,
+                                (fill.in_next - fill.in_cur_base) as isize,
+                                fill.nice_len,
                                 depth,
-                                &mut next_hashes,
+                                &mut fill.next_hashes,
                             );
                         }
                         // SAFETY: see the soundness invariant above (`cache_ptr` bound).
-                        debug_assert!(cache_ptr < opt.match_cache.len());
+                        debug_assert!(fill.cache_ptr < opt.match_cache.len());
                         unsafe {
-                            let hdr = opt.match_cache.get_unchecked_mut(cache_ptr);
+                            let hdr = opt.match_cache.get_unchecked_mut(fill.cache_ptr);
                             hdr.length = 0;
-                            hdr.offset = buf[in_next] as u16;
+                            hdr.offset = buf[fill.in_next] as u16;
                         }
-                        in_next += 1;
-                        cache_ptr += 1;
+                        fill.in_next += 1;
+                        fill.cache_ptr += 1;
                         skip -= 1;
                         if skip == 0 {
                             break;
@@ -1344,29 +1422,35 @@ pub(super) fn run(
                 }
 
                 // Maximum block length or end of input reached?
-                if in_next >= in_max_block_end {
+                if fill.in_next >= in_max_block_end {
                     break;
                 }
                 // Match cache overflowed?
-                if cache_ptr >= MATCH_CACHE_LENGTH {
+                if fill.cache_ptr >= MATCH_CACHE_LENGTH {
                     break;
                 }
                 // Not ready to check for a block end (again)?
-                if !split_stats.ready_to_check_block(in_next - in_block_begin, in_end - in_next) {
+                if !fill
+                    .split_stats
+                    .ready_to_check_block(fill.in_next - fill.in_block_begin, in_end - fill.in_next)
+                {
                     continue;
                 }
                 // Would ending the block be worthwhile?
-                if split_stats.do_end_block_check((in_next - in_block_begin) as u32) {
+                if fill
+                    .split_stats
+                    .do_end_block_check((fill.in_next - fill.in_block_begin) as u32)
+                {
                     change_detected = true;
                     break;
                 }
                 // Not worthwhile: merge the recent stats and remember this point.
                 merge_stats(
-                    &mut split_stats,
+                    &mut fill.split_stats,
                     &mut opt.match_len_freqs,
-                    &mut new_match_len_freqs,
+                    &mut fill.new_match_len_freqs,
                 );
-                prev_end_block_check = Some(in_next);
+                prev_end_block_check = Some(fill.in_next);
             }
         });
 
@@ -1377,9 +1461,9 @@ pub(super) fn run(
             None
         };
         if let Some(in_block_end) = rewind_end {
-            let block_length = in_block_end - in_block_begin;
-            let is_first = in_block_begin == data_start;
-            let mut num_bytes_to_rewind = in_next - in_block_end;
+            let block_length = in_block_end - fill.in_block_begin;
+            let is_first = fill.in_block_begin == data_start;
+            let mut num_bytes_to_rewind = fill.in_next - in_block_end;
 
             // Rewind the match cache to the chosen block end.
             // SAFETY: `cache_ptr` only ever walks backward here, starting
@@ -1388,15 +1472,16 @@ pub(super) fn run(
             // `length` is exactly its own match count, so subtracting it lands
             // on the PRECEDING header) — the same backward-walk invariant
             // `find_min_cost_path` relies on for the same array.
-            let orig_cache_ptr = cache_ptr;
+            let orig_cache_ptr = fill.cache_ptr;
             while num_bytes_to_rewind != 0 {
-                cache_ptr -= 1;
-                debug_assert!(cache_ptr < opt.match_cache.len());
-                cache_ptr -= unsafe { opt.match_cache.get_unchecked(cache_ptr).length as usize };
+                fill.cache_ptr -= 1;
+                debug_assert!(fill.cache_ptr < opt.match_cache.len());
+                fill.cache_ptr -=
+                    unsafe { opt.match_cache.get_unchecked(fill.cache_ptr).length as usize };
                 num_bytes_to_rewind -= 1;
             }
-            let cache_len_rewound = orig_cache_ptr - cache_ptr;
-            let block_cache_end = cache_ptr;
+            let cache_len_rewound = orig_cache_ptr - fill.cache_ptr;
+            let block_cache_end = fill.cache_ptr;
 
             #[cfg(feature = "near-opt-parallel-flush")]
             let prev_used_only_literals = match flush_pipe.as_mut() {
@@ -1409,12 +1494,12 @@ pub(super) fn run(
                 // honest (see the parallel_flush module doc).
                 Some(pipe) => {
                     pipe.snapshot_and_dispatch(
-                        buf[in_block_begin..in_block_end].to_vec(),
+                        buf[fill.in_block_begin..in_block_end].to_vec(),
                         opt.match_cache[..block_cache_end].to_vec(),
                         opt.match_len_freqs.clone(),
-                        split_stats.clone(),
-                        prev_observations,
-                        prev_num_observations,
+                        fill.split_stats.clone(),
+                        fill.prev_observations,
+                        fill.prev_num_observations,
                         is_first,
                         false,
                         *params,
@@ -1426,16 +1511,16 @@ pub(super) fn run(
                         crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
-                        in_block_begin,
+                        fill.in_block_begin,
                         block_length,
                         block_cache_end,
                         is_first,
                         false,
                         params,
                         statics,
-                        &split_stats,
-                        &prev_observations,
-                        prev_num_observations,
+                        &fill.split_stats,
+                        &fill.prev_observations,
+                        fill.prev_num_observations,
                         bw,
                     )
                 }),
@@ -1447,49 +1532,49 @@ pub(super) fn run(
                         crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
-                        in_block_begin,
+                        fill.in_block_begin,
                         block_length,
                         block_cache_end,
                         is_first,
                         false,
                         params,
                         statics,
-                        &split_stats,
-                        &prev_observations,
-                        prev_num_observations,
+                        &fill.split_stats,
+                        &fill.prev_observations,
+                        fill.prev_num_observations,
                         bw,
                     )
                 });
-            prev_block_used_only_literals = prev_used_only_literals;
+            fill.prev_block_used_only_literals = prev_used_only_literals;
 
             // Move the rewound tail back to the start of the cache.
             opt.match_cache
-                .copy_within(cache_ptr..cache_ptr + cache_len_rewound, 0);
-            cache_ptr = cache_len_rewound;
+                .copy_within(fill.cache_ptr..fill.cache_ptr + cache_len_rewound, 0);
+            fill.cache_ptr = cache_len_rewound;
 
             save_stats(
-                &split_stats,
-                &mut prev_observations,
-                &mut prev_num_observations,
+                &fill.split_stats,
+                &mut fill.prev_observations,
+                &mut fill.prev_num_observations,
             );
             // Clear the flushed block's stats, keep the next block's beginning.
-            split_stats.clear_old_observations();
+            fill.split_stats.clear_old_observations();
             for f in opt.match_len_freqs.iter_mut() {
                 *f = 0;
             }
-            in_block_begin = in_block_end;
+            fill.in_block_begin = in_block_end;
         } else {
-            let block_length = in_next - in_block_begin;
-            let is_first = in_block_begin == data_start;
+            let block_length = fill.in_next - fill.in_block_begin;
+            let is_first = fill.in_block_begin == data_start;
             // BFINAL only on the last internal block AND only if this is the
             // last chunk of the stream; a non-final chunk closes with the
             // caller-appended sync-flush marker instead.
-            let is_final = is_last && in_next == in_end;
+            let is_final = is_last && fill.in_next == in_end;
 
             merge_stats(
-                &mut split_stats,
+                &mut fill.split_stats,
                 &mut opt.match_len_freqs,
-                &mut new_match_len_freqs,
+                &mut fill.new_match_len_freqs,
             );
 
             #[cfg(feature = "near-opt-parallel-flush")]
@@ -1499,12 +1584,12 @@ pub(super) fn run(
                 // only depends on the fill's own position).
                 Some(pipe) => {
                     pipe.snapshot_and_dispatch(
-                        buf[in_block_begin..in_next].to_vec(),
-                        opt.match_cache[..cache_ptr].to_vec(),
+                        buf[fill.in_block_begin..fill.in_next].to_vec(),
+                        opt.match_cache[..fill.cache_ptr].to_vec(),
                         opt.match_len_freqs.clone(),
-                        split_stats.clone(),
-                        prev_observations,
-                        prev_num_observations,
+                        fill.split_stats.clone(),
+                        fill.prev_observations,
+                        fill.prev_num_observations,
                         is_first,
                         is_final,
                         *params,
@@ -1516,16 +1601,16 @@ pub(super) fn run(
                         crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
-                        in_block_begin,
+                        fill.in_block_begin,
                         block_length,
-                        cache_ptr,
+                        fill.cache_ptr,
                         is_first,
                         is_final,
                         params,
                         statics,
-                        &split_stats,
-                        &prev_observations,
-                        prev_num_observations,
+                        &fill.split_stats,
+                        &fill.prev_observations,
+                        fill.prev_num_observations,
                         bw,
                     )
                 }),
@@ -1537,39 +1622,39 @@ pub(super) fn run(
                         crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
                     opt.optimize_and_flush(
                         buf,
-                        in_block_begin,
+                        fill.in_block_begin,
                         block_length,
-                        cache_ptr,
+                        fill.cache_ptr,
                         is_first,
                         is_final,
                         params,
                         statics,
-                        &split_stats,
-                        &prev_observations,
-                        prev_num_observations,
+                        &fill.split_stats,
+                        &fill.prev_observations,
+                        fill.prev_num_observations,
                         bw,
                     )
                 });
-            prev_block_used_only_literals = prev_used_only_literals;
+            fill.prev_block_used_only_literals = prev_used_only_literals;
 
-            cache_ptr = 0;
+            fill.cache_ptr = 0;
             save_stats(
-                &split_stats,
-                &mut prev_observations,
-                &mut prev_num_observations,
+                &fill.split_stats,
+                &mut fill.prev_observations,
+                &mut fill.prev_num_observations,
             );
             // init_stats: reset split stats + match_len_freqs for the next block.
-            split_stats.reset();
+            fill.split_stats.reset();
             for f in opt.match_len_freqs.iter_mut() {
                 *f = 0;
             }
-            for f in new_match_len_freqs.iter_mut() {
+            for f in fill.new_match_len_freqs.iter_mut() {
                 *f = 0;
             }
-            in_block_begin = in_next;
+            fill.in_block_begin = fill.in_next;
         }
 
-        if in_next == in_end {
+        if fill.in_next == in_end {
             break;
         }
     }
