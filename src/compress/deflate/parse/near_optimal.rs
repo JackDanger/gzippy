@@ -569,10 +569,15 @@ pub(super) fn bt_forced() -> bool {
 // cfg'd parameter (see `bt.rs`'s get_matches); the bgz-surface history:
 // the mission's e.g. ABIT 24 binds hardest (anatomy probe: 3.68% of descents
 // / 16.8% of descent probe-volume lives beyond it) but pays +31,130 B
-// (+0.048%); 48 pays −745 B (−0.001%, byte-clean vs the inert arm, which IS
-// the pre-promotion byte stream) for −6.3% wall on the M1 / −1.9% on the
-// frozen box; 96/150 priced −4,619 B/−844 B at −4.8%/−5.2% wall. 48 closes
-// the wall cell with the LOWEST size-board risk. text-1MB binds at neither
+// (+0.048%); 48 pays −745 B (−0.001%) on the M1 and −1,251 B on the frozen
+// census box for −6.3% (M1) / −1.9% (box) wall. "Byte-clean" here = inside
+// the census gate's ≤1%-bytes bound, NOT byte identity: on repeat-heavy
+// corpora the shipped stream differs from the pre-promotion stream by these
+// small NEGATIVE byte deltas; on the fixture corpora the budget is PROVABLY
+// inert (every sampled descent ends ≤24 probes — the anatomy pins record
+// zero rows above 24), so fixture bytes are unchanged. 96/150 priced
+// −4,619 B/−844 B at −4.8%/−5.2% wall. 48 closes the wall cell with the
+// LOWEST size-board risk. text-1MB binds at neither
 // (mean 3.30 probes/descent, zero descents over 24) — the lever prices only
 // on repeat-heavy corpora, exactly the named-loss corpus class.
 // The `set_budget` knob stays the L9-T4 probe's side-by-side arms surface:
