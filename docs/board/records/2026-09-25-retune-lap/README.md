@@ -102,3 +102,26 @@ instrumented):**
 - `layout-floors-l9t4/` — the floor calibration (two verified variants)
 - S3 backup: `s3://gzippy-adjudication-20260923/retune-lap/ip-10-50-6-11/`
   (versioned; the scoped-rerun partial rows stream there too)
+
+## The lever-3 (flush+d1) stacked-leg receipt — box 15:45Z-19:27Z, 2026-09-27
+
+`try lever3/promotion --base main` (levels 2,9 × T1,4 × n=45, base arm = the
+museum-clean trunk 6c8d2536):
+- clauses 1/2/3/4/5/6/7/8 ALL OK — zero roundtrip failures, zero pass→fail
+  flips across 15 decidable cells; improvement 0.0056 vs harm 0.0000;
+  fail-gap 0.0881 → 0.0852 (−3.3%); per-cell census drift 0.0035 [4] inside
+  the authorized ≤1% spend; sizes: jr 647,66,1× vs pigz 67,666,705 (0.9574
+  L9/T4); every OTHER substantive gate clean.
+- **pigz's competition rows were RIVAL-UNAVAILABLE this first leg** — the
+  bootstrap make of pigz failed silently on the box. pigz 2.8 was rebuilt
+  02:07Z and try4 re-ran the census with pigz live (verdict at S3,
+  `lever3-leg/ip-10-50-6-102/`).
+- one washable VOID: `libdeflate:L2:T4` base arm (aa_bias 0.0009). plus:
+  real-silesia GATE receipt — the parallel-flush guard TRIpped (4
+  only-literals flips in one chunk) and latched serial; the CHUNK byte
+  receipt 77160db… IDENTICAL across the lever and trunk arms, proving the
+  guard+fallback path preserves byte identity on the real corpus.
+- the local 0-flip corpora did NOT cover this: on real silesia the flip is
+  reachable — the promotion's PRECONDITION (Cargo.toml feature comment,
+  byte identity holds ONLY on zero-flip corpora) is therefore confirmed to
+  be load-bearing and must stay recorded.
