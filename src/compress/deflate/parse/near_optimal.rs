@@ -560,23 +560,24 @@ pub(super) fn bt_forced() -> bool {
 }
 
 // ── `near-opt-bt-probebudget` knob (LEVER #4 / bt, the probe-budget class) ──
-// The per-descent probe budget's in-process measurement surface, the same
-// `set_force_bt` precedent: `run` reads it once per run and threads it into
-// every bt descent via the cfg'd parameter (see `bt.rs`'s get_matches);
-// `parse::near_opt_probebudget::set_budget` drives the arms for the L9-T4
-// probe's side-by-side walls. The compiled-in default is the MEASURED
-// joint winner from the 2026-09-27 arms (FULL silesia.tar 202 MiB at the
-// exact L9-T4 route, best-of-5): the mission's e.g. ABIT 24 binds hardest
-// (anatomy probe: 3.68% of descents / 16.8% of descent probe-volume lives
-// beyond it) but pays +31,130 B (+0.048%); 48 pays −745 B (−0.001%,
-// byte-clean vs the inert arm, which IS production byte-for-byte) for
-// −6.3% wall; 96/150 priced −4,619 B/−844 B at −4.8%/−5.2% wall. 48
-// closes the wall cell with the LOWEST size-board risk, so it is the
-// candidate default a promotion would carry. text-1MB binds at neither
-// (mean 3.30 probes/descent, zero descents over 24) — the lever prices
-// only on repeat-heavy corpora, exactly the named-loss corpus class. No
-// production call site reads this and the whole surface compiles to
-// nothing without the feature.
+// The per-descent probe budget, PROMOTED to being the shipped parse shape
+// (PR #401 probe + PR #402 census verdicts + the frozen-c7a box: 0.981x wall
+// at −1,251 B against the pigz floor; the official cell reads 1.076 → 1.055).
+// The static below is the measured joint winner — 48 — and the feature sits
+// in the DEFAULT feature set, so every production build carries the budget.
+// `run` reads it once per run and threads it into every bt descent via the
+// cfg'd parameter (see `bt.rs`'s get_matches); the bgz-surface history:
+// the mission's e.g. ABIT 24 binds hardest (anatomy probe: 3.68% of descents
+// / 16.8% of descent probe-volume lives beyond it) but pays +31,130 B
+// (+0.048%); 48 pays −745 B (−0.001%, byte-clean vs the inert arm, which IS
+// the pre-promotion byte stream) for −6.3% wall on the M1 / −1.9% on the
+// frozen box; 96/150 priced −4,619 B/−844 B at −4.8%/−5.2% wall. 48 closes
+// the wall cell with the LOWEST size-board risk. text-1MB binds at neither
+// (mean 3.30 probes/descent, zero descents over 24) — the lever prices only
+// on repeat-heavy corpora, exactly the named-loss corpus class.
+// The `set_budget` knob stays the L9-T4 probe's side-by-side arms surface:
+// no production call site reads it, and it is driven only by
+// tests/l9_t4_chunk_cost_probe.rs (dead-code allowed on that basis).
 #[cfg(feature = "near-opt-bt-probebudget")]
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "near-opt-bt-probebudget")]

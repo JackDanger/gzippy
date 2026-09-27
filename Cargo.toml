@@ -70,7 +70,13 @@ path = "src/main.rs"
 # zlib-ng one-shot single-member path and the ISA-L FFI decode path have been
 # removed. (C-FFI remains ONLY for COMPRESSION — ISA-L/libdeflate/zlib-ng — and
 # behind dev/test code as differential oracles.)
-default = ["pure-rust-inflate"]
+default = ["pure-rust-inflate", "near-opt-bt-probebudget"]
+# `near-opt-bt-probebudget` is DEFAULT since the bt-probebudget promotion
+# (PR #401 + the frozen-census box verdict, sprint-2026-09-25 "CENSUS RESULT"):
+# the per-descent probe budget (static 48) is the shipped parse shape —
+# 0.981x wall at −1,251 B against the pigz floor on the frozen c7a box.
+# The in-process knob (`parse::near_opt_probebudget::set_budget`) stays
+# probe-only; no production call site reads it.
 # NO-OP since Increment 7. Historically this gated the pure-Rust DEFLATE encoder
 # onto the T1/T>1 routing alongside the C-FFI backends. As of Inc7 the pure-Rust
 # encoder is the SOLE production compress path unconditionally, so this feature
