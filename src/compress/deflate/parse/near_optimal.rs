@@ -34,9 +34,8 @@ use super::super::huffman::{
     build_dynamic_header, make_huffman_code, CodeScratch, HeaderScratch, HuffmanCode,
 };
 use super::super::level::LevelParams;
-use super::super::matchfinder::bt::{
-    BtMatchfinder, LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE,
-};
+use super::super::matchfinder::bt::{LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE};
+use super::super::matchfinder::NearOptFill;
 use super::super::tables::{
     length_slot, DEFLATE_END_OF_BLOCK, DEFLATE_FIRST_LEN_SYM, DEFLATE_MAX_MATCH_LEN,
     DEFLATE_MIN_MATCH_LEN, DEFLATE_NUM_LITLEN_SYMS, DEFLATE_NUM_OFFSET_SYMS, LENGTH_EXTRA_BITS,
@@ -80,7 +79,8 @@ struct PathCodes {
     offcode: HuffmanCode,
 }
 
-/// Everything the DP / flush phase needs (the bt matchfinder lives separately in
+/// Everything the DP / flush phase needs (the fill matchfinder — production
+/// bt, or the d3 chain gather under `near-opt-d3-probe` — lives separately in
 /// [`run`] so it can write into `match_cache` without aliasing).
 struct Optimizer {
     match_cache: Vec<LzMatch>,
@@ -539,6 +539,24 @@ pub(super) fn stale_flag_fired() -> bool {
 #[allow(dead_code)]
 pub(super) fn set_stale_flag_for_tests(v: bool) {
     parallel_flush::set_stale_flag_for_tests(v);
+}
+
+// ── `near-opt-d3-probe` test/observability surface (LEVER #2, row 2) ────────
+// Thin forwards of the `matchfinder::near_opt_probe` selector's force-bt
+// state at THIS module's top level so `parse::near_opt_d3_probe` can name it
+// (the same measurement-surface precedent as the flush block above: the
+// byte/wall probes need BOTH arms — production bt vs the d3 chain gather —
+// of the same binary, and no production call site reads the toggle).
+#[cfg(feature = "near-opt-d3-probe")]
+#[allow(dead_code)]
+pub(super) fn set_force_bt(v: bool) {
+    crate::compress::deflate::matchfinder::near_opt_probe::set_force_bt(v);
+}
+
+#[cfg(feature = "near-opt-d3-probe")]
+#[allow(dead_code)]
+pub(super) fn bt_forced() -> bool {
+    crate::compress::deflate::matchfinder::near_opt_probe::bt_forced()
 }
 
 // ===========================================================================
@@ -1142,7 +1160,7 @@ pub(super) fn run(
     budget: HeaderBudget,
 ) {
     let mut opt = Box::new(Optimizer::new(budget));
-    let mut bt_mf = BtMatchfinder::new();
+    let mut fill_mf = NearOptFill::new();
 
     // LEVER #3 (feature `near-opt-parallel-flush`): the flush dispatcher.
     // `None` without the feature, on a single-CPU host, or after the stale
@@ -1166,7 +1184,7 @@ pub(super) fn run(
     while in_next < data_start {
         let remaining = in_end - in_next;
         if in_next == in_next_slide {
-            bt_mf.slide_window();
+            fill_mf.slide_window();
             in_cur_base = in_next;
             in_next_slide = in_next + remaining.min(WINDOW_SIZE);
         }
@@ -1174,7 +1192,7 @@ pub(super) fn run(
         let mut nl = nice_len;
         adjust_max_and_nice_len(&mut ml, &mut nl, remaining);
         if ml >= BT_MATCHFINDER_REQUIRED_NBYTES {
-            bt_mf.skip_byte(
+            fill_mf.skip_byte(
                 buf,
                 in_cur_base,
                 (in_next - in_cur_base) as isize,
@@ -1233,7 +1251,7 @@ pub(super) fn run(
 
                 // Slide the window forward if needed.
                 if in_next == in_next_slide {
-                    bt_mf.slide_window();
+                    fill_mf.slide_window();
                     in_cur_base = in_next;
                     in_next_slide = in_next + remaining.min(WINDOW_SIZE);
                 }
@@ -1243,7 +1261,7 @@ pub(super) fn run(
                 let mut best_len = 0u32;
                 adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
                 if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
-                    let n = bt_mf.get_matches(
+                    let n = fill_mf.get_matches(
                         buf,
                         in_cur_base,
                         (in_next - in_cur_base) as isize,
@@ -1294,13 +1312,13 @@ pub(super) fn run(
                     loop {
                         let remaining = in_end - in_next;
                         if in_next == in_next_slide {
-                            bt_mf.slide_window();
+                            fill_mf.slide_window();
                             in_cur_base = in_next;
                             in_next_slide = in_next + remaining.min(WINDOW_SIZE);
                         }
                         adjust_max_and_nice_len(&mut max_len, &mut nice_len, remaining);
                         if max_len >= BT_MATCHFINDER_REQUIRED_NBYTES {
-                            bt_mf.skip_byte(
+                            fill_mf.skip_byte(
                                 buf,
                                 in_cur_base,
                                 (in_next - in_cur_base) as isize,

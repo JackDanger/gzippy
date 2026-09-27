@@ -179,6 +179,36 @@ block-cost-probe = []
 # DEFAULT OFF: an adjudication-gated lever, not a shipped default — the wall
 # claim rides the probe variant's measured numbers before it can be promoted.
 near-opt-parallel-flush = []
+# LEVER #2 / d3 (docs/board/sprint-2026-09-25.md "Lever ledger", row 2): replace
+# the near-optimal fill's binary-tree matchfinder descent with a CHEAPER ordered
+# candidate gatherer under the SAME DP (`find_min_cost_path`'s trusted layout —
+# matches sorted by strictly-increasing length with non-decreasing offsets, the
+# vendor heuristic contract at near_optimal.rs:9-12). Mechanism: the bt tree
+# descent's per-position cost is dominated by tree MAINTENANCE — agent-27's
+# anatomy puts `bt_probe_attempts` at 7.3-10M and `bt_child_table_writes` at
+# 9.6-12.3M per T4-MiB — so the probe swaps the descent for the hc-style hash-
+# chain walk (`matchfinder::near_opt_probe::ChainGather`): O(1) chain inserts
+# (head write + link write) at every fill/skip position, zero child-table
+# writes, and a bounded chain walk that re-extends candidates word-at-a-time.
+# The candidate LAYOUT is guaranteed by construction: per match length only the
+# minimum offset among candidates with at least that extension is recorded
+# (backward running-min over the recorded length-improving candidates), which
+# is exactly the sorted-by-length/non-decreasing-offset shape the DP reads and
+# makes the last entry the longest match the fill's best_len convention
+# requires (split stats + the skip-interior decision both read it).
+#
+# With the feature ON the chain gather is ACTIVE by default for every
+# near-optimal `run` (the probe measures the production entry end to end);
+# `gzippy::compress::deflate::parse::near_opt_d3_probe::set_force_bt(true)`
+# restores the production bt fill in-process so the probe's side-by-side arms
+# live in ONE binary (the same measurement-feature surface precedent as
+# `near_opt_flush_probe`). Output bytes DIFFER from production by design (the
+# candidate set is cheaper, not identical): every probe receipt reports exact
+# deltas, and both arms are roundtrip-verified (the unit tests drive
+# `ChainGather` directly; the stream check rides `gzippy::decompress`).
+# DEFAULT OFF: probe only — the promotion decision (or conviction) rides the
+# measured numbers, never this flag. No env var gates behaviour.
+near-opt-d3-probe = []
 # ── Bucket-split-oracle session (2026-07-26) ────────────────────────────────
 # The `parse_match` anatomy-wall bucket is FUSED (probe + accept/defer +
 # `Sink::push_*` emission + histogram/stats all inlined in one per-position
