@@ -125,3 +125,23 @@ museum-clean trunk 6c8d2536):
   reachable — the promotion's PRECONDITION (Cargo.toml feature comment,
   byte identity holds ONLY on zero-flip corpora) is therefore confirmed to
   be load-bearing and must stay recorded.
+
+## The lever-3 stacked-leg ADJUDICATION (try5, fresh out dir, done 04:43:22Z 27 Sep)
+
+`fulcrum try lever3/promotion --base main`, scoped levels 2,9 @ T4, n=45, ALL
+three rivals live incl. the rebuilt pigz 2.8, no cache-resume coloring:
+- **`pigz:silesia.tar:L9:T4:wall`: 1.0823 (base) → 1.0840 (candidate)** — the
+  d1 depth-100 + pipelined-flush combination made the headline cell WORSE, by
+  the same interval the local depth knob measured flat.
+- `pigz:silesia.tar:L2:T4:wall`: 0.8828 → 0.8894 — a won-with-margin cell
+  eroded Δ +0.0066 beyond the flat margin budget (clause-5 suspect tier,
+  UNDECIDED; no floor coverage exists at the coordinate).
+- clause 4 FAIL (0.0823 → 0.0840 fail-gap), clause 6 FAIL (improvement 0.0000
+  < 2× 0.0066 harm) → **VERDICT: NO-SHIP, doctrine binding.**
+- Actioned: PR #383 closed UNMERGED; trunk keeps `near-opt-parallel-flush`
+  default-OFF and d1 depth-400; the pipelined flush + guard + region
+  machinery stay merged as feature-gated code (byte-identity through the
+  real-corpus guard trip was proven and stays on the receipts).
+- The remaining lever briefs stand priced (sprint doc): d3 — the cheap
+  ordered fill under the same DP — is the next named lever, attacking the
+  47-53% fill share the anatomy identified.
