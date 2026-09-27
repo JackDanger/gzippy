@@ -383,7 +383,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
         let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
         if args.stdout {
-            crate::compress::parallel::compress_rsyncable(
+            crate::compress::rsyncable::compress_rsyncable(
                 &mmap,
                 args.compression_level as u32,
                 opt_config.thread_count,
@@ -393,7 +393,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             .map_err(|e| e.into())
         } else {
             let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-            crate::compress::parallel::compress_rsyncable(
+            crate::compress::rsyncable::compress_rsyncable(
                 &mmap,
                 args.compression_level as u32,
                 opt_config.thread_count,

@@ -5,6 +5,10 @@
 
 pub mod deflate;
 pub mod deflate64;
+/// Gzip header metadata (FNAME/FCOMMENT/MTIME) — extracted from
+/// `parallel` (audit item #3) so production imports stop reaching through a
+/// quarantined C-FFI oracle module.
+pub mod gzip_header;
 pub mod io;
 /// A faithful pure-Rust port of libdeflate's compressor. It is the production
 /// encoder for levels 0-9 and also serves as the per-decision oracle (see
@@ -16,6 +20,10 @@ pub mod ldx_oracle;
 pub mod optimization;
 pub mod parallel;
 pub mod pipelined;
+/// `--rsyncable` content-defined-chunking split + the pure-Rust per-member
+/// compressor — extracted from `parallel` for the same reason (its only
+/// production consumers are io.rs's two call sites).
+pub mod rsyncable;
 // Increment 7: `SimpleOptimizer` is the C-FFI (flate2 / libdeflate / ISA-L)
 // parallel-compress dispatcher. It is OFF the production routing graph and kept
 // only as a differential oracle behind `ffi-oracle`.
