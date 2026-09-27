@@ -1160,7 +1160,7 @@ mod tests {
     /// red/green fact, not a code-reading inference. The unification PR must
     /// flip these deliberately if it changes the params_parallel routing.
     #[test]
-    fn t1_vs_parallel_l897_routing_asymmetry_is_deterministic() {
+    fn l9_retune_vs_l8_alias_routing_is_deterministic() {
         let t1 = params(9);
         let par = params_parallel(9);
         assert_eq!(t1.strategy, Strategy::Lazy2);

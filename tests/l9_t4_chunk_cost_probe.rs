@@ -136,7 +136,7 @@ fn t1_engine_lazy2_depth600() {
 
 #[test]
 #[ignore]
-fn l11_alias_check() {
+fn l11_control_passes4() {
     matrix_for(
         11,
         true,

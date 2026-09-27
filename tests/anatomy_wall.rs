@@ -329,7 +329,7 @@ fn parse_match_covers_every_level_0_through_9() {
 }
 
 #[test]
-fn wall_output_is_absent_from_a_feature_off_style_but_present_here() {
+fn wall_report_lines_appear_exactly_once_here() {
     // Not feature-off (this whole file is feature-gated), but confirms the
     // stderr lines are well-formed and present exactly once per invocation.
     let (_out, w) = compress_with_wall(b"tiny input for a quick sanity check", 1);

@@ -106,7 +106,7 @@ fn decompress_independent(gz: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn t1_is_deterministic_and_every_thread_count_emits_valid_gzip() {
+fn thread_range_determinism_and_validity_pins() {
     let bin = env!("CARGO_BIN_EXE_gzippy");
     let dir = tempfile::tempdir().unwrap();
 
