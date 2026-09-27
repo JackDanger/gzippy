@@ -45,6 +45,7 @@ use std::cell::RefCell;
 use std::fs::File;
 #[cfg(any(test, feature = "ffi-oracle"))]
 use std::io::Read;
+#[cfg(any(test, feature = "ffi-oracle"))]
 use std::io::{self, Write};
 #[cfg(any(test, feature = "ffi-oracle"))]
 use std::path::Path;
@@ -53,50 +54,8 @@ use std::path::Path;
 /// Using "GZ" to identify gzippy-compressed blocks with embedded block sizes
 pub const GZ_SUBFIELD_ID: [u8; 2] = *b"GZ";
 
-/// Metadata for gzip header FNAME and MTIME fields
-#[derive(Clone, Debug, Default)]
-pub struct GzipHeaderInfo {
-    /// Original filename (basename only) for FNAME field
-    pub filename: Option<String>,
-    /// File modification time as Unix timestamp for MTIME field
-    pub mtime: u32,
-    /// Optional comment for FCOMMENT field
-    pub comment: Option<String>,
-}
-
-impl GzipHeaderInfo {
-    /// Serialize as a gzip member header (RFC 1952): CM=8, FLG set from the
-    /// FNAME/FCOMMENT fields actually present, MTIME little-endian, XFL=0,
-    /// OS=0xff (unknown — the value every gzippy encode path emits).
-    ///
-    /// This is THE file-output header for every thread count (issue #309):
-    /// the T>1 pipelined path builds it directly and the T1 file dispatch in
-    /// `compress/io.rs` splices it over the fixed minimal header the T1
-    /// encoders emit. A default `GzipHeaderInfo` serializes to exactly that
-    /// 10-byte minimal header, so `-n` (no name, no time) output is unchanged.
-    pub fn to_member_header(&self) -> Vec<u8> {
-        let mut header = Vec::with_capacity(64);
-        let mut flags: u8 = 0x00;
-        if self.filename.is_some() {
-            flags |= 0x08; // FNAME
-        }
-        if self.comment.is_some() {
-            flags |= 0x10; // FCOMMENT
-        }
-        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
-        header.extend_from_slice(&self.mtime.to_le_bytes());
-        header.extend_from_slice(&[0x00, 0xff]); // XFL, OS
-        if let Some(ref name) = self.filename {
-            header.extend_from_slice(name.as_bytes());
-            header.push(0);
-        }
-        if let Some(ref comment) = self.comment {
-            header.extend_from_slice(comment.as_bytes());
-            header.push(0);
-        }
-        header
-    }
-}
+// GzipHeaderInfo moved to `super::gzip_header` (audit item #3) — re-exported below
+pub use super::gzip_header::GzipHeaderInfo;
 
 /// Adjust compression level for backend compatibility
 ///
@@ -642,133 +601,6 @@ fn compress_block_bgzf_isal(
     let total_block_size = output.len() - header_start;
     output[block_size_offset..block_size_offset + 4]
         .copy_from_slice(&(total_block_size as u32).to_le_bytes());
-}
-
-/// Split data into rsyncable blocks using a rolling hash.
-/// Block boundaries are determined by content, so small input changes
-/// only affect nearby blocks — ideal for rsync workflows.
-///
-/// Uses a simple Adler-style rolling hash with a window of 8KB.
-/// When the hash's low bits match a trigger mask, a block boundary is created.
-/// Target block size is ~128KB (mask = 0x1FFFF = 128K-1).
-pub fn split_rsyncable(data: &[u8]) -> Vec<&[u8]> {
-    const WINDOW: usize = 8192;
-    const MASK: u32 = 0x1FFFF; // ~128KB average block size
-    const MIN_BLOCK: usize = 32 * 1024; // 32KB minimum
-    const MAX_BLOCK: usize = 512 * 1024; // 512KB maximum
-
-    if data.len() <= MIN_BLOCK {
-        return vec![data];
-    }
-
-    let mut blocks = Vec::new();
-    let mut block_start = 0;
-    let mut hash: u32 = 0;
-
-    for i in 0..data.len() {
-        // Add new byte to hash
-        hash = hash.wrapping_add(data[i] as u32);
-
-        // Remove byte leaving the window
-        if i >= WINDOW {
-            hash = hash.wrapping_sub(data[i - WINDOW] as u32);
-        }
-
-        let block_len = i - block_start + 1;
-
-        // Check for boundary: hash hits trigger AND block is big enough
-        if block_len >= MIN_BLOCK && (hash & MASK == MASK || block_len >= MAX_BLOCK) {
-            blocks.push(&data[block_start..block_start + block_len]);
-            block_start += block_len;
-        }
-    }
-
-    // Last block
-    if block_start < data.len() {
-        blocks.push(&data[block_start..]);
-    }
-
-    blocks
-}
-
-/// Compress data with rsyncable block boundaries.
-/// Each content-determined block becomes an independent standard gzip member.
-///
-/// Increment 7: each block is compressed with the pure-Rust DEFLATE engine
-/// (`deflate::encode_gzip_bytes_to_vec` — one self-contained gzip member per block), so
-/// `--rsyncable` carries ZERO C-FFI compressor. `header_info` no longer flows
-/// into per-block headers (each pure member uses the minimal gzip header); the
-/// content-defined boundaries from `split_rsyncable` are what rsync relies on.
-pub fn compress_rsyncable<W: Write + Send>(
-    data: &[u8],
-    compression_level: u32,
-    num_threads: usize,
-    _header_info: &GzipHeaderInfo,
-    mut writer: W,
-) -> io::Result<u64> {
-    use crate::compress::deflate;
-
-    // Gate-4 (CLAUDE.md measurement PROTOCOL): the sole call site of
-    // `compress_rsyncable`'s two production entry points in `io.rs` — print
-    // here so it can't diverge from which branch (stdout vs file writer)
-    // reached it.
-    crate::compress::route::emit(
-        crate::compress::route::RSYNCABLE,
-        compression_level,
-        num_threads,
-    );
-
-    let blocks = split_rsyncable(data);
-
-    if blocks.is_empty() {
-        return Ok(0);
-    }
-
-    // For single block or single thread, compress sequentially
-    if blocks.len() == 1 || num_threads <= 1 {
-        let mut total = 0u64;
-        for block in &blocks {
-            let output = deflate::encode_gzip_bytes_to_vec(block, compression_level);
-            writer.write_all(&output)?;
-            total += block.len() as u64;
-        }
-        return Ok(total);
-    }
-
-    // Parallel: compress blocks using thread pool
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
-
-    let num_blocks = blocks.len();
-    let next_block = AtomicUsize::new(0);
-
-    // Pre-allocate output slots
-    let outputs: Vec<std::sync::Mutex<Vec<u8>>> = (0..num_blocks)
-        .map(|_| std::sync::Mutex::new(Vec::new()))
-        .collect();
-
-    thread::scope(|scope| {
-        for _ in 0..num_threads.min(num_blocks) {
-            scope.spawn(|| loop {
-                let idx = next_block.fetch_add(1, Ordering::Relaxed);
-                if idx >= num_blocks {
-                    break;
-                }
-                let mut output = outputs[idx].lock().unwrap();
-                *output = deflate::encode_gzip_bytes_to_vec(blocks[idx], compression_level);
-            });
-        }
-    });
-
-    // Write outputs in order
-    let mut total = 0u64;
-    for (i, slot) in outputs.iter().enumerate() {
-        let output = slot.lock().unwrap();
-        writer.write_all(&output)?;
-        total += blocks[i].len() as u64;
-    }
-
-    Ok(total)
 }
 
 // These tests exercise the C-FFI ParallelGzEncoder / BGZF block compressors,
