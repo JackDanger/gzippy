@@ -361,10 +361,12 @@ impl PipelinedGzEncoder {
     /// Emit the established whole-stream gzip encoding with the caller's
     /// header. Levels routed to the libdeflate port (`level_uses_ldx`) use it
     /// without an input copy; every other level delegates to the production T1
-    /// encoder so the four exception levels (L1/L3/L6/L7, the ledger-won
-    /// routing) cannot leak port bytes to library callers. Codex review of
-    /// this branch named the leak: `PipelinedGzEncoder::new(level, 1)` at L6
-    /// emitted 322,110 B where the ledger-won byte stream is 304,252 B.
+    /// encoder so the remaining exception levels (L1/L3, the ledger-won
+    /// routing pre-#363) cannot leak port bytes to library callers at levels
+    /// whose ledger-won bytes the port does not carry. (The old Codex-review
+    /// leak it was built to stop — L6 emitting 322,110 B instead of the
+    /// ledger-won 304,252 B — is retired with PR #363: the port now carries
+    /// the good_match pair and emits those same bytes at L6/L7.)
     /// The minimal-header case is byte-for-byte identical to
     /// `libdeflate-gzip -c` at the port levels; file metadata may
     /// intentionally differ.
@@ -384,7 +386,7 @@ impl PipelinedGzEncoder {
             return Ok(data.len() as u64);
         }
 
-        // Every other level (the four exception levels and 10-12) delegates to
+        // Every other level (the two remaining exception levels and 10-12) delegates to
         // the production T1 whole-stream encoder — the bytes the per-label
         // ledger and the pins were graded on.
         let gzip = crate::compress::deflate::encode_gzip_bytes_to_vec(data, level);

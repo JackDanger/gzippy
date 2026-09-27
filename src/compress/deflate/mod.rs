@@ -586,55 +586,32 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with FOUR measured
-    // exceptions. Routing L1/L6/L7 to the port was tried on this branch
-    // (`b28e96f3`) and the per-commit ledger gate went red immediately and
-    // stayed red for 45 commits: `won_cells_stay_won` regresses FOUR cells
-    // (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs gzip +12,610 B
-    // / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus` loses the L1 text
-    // cell to pigz (43,980 vs 42,384 = 1.038x). A won cell that regresses is
-    // a regression on a closed cell — the ledger is append-only and is never
-    // edited to fit a result, so the routing comes back.
-    //
-    // Each exception is a MEASUREMENT with a named gate, not a preference —
-    // and the good_match ones (L6/L7) collapse the moment the port learns
-    // `good_match` (shorten the chain walk once a match >= good_match is
-    // found; zlib/gzip/pigz all use it, and libdeflate does not implement it).
-    // That is the named follow-up lever (PR #363: port `good_match` INTO ldx,
-    // L6/L7 verified byte-identical 11/11, then retire those two exceptions
-    // one at a time):
-    //
-    //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
-    //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
-    //
-    //   L3  the port has NO len-3/sparse machinery (l3_sparse_split, far_len3 —
-    //       the campaign-winning L3 guards), so port L3 (12, 14) is 1-7% LARGER
-    //       than the legacy L3 (8, 14 + len-3 guards) on the 11-file Mac corpus
-    //       (deterministic, 2026-09-01: tabular +18,886 B = 7.4%, text +6,831 B
-    //       = 2.0%, binary +4,316 B; 2MB+ files same direction) and the running
-    //       solvency try shows it LOSING 11 T1 wall cells vs the legacy L3.
-    //       The legacy L3 is exactly what main ships at T1 L3 (main's own
-    //       receipt: whole-buffer and streaming legacy L3 are byte-identical on
-    //       the real corpus), so the exception restores main's bytes AND wall.
-    //       Retires only when the port learns the len-3 machinery (named lever,
-    //       not good_match).
+    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with TWO measured
+    // exceptions remaining (L1, L3). The routing that made all of 0-9 port
+    // (`b28e96f3`) went red on the per-commit ledger immediately and stayed
+    // red for 45 commits pre-`good_match`: `won_cells_stay_won` regressed
+    // FOUR cells (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs
+    // gzip +12,610 B / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus`
+    // lost the L1 text cell to pigz (43,980 vs 42,384 = 1.038x). A won
+    // cell that regresses is a regression on a closed cell — the ledger is
+    // append-only and is never edited to fit a result, so the routing came
+    // back until the named levers landed.
     //
     //   L6  RETIRED (PR #363 follow-up, 2026-09-27): the port now carries the
     //       zlib knob pair itself (`hc_matchfinder_longest_match` takes
     //       `good_match`; port L6 = chain 128 / nice 65 / good 8) and is
     //       BYTE-IDENTICAL to the legacy arm at L6/L7 (11/11 files on the
-    //       branch's probe corpus) and on the canonical 21-member corpus at
-    //       levels 1-9 (189/189 cells, the census record's follow-up). One
-    //       encoder, byte-equal output, and the port's wall is the cheaper
-    //       arm (its in-process data was 1.07x libdeflate vs the legacy
-    //       arm's 1.4-4.1x).
+    //       branch's probe corpus; 189/189 cells over the canonical
+    //       21-member corpus at levels 1-9 — banked on main under
+    //       docs/board/sprint-2026-09-25.md, "bt-probebudget CENSUS RESULT"
+    //       follow-up). One encoder, byte-equal output, and the port's wall
+    //       is the cheaper arm (its in-process data was 1.07x libdeflate vs
+    //       the legacy arm's 1.4-4.1x).
     //
     //   L7  RETIRED (same receipt set): port L7 = chain 256 / nice 130 /
     //       good 32 == legacy L7 bytes; the monotone ladder holds with the
     //       port carrying the pair (the old L6-dips-below-L7 inversion went
     //       away when both sides gained `good_match`).
-    //
-    // STILL EXCEPTIONS (each its own named gate, both rerouted to #364-family levers):
     //
     //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
     //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
