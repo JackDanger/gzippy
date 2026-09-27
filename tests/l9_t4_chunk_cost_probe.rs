@@ -638,6 +638,8 @@ mod d3_probes {
                 max_len,
                 max_len.min(150),
                 100,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                100, // the chain arm ignores it; signature-identical
                 &mut next_hashes,
                 &mut out,
             );
@@ -659,6 +661,372 @@ mod d3_probes {
         assert!(
             lists > 0,
             "the chain gather must find matches on the probe corpus"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LEVER #4 / bt (feature `near-opt-bt-probebudget`, DEFAULT OFF): the
+// per-descent probe-budget arms on the LAST un-priced loss class
+// (pigz:silesia.tar:L9:T4:wall 1.0840). Without the feature this module
+// compiles to nothing.
+//
+// Same dual-shape drive as levers #2/#3 above:
+//   * the L9/T4 chunk shape (`matrix_for`'s exact production entry):
+//     the inert production arm (budget >= the fill's depth) vs budget
+//     {24, 48, 96, 150}, best-of-5 walls + exact byte deltas;
+//   * the L9-T4 whole-FILE path (`compress_with_threads(data, 9, 4)`) per
+//     arm, each roundtrip-verified via `gzippy::decompress` — the arms'
+//     SHAPES may differ by design (a budget cut shrinks the candidate
+//     list; it never reorders it), so the deltas are REPORTED, not asserted
+//     equal, while the roundtrip itself is REQUIRED of every arm.
+// ─────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "near-opt-bt-probebudget")]
+mod bt_probebudget_probes {
+    use super::*;
+    use gzippy::compress::deflate::matchfinder::bt::BtMatchfinder;
+    use gzippy::compress::deflate::parse::near_opt_probebudget;
+
+    /// The production L9-T4 fill depth (`params_parallel(9)` ≡
+    /// `params_parallel(11)` at depth 400 — the matrix's variant 1). A
+    /// budget at this value is the inert production arm.
+    const DEPTH: u32 = 400;
+
+    /// One production-chunk encode at the `matrix_for` shape (L9, T>1
+    /// splice, chunk + 32 KiB dict, `input_total_len` 200 MiB) through the
+    /// requested budget arm.
+    fn encode_arm(body: &[u8], dict: &[u8], budget: u32) -> Vec<u8> {
+        near_opt_probebudget::set_budget(budget);
+        let mut out = Vec::with_capacity(body.len() / 2 + 1024);
+        let _meta = gzippy::compress::deflate::encode_deflate_splice_chunk_to_sink(
+            body,
+            dict,
+            9,
+            true,
+            &mut out,
+            true,
+            200 * 1024 * 1024,
+        );
+        out
+    }
+
+    /// One full-file L9-T4 encode (the parallel route end to end) through
+    /// the requested budget arm, resting the knob back on the inert value.
+    fn encode_full_arm(data: &[u8], budget: u32) -> Vec<u8> {
+        near_opt_probebudget::set_budget(budget);
+        let stream = gzippy::compress_with_threads(data, 9, 4).expect("encode should succeed");
+        near_opt_probebudget::set_budget(DEPTH);
+        stream
+    }
+
+    /// The ARMS constant in arm order: the inert production reference first
+    /// (every wall ratio and byte delta reads against it).
+    const ARMS: [(&str, u32); 5] = [
+        ("full-depth bt (inert budget)", DEPTH),
+        ("ABIT 24", 24),
+        ("ABIT 48", 48),
+        ("ABIT 96", 96),
+        ("ABIT 150", 150),
+    ];
+
+    /// Variant 12 of the matrix, `matrix_for`'s shape: bt fill at each
+    /// budget, best-of-5 after two warmups per arm (the shape the d3 probe
+    /// and `run` use). Rows print in the matrix's format so they paste
+    /// alongside variants 1-11.
+    #[test]
+    #[ignore]
+    fn bt_probebudget_wall_and_bytes_l9t4() {
+        let data = build_corpus();
+        let body = &data[DICT..DICT + CHUNK];
+        let dict = &data[..DICT];
+
+        let mut rows: Vec<(&str, f64, usize)> = Vec::with_capacity(ARMS.len());
+        for (label, budget) in ARMS {
+            let _ = encode_arm(body, dict, budget);
+            let _ = encode_arm(body, dict, budget);
+            let mut times = Vec::with_capacity(5);
+            let mut bytes = 0usize;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let out = encode_arm(body, dict, budget);
+                times.push(t.elapsed().as_secs_f64());
+                bytes = out.len();
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rows.push((label, times[0], bytes));
+        }
+        near_opt_probebudget::set_budget(DEPTH);
+
+        let (_, ref_wall, ref_bytes) = rows[0];
+        println!("-- bt-probebudget L9/T4 chunk (1.8 MB matrix corpus, depth 400, passes 2) --");
+        for (label, wall, bytes) in &rows {
+            let db = *bytes as i64 - ref_bytes as i64;
+            println!(
+                "12 bt-probebudget {label:<28}: best {wall:.4}s bytes {bytes} \
+                 (wall {:.3}x vs inert, bytes {db:+} B, {:+.2}%)",
+                wall / ref_wall,
+                db as f64 / ref_bytes as f64 * 100.0
+            );
+        }
+    }
+
+    /// The shape-confirmation run at the L9-T4 production route: per-arm
+    /// WHOLE-FILE encodes on the probe corpus plus a 2 MiB silesia.tar
+    /// slice, every arm roundtrip-verified (OBSERVABLE roundtrip — the
+    /// byte-exact requirement is the decode-matches-input invariant, not
+    /// arm-to-arm byte identity, because the arms' candidate sets differ by
+    /// design), exact deltas printed, both arms deterministic run-to-run,
+    /// THEN the layout receipt at the matchfinder API: per-pair fresh-state
+    /// positions, a budget descent's recorded list is a true PREFIX of the
+    /// unrestricted walk's list (the trusted strictly-increasing-length /
+    /// non-decreasing-offset order the DP reads is only ever CUT, never
+    /// reshaped), and every budget candidate is a real back-reference —
+    /// so a byte delta is the DP's own choice among well-formed inputs.
+    #[test]
+    fn bt_probebudget_shape_lands_at_l9t4_production() {
+        let mut corpora: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let data = build_corpus();
+            corpora.push((
+                "probe-corpus".to_string(),
+                data[..DICT + CHUNK + 4096].to_vec(),
+            ));
+        }
+        if let Ok(bytes) = std::fs::read("benchmark_data/silesia.tar") {
+            let take = bytes.len().min(2 * 1024 * 1024);
+            corpora.push((
+                "benchmark_data/silesia.tar (2 MiB slice)".to_string(),
+                bytes[..take].to_vec(),
+            ));
+        }
+
+        for (name, data) in &corpora {
+            let mut streams = Vec::with_capacity(ARMS.len());
+            for (label, budget) in ARMS {
+                streams.push((label, encode_full_arm(data, budget)));
+            }
+            for (label, stream) in &streams {
+                assert!(
+                    matches!(
+                        gzippy::decompress(stream),
+                        Ok(back) if back == *data
+                    ),
+                    "{name}: the {label} arm must roundtrip byte-exactly"
+                );
+            }
+            let ref_len = streams[0].1.len() as i64;
+            for (label, stream) in &streams {
+                let d = stream.len() as i64 - ref_len;
+                println!(
+                    "13 bt-probebudget {name:<40} {label:<28}: {} B (delta {d:+} B, {:+.2}%)",
+                    stream.len(),
+                    d as f64 / ref_len as f64 * 100.0
+                );
+            }
+            // Determinism per arm: re-encode and require the same bytes.
+            for idx in 1..streams.len() {
+                let (label, budget) = ARMS[idx];
+                let again = encode_full_arm(data, budget);
+                assert_eq!(
+                    streams[idx].1, again,
+                    "{name}: the {label} arm must be deterministic"
+                );
+            }
+        }
+
+        // The layout receipt: per pair, FRESH matchfinders on the same
+        // corpus prefix share the walk's state evolution to the compared
+        // position, so the budget cut is directly observable as a prefix.
+        // Windows of 4096 positions: inside one window the first position
+        // (identical state) gives the exact-prefix verdict; every position
+        // pins the trusted layout and back-reference validity.
+        let data = build_corpus();
+        let mut padded = data[..128 * 1024].to_vec();
+        padded.resize(padded.len() + 16, 0);
+        let window = 4096usize;
+        let mut budgets_hit = false;
+        let mut lists = 0usize;
+        for start in (0..padded.len() - window).step_by(window) {
+            let mut mf_full = BtMatchfinder::new();
+            let mut mf_b = BtMatchfinder::new();
+            let mut mf_w = BtMatchfinder::new();
+            let mut hashes_full = [0u32; 2];
+            let mut hashes_b = [0u32; 2];
+            let mut hashes_w = [0u32; 2];
+            for pos in start..start + window {
+                let remaining = padded.len() - pos;
+                let max_len = 258u32.min(remaining as u32);
+                if max_len < 5 {
+                    break;
+                }
+                let mut out_full = vec![Default::default(); 260];
+                let mut out_b = vec![Default::default(); 260];
+                let mut out_w = vec![Default::default(); 260];
+                // Signature: (buf, in_base, cur_pos, max_len, nice_len,
+                // max_depth, probe_budget, next_hashes, out) — the full arm
+                // budgets at DEPTH (inert), the b arm at the lever's
+                // ABIT 24. The WITNESS arm at budget 2 exists because a
+                // 24-cap cut usually lands AFTER a descent's last recorded
+                // candidate (same recorded list, fewer probes spent) — the
+                // witness arm's cuts observably shrink SOME recorded list,
+                // proving the cut path keeps the LAYOUT (exact prefix of
+                // the full walk's), which the 24 arm spells out per window
+                // anyway.
+                let nf = mf_full.get_matches(
+                    &padded,
+                    0,
+                    pos as isize,
+                    max_len,
+                    max_len.min(150),
+                    DEPTH,
+                    DEPTH,
+                    &mut hashes_full,
+                    &mut out_full,
+                );
+                let nb = mf_b.get_matches(
+                    &padded,
+                    0,
+                    pos as isize,
+                    max_len,
+                    max_len.min(150),
+                    DEPTH,
+                    24,
+                    &mut hashes_b,
+                    &mut out_b,
+                );
+                let nw = mf_w.get_matches(
+                    &padded,
+                    0,
+                    pos as isize,
+                    max_len,
+                    max_len.min(150),
+                    DEPTH,
+                    2,
+                    &mut hashes_w,
+                    &mut out_w,
+                );
+                let mut prev_len = 0u16;
+                let mut prev_off = 0u16;
+                for m in &out_b[..nb] {
+                    assert!(
+                        m.length > prev_len,
+                        "pos {pos}: lengths must strictly increase (budget arm)"
+                    );
+                    if prev_off != 0 {
+                        assert!(
+                            m.offset >= prev_off,
+                            "pos {pos}: offsets must not decrease (budget arm)"
+                        );
+                    }
+                    // The candidate must be a REAL back-reference (the bytes
+                    // it claims to copy must equal the source bytes).
+                    for i in 0..m.length as usize {
+                        assert_eq!(
+                            padded[pos + i],
+                            padded[pos - m.offset as usize + i],
+                            "pos {pos}: budget candidate mismatches at byte {i}"
+                        );
+                    }
+                    prev_len = m.length;
+                    prev_off = m.offset;
+                }
+                if pos == start {
+                    // Same-state prefix receipt: the budget walk makes the
+                    // SAME visit sequence and stops earlier — the ABIT 24
+                    // list and the witness list must each be a prefix of
+                    // the unrestricted walk's list (the trusted order is
+                    // only ever cut, never reshaped).
+                    assert!(
+                        nb <= nf && out_b[..nb] == out_full[..nb],
+                        "pos {pos}: the budget list must be a prefix of the \
+                         unrestricted walk's list (nb {nb}, nf {nf})"
+                    );
+                    assert!(
+                        nw <= nf && out_w[..nw] == out_full[..nw],
+                        "pos {pos}: the witness list must be a prefix of the \
+                         unrestricted walk's list (nw {nw}, nf {nf})"
+                    );
+                    // Same walk-order prefix: every witness candidate is a
+                    // prefix-member so byte deltas are the DP's own choice.
+                    assert!(
+                        nw <= nb && out_w[..nw] == out_b[..nw],
+                        "pos {pos}: the witness list must be a prefix of the \
+                         24-arm's list"
+                    );
+                }
+                if nw < nb || nw < nf {
+                    budgets_hit = true;
+                }
+                lists += usize::from(nf > 0);
+            }
+        }
+        assert!(
+            lists > 0,
+            "the fill must find matches on the probe corpus somewhere"
+        );
+        assert!(
+            budgets_hit,
+            "the probe corpus must exercise budget cuts somewhere \
+             (24 vs 400 differ) — else the prefix receipt never engaged"
+        );
+        near_opt_probebudget::set_budget(DEPTH);
+    }
+
+    /// The whole-NAMED-LOSS run: every budget arm over the ENTIRE
+    /// `benchmark_data/silesia.tar` (202 MiB — the actual corpus of
+    /// pigz:silesia.tar:L9:T4:wall 1.0840) through the L9-T4 parallel route
+    /// (`compress_with_threads(data, 9, 4)`), best-of-5 per arm after one
+    /// warmup (the `run` helper's shape), the FIRST stream of each arm
+    /// roundtrip-verified through `gzippy::decompress`, exact byte deltas
+    /// reported. This is the cell the chunk-level matrix above is the
+    /// cheap proxy for; wall spread on this box made best-of-2 unstable.
+    #[test]
+    #[ignore]
+    fn bt_probebudget_full_silesia_file_l9t4() {
+        let data = std::fs::read("benchmark_data/silesia.tar")
+            .expect("benchmark_data/silesia.tar must exist for this probe");
+        let ref_stream = encode_full_arm(&data, DEPTH);
+        let mut rows: Vec<(&str, f64, usize)> = Vec::new();
+        for (label, budget) in ARMS {
+            let mut times = Vec::new();
+            let mut bytes = 0usize;
+            for run in 0..5 {
+                let t = Instant::now();
+                let stream = encode_full_arm(&data, budget);
+                times.push(t.elapsed().as_secs_f64());
+                bytes = stream.len();
+                if run == 0 {
+                    assert!(
+                        matches!(
+                            gzippy::decompress(&stream),
+                            Ok(back) if back == data
+                        ),
+                        "{label}: the full-file arm must roundtrip byte-exactly"
+                    );
+                }
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rows.push((label, times[0], bytes));
+        }
+
+        let (_, ref_wall, ref_bytes) = rows[0];
+        println!(
+            "-- bt-probebudget FULL silesia.tar ({} B), L9-T4 whole-file --",
+            data.len()
+        );
+        for (label, wall, bytes) in &rows {
+            let d = *bytes as i64 - ref_bytes as i64;
+            println!(
+                "14 bt-probebudget {label:<28}: best {wall:.3}s bytes {bytes} \
+                 (wall {:.3}x vs inert, bytes {d:+} B, {:+.3}%)",
+                wall / ref_wall,
+                d as f64 / ref_bytes as f64 * 100.0
+            );
+        }
+        assert_eq!(
+            ref_stream.len(),
+            ref_bytes,
+            "the inert arm stream is the byte reference"
         );
     }
 }

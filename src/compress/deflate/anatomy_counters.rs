@@ -47,6 +47,11 @@
 //!   (the tree-descent shape doesn't map onto hc's simple probe/miss/accept
 //!   model 1:1, so `bt_probe_outcome_*` buckets the single-byte equality
 //!   check + `lz_extend` pair, not a 4-byte prefilter compare).
+//!   **ADDED 2026-09-27 (bt-probebudget lever probe)**: the per-descent
+//!   `bt_descents_*` / `bt_descent_p*` histogram and the `over{B}` integrals
+//!   (see the counter list) — one `note_bt_descent` call per descent exit in
+//!   `advance`, recorded across get_matches AND skip_byte calls; prices the
+//!   probe-budget lever's stop rule at zero behavior change.
 //! - **`literals_emitted`/`matches_emitted`(`_fast`)/`histogram_updates`** —
 //!   `parse/mod.rs`'s `Sink::push_{literal,match}[_fast]`, exactly as spec'd.
 //! - **`block_split_observations`** — `block_split.rs`'s
@@ -290,6 +295,44 @@ define_counters!(
     bt_child_table_reads,
     bt_child_table_writes,
     bt_positions_skipped,
+    // Per-descent probe-volume histogram (bt-probebudget lever probe,
+    // 2026-09-27): probes-per-descent over ONE `advance` call — get_matches
+    // OR skip_byte, both counted; exit reason split. The buckets 24/48/96/150
+    // sit exactly at the lever's candidate budgets; the `over{B}` integrals
+    // are the exact max probe volume a per-descent budget B could remove
+    // (sum of max(probes - B, 0)) and `count_over{B}` the descents it cuts.
+    // Prices the mission's stop rule (production rarely > ~24 probes ⇒
+    // budget 24 is inert) BEFORE any behavior change ships.
+    bt_descents_total,
+    bt_descents_get_matches,
+    bt_descents_nice_exits,
+    bt_descents_depth_exits,
+    bt_descent_p0,
+    bt_descent_p1,
+    bt_descent_p2,
+    bt_descent_p3_4,
+    bt_descent_p5_6,
+    bt_descent_p7_8,
+    bt_descent_p9_12,
+    bt_descent_p13_16,
+    bt_descent_p17_24,
+    bt_descent_p25_32,
+    bt_descent_p33_48,
+    bt_descent_p49_64,
+    bt_descent_p65_96,
+    bt_descent_p97_128,
+    bt_descent_p129_150,
+    bt_descent_p151_192,
+    bt_descent_p193_256,
+    bt_descent_p257_inf,
+    bt_descent_probes_over24_total,
+    bt_descent_probes_over48_total,
+    bt_descent_probes_over96_total,
+    bt_descent_probes_over150_total,
+    bt_descent_count_over24_total,
+    bt_descent_count_over48_total,
+    bt_descent_count_over96_total,
+    bt_descent_count_over150_total,
     // Single-probe fast matchfinder (matchfinder-free, parse/fast.rs — L0/L1).
     fast_positions_processed,
     fast_positions_skipped,
@@ -360,6 +403,73 @@ define_counters!(
     alloc_events,
     alloc_bytes,
 );
+
+/// Record one completed bt descent (lever bt-probebudget probe,
+/// 2026-09-27): `probes` is the number of descent-loop iterations the call
+/// spent, `is_rec` distinguishes the get_matches (REC) from the skip_byte
+/// shape, `exit_nice` / `exit_depth` / probes == 0 are the three exits. A
+/// budget cut lands at the same loop-bottom site as `exit_depth`; a descent
+/// cut before its nice_len hit loses the candidate AND the follow-on
+/// skip-interior walk, so `bt_descents_nice_exits` pairs with the
+/// `count_over{B}` cuts to price that risk before any change ships. Zero
+/// cost when `anatomy-counters` is off (bt.rs's call sites are cfg'd out
+/// with it).
+#[cfg(feature = "anatomy-counters")]
+pub fn note_bt_descent(probes: u32, is_rec: bool, exit_nice: bool, exit_depth: bool) {
+    // `Relaxed` is the module-level feature-gated import above.
+    let c = &COUNTERS;
+    c.bt_descents_total.fetch_add(1, Relaxed);
+    let bucket: &AtomicU64 = match probes {
+        0 => &c.bt_descent_p0,
+        1 => &c.bt_descent_p1,
+        2 => &c.bt_descent_p2,
+        3..=4 => &c.bt_descent_p3_4,
+        5..=6 => &c.bt_descent_p5_6,
+        7..=8 => &c.bt_descent_p7_8,
+        9..=12 => &c.bt_descent_p9_12,
+        13..=16 => &c.bt_descent_p13_16,
+        17..=24 => &c.bt_descent_p17_24,
+        25..=32 => &c.bt_descent_p25_32,
+        33..=48 => &c.bt_descent_p33_48,
+        49..=64 => &c.bt_descent_p49_64,
+        65..=96 => &c.bt_descent_p65_96,
+        97..=128 => &c.bt_descent_p97_128,
+        129..=150 => &c.bt_descent_p129_150,
+        151..=192 => &c.bt_descent_p151_192,
+        193..=256 => &c.bt_descent_p193_256,
+        _ => &c.bt_descent_p257_inf,
+    };
+    bucket.fetch_add(1, Relaxed);
+    if probes > 150 {
+        c.bt_descent_probes_over150_total
+            .fetch_add((probes - 150) as u64, Relaxed);
+        c.bt_descent_count_over150_total.fetch_add(1, Relaxed);
+    }
+    if probes > 96 {
+        c.bt_descent_probes_over96_total
+            .fetch_add((probes - 96) as u64, Relaxed);
+        c.bt_descent_count_over96_total.fetch_add(1, Relaxed);
+    }
+    if probes > 48 {
+        c.bt_descent_probes_over48_total
+            .fetch_add((probes - 48) as u64, Relaxed);
+        c.bt_descent_count_over48_total.fetch_add(1, Relaxed);
+    }
+    if probes > 24 {
+        c.bt_descent_probes_over24_total
+            .fetch_add((probes - 24) as u64, Relaxed);
+        c.bt_descent_count_over24_total.fetch_add(1, Relaxed);
+    }
+    if is_rec {
+        c.bt_descents_get_matches.fetch_add(1, Relaxed);
+    }
+    if exit_nice {
+        c.bt_descents_nice_exits.fetch_add(1, Relaxed);
+    }
+    if exit_depth {
+        c.bt_descents_depth_exits.fetch_add(1, Relaxed);
+    }
+}
 
 /// Reset every counter. Only exists when `anatomy-counters` is on. No
 /// production call site (see `AnatomyCounters::reset`'s doc); kept for this

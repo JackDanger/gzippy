@@ -150,7 +150,11 @@ impl ChainGather {
     ///
     /// `max_len >= BT_MATCHFINDER_REQUIRED_NBYTES`, `nice_len <= max_len`,
     /// `max_depth >= 1`, and `out` holds `>= nice_len - 2` slots — the fill
-    /// loop's call sites guarantee all three.
+    /// loop's call sites guarantee all three. `probe_budget`
+    /// (`near-opt-bt-probebudget`) is accepted to keep `D3Fill`'s two arms
+    /// signature-identical but NOT spent: the chain walker's link budget is
+    /// `CHAIN_WALK_BUDGET` (this probe's own d3 cap), not the bt monster's
+    /// per-descent knob.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn get_matches(
@@ -161,6 +165,7 @@ impl ChainGather {
         max_len: u32,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] _probe_budget: u32,
         next_hashes: &mut [u32; 2],
         out: &mut [LzMatch],
     ) -> usize {
@@ -179,6 +184,7 @@ impl ChainGather {
     /// bt-`skip_byte`-shaped: advance one byte without gathering. The chain
     /// insert is O(1) (head + link), so there is no descent and no depth
     /// budget to spend — the lever-#2 point on the skip-interior path.
+    /// `probe_budget` (`near-opt-bt-probebudget`) ignored, same as above.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn skip_byte(
@@ -188,6 +194,7 @@ impl ChainGather {
         cur_pos: isize,
         _nice_len: u32,
         _max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] _probe_budget: u32,
         next_hashes: &mut [u32; 2],
     ) {
         self.advance::<false>(buf, in_base, cur_pos, 0, 0, 0, next_hashes, &mut []);
@@ -394,6 +401,11 @@ impl D3Fill {
     }
 
     /// bt-signature delegation (the fill loop's three call sites unchanged).
+    ///
+    /// `probe_budget` under `near-opt-bt-probebudget` forwards to the bt arm
+    /// (the lever's own descent cap) and is IGNORED by the chain arm (the
+    /// chain gather carries its own `CHAIN_WALK_BUDGET`; a per-descent cap
+    /// there is d1/d3's already-priced territory, not this lever's).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn get_matches(
@@ -404,6 +416,7 @@ impl D3Fill {
         max_len: u32,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] probe_budget: u32,
         next_hashes: &mut [u32; 2],
         out: &mut [LzMatch],
     ) -> usize {
@@ -415,6 +428,8 @@ impl D3Fill {
                 max_len,
                 nice_len,
                 max_depth,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                probe_budget,
                 next_hashes,
                 out,
             ),
@@ -425,6 +440,8 @@ impl D3Fill {
                 max_len,
                 nice_len,
                 max_depth,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                probe_budget,
                 next_hashes,
                 out,
             ),
@@ -441,13 +458,30 @@ impl D3Fill {
         cur_pos: isize,
         nice_len: u32,
         max_depth: u32,
+        #[cfg(feature = "near-opt-bt-probebudget")] probe_budget: u32,
         next_hashes: &mut [u32; 2],
     ) {
         match self {
-            D3Fill::Bt(mf) => mf.skip_byte(buf, in_base, cur_pos, nice_len, max_depth, next_hashes),
-            D3Fill::Chain(mf) => {
-                mf.skip_byte(buf, in_base, cur_pos, nice_len, max_depth, next_hashes)
-            }
+            D3Fill::Bt(mf) => mf.skip_byte(
+                buf,
+                in_base,
+                cur_pos,
+                nice_len,
+                max_depth,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                probe_budget,
+                next_hashes,
+            ),
+            D3Fill::Chain(mf) => mf.skip_byte(
+                buf,
+                in_base,
+                cur_pos,
+                nice_len,
+                max_depth,
+                #[cfg(feature = "near-opt-bt-probebudget")]
+                probe_budget,
+                next_hashes,
+            ),
         }
     }
 
@@ -501,6 +535,8 @@ mod tests {
                     max_len,
                     nl,
                     max_depth,
+                    #[cfg(feature = "near-opt-bt-probebudget")]
+                    max_depth, // the chain arm ignores it; kept signature-identical
                     &mut next_hashes,
                     &mut out,
                 );
