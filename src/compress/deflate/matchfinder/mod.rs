@@ -80,3 +80,21 @@ pub mod ht;
 /// other level tier. See the module doc above for why it stays a distinct
 /// type from [`bt`] rather than merging behind one trait.
 pub mod lzfind;
+
+// LEVER #2 / d3 PROBE (feature `near-opt-d3-probe`, DEFAULT OFF): the
+// chain-walk candidate gatherer that stands in for [`bt`] under the
+// near-optimal parser's fill. Its module doc carries the lever rationale and
+// the two rejected candidates. Off by default: the type does not exist in a
+// default build, the alias below points straight at [`bt::BtMatchfinder`],
+// and the near-optimal call sites never move.
+#[cfg(feature = "near-opt-d3-probe")]
+pub mod near_opt_probe;
+
+/// The near-optimal fill matchfinder behind the d3 probe: production bt
+/// without the feature (the alias IS `BtMatchfinder` — zero-cost), the d3
+/// chain gather + bt selector with the feature on (`near_opt_probe::D3Fill`,
+/// same signatures, same positional frame).
+#[cfg(not(feature = "near-opt-d3-probe"))]
+pub use self::bt::BtMatchfinder as NearOptFill;
+#[cfg(feature = "near-opt-d3-probe")]
+pub use self::near_opt_probe::D3Fill as NearOptFill;

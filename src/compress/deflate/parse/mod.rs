@@ -98,6 +98,28 @@ pub mod near_opt_flush_probe {
         super::near_optimal::set_stale_flag_for_tests(v);
     }
 }
+
+/// Test/observability handle for the near-optimal d3 FILL probe (lever #2 /
+/// d3, feature `near-opt-d3-probe`, DEFAULT OFF; compiles to nothing without
+/// it — so the default suite never sees the probe). Same measurement-surface
+/// precedent as `near_opt_flush_probe` above: the wall/bytes side-by-side
+/// needs BOTH arms of the same binary — the production bt fill (force-bt) vs
+/// the d3 chain gather (the feature's default) — and no production call site
+/// picks an encode route here (CLAUDE.md non-negotiable #3).
+#[cfg(feature = "near-opt-d3-probe")]
+pub mod near_opt_d3_probe {
+    /// Restore the production bt fill for subsequent near-optimal runs (the
+    /// probe's serial arm; byte-identical to today's shape by construction).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn set_force_bt(v: bool) {
+        super::near_optimal::set_force_bt(v);
+    }
+    /// Whether the force-bt override is latched (the probe's arm witness).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn bt_forced() -> bool {
+        super::near_optimal::bt_forced()
+    }
+}
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
 /// REOPEN it rests on.
