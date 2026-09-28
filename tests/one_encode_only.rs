@@ -103,7 +103,12 @@ fn every_level_encodes_each_input_exactly_once() {
 /// cells (binary vs gzip +1,614 B / vs pigz +887 B; text vs gzip +12,610 B /
 /// vs pigz +12,090 B).
 ///
-/// L6/L7 RETIRED (2026-09-27, PR #363): the port carries the zlib `good_match`
+/// L7 RETIRED (2026-09-27, PR #363) — and L6's flip was PRICED and REVERTED
+/// (2026-09-28): the frozen-box L6-T1 leg measured the routed port +1.8%
+/// wall vs the legacy arm (0.4075 → 0.4149 against the gzip floor,
+/// byte-equal output), so L6 keeps the legacy encoder until the port's L6
+/// economy reprices. The port's doc wall economy at L6 was the one cell the
+/// 4,7-band try never measured — this deviation is priced now. the port carries the zlib `good_match`
 /// knobs itself (L6 chain 128/nice 65/good 8; L7 chain 256/nice 130/good 32)
 /// and is byte-identical to the legacy arm (11/11 branch receipts; 189/189
 /// cells over the canonical 21-member corpus at levels 1-9) — the flipped-tree
@@ -121,7 +126,7 @@ fn every_level_encodes_each_input_exactly_once() {
 /// above is the same machinery that made the legacy L3 win. L1 stays an
 /// exception until someone beats pigz -1 on that text cell from the port.
 /// Until then L1 stays on the measured-best legacy config.
-const PORT_EXCEPTIONS: &[u32] = &[1];
+const PORT_EXCEPTIONS: &[u32] = &[1, 6];
 
 #[test]
 fn the_port_is_the_production_encoder_for_levels_0_through_9() {

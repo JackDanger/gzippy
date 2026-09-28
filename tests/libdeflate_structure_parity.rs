@@ -58,15 +58,18 @@ fn t1_gzip_matches_the_libdeflate_port_at_every_vendor_level() {
                 "{name} L{level}: ISIZE"
             );
 
-            if matches!(level, 1 | 3) {
-                // Documented L1/L3 exceptions: these levels route to the
-                // legacy encoder (measured size wins, see `level_uses_ldx`), so
-                // their body is NOT the port's. Pin what still holds: valid
+            if matches!(level, 1 | 3 | 6) {
+                // Documented exceptions (L1/L3/L6): these levels route to
+                // the legacy encoder (measured wins, see `level_uses_ldx`),
+                // so their body is NOT the port's. Pin what still holds: valid
                 // gzip that round-trips through an independent decoder. The
                 // routing itself is pinned by `tests/one_encode_only.rs`
-                // (encoder-entry census). L6/L7 are no longer exceptions: the
-                // port carries the good_match pair byte-identically (PR #363),
-                // so their bodies go through the structural assert below.
+                // (encoder-entry census). L7 remains port-routed: it carries
+                // the good_match pair byte-identically (PR #363) and its
+                // flipped-tree wall verdict cleared (−0.32% on the changed
+                // path); L6's flip was measured and REVERTED (2026-09-28, the
+                // routed port's L6-T1 wall was +1.8% vs the legacy arm at
+                // byte-equal output), so its body is off the port again.
                 assert_eq!(
                     independent_roundtrip(&gzip),
                     input,

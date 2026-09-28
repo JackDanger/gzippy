@@ -636,13 +636,23 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //       M1 interleaved, at parity (0.86-1.11x per file); the adjudicating
     //       wall leg is the frozen `fulcrum try` on this branch.
     //
+    //   L6  STAYS AN EXCEPTION (2026-09-28): the flip was priced and RETIRED
+    //       for L6 — the frozen-box L6-T1 leg (base 9a57a684 legacy arm vs
+    //       the routed port, gzip floor framed) showed the port's L6 wall
+    //       0.4075 → 0.4149 = +1.8% (byte-equal output; erodes the
+    //       heavily-won cell past the flat budget; UNDECIDED in the floor
+    //       screen, clause 6 fail). The port's good_match bookkeeping pays
+    //       for itself at L6-T1 in instructions (+3.6-5.2% Ir/B) and NOT in
+    //       wall. L7 keeps its retirement (−0.32% on the same leg); L6 goes
+    //       back to the legacy arm until the port's L6 economy reprices.
+    //
     //   L1  stays an exception: our L1 is igzip-derived and BEATS pigz -1 on
     //       text where the port does not (43,980 vs 42,384 = 1.038x pigz).
     //       Gate: `fast_l1_ratio_multi_corpus`. #347.
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times in this campaign.
-    !matches!(level, 1) && level <= 9
+    !matches!(level, 1 | 6) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {

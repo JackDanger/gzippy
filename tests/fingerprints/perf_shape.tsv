@@ -59,12 +59,12 @@ binary	2	huffman_tree_nodes_visited	0	19142
 binary	2	literals_emitted	566712	565897
 binary	2	match_length_bytes_total	481864	482679
 binary	2	matches_emitted	42986	42053
-binary	6	bitstream_flush_word_calls	184004	177271
+binary	6	bitstream_flush_word_calls	183433	177271
 binary	6	block_split_observations	600388	599724
 binary	6	blocks_emitted_dynamic	4	4
 binary	6	dynamic_header_bits_total	2105	2059
 binary	6	emit_body_bits	5192233	5096880
-binary	6	hc_chain_table_reads	2037541	8380719
+binary	6	hc_chain_table_reads	2037542	8380719
 binary	6	hc_hash_computations	632065	625231
 binary	6	hc_head_table_reads	1264130	1250462
 binary	6	hc_head_table_writes	1264130	1250462
@@ -76,7 +76,7 @@ binary	6	hc_probe_outcome_too_short	448	5201
 binary	6	histogram_updates	632066	625241
 binary	6	huffman_exact_code_chosen	0	1
 binary	6	huffman_length_limited_calls	0	8
-binary	6	huffman_make_code_calls	14	34
+binary	6	huffman_make_code_calls	12	34
 binary	6	huffman_tree_nodes_visited	0	19034
 binary	6	literals_emitted	568710	574207
 binary	6	match_length_bytes_total	479866	474369
@@ -176,7 +176,7 @@ noise	6	hc_probe_outcome_accepted	8	8
 noise	6	hc_probe_outcome_miss	325332	325330
 noise	6	histogram_updates	1048122	1048122
 noise	6	huffman_length_limited_calls	0	14
-noise	6	huffman_make_code_calls	14	43
+noise	6	huffman_make_code_calls	12	43
 noise	6	huffman_tree_nodes_visited	0	30430
 noise	6	literals_emitted	1047230	1047230
 noise	6	match_length_bytes_total	1346	1346
@@ -260,7 +260,7 @@ tabular	2	huffman_tree_nodes_visited	0	2866
 tabular	2	literals_emitted	107353	94666
 tabular	2	match_length_bytes_total	941223	953910
 tabular	2	matches_emitted	99216	98703
-tabular	6	bitstream_flush_word_calls	139027	136493
+tabular	6	bitstream_flush_word_calls	138780	136493
 tabular	6	block_split_observations	198495	197098
 tabular	6	blocks_emitted_dynamic	5	6
 tabular	6	dynamic_header_bits_total	1348	1601
@@ -276,7 +276,7 @@ tabular	6	hc_probe_outcome_miss	3138343	10401614
 tabular	6	hc_probe_outcome_too_short	13700	50563
 tabular	6	histogram_updates	275669	272041
 tabular	6	huffman_length_limited_calls	0	12
-tabular	6	huffman_make_code_calls	17	60
+tabular	6	huffman_make_code_calls	15	60
 tabular	6	huffman_tree_nodes_visited	0	3850
 tabular	6	literals_emitted	121321	122155
 tabular	6	match_length_bytes_total	927255	926421
@@ -372,12 +372,12 @@ text	2	huffman_tree_nodes_visited	0	6664
 text	2	literals_emitted	41552	17846
 text	2	match_length_bytes_total	1007024	1030730
 text	2	matches_emitted	155225	145738
-text	6	bitstream_flush_word_calls	146865	146143
+text	6	bitstream_flush_word_calls	146378	146143
 text	6	block_split_observations	154062	154811
 text	6	blocks_emitted_dynamic	5	5
 text	6	dynamic_header_bits_total	2245	2297
 text	6	emit_body_bits	2431611	2421433
-text	6	hc_chain_table_reads	11628538	18718851
+text	6	hc_chain_table_reads	11628539	18718851
 text	6	hc_hash_computations	275899	274165
 text	6	hc_head_table_reads	551798	548330
 text	6	hc_head_table_writes	551798	548330
@@ -389,7 +389,7 @@ text	6	hc_probe_outcome_too_short	3446	8914
 text	6	histogram_updates	275900	274169
 text	6	huffman_exact_code_chosen	0	1
 text	6	huffman_length_limited_calls	0	10
-text	6	huffman_make_code_calls	17	50
+text	6	huffman_make_code_calls	15	50
 text	6	huffman_tree_nodes_visited	0	6464
 text	6	literals_emitted	32224	35453
 text	6	match_length_bytes_total	1016352	1013123
