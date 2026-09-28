@@ -137,6 +137,34 @@ impl LdxCompressor {
         // C: the level -> config map at :3919-3990, ported verbatim for the levels whose
         // compressor exists. CLAUDE.md clause 5: no test pins these VALUES; the
         // invariant test lives in `compress_greedy` and checks that effort RISES.
+        // MEASUREMENT-ONLY override (`ladder-tune` feature, never in default, no
+        // production caller reads the env in shipped builds): `GZIPPY_LDX_CFG=<level>:<depth>:<nice>[:<good>]`
+        // replaces that ONE level's triple so the config space is bisectable on
+        // the port itself (the residual-card probe surface for the cadence band).
+        #[cfg(feature = "ladder-tune")]
+        let mut cfg_override: Option<(u32, u32, u32)> = None;
+        #[cfg(feature = "ladder-tune")]
+        for (lvl, depth, nice, good) in std::env::var("GZIPPY_LDX_CFG")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|seg| {
+                        let mut it = seg.split(':');
+                        let l: u32 = it.next()?.parse().ok()?;
+                        let d: u32 = it.next()?.parse().ok()?;
+                        let n: u32 = it.next()?.parse().ok()?;
+                        let g: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        Some((l, d, n, g))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        {
+            if lvl == compression_level {
+                cfg_override = Some((depth, nice, good));
+            }
+        }
+
         let (max_search_depth, nice_match_length, good_match) = match compression_level {
             0 => {
                 // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
@@ -180,6 +208,11 @@ impl LdxCompressor {
             9 => (600, DEFLATE_MAX_MATCH_LEN, 0),
             _ => return None,
         };
+        // The override shadows the table ONLY under the measurement feature;
+        // shipped builds keep the table's own triple with no cfg dance.
+        #[cfg(feature = "ladder-tune")]
+        let (max_search_depth, nice_match_length, good_match) =
+            cfg_override.unwrap_or((max_search_depth, nice_match_length, good_match));
 
         let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
             // ⚠ EXPERIMENT (2026-09-01): gate OFF to isolate its contribution.
