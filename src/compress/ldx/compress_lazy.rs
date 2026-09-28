@@ -85,6 +85,7 @@ pub(crate) fn deflate_compress_lazy(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
 ) {
     deflate_compress_lazy_generic(
         c,
@@ -94,6 +95,7 @@ pub(crate) fn deflate_compress_lazy(
         os,
         max_search_depth,
         nice_match_length,
+        good_match,
         false,
     );
 }
@@ -108,6 +110,7 @@ pub(crate) fn deflate_compress_lazy2(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
 ) {
     deflate_compress_lazy_generic(
         c,
@@ -117,6 +120,7 @@ pub(crate) fn deflate_compress_lazy2(
         os,
         max_search_depth,
         nice_match_length,
+        good_match,
         true,
     );
 }
@@ -130,6 +134,7 @@ pub(crate) fn deflate_compress_lazy_generic(
     os: &mut DeflateOutputBitstream<'_>,
     max_search_depth: u32,
     nice_match_length: u32,
+    good_match: u32,
     lazy2: bool,
 ) {
     let mut in_next: usize = 0;
@@ -176,6 +181,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                 max_len,
                 nice_len,
                 max_search_depth,
+                good_match,
                 &mut next_hashes,
                 &mut cur_offset,
             );
@@ -233,6 +239,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                         max_len,
                         nice_len,
                         max_search_depth >> 1,
+                        good_match,
                         &mut next_hashes,
                         &mut next_offset,
                     );
@@ -267,6 +274,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                             max_len,
                             nice_len,
                             max_search_depth >> 2,
+                            good_match,
                             &mut next_hashes,
                             &mut next_offset,
                         );

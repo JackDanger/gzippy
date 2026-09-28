@@ -5,9 +5,13 @@
 //! a small-input shortcut, or a header metadata regression without requiring a
 //! vendor executable in every test environment.
 //!
-//! The L1/L6/L7 measured exceptions (`level_uses_ldx`) route to the legacy
-//! encoder instead; for those levels this file pins metadata + independent
+//! Two measured exceptions remain (`level_uses_ldx`): L1 (igzip-derived,
+//! beats pigz -1 on the text cell) and L3 (the campaign-winning len-3
+//! guards). For those levels this file pins metadata + independent
 //! roundtrip, and `tests/one_encode_only.rs` pins the routing itself.
+//! L6/L7 were retired on 2026-09-27 (PR #363): the port carries the
+//! zlib good_match pair byte-identically, so their bodies ARE the port's
+//! and the structural assert below now guards them.
 
 use gzippy::compress::{
     deflate::encode_gzip_bytes_to_vec, ldx::compress_for_diff, pipelined::PipelinedGzEncoder,
@@ -54,13 +58,15 @@ fn t1_gzip_matches_the_libdeflate_port_at_every_vendor_level() {
                 "{name} L{level}: ISIZE"
             );
 
-            if matches!(level, 1 | 3 | 6 | 7) {
-                // Documented L1/L3/L6/L7 exceptions: these levels route to the
+            if matches!(level, 1 | 3) {
+                // Documented L1/L3 exceptions: these levels route to the
                 // legacy encoder (measured size wins, see `level_uses_ldx`), so
                 // their body is NOT the port's. Pin what still holds: valid
                 // gzip that round-trips through an independent decoder. The
                 // routing itself is pinned by `tests/one_encode_only.rs`
-                // (encoder-entry census).
+                // (encoder-entry census). L6/L7 are no longer exceptions: the
+                // port carries the good_match pair byte-identically (PR #363),
+                // so their bodies go through the structural assert below.
                 assert_eq!(
                     independent_roundtrip(&gzip),
                     input,

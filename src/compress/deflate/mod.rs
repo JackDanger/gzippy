@@ -586,23 +586,32 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with FOUR measured
-    // exceptions. Routing L1/L6/L7 to the port was tried on this branch
-    // (`b28e96f3`) and the per-commit ledger gate went red immediately and
-    // stayed red for 45 commits: `won_cells_stay_won` regresses FOUR cells
-    // (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs gzip +12,610 B
-    // / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus` loses the L1 text
-    // cell to pigz (43,980 vs 42,384 = 1.038x). A won cell that regresses is
-    // a regression on a closed cell — the ledger is append-only and is never
-    // edited to fit a result, so the routing comes back.
+    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with TWO measured
+    // exceptions remaining (L1, L3). The routing that made all of 0-9 port
+    // (`b28e96f3`) went red on the per-commit ledger immediately and stayed
+    // red for 45 commits pre-`good_match`: `won_cells_stay_won` regressed
+    // FOUR cells (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs
+    // gzip +12,610 B / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus`
+    // lost the L1 text cell to pigz (43,980 vs 42,384 = 1.038x). A won
+    // cell that regresses is a regression on a closed cell — the ledger is
+    // append-only and is never edited to fit a result, so the routing came
+    // back until the named levers landed.
     //
-    // Each exception is a MEASUREMENT with a named gate, not a preference —
-    // and the good_match ones (L6/L7) collapse the moment the port learns
-    // `good_match` (shorten the chain walk once a match >= good_match is
-    // found; zlib/gzip/pigz all use it, and libdeflate does not implement it).
-    // That is the named follow-up lever (PR #363: port `good_match` INTO ldx,
-    // L6/L7 verified byte-identical 11/11, then retire those two exceptions
-    // one at a time):
+    //   L6  RETIRED (PR #363 follow-up, 2026-09-27): the port now carries the
+    //       zlib knob pair itself (`hc_matchfinder_longest_match` takes
+    //       `good_match`; port L6 = chain 128 / nice 65 / good 8) and is
+    //       BYTE-IDENTICAL to the legacy arm at L6/L7 (11/11 files on the
+    //       branch's probe corpus; 189/189 cells over the canonical
+    //       21-member corpus at levels 1-9 — banked on main under
+    //       docs/board/sprint-2026-09-25.md, "bt-probebudget CENSUS RESULT"
+    //       follow-up). One encoder, byte-equal output, and the port's wall
+    //       is the cheaper arm (its in-process data was 1.07x libdeflate vs
+    //       the legacy arm's 1.4-4.1x).
+    //
+    //   L7  RETIRED (same receipt set): port L7 = chain 256 / nice 130 /
+    //       good 32 == legacy L7 bytes; the monotone ladder holds with the
+    //       port carrying the pair (the old L6-dips-below-L7 inversion went
+    //       away when both sides gained `good_match`).
     //
     //   L1  our L1 is igzip-derived and BEATS pigz -1 on text where the port does not
     //       (43,980 vs 42,384 = 1.038x pigz). Gate: `fast_l1_ratio_multi_corpus`. #347.
@@ -619,21 +628,9 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //       Retires only when the port learns the len-3 machinery (named lever,
     //       not good_match).
     //
-    //   L6  `won_cells_stay_won` (append-only) regresses FOUR cells if L6 routes here:
-    //         binary:L6 vs gzip +1,614 B / vs pigz +887 B
-    //         text:L6   vs gzip +12,610 B / vs pigz +12,090 B
-    //       Those cells were won by the ZLIB arm = baseline + `good_match` 8 + chain
-    //       128. Carrying those knobs on the level keeps the cells with ONE encode.
-    //
-    //   L7  follows from L6: the port has no `good_match`, so our L6 is stronger than
-    //       the port's L7 (100, 130) and `ladder_is_monotone_t1` fires (305,775 >
-    //       304,252 on text). L7 keeps the legacy encoder at its own measured-best
-    //       single config (chain 256, `good_match` 32) — monotone, and 2 clause-3 flips
-    //       against 4 for `params(7)`.
-    //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times in this campaign.
-    !matches!(level, 1 | 3 | 6 | 7) && level <= 9
+    !matches!(level, 1 | 3) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
