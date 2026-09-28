@@ -21,15 +21,17 @@ re-fetched or re-read later even after ref deletion.
     origin/sf4-elim-copies              origin/sf6-inline-tables
     origin/t1seam-locate
 
-## Batch 2 — KEEP (live work: open PR / unmerged stack)
+## Batch 2 — RESOLVED (2026-09-28, the open-PR census after #403/#404/#405 landed)
 
-| branch | tip sha | why it stays |
-|---|---|---|
-| `perf/t1-output-cap` | `ee0c1d2c` | the unmerged one-encoder stack; PR to be opened FIRST (its content is the landing order below) |
-| `lever/ldx-good-match` | `df31c2a5` | PR #363; rebase onto the stack's next landed point before CI rerun |
-| `lever/ldx-len3` | `f8b9c7e5` | PR #364; contains #363 |
-| `lever/one-encode-per-level` | `4d368406` | PR #356, superseded by the stack's `d9418505`; closes with disposition pointing at the stack |
-| `lever/postparse-split` | `4893dbff` | PR #346, verdict NO-SHIP recorded in-body; closes as measured-and-stopped |
+| branch / PR | closure disposition |
+|---|---|
+| `perf/t1-output-cap` (the stack) | landed through #366/#367 (merged 09-05 / 09-24) + the ladder renames #400; content resident on trunk |
+| `lever/ldx-good-match` | **MERGED via PR #363** (321e944f) — the good_match pair + the L7 routing retirement; the L6 half was re-measured on its own box leg and REVERTED (the routed port's L6-T1 wall was +1.8% vs the legacy arm; see the mod.rs record) |
+| `lever/ldx-len3` | **MERGED via PR #364** (84f22994) — the len-3 machinery + the L3 retirement; its landing carried the L6-revert re-pins |
+| `lever/one-encode-per-level` (PR #356) | closed with disposition (superseded by the stack, per the older census note) |
+| `lever/postparse-split` (PR #346) | closed NO-SHIP (measured-and-stopped) |
+| `lever/ldx-forceinline` (PR #368) | stays OPEN as the review vehicle per its own contract ("does NOT propose merging now") — reopen path documented in-PR (rebase onto the knob pair + len-3 wiring, round-3-style review, one frozen try) |
+| the #369 L2 carry | CLOSED superseded — the machinery it carried landed via #364; the L2 min-match-3 lever card lives on the residual board |
 
 ## Batch 3 — ARCHIVE-LATER (falsified / superseded / probes; no open PR, no live ref)
 
