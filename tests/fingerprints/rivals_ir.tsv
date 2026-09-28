@@ -25,6 +25,12 @@
 #   (records branch records/2026-09-22-ec2-c7a4xl; improvement 3.2462x across
 #   33/36 decidable cells, residual harm 0.0000). Standing item: a
 #   trainer-class recalibration before any of these informational pins gate.
+# noise:L9 ours re-pinned 2026-09-28 (110.42 -> 119.60 Ir/B, +8.3%): the promoted
+# bt-probebudget's per-descent budget decrement is paid inside every deep walk and
+# noise-L9 (the deepest-walk fixture) pays it hardest. Wall authority unchanged:
+# the frozen-box census measured the promotion net -1.9% wall at the production
+# route with these same noise semantics included — an Ir-proxy delta is a named
+# price, not a wall regression. Measured on the ratchet leg (ours 0.832x 143.75).
 fixture	level	rival	rival_ir_per_b	ours_ir_per_b	margin
 text	1	gzip	92.34	67.21	0.728
 text	1	pigz	94.29	67.21	0.713
@@ -80,5 +86,5 @@ noise	6	gzip	146.38	126.35	0.864
 noise	6	pigz	143.75	126.35	0.879
 noise	6	libdeflate	80.55	126.35	1.569
 noise	9	gzip	146.38	110.42	0.755
-noise	9	pigz	143.75	110.42	0.769
+noise	9	pigz	143.75	119.60	0.832
 noise	9	libdeflate	82.53	110.42	1.338

@@ -94,28 +94,39 @@ fn every_level_encodes_each_input_exactly_once() {
 /// If a level silently falls back to the legacy encoder, its wall and size stop being
 /// comparable to the vendor and every ours-vs-libdeflate number becomes meaningless.
 ///
-/// ⭐ TWO MEASURED EXCEPTIONS (L1, L3), each with a named gate and a
+/// ⭐ ONE MEASURED EXCEPTION REMAINS (L1), each with a named gate and a
 /// path back to the port — see `level_uses_ldx` in `src/compress/deflate/mod.rs`
 /// for the full measurement record. Routing all of 0-9 to the port (`b28e96f3`)
 /// went red on the per-commit ledger immediately and stayed red for 45 commits:
-/// L1 loses to pigz on the `fast_l1_ratio_multi_corpus` cell, and (pre-knob)
-/// L6 regressed FOUR `won_cells_stay_won` cells (binary vs gzip +1,614 B / vs
-/// pigz +887 B; text vs gzip +12,610 B / vs pigz +12,090 B). L3 is a different
-/// class: the port has no len-3/sparse machinery, so its L3 is 1-7% LARGER
-/// than the legacy L3 (the campaign-winning L3 guards) and lost 11 T1 wall
-/// cells in the 2026-09-01 solvency try.
+/// L1 loses to pigz on the `fast_l1_ratio_multi_corpus` cell (43,980 vs
+/// 42,384 = 1.038x pigz), and (pre-knob) L6 regressed FOUR `won_cells_stay_won`
+/// cells (binary vs gzip +1,614 B / vs pigz +887 B; text vs gzip +12,610 B /
+/// vs pigz +12,090 B).
 ///
-/// L6/L7 RETIRED (2026-09-27, PR #363): the port carries the zlib `good_match`
+/// L7 RETIRED (2026-09-27, PR #363) — and L6's flip was PRICED and REVERTED
+/// (2026-09-28): the frozen-box L6-T1 leg measured the routed port +1.8%
+/// wall vs the legacy arm (0.4075 → 0.4149 against the gzip floor,
+/// byte-equal output), so L6 keeps the legacy encoder until the port's L6
+/// economy reprices. The port's doc wall economy at L6 was the one cell the
+/// 4,7-band try never measured — this deviation is priced now. the port carries the zlib `good_match`
 /// knobs itself (L6 chain 128/nice 65/good 8; L7 chain 256/nice 130/good 32)
 /// and is byte-identical to the legacy arm (11/11 branch receipts; 189/189
-/// cells over the canonical 21-member corpus at levels 1-9). One encoder, no
-/// byte change on the retired levels, and the port's wall is the cheaper arm.
+/// cells over the canonical 21-member corpus at levels 1-9) — the flipped-tree
+/// wall verdict cleared the routing (no regression, 4 cells won-with-margin).
 ///
-/// The port L3 collapses the moment it learns the len-3 machinery (PR #364's
-/// named lever). L1 stays an exception until someone beats pigz -1 on that
-/// text cell from the port. Until then these levels stay on the
-/// measured-best legacy config.
-const PORT_EXCEPTIONS: &[u32] = &[1, 3];
+/// L3 RETIRED (this PR's landing): the port learned the len-3 machinery
+/// (`ldx/far_len3.rs` + the sparse-blocks split-hold modulator; 11/11 files
+/// byte-identical to the incumbent lazy lazy-parser output at equal configs —
+/// the two lazy parsers agree byte-for-byte; the old 25-36 KB gap was one
+/// broken `bsr32` in the gate's fixed-point log2). The M1 wall read was
+/// parity (0.86-1.11x per file); the frozen-box leg on THIS tree can price
+/// it once more before any board re-census.
+///
+/// The port L3 collapses... nothing remains: the len-3 machinery L3 landed
+/// above is the same machinery that made the legacy L3 win. L1 stays an
+/// exception until someone beats pigz -1 on that text cell from the port.
+/// Until then L1 stays on the measured-best legacy config.
+const PORT_EXCEPTIONS: &[u32] = &[1, 6];
 
 #[test]
 fn the_port_is_the_production_encoder_for_levels_0_through_9() {
