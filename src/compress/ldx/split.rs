@@ -182,9 +182,22 @@ pub(crate) fn do_end_block_check(stats: &mut BlockSplitStats, block_length: u32)
         // The `/ 512` sits BETWEEN the two multiplies, not after both. Moving it
         // changes the value by the truncation it performs, so the grouping is part of
         // the heuristic, not an optimisation.
+        // The split sensitivity: 200/512 is the vendor's heuristic ratio.
+        // MEASUREMENT-ONLY override (ladder-tune feature; the residual board's
+        // data.sqlite L4 card: the shipped cadence emits 2,506 dynamic blocks
+        // where gzip carries 575 — the header amortization is the priced gap).
+        // `GZIPPY_LDX_SPLIT=<multiplier>` re-prices the cut.
+        #[cfg(feature = "ladder-tune")]
+        let split_sensitivity: u32 = if let Ok(raw) = std::env::var("GZIPPY_LDX_SPLIT") {
+            raw.parse().unwrap_or(200)
+        } else {
+            200
+        };
+        #[cfg(not(feature = "ladder-tune"))]
+        let split_sensitivity: u32 = 200;
         let mut cutoff = stats
             .num_new_observations
-            .wrapping_mul(200)
+            .wrapping_mul(split_sensitivity)
             .wrapping_div(512)
             .wrapping_mul(stats.num_observations);
 
