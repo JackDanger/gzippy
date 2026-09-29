@@ -250,6 +250,17 @@ pub(crate) fn deflate_compress_lazy_generic(
             in_max_block_end - in_next,
             max_search_depth,
         );
+        // MEASUREMENT-ONLY min-match floor override (ladder-tune feature; the
+        // residual board's access.log L5 card: the shipped content heuristic
+        // may be clamping min_len to 4+ where the RIVAL takes len-3 tokens —
+        // 50,210 of them on this corpus). `GZIPPY_LDX_MIN=<floor>` applies the
+        // explicit floor everywhere in this invocation.
+        #[cfg(feature = "ladder-tune")]
+        let mut min_len = if let Ok(raw) = std::env::var("GZIPPY_LDX_MIN") {
+            core::cmp::min(raw.parse::<u32>().unwrap_or(min_len), min_len)
+        } else {
+            min_len
+        };
         // Far-len-3 gate: per-block state, recalc on the same widening
         // cadence as min_len — legacy `lazy.rs` sequence, verbatim.
         let mut far_len3 = FarLen3Gate::INERT;
@@ -259,6 +270,12 @@ pub(crate) fn deflate_compress_lazy_generic(
             // Recalculate the minimum match length if it hasn't been done recently.
             if in_next >= next_recalc_min_len {
                 min_len = recalculate_min_match_len(&c.freqs, max_search_depth);
+                #[cfg(feature = "ladder-tune")]
+                if let Ok(raw) = std::env::var("GZIPPY_LDX_MIN") {
+                    if let Ok(v) = raw.parse::<u32>() {
+                        min_len = core::cmp::min(v, min_len);
+                    }
+                }
                 next_recalc_min_len +=
                     core::cmp::min(in_end - next_recalc_min_len, in_next - in_block_begin);
             }

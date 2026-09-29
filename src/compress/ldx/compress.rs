@@ -215,8 +215,13 @@ impl LdxCompressor {
             cfg_override.unwrap_or((max_search_depth, nice_match_length, good_match));
 
         let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
-            // ⚠ EXPERIMENT (2026-09-01): gate OFF to isolate its contribution.
+            // ⚠ PROBE (2026-09-28, the residual board's access.log L5 card):
+            // the fingerprint diff named 50,210 len-3 tokens in gzip's access.log
+            // stream where ours carries zero — the far-len-3 gate is the priced
+            // candidate at L5 too. MEASUREMENT-ONLY row until the sweep plus the
+            // wall check adjudicate it.
             3 => (true, 224),
+            5 => (true, 224),
             _ => (false, 0),
         };
 
