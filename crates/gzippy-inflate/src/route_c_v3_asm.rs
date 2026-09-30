@@ -10,8 +10,7 @@
 //!
 //! ## Why this exists
 //!
-//! Per `docs/perf/2026-05-28-isal-vs-purerust-attribution.md`, the
-//! 28pp gap to ISA-L is in inner-loop inflate cycles per symbol. The
+//! The 28pp gap to ISA-L is in inner-loop inflate cycles per symbol. The
 //! production Rust path runs at ~5-6 ns/symbol while ISA-L's
 //! hand-tuned asm runs at ~1-2 ns/symbol. No micro-optimization on
 //! the Rust hot loop will recover that without going to asm — three

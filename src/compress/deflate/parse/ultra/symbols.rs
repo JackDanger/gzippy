@@ -15,9 +15,9 @@ pub const ZOPFLI_WINDOW_MASK: usize = ZOPFLI_WINDOW_SIZE - 1;
 // would have chosen, which is a structural cap on cross-boundary block
 // placement that ECT does not carry. No hidden dependency found: this
 // constant is consumed only in `deflate::deflate`'s top-level chaining loop
-// (deflate.rs:779-822), which is fully sequential — no outer parallelism or
+// (deflate.rs:755-792), which is fully sequential — no outer parallelism or
 // threading assumption keys off the 1MB granularity (see
-// `src/compress/zopfli.rs`, whose only parallelism is *intra*-block via
+// `src/compress/deflate/parse/ultra/`, whose only parallelism is *intra*-block via
 // `ZopfliOptions::thread_budget` inside `deflate_part`, independent of
 // master-block size).
 pub const ZOPFLI_MASTER_BLOCK_SIZE: usize = 5_000_000;

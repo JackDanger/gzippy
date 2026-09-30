@@ -16,8 +16,8 @@
 //! ## Sources used
 //!
 //! - RFC 1951 §3.2.7 (dynamic Huffman block format)
-//! - rapidgzip/src/rapidgzip/blockfinder/DynamicHuffman.hpp
-//! - libdeflate/lib/deflate_decompress.c (build_decode_table)
+//! - vendor/rapidgzip/librapidarchive/src/rapidgzip/blockfinder/DynamicHuffman.hpp
+//! - vendor/libdeflate/lib/deflate_decompress.c (build_decode_table)
 //! - ISA-L's `inflate.h` (struct inflate_huff_code_large)
 //!
 //! ## Why a separate module from route_c_fixed

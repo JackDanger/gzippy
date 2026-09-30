@@ -191,9 +191,10 @@ impl FastLocalCounters {
 /// candidate, not a production default (see `L1Tune::from_env`'s doc
 /// comment) — promoting it to the actual `Strategy::Fast` default path is a
 /// separate, supervisor-gated decision this change does not make.
-/// `examples/l1_search.rs` sweeps these via env vars across many process
-/// invocations (no rebuild per candidate — the whole point of threading
-/// them as runtime values instead of consts). Consumed ONLY by
+/// The deleted `examples/l1_search.rs` harness swept these via env vars
+/// across many process invocations (no rebuild per candidate — the whole
+/// point of threading them as runtime values instead of consts).
+/// Consumed ONLY by
 /// [`process_position_l1`]/[`fastloop_l1`]/[`run`] when `l1-tune` is
 /// compiled in; the default build has none of this code.
 #[cfg(feature = "l1-tune")]
@@ -704,8 +705,9 @@ pub mod tune {
     }
 
     /// Override the tune parameters for every subsequent `run()` call in
-    /// THIS process. Search-only API: `examples/l1_search.rs` sweeps configs
-    /// by calling this between candidates — one process, no rebuild and no
+    /// THIS process. Search-only API: the deleted `examples/l1_search.rs`
+    /// harness swept configs by calling this between candidates — one
+    /// process, no rebuild and no
     /// respawn per candidate (the env-var path alone can't do this: it is
     /// read once and cached, by design, so a single process can't change it
     /// via `std::env::set_var` after the first `get()`).
@@ -1305,7 +1307,7 @@ const SHORTEST_MATCH3: u32 = 3;
 /// attempts are on record. And the SIZE leg of a head3-preserving 2-way
 /// bucket is also unmeasured — do not assume it inherits the plain-`ht`
 /// result, which is 14 closed / 6 opened at BOTH T1 and T4 (measured
-/// 2026-08-01, `docs/board/after-227-the-whole-real-deficit-is-L1.md`).
+/// 2026-08-01; the board record has since been folded away).
 /// Any reopen needs `fulcrum ab paired` at T4 on solvency, aa_bias reported.
 ///
 /// This lever tries the SAME idea far more narrowly: instead of a second

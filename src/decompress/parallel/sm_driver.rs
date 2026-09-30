@@ -8,7 +8,8 @@
 //!
 //! # Window-sparsity configuration (keepIndex=false faithful port)
 //!
-//! Vendor (`ParallelGzipReader.hpp:1320-1330`, `tools/rapidgzip.cpp:47,167`):
+//! Vendor (`ParallelGzipReader.hpp:1320-1330`,
+//! `librapidarchive/src/tools/rapidgzip.cpp:47,167`):
 //! the CLI default is `keepIndex{false}`. `applyChunkDataConfiguration` then sets:
 //!   ```cpp
 //!   m_chunkConfiguration.windowSparsity = m_keepIndex && m_windowSparsity;  // → false
@@ -132,7 +133,8 @@ fn read_parallel_sm_inner<W: std::io::Write>(
     };
 
     // Faithful port of vendor `applyChunkDataConfiguration` at keepIndex=false
-    // (ParallelGzipReader.hpp:1320-1330, tools/rapidgzip.cpp:47):
+    // (ParallelGzipReader.hpp:1320-1330,
+    // librapidarchive/src/tools/rapidgzip.cpp:47):
     //   windowSparsity   = keepIndex && windowSparsity = false
     //   windowCompressionType = keepIndex ? userValue : Some(NONE) = Some(NONE)
     let sparsity = window_sparsity_kill_switch();

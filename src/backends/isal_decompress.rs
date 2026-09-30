@@ -231,7 +231,7 @@ pub fn scan_deflate_isal(
 /// that can be pre-loaded with the partial first byte's bits before starting.
 ///
 /// This is the same "inflatePrime" pattern used by rapidgzip's IsalInflateWrapper
-/// (rapidgzip/librapidarchive/src/rapidgzip/gzip/isal.hpp).
+/// (vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/isal.hpp).
 ///
 /// `dict` is the 32KB sliding-window from the previous chunk. Empty slice is
 /// valid (first chunk or chunk with no back-references before start).
