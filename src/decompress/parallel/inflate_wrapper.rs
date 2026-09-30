@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// pre-existing parallel-module dead code from the default-feature flip; delete in a dedicated cleanup
 
 //! Port of `rapidgzip::IsalInflateWrapper`
 //! (vendor/rapidgzip/.../gzip/isal.hpp) scoped to single-member raw-
@@ -144,9 +144,8 @@ fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
 // ── Pure-Rust backend ─────────────────────────────────────────────────────
 //
 // Routes through `Inflate<Clean, Generic, Streaming>` — the unified-decoder
-// surface. This SECOND engine was removed from the gzippy-native
-// window-seeded INEXACT route (those chunks now decode on the ONE
-// `deflate::Block`; see
+// surface. This is NOT the engine of the gzippy-native window-seeded
+// INEXACT route (those chunks decode on the ONE `deflate::Block`; see
 // `chunk_decode::finish_decode_chunk_seeded_block_native` and the
 // `tests::routing::seeded_block_engine_runs_on_parallel_sm` trap). The
 // wrapper remains the engine for the until-exact paths and the gzippy-isal

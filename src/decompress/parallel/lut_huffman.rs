@@ -1601,15 +1601,14 @@ mod tests {
         assert_eq!(result.sym_count, 1);
     }
 
-    /// Regression test for the INVALID_SYMBOL false-positive bug fixed
-    /// 2026-05-27. ISA-L's packed-pair LUT entries can have
+    /// Regression test for the INVALID_SYMBOL false-positive bug. ISA-L's
+    /// packed-pair LUT entries can have
     /// `symbol & LARGE_SHORT_SYM_MASK == 0x1FFF` for VALID literal pairs
     /// — the caller MUST NOT use `symbol == INVALID_SYMBOL` as the
     /// invalid-code sentinel; only `bit_count == 0` distinguishes
-    /// invalid. The bug was caught via reduced-bench data showing my
-    /// port produced different bootstrap byte counts on silesia even
-    /// though byte-perfect; tracing the LUT entries showed packed pairs
-    /// where (sym1 | sym2 << 8) coincidentally equaled 0x1FFF.
+    /// invalid. The bug surfaced as different bootstrap byte counts on
+    /// silesia with byte-perfect output; tracing the LUT entries showed
+    /// packed pairs where (sym1 | sym2 << 8) coincidentally equaled 0x1FFF.
     #[test]
     fn decoded_symbol_can_equal_invalid_sentinel_for_valid_pair() {
         // Build a Kraft-valid code-length set with short codes that

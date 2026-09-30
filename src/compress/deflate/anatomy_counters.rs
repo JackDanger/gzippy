@@ -47,7 +47,7 @@
 //!   (the tree-descent shape doesn't map onto hc's simple probe/miss/accept
 //!   model 1:1, so `bt_probe_outcome_*` buckets the single-byte equality
 //!   check + `lz_extend` pair, not a 4-byte prefilter compare).
-//!   **ADDED 2026-09-27 (bt-probebudget lever probe)**: the per-descent
+//!   The per-descent
 //!   `bt_descents_*` / `bt_descent_p*` histogram and the `over{B}` integrals
 //!   (see the counter list) — one `note_bt_descent` call per descent exit in
 //!   `advance`, recorded across get_matches AND skip_byte calls; prices the
@@ -87,10 +87,10 @@
 //!   `emit_block` calls for EVERY block (dynamic candidate always built for
 //!   the stored/static/dynamic cost comparison, win or lose) uses the
 //!   APPROXIMATE builder `huffman::fast::make_huffman_code` instead — so on
-//!   the mission's own L1 text6 target, `huffman_length_limited_calls` is
+//!   the L1 text6 target, `huffman_length_limited_calls` is
 //!   always 0 and the spec's "`2 * blocks_emitted_dynamic`" cross-check is
 //!   vacuous for that path. Added `huffman_make_code_calls` (see below) so
-//!   the mission's closed-loop reconciliation has a non-vacuous huffman-build
+//!   the L1 reconciliation has a non-vacuous huffman-build
 //!   counter on the actual target corpus/level; `huffman_length_limited_calls`
 //!   is kept for when `parse::ultra` is exercised.
 //! - **`huffman_make_code_calls`** — ADDED (not in the spec's literal list):
@@ -102,8 +102,8 @@
 //!   reconciliation test in this module for the exact expected count.
 //! - **`match_length_bytes_total`** — ADDED (not in the spec's literal list):
 //!   sum of match lengths pushed via `push_match`/`push_match_fast`. Needed
-//!   for the "tokens emitted == extract count" invariant the mission asks
-//!   for: `literals_emitted + match_length_bytes_total == total input bytes
+//!   for the "tokens emitted == extract count" invariant:
+//!   `literals_emitted + match_length_bytes_total == total input bytes
 //!   parsed` (every input byte is covered by exactly one literal or exactly
 //!   one position of exactly one match — the LZ77 parse invariant).
 //! - **`alloc_events`/`alloc_bytes`** — the `Vec::with_capacity` sites in
@@ -119,8 +119,8 @@
 //!
 //! ## `fast_*` — L0/L1 single-probe matchfinder (`parse/fast.rs`)
 //!
-//! Added 2026-07-22 to close a coverage gap: `fast.rs` is the ONLY parser
-//! with zero anatomy instrumentation before this — a calibration run
+//! Closes a coverage gap: `fast.rs` is the ONLY parser
+//! with zero anatomy instrumentation — a calibration run
 //! confirmed `hc_probe_attempts`/`bt_probe_attempts` sit at exactly 0 at L1
 //! (the fast path never touches the hash-chain/binary-tree finders at all).
 //! `fast.rs`'s finder logic is spread across three functions
@@ -154,7 +154,7 @@
 //!   (L1/`fastloop_l1` never activates ACCEL, so `fast_positions_skipped` is
 //!   always 0 there). `processed + skipped == in_end - data_start` by
 //!   construction (every coded byte lands in exactly one bucket) — the
-//!   mission's reconciliation invariant.
+//!   reconciliation invariant of this section.
 //! - **`fast_hash_computations`/`fast_head_table_reads`/
 //!   `fast_head_table_writes`** — every real (non-speculative) `lz_hash`
 //!   call, `head[h]` read, and `head[h] = pos` write across the primary
@@ -177,7 +177,7 @@
 //!   existed but `lz_extend` returned `< SHORTEST_MATCH`; `accepted` = a
 //!   match of `>= SHORTEST_MATCH` was actually emitted via `push_match_fast`
 //!   (so `fast_probe_outcome_accepted == matches_emitted_fast` EXACTLY — the
-//!   mission's cross-check); `deferred` **DEVIATES from the spec's literal
+//!   cross-check); `deferred` **DEVIATES from the spec's literal
 //!   3-bucket list** (miss/too-short/accepted) — `process_position_l1`'s lazy
 //!   peek can find a `>= SHORTEST_MATCH` candidate and then DEFER it (emit a
 //!   literal instead, see `LAZY_PEEK_MAX_LEN`'s doc comment), which is
@@ -295,13 +295,13 @@ define_counters!(
     bt_child_table_reads,
     bt_child_table_writes,
     bt_positions_skipped,
-    // Per-descent probe-volume histogram (bt-probebudget lever probe,
-    // 2026-09-27): probes-per-descent over ONE `advance` call — get_matches
+    // Per-descent probe-volume histogram (bt-probebudget pricing):
+    // probes-per-descent over ONE `advance` call — get_matches
     // OR skip_byte, both counted; exit reason split. The buckets 24/48/96/150
     // sit exactly at the lever's candidate budgets; the `over{B}` integrals
     // are the exact max probe volume a per-descent budget B could remove
     // (sum of max(probes - B, 0)) and `count_over{B}` the descents it cuts.
-    // Prices the mission's stop rule (production rarely > ~24 probes ⇒
+    // Prices the lever's stop rule (production rarely > ~24 probes ⇒
     // budget 24 is inert) BEFORE any behavior change ships.
     bt_descents_total,
     bt_descents_get_matches,
@@ -362,7 +362,7 @@ define_counters!(
     // `emit_body_bits / bitstream_flush_word_calls` is the observed average
     // bits committed per flush against the ~56-bit safe budget
     // (`BITBUF_NBITS - 7`) — the headroom figure a batched-flush-cadence
-    // reopen would need (see `emit_sequences`'s FALSIFIED note, 2026-07-22:
+    // reopen would need (see `emit_sequences`'s FALSIFIED note:
     // the aggregate headroom this pair measures — ~14-25 bits/flush of ~56 —
     // does NOT translate into a safely widenable static batch, because the
     // safety bound is set by a block's WORST single symbol, not its average,
@@ -391,7 +391,7 @@ define_counters!(
     // the block-count lever is argued from. Previously INFERRED at ~350 B/header from the
     // seam accounting; this counter replaces the inference.
     dynamic_header_bits_total,
-    // Lever-#3 probe (2026-09-25): `prev_block_used_only_literals` decides the
+    // Freshness-chain finding: `prev_block_used_only_literals` decides the
     // next block's `min_match_len` (near_optimal.rs:572-576). If it never
     // flips TRUE on real corpora, block-parallel optimize_and_flush is
     // byte-identical by evidence, not argument (the freshness chain has
@@ -404,8 +404,8 @@ define_counters!(
     alloc_bytes,
 );
 
-/// Record one completed bt descent (lever bt-probebudget probe,
-/// 2026-09-27): `probes` is the number of descent-loop iterations the call
+/// Record one completed bt descent (bt-probebudget pricing): `probes` is the
+/// number of descent-loop iterations the call
 /// spent, `is_rec` distinguishes the get_matches (REC) from the skip_byte
 /// shape, `exit_nice` / `exit_depth` / probes == 0 are the three exits. A
 /// budget cut lands at the same loop-bottom site as `exit_depth`; a descent
@@ -482,7 +482,7 @@ pub fn reset() {
 
 /// Cross-counter reconciliation, run once at dump time (see
 /// `flush_to_stderr`). Catches the double-count bug class the
-/// `fast_probe_outcome_*` counters had (2026-07-25 — a position hash3
+/// `fast_probe_outcome_*` counters had (a position hash3
 /// rescued was charged into BOTH its primary miss/too_short bucket AND its
 /// final accepted/deferred bucket, which ALSO inflated the derived
 /// `fast_positions_processed` sum by the same amount): every check here is

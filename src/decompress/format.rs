@@ -50,11 +50,10 @@ pub(crate) fn is_likely_multi_member(data: &[u8]) -> bool {
     // Scan only the first 16 MiB of compressed data. This catches all
     // realistic multi-member streams: pigz / parallel gzip producers
     // default to ~128 KiB member sizes (~125 members per 16 MiB), and
-    // bgzip is detected upstream via `has_bgzf_markers`. Single-member
-    // files (which never contain a second magic) used to pay a full
-    // O(N) memchr scan against the whole input — measured at +3.80 pp
-    // of total CPU on a 162 MiB silesia fixture vs rapidgzip 0% (the
-    // `scan_detect` band in the 2026-05-19 profile diff).
+    // bgzip is detected upstream via `has_bgzf_markers`. The window avoids
+    // a full O(N) memmem scan of the whole input on single-member files —
+    // a 162 MiB silesia fixture measured that scan at +3.80 pp of total
+    // CPU (rapidgzip pays ~0 for the same detection).
     //
     // Trade-off: a multi-member stream whose SECOND member starts past
     // byte 16 MiB is classified single-member by this scan. This is SAFE

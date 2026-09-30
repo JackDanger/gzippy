@@ -401,7 +401,7 @@ where
                 }
             }
         };
-        // Lever G: do NOT insert into the cache after on-demand fetch.
+        // Do NOT insert into the cache after an on-demand fetch.
         // See note at `try_take_prefetched` — the cache-insert held a
         // second Arc ref forcing the consumer's `Arc::try_unwrap` to
         // fail and deep-clone the ~MB-sized ChunkData. Vendor's cache
@@ -431,13 +431,12 @@ where
                 // consume ("source":"prefetch") or a wasted decode
                 // (no matching cache.get_outcome → discarded by
                 // clear_prefetch_cache at end-of-decode).
-                // Lever G: previously this evicted from prefetch_cache
-                // and PROMOTED a clone into self.cache for "subsequent
-                // gets". The single-pass forward consumer never re-gets
-                // the same key, so the promotion held a redundant Arc
-                // ref that forced the consumer's `Arc::try_unwrap` to
-                // deep-clone (~7ms × 24 chunks). Drop the promote —
-                // just evict from prefetch_cache and return.
+                // No promotion into `self.cache` here: the single-pass
+                // forward consumer never re-gets the same key, so the
+                // promoted clone would hold a redundant Arc ref that
+                // forces the consumer's `Arc::try_unwrap` to deep-clone
+                // (~7ms × 24 chunks). Just evict from prefetch_cache
+                // and return.
                 pc.evict(block_offset);
                 return Some(v);
             }
@@ -1004,7 +1003,8 @@ mod tests {
 
     #[test]
     fn prefetched_block_is_evicted_on_get_without_promotion() {
-        // Lever G (commit 4890e81): the single-pass forward consumer never
+        // No-promotion contract (commit 4890e81): the single-pass forward
+        // consumer never
         // re-gets the same key, so the old prefetch→main-cache PROMOTE held
         // a redundant Arc ref that forced the consumer's `Arc::try_unwrap`
         // to deep-clone (~7ms × 24 chunks). Behavior changed: `get_if_available`
@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(bf.prefetch_cache_size(), 1);
         let v = bf.get_if_available(&200);
         assert_eq!(v, Some("pre-200".into()));
-        // Post-Lever-G: prefetch evicted, main cache NOT populated.
+        // Post-change: prefetch evicted, main cache NOT populated.
         assert_eq!(bf.cache_size(), 0);
     }
 
@@ -1047,14 +1047,14 @@ mod tests {
 
     #[test]
     fn statistics_track_hits_and_prefetch_count() {
-        // Lever G (4890e81): no promotion. The second `get_if_available`
+        // No-promotion contract (commit 4890e81): the second `get_if_available`
         // after the first one drained the prefetch_cache returns None
         // — it's a miss, not a main-cache hit. Statistics still record
         // the original prefetch insertion + the one prefetch hit.
         let bf = new_fetcher();
         bf.insert_prefetched(500, "p".into());
         let _ = bf.get_if_available(&500); // prefetch hit, evicts
-        let _ = bf.get_if_available(&500); // miss (no promotion under Lever G)
+        let _ = bf.get_if_available(&500); // miss (no promotion)
         let snap = bf.statistics.base.snapshot();
         assert!(snap.prefetch_count >= 1);
         assert!(snap.prefetch_cache_hits >= 1);
@@ -1119,10 +1119,11 @@ mod tests {
             .unwrap();
         assert_eq!(v, "prefetched");
         assert!(!dispatched);
-        // Prefetch receiver was consumed. Lever G (4890e81): no promotion
+        // Prefetch receiver was consumed. No-promotion contract (4890e81):
+        // no promotion
         // to main cache — single-pass forward consumer never re-gets the
         // same key, so the prefetch→main-cache promote was holding a
-        // redundant Arc ref. Post-Lever-G, the in-flight receiver is
+        // redundant Arc ref. The in-flight receiver is
         // drained and the result is returned WITHOUT entering main cache.
         assert!(!bf.prefetch_in_flight(&900));
         assert_eq!(bf.cache_size(), 0);

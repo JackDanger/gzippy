@@ -27,18 +27,16 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-// (Removed 2026-06-04, task #8) `MIN_PARALLEL_SIZE`: was a 4 MiB floor below
-// which a C-FFI one-shot decoded small inputs. The ParallelSM pipeline is now
-// the SOLE single-member path at any size (verified byte-exact for tiny /
-// incompressible / stored at T1+T4), so there is no floor and no one-shot FFI
-// fallback. (That pipeline is pure-Rust on gzippy-native; on gzippy-isal its
-// clean tail decodes via ISA-L FFI — see chunk_decode.rs `finish_decode_chunk_impl`.)
-// 1 (was 2, 2026-05-31): the parallel-SM engine is the production path at EVERY
-// thread count (MIN_PARALLEL_SM_THREADS=0, user directive). At num_threads=1 the
-// pool has one worker and the consumer runs on the calling thread (2 OS threads,
-// no worker==consumer deadlock), so the engine runs single-threaded rather than
-// erroring "input below parallel SM minimum (routing bug)". This is what lets us
-// measure the engine we are optimizing at T=1 instead of a libdeflate confound.
+// The ParallelSM pipeline is the SOLE single-member path at any size (verified
+// byte-exact for tiny / incompressible / stored at T1+T4), so there is no input
+// floor and no one-shot C-FFI fallback. (On gzippy-isal its clean tail decodes
+// via ISA-L FFI — see chunk_decode.rs `finish_decode_chunk_impl`.)
+// 1 (not 2): the parallel-SM engine is the production path at EVERY thread
+// count. At num_threads=1 the pool has one worker and the consumer runs on the
+// calling thread (2 OS threads, no worker==consumer deadlock), so the engine
+// runs single-threaded rather than erroring "input below parallel SM minimum
+// (routing bug)". This is what lets us measure the engine we are optimizing at
+// T=1 instead of a libdeflate confound.
 const MIN_THREADS_FOR_PARALLEL: usize = 1;
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -653,14 +651,9 @@ pub static AARCH64_PRESTACK_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 pub static SMALL_OUTPUT_SERIAL_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Production entry point: [`effective_parallel_threads_with`] fed the
-/// selector defaults (with every parallel-selector env knob removed). The former
-/// work-per-thread cap (over-threading guard) and
-/// its `GZIPPY_MIN_BYTES_PER_THREAD` override were REMOVED (2026-07-13): no
-/// nonzero floor is a clean no-regress win across arches
-/// (the movie.mp4 high-T regression it was built for is gone at HEAD; the only
-/// residual over-threading — access.log — already beats rapidgzip), so per the
-/// no-env-vars-in-prod-path rule the cap was deleted rather than baked to a
-/// nonzero default.
+/// selector defaults. This path reads no env overrides, and there is
+/// deliberately no work-per-thread over-threading guard — paired sweeps found
+/// no nonzero floor without a wall regression.
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub(crate) fn effective_parallel_threads(
     gzip_data: &[u8],
@@ -693,12 +686,8 @@ pub(crate) fn effective_parallel_threads(
 ///      repaid, so route serial; at/above it, parallel. High-ratio streams get
 ///      proportionally high crossovers (silesia 3.1 → T3, nasa 9.9 → T10-14,
 ///      software 29.8 → ≥30 i.e. serial at every practical T), which is what
-///      protects the extreme-ratio corpora now that the former T-blind hard
-///      ratio cap (`ratio >= 8 → serial at EVERY T`) is deleted — that cap
-///      pre-empted this selector and forfeited high-T wins.
-/// (A former 3rd guard, the WORK-PER-THREAD CAP over-threading guard, was
-/// removed 2026-07-13 — it was frozen disabled and had no clean job left; see
-/// [`effective_parallel_threads`].)
+///      protects the extreme-ratio corpora without a T-blind hard ratio cap —
+///      such a cap pre-empted this selector and forfeited high-T wins.
 /// ISIZE wrap (>4 GiB output) or near-incompressible (isize<deflate) yields a
 /// low ratio → low/no crossover → keep the requested threads (parallel is
 /// correct there).
@@ -808,9 +797,7 @@ pub(crate) fn effective_parallel_threads_with(
     ]) as u64;
     let deflate_len = deflate_data_len as u64;
 
-    // NOTE (2026-07-05): the former T-BLIND hard ratio cap that lived here
-    // (`if isize >= 8*deflate { return 1 }` at EVERY T, env-controlled)
-    // is DELETED on x86_64. It pre-empted the
+    // x86_64 has NO T-blind hard ratio cap: such a cap pre-empted the
     // T-aware cost-model selector below on every high-ratio stream, forfeiting
     // the parallel wins the selector grants at high T (nasa/bignasa T16 recover
     // large parallel wins with the cap lifted).
@@ -825,11 +812,10 @@ pub(crate) fn effective_parallel_threads_with(
     //
     // aarch64 KEEPS the prestack cap: its cost-model selector is DISABLED
     // (margin 0.0, see [`arch_crossover_margin_default`]) so nothing else would
-    // serialize high-ratio streams there, and the bare deletion REGRESSES Apple
+    // serialize high-ratio streams there, and removing the cap REGRESSES Apple
     // M1 (logs-class and software-class slower at T2/T8). The cap IS
     // aarch64's prestack routing — byte-transparent, knob-free (no env
-    // override; the old ratio-cap env knob is deleted per the
-    // no-env-vars-in-prod-path rule). x86_64 codegen compiles this out.
+    // override). x86_64 codegen compiles this out.
     #[cfg(target_arch = "aarch64")]
     if isize_field >= AARCH64_PRESTACK_RATIO_MAX.saturating_mul(deflate_len) {
         AARCH64_PRESTACK_CAP_APPLIED.fetch_add(1, Ordering::Relaxed);
@@ -899,12 +885,6 @@ pub(crate) fn effective_parallel_threads_with(
         }
     }
 
-    // (A former WORK-PER-THREAD CAP over-threading guard lived here — capping
-    // effective-T so each worker got a minimum of COMPRESSED bytes to amortize
-    // per-chunk serial cost. It was frozen disabled and removed 2026-07-13: at
-    // HEAD the movie.mp4 high-T regression it targeted is gone, and no nonzero
-    // floor is a clean no-regress win across the corpus. See
-    // [`effective_parallel_threads`].)
     num_threads
 }
 
@@ -1306,8 +1286,8 @@ fn map_read_sm_err(
     }
 }
 
-/// T1 fast path for [`crate::decompress::DecodePath::MultiMemberSeq`] (mmiso
-/// 2026-07-06). Decode a plain multi-member gzip stream at parallelization=1
+/// T1 fast path for [`crate::decompress::DecodePath::MultiMemberSeq`]. Decode
+/// a plain multi-member gzip stream at parallelization=1
 /// through the ParallelSM chunk kernel instead of the legacy scalar
 /// `inflate_consume_first_bits` — recovering the located ~3× T1 deficit
 /// (fewer insn/byte and lower RSS than the scalar path).
@@ -1451,11 +1431,10 @@ mod tests {
         v
     }
 
-    /// HIGH-RATIO ROUTING (2026-07-05):
+    /// HIGH-RATIO ROUTING (the [`effective_parallel_threads_with`] contract):
     /// x86_64 — NO T-blind ratio cap: a high-ISIZE-ratio stream is serialized
     /// ONLY below its T-aware crossover (`ceil(ratio × margin)`), never at every
-    /// T. The former hard cap (`ratio >= 8 → 1 thread at EVERY T`) forfeited
-    /// high-T parallel wins and is DELETED there.
+    /// T.
     /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
     /// regresses M1 on logs/software-class at T2).
     /// Neutral params that isolate a SINGLE guard: floor disabled (`min_output=0`),
@@ -1464,13 +1443,9 @@ mod tests {
     const NO_FLOOR: u64 = 0;
     const NO_BONUS_BYTES: u64 = 0;
 
-    /// HIGH-RATIO ROUTING (2026-07-05):
-    /// x86_64 — NO T-blind ratio cap: a high-ISIZE-ratio stream is serialized
-    /// ONLY below its T-aware crossover (`ceil(ratio × margin)`), never at every
-    /// T. The former hard cap (`ratio >= 8 → 1 thread at EVERY T`) forfeited
-    /// high-T parallel wins and is DELETED there.
-    /// aarch64 — the prestack cap REMAINS (selector disabled; removing the cap
-    /// regresses M1 on logs/software-class at T2).
+    /// HIGH-RATIO ROUTING: x86_64 serializes a high-ISIZE-ratio stream ONLY
+    /// below its T-aware crossover (`ceil(ratio × margin)`), never at every T;
+    /// aarch64 keeps the prestack cap.
     ///
     /// Calls [`effective_parallel_threads_with`] directly with an explicit
     /// margin=1.0 (vendor-independent — the production arch default is 1.6 on

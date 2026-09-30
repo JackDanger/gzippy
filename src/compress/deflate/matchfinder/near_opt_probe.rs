@@ -1,9 +1,8 @@
-//! LEVER #2 / d3 PROBE — cheap ordered candidate fill for the near-optimal
-//! parser (feature `near-opt-d3-probe`, DEFAULT OFF).
-//!
-//! Docs/board/sprint-2026-09-25.md, "Lever ledger" row 2: "cheap ordered fill
-//! under the same DP". Agent-27's anatomy puts the near-opt fill's wall where
-//! the bt descent lives: `bt_probe_attempts` 7.3-10M and
+//! d3 PROBE — cheap ordered candidate fill for the near-optimal
+//! parser (feature `near-opt-d3-probe`, DEFAULT OFF; see
+//! `docs/board/sprint-2026-09-25.md`, "cheap ordered fill under the same DP").
+//! The near-opt fill's wall is
+//! where the bt descent lives: `bt_probe_attempts` 7.3-10M and
 //! `bt_child_table_writes` 9.6-12.3M per T4-MiB — the descent loop's
 //! tree-MAINTENANCE writes (one per visited node, plus the pending re-roots)
 //! are paid at every fill/skip byte even when they produce no candidate.

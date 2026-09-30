@@ -5,19 +5,13 @@
 //! `BlockFetcher`-driven dispatch
 //! (vendor/.../core/BlockFetcher.hpp:245-329).
 //!
-//! Cutover (2026-05-17): the previous 1661-line implementation
-//! reimplemented the prefetch ring, the dispatch primitive, and the
-//! cache-hit / take-from-prefetch flow inline in `consumer_loop` —
-//! `BlockFetcher::get` was a thin synchronous wrapper invoked from
-//! inside a closure that did everything. This rewrite reverses that
-//! relationship: `BlockFetcher::get` IS the dispatch primitive (it owns
+//! `BlockFetcher::get` IS the dispatch primitive (it owns
 //! `m_prefetching` per BlockFetcher.hpp:131 and the cache lookup +
 //! prefetch-take + on-demand-submit + insert-into-cache flow per
 //! BlockFetcher.hpp:245-329) and the consumer is ~80 lines of
 //! processNextChunk-shaped orchestration.
 //!
-//! Step 3 (2026-05-17): the `std::thread::scope + Mutex<mpsc::Receiver<Job>>`
-//! worker pool is replaced by the literal port of `rapidgzip::ThreadPool`
+//! The worker pool is the literal port of `rapidgzip::ThreadPool`
 //! (`thread_pool.rs`, vendor/.../core/ThreadPool.hpp:33-248). Decode
 //! tasks AND post-process tasks both submit through the same
 //! `ThreadPool::submit(closure, priority)` returning a `Future<R>`
@@ -707,9 +701,6 @@ fn drive_impl<W: std::io::Write>(
     //   m_cache( std::max( size_t( 16 ), m_parallelization ) )
     //   m_prefetchCache( 2 * m_parallelization )
     //   threadPoolSaturated: m_prefetching.size() + 1 >= m_parallelization
-    // gzippy previously diverged: cache_capacity = pool_size*2 (vendor is
-    // max(16,pool)) and a prefetch-saturation lever with no vendor counterpart.
-    // Both deleted; sizing now matches vendor.
     let cache_capacity = std::cmp::max(16, pool_size);
     let prefetch_capacity = pool_size * 2;
     let block_fetcher: Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>> =
@@ -740,20 +731,19 @@ fn drive_impl<W: std::io::Write>(
     // TRANSLITERATION (vendor BlockFetcher.hpp:185): `m_threadPool( m_parallelization
     // == 1 ? 0 : m_parallelization )`. At a single thread, vendor uses ZERO pool
     // threads so submitted tasks run INLINE (deferred), avoiding a cross-thread
-    // handoff that can't be overlapped. gzippy passed `pool_size` straight through
-    // (one real worker), which made the eager full-scan's apply_window submits pure
-    // overhead at T1. Apply the `==1 ? 0` ONLY at pool construction;
+    // handoff that can't be overlapped (passing `pool_size` straight through —
+    // one real worker — makes the eager full-scan's apply_window submits pure
+    // overhead at T1). Apply the `==1 ? 0` ONLY at pool construction;
     // the cache/prefetch sizing above keeps reading the true `pool_size` (vendor sizes
     // m_prefetchCache off m_parallelization, which stays 1 → 2, not 0).
     let pool_threads = if pool_size == 1 { 0 } else { pool_size };
     // Build the decode pool with an EMPTY pinning map — faithful to rapidgzip's
     // decode pool (`BlockFetcher.hpp:185` constructs the pool with a thread COUNT
-    // only, empty pinning → the OS scheduler places threads). gzippy previously
-    // added speculative worker-pinning (`with_pinning_for_capacity`) rapidgzip
-    // never had; on an SMT box the default `get_core_ids()` cycling order packed
-    // workers onto SMT-sibling logical cores of the same physical core. The
-    // unpinned pool lets the OS spread the workers across distinct
-    // physical cores on its own — so the pinning is deleted.
+    // only, empty pinning → the OS scheduler places threads). Speculative
+    // worker-pinning (`with_pinning_for_capacity`) — which rapidgzip never had —
+    // packed workers onto SMT-sibling logical cores of the same physical core on
+    // SMT boxes; the unpinned pool lets the OS spread the workers across
+    // distinct physical cores on its own.
     let thread_pool = Arc::new(ThreadPool::new(
         pool_threads,
         crate::decompress::parallel::thread_pool::ThreadPinning::new(),
@@ -1164,15 +1154,15 @@ fn consumer_loop<W: std::io::Write>(
                 // Vendor BlockFetcher.hpp:297-299 — `prefetchNewBlocks` runs on
                 // EVERY index-changed `get()`, INCLUDING when the result was
                 // already cached/prefetched: vendor's call sits BEFORE the
-                // cached-result return at BlockFetcher.hpp:302-309. gzippy's
-                // hit path (the partition-keyed take above) previously skipped
-                // it — the dispatch drive only existed on the miss path
-                // (inside `get_with_prefetch`) and in the 1ms blocked-pump
-                // ticks — so during a drain of already-ready prefetched chunks
-                // the dispatcher went COMPLETELY silent, stalling on-demand at
-                // the first un-prefetched partition. Driving here keeps the
-                // prefetch horizon advancing one call per consumed chunk,
-                // exactly like vendor.
+                // cached-result return at BlockFetcher.hpp:302-309. The hit
+                // path (the partition-keyed take above) must drive too, not
+                // just the miss path (inside `get_with_prefetch`) and the
+                // 1ms blocked-pump ticks — during a drain of already-ready
+                // prefetched chunks the dispatcher would otherwise go
+                // COMPLETELY silent, stalling on-demand at the first
+                // un-prefetched partition. Driving here keeps the prefetch
+                // horizon advancing one call per consumed chunk, exactly
+                // like vendor.
                 // Miss-path ordering is untouched: on-demand submit still
                 // precedes the dispatch drive (vendor BlockFetcher.hpp:276
                 // before :297), so the head-of-line task cannot queue behind
@@ -1664,7 +1654,7 @@ fn stop_hint_bit_for(
     total_bits: usize,
     floor: usize,
 ) -> usize {
-    // OVERSHOOT FIX (task #12). `min_gap` rejects a stop-hint candidate too close
+    // OVERSHOOT FIX. `min_gap` rejects a stop-hint candidate too close
     // to `floor` so we don't decode a degenerate tiny chunk. It was `spacing`,
     // which ALSO rejected the next partition boundary P+1 when `floor` is an
     // OVERSHOOT TAIL just past P (gap to P+1 = spacing − overshoot ≈ 0.99·spacing
@@ -3005,7 +2995,7 @@ fn drain_one_pending<W: std::io::Write>(
         total_crc.append(stream_crc);
     }
 
-    // Lever G: do NOT re-insert the consumed chunk into the cache.
+    // Do NOT re-insert the consumed chunk into the cache.
     // Single-pass forward decode never queries the same key twice, so
     // the post-consume re-insert was strictly wasted bookkeeping (and
     // an extra Arc allocation per chunk).
