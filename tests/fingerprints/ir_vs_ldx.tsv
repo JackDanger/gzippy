@@ -22,20 +22,33 @@
 # budget-vs-self tell the same story: the restructure traded Ir (still less
 # than main-before) for the 5.7x/3.25x wall and the size wins.
 # Pinned on host 'runnervmtr4k5' , gzippy @ 104a26b, 2026-09-24.
+# APPEND (2026-09-30, agent-b1, residual-gap campaign): L4/L5 rows added
+# (the residual board's band: access.log L5 T1, data.sqlite L4 T1). Seeded
+# on 'runnervmtr4k5' (x86_64 valgrind, same host class as the re-pin above) at
+# gzippy @ 88a16b6, via the extended generators committed with this file.
+# Same ratchet rules as the header: tighten in the improving PR only.
 fixture	level	ours_ir_per_b	ldx_ir_per_b	margin
 text	1	67.26	55.08	1.222
 text	2	73.92	72.98	1.013
+text	4	87.95	87.03	1.011
+text	5	114.29	113.37	1.009
 text	6	234.75	147.85	1.588
 text	9	456.29	455.39	1.002
 tabular	1	53.69	41.59	1.291
 tabular	2	56.50	55.63	1.016
+tabular	4	63.18	62.32	1.014
+tabular	5	77.12	76.27	1.012
 tabular	6	108.86	87.42	1.246
 tabular	9	369.05	368.23	1.003
 binary	1	87.62	48.47	1.808
 binary	2	75.91	74.67	1.017
+binary	4	79.61	78.38	1.016
+binary	5	84.81	83.58	1.015
 binary	6	125.63	91.28	1.377
 binary	9	263.78	262.57	1.005
 noise	1	117.14	57.42	2.040
 noise	2	98.40	97.69	1.008
+noise	4	98.40	97.69	1.008
+noise	5	99.42	98.70	1.008
 noise	6	131.30	98.70	1.331
 noise	9	119.60	0.075	1.007

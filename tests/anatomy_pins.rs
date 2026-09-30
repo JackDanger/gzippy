@@ -71,8 +71,9 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// The pinned level grid. T1 only (see module doc); T>1 work distribution is
-/// schedule-dependent and is NOT pinned here.
-const LEVELS: &[u32] = &[1, 2, 6, 9];
+/// schedule-dependent and is NOT pinned here. L4/L5 cover the residual
+/// board's band (the access.log L5 / data.sqlite L4 T1 cards).
+const LEVELS: &[u32] = &[1, 2, 4, 5, 6, 9];
 
 const REGEN_CMD: &str =
     "UPDATE_ANATOMY_PINS=1 cargo test --release --test anatomy_pins --features anatomy-counters";
@@ -233,7 +234,7 @@ fn tsv_header() -> String {
      # zero bytes and never reads this file.\n\
      # Scope: T1 ONLY (in-process encode_gzip_bytes_to_vec, the production T1\n\
      # entry point). T>1 work distribution is schedule-dependent and unpinned.\n\
-     # Grid: src/fixtures.rs synthetic fixtures x levels {1, 2, 6, 9}.\n\
+     # Grid: src/fixtures.rs synthetic fixtures x levels {1, 2, 4, 5, 6, 9}.\n\
      #\n\
      # Counters are a calibrated wall proxy ONLY after per-arch calibration:\n\
      # a measured -27% write-count moved wall 0%, while a -21% Ir moved wall\n\
