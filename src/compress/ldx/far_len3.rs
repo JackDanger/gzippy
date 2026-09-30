@@ -160,3 +160,39 @@ impl FarLen3Gate {
         !self.any_open
     }
 }
+
+// ⚠ PROBE (2026-09-30, the residual board's access.log L5 card;
+// `GZIPPY_LDX_MIN3=1` under the `ladder-tune` feature, compiled out of every
+// shipped build). The probe's len-3 candidates come from a bounded backward
+// scan in the lazy parser's no-match path and are priced through this gate.
+// One bootstrap asymmetry had to be broken for the gate to open at L5 at all:
+// `deflate_begin_sequences` resets the block frequencies, and the recalc'd
+// min-match floor keeps every block here emitting zero len-3 of its own, so
+// the real `f_len3` stays 0 and plain [`FarLen3Gate::recalc`] stays INERT
+// forever — the first cost-winning arc could never be emitted. While a block
+// holds no observed len-3 of its own, `recalc_probe` prices len-3 at the
+// block's observed len-4 mass (the nearest content-derived proxy for the
+// block's short-arc economy); the first real len-3 emission re-enters the
+// exact `recalc` numbers. The shipped L3 row calls `recalc` only and is
+// untouched, as is every shipped build (this impl is feature-cfg'd out).
+#[cfg(feature = "ladder-tune")]
+impl FarLen3Gate {
+    /// [`FarLen3Gate::recalc`], bootstrapped for the L5 len-3 scan probe.
+    pub(super) fn recalc_probe(freqs: &DeflateFreqs, margin_eighth_bits: u32) -> Self {
+        if freqs.litlen[DEFLATE_FIRST_LEN_SYM as usize] > 0 {
+            // The block carries len-3 evidence of its own: exact shipped
+            // numbers.
+            return Self::recalc(freqs, margin_eighth_bits);
+        }
+        // Length 4 is length slot 1 (`DEFLATE_LENGTH_SLOT[4] == 1`).
+        let f_len4 = freqs.litlen[DEFLATE_FIRST_LEN_SYM as usize + 1];
+        if f_len4 == 0 {
+            // No len-4 evidence either: the plain recalc (INERT here), so the
+            // gate never opens on an evidence-free block.
+            return Self::recalc(freqs, margin_eighth_bits);
+        }
+        let mut seeded = freqs.clone();
+        seeded.litlen[DEFLATE_FIRST_LEN_SYM as usize] = f_len4;
+        Self::recalc(&seeded, margin_eighth_bits)
+    }
+}

@@ -216,6 +216,16 @@ pub(crate) fn deflate_compress_lazy_generic(
     let mut nice_len: u32 = core::cmp::min(nice_match_length, max_len);
     let mut next_hashes: [u32; 2] = [0, 0];
 
+    // ⚠ PROBE (2026-09-30, the residual board's access.log L5 card; the
+    // `ladder-tune` feature, compiled out of shipped builds):
+    // `GZIPPY_LDX_MIN3=1` arms the optional len-3 head scan in the no-match
+    // path below plus the seed-bootstrapped gate recalc. Parsed ONCE per
+    // invocation — unlike the `GZIPPY_LDX_MIN` re-reads further down, this
+    // knob's call site sits on the per-position literal path, so the env
+    // read must not run per position.
+    #[cfg(feature = "ladder-tune")]
+    let min3_probe = std::env::var("GZIPPY_LDX_MIN3").ok().as_deref() == Some("1");
+
     // L3 split-hold state (inert unless sparse_split_guard_mul > 0).
     let mut blocks_completed = 0u32;
     let mut split_hold_latched = false;
@@ -282,7 +292,22 @@ pub(crate) fn deflate_compress_lazy_generic(
             // Refresh the far-len-3 gate on the same cadence (legacy `lazy.rs`).
             if in_next >= next_recalc_far_len3 {
                 if far_len3_gate {
-                    far_len3 = FarLen3Gate::recalc(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS);
+                    // ⚠ PROBE [ladder-tune, GZIPPY_LDX_MIN3=1]: the
+                    // seed-bootstrapped recalc (see `far_len3.rs`) lets the
+                    // gate open on a block that has emitted no len-3 of its
+                    // own yet; probe-off builds take the exact shipped recalc.
+                    #[cfg(feature = "ladder-tune")]
+                    {
+                        far_len3 = if min3_probe {
+                            FarLen3Gate::recalc_probe(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS)
+                        } else {
+                            FarLen3Gate::recalc(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS)
+                        };
+                    }
+                    #[cfg(not(feature = "ladder-tune"))]
+                    {
+                        far_len3 = FarLen3Gate::recalc(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS);
+                    }
                 }
                 next_recalc_far_len3 +=
                     core::cmp::min(in_end - next_recalc_far_len3, in_next - in_block_begin);
@@ -339,11 +364,49 @@ pub(crate) fn deflate_compress_lazy_generic(
             {
                 // No match found. Choose a literal.
                 debug_assert!(in_next < r#in.len());
-                let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
-                in_next += 1;
-                deflate_choose_literal(c, lit, true, unsafe {
-                    p.sequences.get_unchecked_mut(seq_idx)
-                });
+
+                // ⚠ PROBE (2026-09-30, the residual board's access.log L5
+                // card; `ladder-tune` + `GZIPPY_LDX_MIN3=1`, compiled out of
+                // shipped builds). This is the h4 matcher's hopeless
+                // position — `cur_offset == 0` means the search returned no
+                // candidate at all. The scan consults the nearest TRUE
+                // 3-byte match within a bounded window and prices it through
+                // the running far-len-3 gate; allowed -> emit the token.
+                // Positions that DID return a real, just-too-short candidate
+                // (`cur_offset != 0`) keep the shipped literal — the
+                // ungated-near-len-3 pattern that cost bytes in the
+                // `GZIPPY_LDX_MIN=3` reading stays out of this probe.
+                #[cfg(feature = "ladder-tune")]
+                let probe_handled = min3_probe
+                    && far_len3_gate
+                    && in_end - in_next >= DEFLATE_MIN_MATCH_LEN as usize
+                    && lz3_probe_emit(
+                        c,
+                        p,
+                        r#in,
+                        in_next,
+                        in_end,
+                        &mut in_cur_base,
+                        &mut next_hashes,
+                        &mut seq_idx,
+                        &far_len3,
+                    );
+                #[cfg(not(feature = "ladder-tune"))]
+                let probe_handled = false;
+
+                if probe_handled {
+                    // The token consumed this position and the two after it.
+                    // This position was inserted by the matcher call above;
+                    // the helper's skip call inserted the two inside-match
+                    // positions and advanced `next_hashes` / `in_cur_base`.
+                    in_next += DEFLATE_MIN_MATCH_LEN as usize;
+                } else {
+                    let lit = unsafe { *r#in.get_unchecked(in_next) } as usize;
+                    in_next += 1;
+                    deflate_choose_literal(c, lit, true, unsafe {
+                        p.sequences.get_unchecked_mut(seq_idx)
+                    });
+                }
             } else {
                 in_next += 1;
 
@@ -533,6 +596,99 @@ pub(crate) fn deflate_compress_lazy_generic(
     }
 }
 
+// === The L5 len-3 head-scan probe (ladder-tune only) ==========================
+
+/// The probe's backward-scan window cap (bytes behind the hopeless position)
+/// per the card's "try <= 8 KiB first, make the window a constant".
+#[cfg(feature = "ladder-tune")]
+const LZ3_PROBE_SCAN_WINDOW: usize = 8192;
+
+/// Nearest-first backward scan for a TRUE 3-byte match: returns the distance
+/// to the closest one within [`LZ3_PROBE_SCAN_WINDOW`], or 0 when none. The
+/// first byte is the cheap per-candidate filter; all three bytes are verified,
+/// so every distance returned denotes a real match the emitter can price.
+///
+/// SAFETY (unchecked loads): the call site proves `pos + 2 < in_end` before
+/// this helper runs, and `q <= pos - 1` gives `q + 2 < in_end`, so every
+/// indexed byte is within the input extent.
+#[cfg(feature = "ladder-tune")]
+#[inline(always)]
+fn lz3_probe_nearest_offset(r#in: &[u8], pos: usize, s0: u8, s1: u8, s2: u8) -> u32 {
+    let mut back = 1usize;
+    while back <= LZ3_PROBE_SCAN_WINDOW && back <= pos {
+        let q = pos - back;
+        if unsafe { *r#in.get_unchecked(q) } == s0
+            && unsafe { *r#in.get_unchecked(q + 1) } == s1
+            && unsafe { *r#in.get_unchecked(q + 2) } == s2
+        {
+            return back as u32;
+        }
+        back += 1;
+    }
+    0
+}
+
+/// ⚠ PROBE (2026-09-30, the residual board's access.log L5 card;
+/// `ladder-tune` + `GZIPPY_LDX_MIN3=1`, compiled out of shipped builds).
+///
+/// At the lazy parser's hopeless position (`pos`, where the h4 matcher found
+/// NO candidate at all): find the nearest true len-3 match in the window and
+/// price the arc through the running [`FarLen3Gate`]. Allowed -> emit the
+/// len-3 token and return true; refused or absent -> false, and the caller
+/// emits the shipped literal unchanged.
+///
+/// The emission mirrors the parser's own `cur_len >= nice_len` match tail:
+/// a match just found at `pos` closes one sequence, and the skip call inserts
+/// the two INSIDE-match positions (`pos + 1`, `pos + 2`) so the matcher's next
+/// search at `pos + 3` starts from a complete table, with `next_hashes` and
+/// `in_cur_base` advanced exactly as that tail leaves them. The caller then
+/// advances its `in_next` by `DEFLATE_MIN_MATCH_LEN`.
+#[cfg(feature = "ladder-tune")]
+#[allow(clippy::too_many_arguments)]
+fn lz3_probe_emit(
+    c: &mut Compressor,
+    p: &mut GreedyState,
+    r#in: &[u8],
+    pos: usize,
+    in_end: usize,
+    in_cur_base: &mut usize,
+    next_hashes: &mut [u32; 2],
+    seq_idx: &mut usize,
+    far_len3: &FarLen3Gate,
+) -> bool {
+    if far_len3.inert() {
+        // The closed gate refuses every arc: skip the scan entirely.
+        return false;
+    }
+    // The three literals the arc would replace. The call site proved
+    // `pos + 2 < in_end`.
+    let s0 = unsafe { *r#in.get_unchecked(pos) };
+    let s1 = unsafe { *r#in.get_unchecked(pos + 1) };
+    let s2 = unsafe { *r#in.get_unchecked(pos + 2) };
+    let offset = lz3_probe_nearest_offset(r#in, pos, s0, s1, s2);
+    if offset == 0 || !far_len3.allows(offset, s0, s1, s2) {
+        return false;
+    }
+    deflate_choose_match(
+        c,
+        DEFLATE_MIN_MATCH_LEN,
+        offset,
+        true,
+        &mut p.sequences,
+        seq_idx,
+    );
+    hc_matchfinder_skip_bytes(
+        &mut p.hc_mf,
+        r#in,
+        in_cur_base,
+        pos + 1,
+        in_end,
+        DEFLATE_MIN_MATCH_LEN - 1,
+        next_hashes,
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,5 +862,95 @@ mod tests {
         let l9 = compress_at(9, &data).len();
         assert!(l8 <= l7, "lazy2 L8 ({l8}) is worse than lazy L7 ({l7})");
         assert!(l9 <= l8, "L9 ({l9}) is worse than L8 ({l8})");
+    }
+
+    /// The LZ3 probe's scan must agree with a brute-force oracle at every
+    /// sampled position: only TRUE matches, nearest-first, 0 on misses — and
+    /// the planted/pinned cases must surface (distance-1 overlap wins; a
+    /// distance-90 plant is reported as exactly 90).
+    #[cfg(feature = "ladder-tune")]
+    #[test]
+    fn lz3_probe_scan_returns_the_nearest_true_trigram() {
+        let mut state: u32 = 0xC0FF_EE01;
+        let mut buf: Vec<u8> = Vec::new();
+        for _ in 0..30_000 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(41);
+            buf.push((state >> 24) as u8);
+        }
+
+        // Brute-force oracle: nearest true trigram within a 4096 bound (below
+        // the probe's window cap, so the cap cannot win the tie either way).
+        let oracle = |buf: &[u8], pos: usize| -> u32 {
+            for back in 1..=4096.min(pos) {
+                if buf[pos - back] == buf[pos]
+                    && buf[pos - back + 1] == buf[pos + 1]
+                    && buf[pos - back + 2] == buf[pos + 2]
+                {
+                    return back as u32;
+                }
+            }
+            0
+        };
+        for pos in [128usize, 5_000, 17_333, buf.len() - 3] {
+            assert_eq!(
+                lz3_probe_nearest_offset(&buf, pos, buf[pos], buf[pos + 1], buf[pos + 2]),
+                oracle(&buf, pos),
+                "oracle divergence at pos={pos}"
+            );
+        }
+
+        // Overlap arc: probe from INSIDE the run (the bytes one behind start
+        // the same run), so the nearest true trigram is distance 1 regardless
+        // of the random prefix.
+        let run_pos = buf.len();
+        buf.extend_from_slice(b"AAAAAAAA");
+        assert_eq!(
+            lz3_probe_nearest_offset(&buf, run_pos + 4, b'A', b'A', b'A'),
+            1,
+            "a distance-1 overlap arc must be found nearest-first"
+        );
+
+        // Planted trigram exactly 90 behind its probe position, with no nearer
+        // occurrence anywhere in the buffer that this deterministic data
+        // guarantees.
+        let plant = buf.len() + 95;
+        buf.resize(plant + 3, 0);
+        let wanted = [b'Q', b'Z', 0x07];
+        buf[plant - 90] = wanted[0];
+        buf[plant - 89] = wanted[1];
+        buf[plant - 88] = wanted[2];
+        assert_eq!(
+            lz3_probe_nearest_offset(&buf, plant, wanted[0], wanted[1], wanted[2]),
+            90,
+            "the planted trigram must be reported at its planted distance"
+        );
+    }
+
+    #[cfg(feature = "ladder-tune")]
+    #[test]
+    fn lz3_probe_scan_respects_the_window_cap() {
+        // (i % 251) filler: no accidental occurrence of the probe trigram,
+        // which is not a consecutive i%251 run.
+        let pos = LZ3_PROBE_SCAN_WINDOW + 10;
+        let mut buf = vec![0u8; pos + 3];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        // A true match whose START is one byte past the cap: out of window.
+        let past = pos - LZ3_PROBE_SCAN_WINDOW - 1;
+        buf[past] = 0xEE;
+        buf[past + 1] = 0xDD;
+        buf[past + 2] = 0xCC;
+        assert_eq!(lz3_probe_nearest_offset(&buf, pos, 0xEE, 0xDD, 0xCC), 0);
+
+        // The same trigram with its start AT the cap: in window, reported.
+        let at_cap = pos - LZ3_PROBE_SCAN_WINDOW;
+        buf[at_cap] = 0xEE;
+        buf[at_cap + 1] = 0xDD;
+        buf[at_cap + 2] = 0xCC;
+        assert_eq!(
+            lz3_probe_nearest_offset(&buf, pos, 0xEE, 0xDD, 0xCC),
+            LZ3_PROBE_SCAN_WINDOW as u32
+        );
     }
 }
