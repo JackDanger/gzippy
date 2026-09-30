@@ -21,6 +21,23 @@ use super::{
     DEFLATE_NUM_PRECODE_SYMS, MAX_LITLEN_CODEWORD_LEN, MAX_OFFSET_CODEWORD_LEN,
 };
 
+/// Literal codewords per flush on the emit loop's fast path.
+///
+/// C: the fixed 4 pinned by `CAN_BUFFER(4 * MAX_LITLEN_CODEWORD_LEN)` at the
+/// literal-run emitter: on the 64-bit buffer 4 worst-case literals
+/// (4×14 = 56; 7 + 56 = 63 = `BITBUF_NBITS`) is the MAXIMUM batch — the
+/// geometry the C hard-coded. The `ladder-tune` u128 accumulator widens
+/// `bitstream::BitbufT`, and the SAME formula then admits 8
+/// (8×14 = 112; 7 + 112 = 119 ≤ 127): the worst-symbol block bound that barred
+/// batch widening WITHIN 64 bits (`anatomy_counters.rs`'s `emit_body_bits` /
+/// `bitstream_flush_word_calls` note, 2026-07-22) is met outright, so the batch
+/// capacity doubles where literal runs are long enough to spend it. Shipped
+/// (no-feature) builds compile the C's 4 bit-for-bit.
+#[cfg(feature = "ladder-tune")]
+const LITERAL_FLUSH_BATCH: u32 = 8;
+#[cfg(not(feature = "ladder-tune"))]
+const LITERAL_FLUSH_BATCH: u32 = 4;
+
 /// C: `#define SEQ_LENGTH_SHIFT 23` (:366)
 pub(crate) const SEQ_LENGTH_SHIFT: u32 = 23;
 /// C: `#define SEQ_LITRUNLEN_MASK (((u32)1 << SEQ_LENGTH_SHIFT) - 1)` (:367)
@@ -171,8 +188,9 @@ pub(crate) fn deflate_flush_block(
                     );
                 }
                 // `bitcount & ~7` is why BITBUF_NBITS is one less than the word
-                // width: it caps the shift at 56, never the full 64 (which is UB in
-                // C and a panic in Rust).
+                // width: it caps the shift at 8*WORDBYTES - 8 — 56 on the 64-bit
+                // buffer, 120 under the ladder-tune u128 accumulator — never the
+                // full width (which is UB in C and a panic in Rust).
                 bitbuf >>= bitcount & !7;
                 out_next += (bitcount >> 3) as usize;
                 bitcount &= 7;
@@ -435,9 +453,14 @@ pub(crate) fn deflate_flush_block(
 
         // Output the lengths of the codewords in the precode.
         if can_buffer(3 * (DEFLATE_NUM_PRECODE_SYMS as u32 - 1)) {
-            // A 64-bit bitbuffer is just one bit too small to hold the maximum number
-            // of precode lens, so to minimize flushes we merge one len with the
-            // previous fields.
+            // C's comment: "A 64-bit bitbuffer is just one bit too small to hold
+            // the maximum number of precode lens, so to minimize flushes we
+            // merge one len with the previous fields." The port's 19-symbol
+            // precode makes that test true on the 64-bit buffer outright
+            // (61 <= 63), and the same formula vs the ladder-tune u128
+            // accumulator keeps it true, so this merged form is the shape on
+            // every width this crate compiles for — the widening does not
+            // re-group this branch.
             let mut precode_sym = DEFLATE_PRECODE_LENS_PERMUTATION[0] as usize;
             add_bits!(unsafe { *c.o_precode.lens.get_unchecked(precode_sym) }, 3);
             flush_bits!();
@@ -538,9 +561,9 @@ pub(crate) fn deflate_flush_block(
             let length = seq.litrunlen_and_length >> SEQ_LENGTH_SHIFT;
 
             // Output a run of literals.
-            if can_buffer(4 * MAX_LITLEN_CODEWORD_LEN as u32) {
-                while litrunlen >= 4 {
-                    for _ in 0..4 {
+            if can_buffer(LITERAL_FLUSH_BATCH * MAX_LITLEN_CODEWORD_LEN as u32) {
+                while litrunlen >= LITERAL_FLUSH_BATCH {
+                    for _ in 0..LITERAL_FLUSH_BATCH {
                         debug_assert!(in_next < block_begin.len());
                         let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
                         in_next += 1;
@@ -550,12 +573,15 @@ pub(crate) fn deflate_flush_block(
                         );
                     }
                     flush_bits!();
-                    litrunlen -= 4;
+                    litrunlen -= LITERAL_FLUSH_BATCH;
                 }
                 // C: `if (litrunlen-- != 0) { ... }` — a post-decrement chain that
                 // emits 1, 2 or 3 trailing literals and flushes ONCE. Rewriting it as
                 // a loop with a flush per literal is valid DEFLATE and different
-                // codegen; the single flush is the point.
+                // codegen; the single flush is the point. On the ladder-tune u128
+                // batch the remainder can reach 7, so the third literal's arm can
+                // spill into the gated loop below — same adds IN ORDER, same
+                // single flush, so the emitted bits are the C's chain's bits.
                 if litrunlen != 0 {
                     litrunlen -= 1;
                     debug_assert!(in_next < block_begin.len());
@@ -582,6 +608,21 @@ pub(crate) fn deflate_flush_block(
                                 unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
                                 unsafe { *chosen.lens.litlen.get_unchecked(lit) }
                             );
+                            // Unreached on a shipped (64-bit / 32-bit) width: the
+                            // remainder above is at most 3 literals there. Compiled
+                            // only against the u128 batch, where up to 4 more
+                            // trailing literals are still pending.
+                            #[cfg(feature = "ladder-tune")]
+                            while litrunlen > 1 {
+                                litrunlen -= 1;
+                                debug_assert!(in_next < block_begin.len());
+                                let lit = unsafe { *block_begin.get_unchecked(in_next) } as usize;
+                                in_next += 1;
+                                add_bits!(
+                                    unsafe { *chosen.codewords.litlen.get_unchecked(lit) },
+                                    unsafe { *chosen.lens.litlen.get_unchecked(lit) }
+                                );
+                            }
                         }
                     }
                     flush_bits!();

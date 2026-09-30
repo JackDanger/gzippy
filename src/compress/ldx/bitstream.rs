@@ -26,7 +26,31 @@
 /// The type for the bitbuffer variable, which temporarily holds bits that are being
 /// packed into bytes and written to the output buffer. For best performance, this
 /// should have size equal to a machine word.
+///
+/// # The u128 accumulator (MEASUREMENT-ONLY, `ladder-tune`)
+///
+/// Under `ladder-tune` the accumulator widens to `u128` — two 64-bit registers
+/// (aarch64 `ldp`/`stp` pairs) or `shld`/`shrd` pairs (x86) — lifting
+/// [`BITBUF_NBITS`] 63→127. This is NOT the falsified 2026-07-22 batch-widening:
+/// that experiment tried to widen a flush batch **within** the 64-bit buffer and
+/// failed because the bound is set by a block's WORST single symbol
+/// (`anatomy_counters.rs` `emit_body_bits`/`bitstream_flush_word_calls` note).
+/// A wider accumulator is a different lever the same counters kept open: every
+/// worst-case flush group the C's `CAN_BUFFER` glue branches on must fit the
+/// widened form or it is not compile-time-true, and the only group the 64-bit
+/// buffer pinned at its ceiling was the 4-literal batch (4×14 + 7 = 63).
+///
+/// Byte identity is by CONSTRUCTION, not by check: the buffer holds an LSB-first
+/// bit string; every flush advances `bitcount >> 3` whole bytes off its low end
+/// and keeps `bitcount & 7` bits, so the sequence of bytes that reaches the
+/// output is independent of WHERE between symbols flushes are taken. Shipped
+/// builds keep the C's `machine_word_t` bit for bit — the feature is a
+/// measurement build (docs/board/sprint-2026-09-25.md, the cadence card whose
+/// +18.8% wall quote this lever is priced against).
+#[cfg(not(feature = "ladder-tune"))]
 pub(crate) type BitbufT = usize;
+#[cfg(feature = "ladder-tune")]
+pub(crate) type BitbufT = u128;
 
 /// C: `#define WORDBYTES sizeof(machine_word_t)`
 pub(crate) const WORDBYTES: usize = core::mem::size_of::<BitbufT>();
@@ -92,10 +116,32 @@ mod tests {
 
     /// The `CAN_BUFFER` answers that `deflate_flush_block` branches on. On a 64-bit
     /// target every one of them is true, which is why the C's fast paths are taken;
-    /// pinning them documents WHICH shape we are actually compiling.
+    /// pinning them documents WHICH shape we are actually compiling. The
+    /// `ladder-tune` u128 accumulator compiles the SAME test points on the widened
+    /// buffer, where every worst-case group the glue branches on fits outright.
     #[test]
     fn can_buffer_answers_on_this_target() {
-        if WORDBYTES == 8 {
+        if WORDBYTES == 16 {
+            // The u128 lever: everything the 64-bit build pinned as its exact
+            // ceiling is now true with room to spare, flush frequencies fall
+            // only where flush.rs re-groups against the new const bound.
+            assert_eq!(BITBUF_NBITS, 127);
+            // A litlen codeword (max 14) plus its extra length bits (max 5).
+            assert!(can_buffer(14 + 5));
+            // A whole match: litlen + extra len + offset codeword + extra offset.
+            assert!(can_buffer(14 + 5 + 15 + 13));
+            // Four literals — one bit AT the 63-bit ceiling before, loose now.
+            assert!(can_buffer(4 * 14));
+            // The batch the within-64-bit falsification could not admit.
+            assert!(can_buffer(8 * 14));
+            // 18 of the 19 precode lengths merged with the preceding header
+            // fields, and even the 19th — false on the 64-bit buffer.
+            assert!(can_buffer(3 * 18));
+            assert!(can_buffer(3 * 19));
+            // The C's formula admits nothing past `BITBUF_NBITS - 7` bits.
+            assert!(can_buffer(127 - 7));
+            assert!(!can_buffer(127 - 6));
+        } else if WORDBYTES == 8 {
             assert_eq!(BITBUF_NBITS, 63);
             // A litlen codeword (max 14) plus its extra length bits (max 5).
             assert!(can_buffer(14 + 5));
