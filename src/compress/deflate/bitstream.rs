@@ -30,13 +30,13 @@ pub struct BitWriter {
     out: Vec<u8>,
 }
 
-// LAYOUT IS LOAD-BEARING (bisect receipt, 2026-08-03). This struct sits on the
-// T1 hot path at every level, and the first bit-splice substrate added an
+// LAYOUT IS LOAD-BEARING (bisect-verified). This struct sits on the
+// T1 hot path at every level, and an earlier bit-splice substrate added an
 // `align_sensitive: bool` field here plus a store in `align_to_byte()`. That
 // alone — with the splicer never running — moved armexe.elf L1/T1 from ratio
-// 0.576 to 0.615 wall vs gzip on the frozen Zen2 box (3-arm bisect: pristine
-// main / substrate-only / full branch = 0.576 / 0.615 / 0.612; fulcrum ab
-// paired n=25, artifacts solvency:/root/bs2-*.json). Binary-class files (dense
+// 0.576 to 0.615 wall vs gzip on Zen2 (3-arm bisect: pristine
+// main / substrate-only / full branch = 0.576 / 0.615 / 0.612). Binary-class
+// files (dense
 // short matches, the most emit calls per byte) pay the most. Stored-block
 // detection for the T>1 splicer therefore lives OFF this struct — a
 // thread-local in `deflate::mod` set by the two cold stored-block emitters —
@@ -231,7 +231,7 @@ impl BitWriter {
     /// Pad with zero bits up to the next byte boundary and flush.
     ///
     /// Correctness note (found while porting `parse::ultra`'s stored-block
-    /// emitter onto this writer, 2026-07-20): an earlier version computed
+    /// emitter onto this writer): an earlier version computed
     /// `pad = (8 - (bitcount & 7)) & 7` and added it to `bitcount` BEFORE
     /// flushing. For any incoming `bitcount` in `57..=63` that lands
     /// EXACTLY on `bitcount + pad == 64`, and `flush_bits`'s
@@ -540,25 +540,18 @@ impl BitSplicer {
         let mut carry = self.pending;
         // Word-wise shift: 8 bytes per iteration through a u64 lane. The v1
         // byte-at-a-time loop serialized megabytes of single-byte work on the
-        // writer thread's critical path — adjudicated as the confirmed
-        // pigz:tool.bin:L4:T4 wall flip (0.9815 -> 1.0129, 22 MB output,
-        // corpus tool.bin; try.json in lever-origin-lever-t4-bitsplice).
+        // writer thread's critical path (a confirmed pigz:tool.bin:L4:T4 wall
+        // flip, 0.9815 -> 1.0129, 22 MB output).
         // Little-endian u64 keeps DEFLATE's LSB-first order: within the lane,
         // byte k's low bits receive byte k-1's high bits, exactly as the
         // byte loop did; the lane's top `inv` bits carry into the next lane.
         // clippy 1.98 `chunks_exact_to_as_chunks` suggests `as_chunks::<8>()`.
-        // NOT taken here: this is the adjudicated bit-writer hot path (see the
-        // wall-flip receipt above), `as_chunks` returns a different shape
-        // (`(&[[u8;8]], &[u8])`) so the carry/remainder handling is not a
-        // mechanical swap, and CLAUDE.md hard stop 4 says a hot-loop rewrite must
-        // show the counter moving. Convert it as a MEASURED change or not at all.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        // clippy 1.98 `chunks_exact_to_as_chunks` suggests `as_chunks::<8>()`.
-        // NOT taken: this is the adjudicated bit-writer hot path (wall-flip
-        // receipt above); `as_chunks` returns `(&[[u8;8]], &[u8])`, a different
-        // shape, so the carry/remainder handling is not a mechanical swap, and
-        // CLAUDE.md hard stop 4 wants a counter before a hot-loop rewrite.
-        // `unknown_lints` is required for toolchains older than 1.98.
+        // NOT taken: this is the hot bit-writer path and `as_chunks` returns
+        // a different shape (`(&[[u8;8]], &[u8])`), so the carry/remainder
+        // handling is not a mechanical swap; a hot-loop rewrite must show a
+        // counter moving (CLAUDE.md hard stop 4). Convert it as a MEASURED
+        // change or not at all. `unknown_lints` is required for toolchains
+        // older than 1.98.
         #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
         let mut chunks = data.chunks_exact(8);
         for ch in &mut chunks {
@@ -898,7 +891,7 @@ mod tests {
 
     #[test]
     fn align_to_byte_handles_all_bitcounts_up_to_63() {
-        // Regression test for a real bug found 2026-07-20 while porting
+        // Regression test for a real bug found while porting
         // `parse::ultra`'s stored-block emitter onto this writer: for any
         // incoming `bitcount` in 57..=63, the OLD `align_to_byte`
         // (`pad = (8 - (bitcount & 7)) & 7; bitcount += pad; flush_bits()`)
@@ -1027,12 +1020,11 @@ mod tests {
     }
 }
 
-/// The seam the campaign actually depends on: a fragment ending UNALIGNED
+/// The seam the T>1 splicer depends on: a fragment ending UNALIGNED
 /// (3 live bits) whose successor fragment is a REAL stored block carrying
 /// data (not the opaque-tail test above). The splicer must emit the
 /// empty-stored sync seam BEFORE the stored fragment so the decoder reads
-/// LEN/NLEN byte-aligned — the exact byte expectation was derived by
-/// codex's review of the structure slice; before this test existed, a
+/// LEN/NLEN byte-aligned. Before this test existed, a
 /// seam regression would have decoded garbage that neither the fixtures
 /// (single-chunk) nor the opaque-tail seam test could see.
 #[test]

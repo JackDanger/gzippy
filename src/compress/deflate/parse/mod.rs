@@ -33,24 +33,13 @@ use super::tables::{
 };
 
 mod fast;
-// L1-band ratio-close-out config-space search (2026-07-22 campaign, `l1-tune`
-// Cargo feature, OFF by default): re-export `fast::tune` publicly ONLY under
-// the feature so `examples/l1_search.rs` (a separate binary crate depending
-// on this lib through its public API) can call `tune::set`/`get` to sweep
-// configs within one process. `fast` itself stays private in the default
-// build — this re-export is the sole surface the search tool needs.
+// `l1-tune` Cargo feature, OFF by default: re-export `fast::tune` publicly
+// ONLY under the feature so the config-space search driver can reach
+// `tune::set`/`get` through this lib's public API within one process. `fast`
+// itself stays private in the
+// default build — this re-export is the sole surface the search tool needs.
 #[cfg(feature = "l1-tune")]
 pub use fast::tune;
-// DELETED 2026-07-27 by user order: `gated.rs`, the detector-gated lazy-L3 parser.
-// A nine-line doc comment for it survived here until 2026-07-30, dangling on `mod
-// greedy;` and still advertising `GZIPPY_L3TUNE_GATE_*` env vars plus "a `--tune`-style
-// channel + `fulcrum l3search`" as "a real, named, un-taken next step". Both are
-// forbidden: `CLAUDE.md` non-negotiable #3 bans env-var knobs and content detectors
-// choosing a parser, and `fulcrum l1search` was deleted as constitutionally banned.
-//
-// Recorded because a retraction that does not reach every statement of the thing gets
-// re-inherited by the next session that reads the file. A stale comment proposing
-// forbidden work is not inert documentation; it is an instruction.
 mod far_len3;
 mod greedy;
 /// PROPOSER-RECALL instrument for the block-split heuristic. OFF by default;
@@ -91,7 +80,7 @@ pub mod near_opt_flush_probe {
     }
     /// Test-only latch/wiper for the guard's FALLBACK half (a real flip is
     /// corpus-dependent and the measured zero-flip finding says it never
-    /// fires on the campaign corpora; this proves what happens to chunks
+    /// fires on any bench corpus; this proves what happens to chunks
     /// AFTER a latch).
     #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
     pub fn set_stale_flag_for_tests(v: bool) {
@@ -121,9 +110,9 @@ pub mod near_opt_d3_probe {
     }
 }
 
-/// Test/observability handle for the bt PROBE-BUDGET lever (LEVER #4 / bt,
-/// feature `near-opt-bt-probebudget`, which sits IN the default feature set
-/// since the 2026-09-27 promotion — this module IS part of the shipped
+/// Test/observability handle for the bt PROBE-BUDGET (feature
+/// `near-opt-bt-probebudget`, in the default feature set — this module is
+/// part of the shipped
 /// library API). Same measurement-surface precedent as `near_opt_d3_probe`
 /// above: the L9-T4 probe's budget arms (24/48/96/150) all live in ONE
 /// binary through this knob; no production call site picks an encode route
@@ -146,7 +135,7 @@ pub mod near_opt_probebudget {
 }
 /// Level-1 parser over the 2-way hash-table matchfinder — libdeflate's
 /// `deflate_compress_fastest`. See its module doc for the vendor diff and the
-/// REOPEN it rests on.
+/// synthesis-lever rationale.
 #[allow(dead_code)]
 mod ht_fast;
 mod lazy;
@@ -619,12 +608,11 @@ pub(super) fn compress(
             fast::LazyPeekCostGateCfg::DISABLED,
             budget,
         ),
-        // `l1-tune` (2026-07-22 L1-band search campaign, OFF by default):
-        // block length and insert-depth are already plain runtime params to
-        // `fast::run`, so overriding them for the search is just swapping
-        // the two consts below for the env-var-backed tune values here — no
-        // change to `fast::run`'s signature needed. Byte-identical to the
-        // `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
+        // `l1-tune`: block length and insert-depth are already plain runtime
+        // params to `fast::run`, so overriding them for the search is just
+        // swapping the two consts below for the env-var-backed tune values
+        // here — no change to `fast::run`'s signature needed. Byte-identical
+        // to the `not(feature)` arm when no `GZIPPY_L1TUNE_*` env var is set.
         #[cfg(not(feature = "l1-tune"))]
         Strategy::Fast => {
             let bucket2 = fast::Bucket2Cfg {
@@ -790,8 +778,9 @@ pub(super) fn compress(
 ///
 /// The whole-buffer entry points build this fresh per call.
 ///
-/// NOTE (2026-08-30): the single-pass STREAMING encoder that kept ONE of these
-/// across the whole file was deleted — `ldx` is the production T1 parser for
+/// NOTE: there is no single-pass STREAMING encoder and no code that keeps ONE
+/// of these
+/// across the whole file — `ldx` is the production T1 parser for
 /// L0-L9 (whole-buffer by construction) and L10-12 has no resumable runner, so
 /// no production level can stream. The `run_resumable` functions below remain
 /// live as the implementation of the whole-buffer `run` (which calls them once
@@ -1091,42 +1080,13 @@ impl StoredCoalescer {
 /// Emit the accumulated block, choosing the cheapest of stored / static-Huffman
 /// / dynamic-Huffman. `block_start` is the absolute offset of the block's first
 /// byte in `buf`.
-/// PARKED 2026-08-01 — RLE-shaped histogram, gated to the T>1 path. A STRICT SIZE
-/// WIN that dies on clause 5, not on the encoder. Branch `lever/rle-shape-t4`
-/// (`b9cf59ef`), adjudicated NO-SHIP; artifact
-/// `~/www/gzippy-bench/campaign/lever-lever-rle-shape-t4/try.json`.
 ///
-/// THE MECHANISM. Beside the true histogram, cost a second one shaped the way zopfli's
-/// `TryOptimizeHuffmanForRle` shapes it, and keep it only when the header comes out
-/// STRICTLY smaller. A `HeaderBudget` enum threaded to this function makes it
-/// `Generous` on the T>1 path and `Lean` everywhere else, so T1 never pays.
-///
-/// WHAT IT BOUGHT (deterministic, both censuses over the same 792 comparable cells):
-///     23 size cells CLOSED, 0 opened — all `libdeflate_T4`, spread over 7 levels
-///     T1 output byte-identical to main: 198/198 (22 corpus files x levels 1-9)
-///     T4 strictly smaller on every file checked (-151 .. -208 B on armexe.elf)
-/// It cannot make a block bigger: the shaped code is adopted only when it is cheaper.
-///
-/// WHAT IT COST. `make lever ARGS="--threads 1,4"`, NO-SHIP on clause 5 with 25 cells
-/// over the 0.005 erosion budget: 18 at T4, 12 of them against pigz. `Generous` runs a
-/// second symbol-sort + package-merge per block, which is real work on the exact path
-/// it is gated to. That is the FOURTH size lever to die in this clause.
-///
-/// ⚠ THE EROSION MAGNITUDES ARE NOT TRUSTWORTHY AND MUST NOT BE QUOTED. 7 of the 25
-/// cells were T1, where the output is provably byte-identical, so those readings are
-/// impossible and the run was contaminated: ~12 `fulcrum ab paired` jobs were run on
-/// the same laptop during rows 176-264 of it, and `scripts/campaign/lever.sh` invokes
-/// no box-freeze guard. The VERDICT stands (18 T4 cells, real mechanism, 4-8x over
-/// budget); the NUMBERS need an idle re-run before any successor prices against them.
-///
-/// WHAT WOULD REVIVE IT. Not a re-run, and not tuning the shaping. Only a way to
-/// obtain the shaped candidate for materially less than a second package-merge —
-/// or a clause-5 budget argument made at a coordinate where T4 wall slack is real
-/// rather than assumed. Compose it with a T4 wall win before re-adjudicating; on its
-/// own the size case is already proven and already insufficient.
-///
-/// Do not re-derive the size win. It is measured, it is 23 cells, and it is not the
-/// part that fails.
+/// NOT TAKEN (priced NO-SHIP, see `docs/board/`): beside the true histogram,
+/// a second zopfli-shaped RLE histogram adopted only when its header comes
+/// out STRICTLY smaller is a real T4 size win (23 cells) but its `Generous`
+/// path costs a second symbol-sort + package-merge per block on the T>1 path
+/// it would be gated to — far over the wall budget. Do not re-derive the size
+/// win; it is measured.
 #[allow(clippy::too_many_arguments)]
 fn emit_block(
     bw: &mut BitWriter,
@@ -2400,8 +2360,8 @@ mod l1_bakeoff {
     //! A ONE-BLOCK, SUB-SECOND optimisation loop for the L1 matchfinder.
     //!
     //! WHY THIS EXISTS. The L1 deficit is the largest remaining SIZE class on the
-    //! board (16 of 37 residual cells after #227, and the largest level in the
-    //! 22-file census at 35 cells). `fulcrum why` established that it is
+    //! residual board (see `docs/board/residual-after-227.md`). `fulcrum why`
+    //! established that it is
     //! ALGORITHMIC, not implementation — at `data.csv:L01:T01` we emit
     //! **741,183 literals against libdeflate's 256,099 (2.89x)** and find 4.4%
     //! fewer matches, while header bits are near-identical. Every other level
@@ -2420,12 +2380,12 @@ mod l1_bakeoff {
     //! nothing measured here can change the shipped binary. The SHIPPED L1 is the
     //! `Fast` column, and it is +1.634% vs libdeflate — that gap IS the L1 class.
     //! The ratchet exists to keep the candidate honest until the routing lands
-    //! (blocked on #227's `params_parallel`, since it must be gated T>1).
+    //! (the routing must be gated T>1).
     //!
     //! `Strategy::Fast` (shipped) is igzip-class chainless SINGLE-PROBE.
     //! `ht_fast` is the libdeflate-class 2-ENTRY-BUCKET synthesis that also keeps
     //! our length-3 table. Both are already in the tree and both are
-    //! `fulcrum verify`-clean; only the ROUTING was reverted (see the FALSIFY at
+    //! `fulcrum verify`-clean; only the ROUTING is parked (see the note at
     //! the `Strategy::Fast` dispatch arm).
     //!
     //! HOW TO USE IT:
@@ -2556,18 +2516,17 @@ mod l1_bakeoff {
     /// a file the test SAYS SO and prints the new number to paste in. Tighten
     /// freely; loosening one needs a reason in the commit message.
     ///
-    /// Seeded 2026-08-01 from `ht_fast` as it stands. `Strategy::Fast` (shipped)
+    /// Seeded from `ht_fast` as it stands. `Strategy::Fast` (shipped)
     /// is far worse on 7 of these 8 — that gap is the L1 class, and it is why
     /// this file exists.
-    /// Re-seeded 2026-08-01 from the WORST-OF-FOUR-RIVALS measurement. The first
-    /// seed used libdeflate only and was therefore wrong on `armexe.elf`, whose
-    /// binding rival is **pigz** (-3863) not libdeflate (-4013) — the ratchet
-    /// fired REGRESSION on its own seed data, which is the guard working.
+    /// The seed is WORST-OF-FOUR-RIVALS (not libdeflate-only): on `armexe.elf`
+    /// the binding rival is **pigz** (-3863) not libdeflate (-4013), and a
+    /// libdeflate-only seed would fire REGRESSION on its own seed data.
     ///
     /// libdeflate is the binding rival on 7 of 8; gzip/pigz/igzip trail by
     /// 2,600-11,600 B at L1. But "usually libdeflate" is not "always", and the
-    /// one exception is exactly the file the FALSIFY at `parse/mod.rs` warned
-    /// about losing.
+    /// one exception is exactly the file the parked `ht_fast` routing note at
+    /// `parse/mod.rs` warned about losing.
     const RATCHET: &[(&str, i64)] = &[
         ("armexe.elf", -3863),
         ("data.parquet", -984),

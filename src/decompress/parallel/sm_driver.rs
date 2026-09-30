@@ -20,12 +20,12 @@
 //! chunk finalize.
 //!
 //! The `GZIPPY_WINDOW_SPARSITY=1` kill-switch (which restored the old
-//! always-on behavior) was removed 2026-07-07 — sparsity is always
+//! always-on behavior) was removed — sparsity is always
 //! OFF (the faithful keepIndex=false default).
 
 /// Whether the pre-port always-on window-sparsity behavior is active.
-/// Hardcoded OFF (shipped default; the `GZIPPY_WINDOW_SPARSITY=1` kill-switch
-/// that used to restore it was removed as dead — byte-transparent).
+/// Hardcoded OFF (shipped default; the former kill-switch was removed as
+/// dead — byte-transparent).
 fn window_sparsity_kill_switch() -> bool {
     false
 }

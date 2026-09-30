@@ -63,10 +63,9 @@ pub(super) fn run(
 ///
 /// `is_last` marks BFINAL on the closing block; it is false for every
 /// non-final chunk of a CONCATENATED stream (the T>1 path), which nonetheless
-/// has to consume all the input it was handed. (The streaming `Bounded`
-/// mode — stop at the last block boundary with lookahead room to spare —
-/// was deleted with the single-pass streaming encoder, 2026-08-30: no
-/// production level can stream, so the early-return it controlled was dead.)
+/// has to consume all the input it was handed. (There is no streaming
+/// `Bounded` stop-early mode: no production level can stream, so the
+/// early-return it controlled would be dead.)
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_resumable(
     buf: &[u8],

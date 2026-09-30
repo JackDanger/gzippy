@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// pre-existing parallel-module dead code from the default-feature flip; delete in a dedicated cleanup
 
 //! Per-chunk deflate decode DRIVER for parallel single-member (the decode
 //! *logic*, despite the data-flavored name). Port of rapidgzip's
@@ -65,18 +65,10 @@ impl From<std::io::Error> for ChunkDecodeError {
 #[allow(dead_code)]
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
-/// Whether the clean-tail decode routes through REAL ISA-L FFI.
-///
-/// The pure-Rust DEFLATE engine is the SOLE production decode path; ISA-L
-/// clean-tail decode was a measurement oracle only, controlled by
-/// `GZIPPY_ISAL_ENGINE_ORACLE`. The env override was removed 2026-07-07 —
-/// hardcoded OFF (pure-Rust identity); no production ISA-L decode exists, the
-/// decode graph is pure-Rust and C-FFI is compression-only per CLAUDE.md. The
-/// oracle-only `finish_decode_chunk_isal_oracle` call site this used to gate
-/// was a mechanically dead consequence and has been removed (2026-07-07),
-/// along with its `isal_incremental_growth` sizing knob (`GZIPPY_ISAL_GROW_MIB`
-/// / `GZIPPY_ISAL_INITIAL_FACTOR` / `GZIPPY_ISAL_INCREMENTAL_GROWTH`) — both
-/// had zero remaining callers once this predicate went hardcoded OFF.
+/// Whether the clean-tail decode routes through REAL ISA-L FFI: always
+/// `false`. The pure-Rust DEFLATE engine is the SOLE production decode path
+/// (single-member decode is pure-Rust ParallelSM at every T); the only C-FFI
+/// graph left is compression.
 #[cfg(parallel_sm)]
 #[inline]
 fn isal_engine_oracle_enabled() -> bool {
@@ -84,10 +76,8 @@ fn isal_engine_oracle_enabled() -> bool {
 }
 
 /// Window-seeded INEXACT clean-decode engine: window-seeded INEXACT chunks
-/// decode on the ONE `deflate::Block` engine. Was previously kill-switchable via
-/// `GZIPPY_SEEDED_BLOCK=0` (restoring the older wrapper path); the env
-/// override was removed 2026-07-07 — hardcoded to the shipped
-/// default (ON). Production proof of which engine decoded each seeded chunk:
+/// decode on the ONE `deflate::Block` engine — hardcoded ON. Production proof
+/// of which engine decoded each seeded chunk:
 /// [`SEEDED_BLOCK_CHUNKS`] vs [`SEEDED_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
 fn seeded_block_enabled() -> bool {
@@ -95,10 +85,8 @@ fn seeded_block_enabled() -> bool {
 }
 
 /// Whether the seeded-Block route is taken for a window-seeded inexact
-/// chunk: always ON (see [`seeded_block_enabled`] — the
-/// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
-/// production ISA-L decode graph exists to preserve — single-member decode
-/// is pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
+/// chunk: always ON (see [`seeded_block_enabled`]; single-member decode is
+/// pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
 #[cfg(parallel_sm)]
 fn seeded_block_route_enabled() -> bool {
     seeded_block_enabled()
@@ -106,10 +94,8 @@ fn seeded_block_route_enabled() -> bool {
 
 /// Window-seeded UNTIL-EXACT clean-decode engine (a labeled deviation from the
 /// vendor blueprint): window-seeded UNTIL-EXACT chunks decode on the ONE
-/// `deflate::Block` engine. Was previously kill-switchable via
-/// `GZIPPY_EXACT_BLOCK=0` (restoring the older wrapper path); the env
-/// override was removed 2026-07-07 — hardcoded to the shipped
-/// default (ON). Production proof of which engine decoded each exact chunk:
+/// `deflate::Block` engine — hardcoded ON. Production proof of which engine
+/// decoded each exact chunk:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`] (`--verbose` dump).
 #[cfg(parallel_sm)]
 fn exact_block_enabled() -> bool {
@@ -117,10 +103,8 @@ fn exact_block_enabled() -> bool {
 }
 
 /// Whether the exact-Block route is taken for a window-seeded UNTIL-EXACT
-/// chunk: always ON (see [`exact_block_enabled`] — the
-/// `GZIPPY_ISAL_ENGINE_ORACLE` term was dropped 2026-07-07, confirmed no
-/// production ISA-L decode graph exists to preserve — single-member decode
-/// is pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
+/// chunk: always ON (see [`exact_block_enabled`]; single-member decode is
+/// pure-Rust ParallelSM at every T, see `decompress/mod.rs`).
 #[cfg(parallel_sm)]
 fn exact_block_route_enabled() -> bool {
     exact_block_enabled()
@@ -131,7 +115,7 @@ fn exact_block_route_enabled() -> bool {
 /// `compressed_span` is the chunk's compressed byte span.  `expansion_ratio_ceil` is
 /// the member-level ratio ceiling from `ChunkConfiguration::expansion_ratio_ceil`; a
 /// value of 0 means the ratio was unknown at configuration time → falls back to the
-/// historical 8× factor.
+/// legacy 8× factor.
 ///
 /// Result is clamped to `[RESERVE_FLOOR, RESERVE_CAP]`.  Growth past `RESERVE_CAP`
 /// is handled by the GROW_BYTES loop downstream and is always safe — this function
@@ -168,7 +152,7 @@ pub(crate) fn compute_initial_reserve(compressed_span: usize, expansion_ratio_ce
         return crate::decompress::parallel::chunk_buffer_pool::RESIDENT_PINNED_CAPACITY;
     }
     let factor = if expansion_ratio_ceil == 0 {
-        8 // unknown → historical default
+        8 // unknown → legacy default
     } else {
         expansion_ratio_ceil as usize
     };
@@ -309,13 +293,8 @@ fn finish_decode_chunk_impl(
     // the ceiling turns that runaway into a terminal error instead of an OOM.
     chunk.set_output_ceiling_for_input(input.len());
 
-    // The ISA-L clean-tail measurement-oracle branch that used to sit here
-    // (`GZIPPY_ISAL_ENGINE_ORACLE`) was removed 2026-07-07 —
-    // no production ISA-L decode graph exists (single-member decode
-    // is pure-Rust ParallelSM at every T; C-FFI is compression-only per
-    // CLAUDE.md). `finish_decode_chunk_isal_oracle` and `isal_incremental_growth`
-    // were themselves deleted (2026-07-07) — zero remaining
-    // callers once this branch was removed.
+    // No ISA-L clean-tail arm here: the pure-Rust engine is the sole decode
+    // engine (the only C-FFI graph left is compression).
 
     let read_cap = if until_exact {
         stop_hint_bits
@@ -545,8 +524,7 @@ fn decode_chunk_with_rapidgzip_impl(
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
             // Until-exact decodes on the ONE `deflate::Block`
-            // engine (always ON — see `exact_block_route_enabled`; the wrapper
-            // fallback arm this used to have was removed 2026-07-07).
+            // engine (always ON — see `exact_block_route_enabled`).
             // See `finish_decode_chunk_exact_block_native` for the labeled
             // deviation + pre-registered contract.
             debug_assert!(exact_block_route_enabled());
@@ -560,8 +538,7 @@ fn decode_chunk_with_rapidgzip_impl(
         } else {
             // Window-seeded INEXACT chunks decode on the ONE
             // `deflate::Block` engine (vendor GzipChunk.hpp:454-458; always ON —
-            // see `seeded_block_route_enabled`; the wrapper fallback arm this
-            // used to have was removed 2026-07-07) instead of the
+            // see `seeded_block_route_enabled`) instead of the
             // second clean engine (`StreamingInflateWrapper`/`unified::Inflate`).
             debug_assert!(seeded_block_route_enabled());
             finish_decode_chunk_seeded_block_native(
@@ -1055,9 +1032,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     until_exact: bool,
     // Per-block EOB boundary recording. The boundary index feeds the block-map /
     // prefetch / subchunk-split (T>1 scaffold). Every remaining caller passes
-    // `true` — the former T1-MONOLITH divergence that passed `false` (no
-    // boundary recording, pure T>1 scaffold skipped) was removed 2026-07-07
-    // (dead opt-in path).
+    // `true`.
     record_boundaries: bool,
 ) -> Result<(), ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::{BlockError, CompressionType};
@@ -1415,9 +1390,8 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 /// there); the gzippy-isal clean-tail handoff is untouched (faithful
 /// rapidgzip WITH_ISAL, GzipChunk.hpp:440-444/520-526).
 ///
-/// Route: [`seeded_block_route_enabled`] (hardcoded ON; the wrapper arm now
-/// runs only on the gzippy-isal build — the `GZIPPY_SEEDED_BLOCK=0` env
-/// kill-switch was removed 2026-07-07).
+/// Route: [`seeded_block_route_enabled`] (hardcoded ON; the wrapper arm
+/// runs only on the gzippy-isal build).
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_seeded_block_native(
     chunk: &mut ChunkData,
@@ -1640,9 +1614,8 @@ pub static MULTI_MEMBER_CONTINUATIONS: std::sync::atomic::AtomicU64 =
 ///      `decode_base + n_bytes_read` accounting (pinned by the parity nets'
 ///      subchunk-key equality).
 ///
-/// Route: [`exact_block_route_enabled`] (hardcoded ON; the wrapper arm now
-/// runs only on the gzippy-isal build — the `GZIPPY_EXACT_BLOCK=0` env
-/// kill-switch was removed 2026-07-07). Engine proof:
+/// Route: [`exact_block_route_enabled`] (hardcoded ON; the wrapper arm
+/// runs only on the gzippy-isal build). Engine proof:
 /// [`EXACT_BLOCK_CHUNKS`] vs [`EXACT_WRAPPER_CHUNKS`].
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_exact_block_native(
@@ -1715,8 +1688,7 @@ fn decode_chunk_exact_block_native(
 pub static SEEDED_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// M3 engine proof (complement): window-seeded INEXACT chunks decoded on the
-/// pre-M3 wrapper arm (the gzippy-isal build or the ISA-L measurement oracle;
-/// the `GZIPPY_SEEDED_BLOCK=0` env kill-switch was removed 2026-07-07).
+/// pre-M3 wrapper arm (gzippy-isal build or ISA-L measurement oracle).
 #[cfg(parallel_sm)]
 pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1727,8 +1699,7 @@ pub static SEEDED_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
 pub static EXACT_BLOCK_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// M4 engine proof (complement): UNTIL-EXACT chunks decoded on the wrapper
-/// arm (the gzippy-isal build or the ISA-L measurement oracle; the
-/// `GZIPPY_EXACT_BLOCK=0` env kill-switch was removed 2026-07-07).
+/// arm (gzippy-isal build or ISA-L measurement oracle).
 #[cfg(parallel_sm)]
 pub static EXACT_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2134,8 +2105,9 @@ mod tests {
         enc.finish().unwrap()
     }
 
-    /// P0 REGRESSION (2026-06-12, /tmp/mono-gnu9.tar.gz: deterministic CRC32
-    /// mismatch with EXACTLY ONE wrong output byte at 35,335,338 — 'L' for '.').
+    /// Regression: a deterministic CRC32 mismatch with EXACTLY ONE wrong
+    /// output byte at 35,335,338 ('L' for '.') seen decoding the GNU-gzip
+    /// monorepo stream.
     ///
     /// Root cause: `emit_backref_ring`'s word-copy rounds the run up to a
     /// multiple of 4 u16; for the FINAL back-ref of a maximally-full `read()`
@@ -2457,7 +2429,7 @@ mod tests {
         );
     }
 
-    /// MANDATORY faithful-u8 seam trap (charter 2026-06-07). After the in-place
+    /// MANDATORY faithful-u8 seam trap. After the in-place
     /// u16->u8 width flip at 32768, a distance-32768 back-ref must read the
     /// OLDEST byte of the repacked u8 window (the value-downcasted survivor at
     /// u8 slot `U8_RING_SIZE - 32768`). A wrong dest offset, a missing rotation,
@@ -3182,8 +3154,7 @@ mod native_fold_parity {
 // from `StreamingInflateWrapper`/`unified::Inflate` onto the ONE
 // `deflate::Block` engine (vendor GzipChunk.hpp:454-458). This gate nets the
 // two arms — `finish_decode_chunk_seeded_block_native` (new production) vs
-// `finish_decode_chunk_with_inexact_offset` (the pre-M3 wrapper arm; its
-// `GZIPPY_SEEDED_BLOCK=0` env kill-switch was removed 2026-07-07) — on
+// `finish_decode_chunk_with_inexact_offset` (the pre-M3 wrapper arm) — on
 // generated corpora, asserting:
 //   (a) decoded bytes        (b) decoded_size / data_prefix_len accounting
 //   (c) final bit (encoded_size_bits)   (d) per-stream CRC32 values
@@ -3349,7 +3320,7 @@ mod seeded_block_parity {
         );
 
         // (c) final bit. Strict equality, with exactly TWO measured, documented
-        // exceptions where the WRAPPER (kill-switch arm) semantics differ:
+        // exceptions where the WRAPPER arm semantics differ:
         //
         //   1. STREAM END (BFINAL decoded; bb == truth): the wrapper reports
         //      `tell_compressed()` after `finished` — the byte-aligned input
@@ -3704,8 +3675,7 @@ mod seeded_block_parity {
 // C-FFI `decodeChunkWithInflateWrapper`, GzipChunk.hpp:192-265; see
 // `finish_decode_chunk_exact_block_native`). This gate nets the two arms —
 // `finish_decode_chunk_exact_block_native` (new production) vs
-// `finish_decode_chunk_impl(until_exact=true)` (the pre-M4 wrapper arm; its
-// `GZIPPY_EXACT_BLOCK=0` env kill-switch was removed 2026-07-07) — on
+// `finish_decode_chunk_impl(until_exact=true)` (the pre-M4 wrapper arm) — on
 // generated corpora, asserting STRICT equality (no
 // M3-style final-bit exceptions: on success both arms must land EXACTLY at
 // stop_hint_bits by the until-exact contract):
@@ -4236,7 +4206,7 @@ mod exact_block_parity {
     }
 
     /// Default route proof: `decode_chunk_until_exact` with a full window and
-    /// `until_exact=true` takes the Block engine (kill-switch arm untouched).
+    /// `until_exact=true` takes the Block engine.
     #[test]
     fn exact_route_defaults_to_block() {
         let dict = make_dict();

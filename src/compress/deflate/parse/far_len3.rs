@@ -5,8 +5,7 @@
 //! while our greedy/lazy (ported from libdeflate) refuse len-3 at
 //! offset > 4096 (greedy) / > 8192 (lazy). On high-entropy content where three
 //! literals cost more than a far len-3 match (dd79_bin6: 6.54 bits/byte) the
-//! fixed guard donates ~41 KB at L2 / ~25 KB at L3 to gzip (trainer causal
-//! probe 2026-08-09, memory leaf project_len3_guard_dd79_mechanism.md).
+//! fixed guard donates ~41 KB at L2 / ~25 KB at L3 to gzip.
 //!
 //! Two simpler policies are measured dead, both on tie-guard levels 1-9
 //! (107 T1 libdeflate byte-ties, bar = non-worse on EVERY tie):

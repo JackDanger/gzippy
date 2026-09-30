@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// pre-existing parallel-module dead code from the default-feature flip; delete in a dedicated cleanup
 
 //! Literal port of `rapidgzip::deflate::Block`
 //! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state
@@ -437,9 +437,9 @@ fn read_stored_bytes_aligned(bits: &mut Bits, dst: &mut [u8]) -> usize {
     i + rest
 }
 
-/// Literal port of rapidgzip `deflate::Block` — production bootstrap session
+/// Literal port of rapidgzip `deflate::Block`
 /// (vendor `decodeChunkWithRapidgzip`, GzipChunk.hpp:468-654). This is the
-/// ONE compiled engine (the legacy `MarkerRing` alternate was deleted in M5).
+/// ONE compiled engine (the legacy `MarkerRing` alternate is deleted).
 #[cfg(parallel_sm)]
 pub struct Block {
     at_end_of_block: bool,
@@ -515,10 +515,10 @@ pub struct Block {
     /// code+extra from the already-peeked word (same technique as the
     /// wrapper's `DistTable`, resumable.rs:1394-1405). AUTHORIZED DEVIATION
     /// from the vendor distance-decode choice, scoped to the inner Huffman
-    /// loop (CLAUDE.md "fastest possible raw Huffman decoder": LitLenTable/
-    /// DistTable/Bits primitives are open territory). `dist_hc` stays the
-    /// engine for the careful loop and every marker/ring path (vendor-
-    /// faithful); byte-exactness: identical symbols => identical
+    /// loop (unlike `dist_hc`, which stays the vendor-faithful engine
+    /// for the careful loop and every marker/ring path). LitLenTable/
+    /// DistTable/Bits primitives are open territory; byte-exactness:
+    /// identical symbols => identical
     /// distance/bit-consumption, unassigned/invalid code => raw==0 entry =>
     /// `InvalidHuffmanCode`, exactly `dist_hc`'s `None`.
     ///
@@ -1943,9 +1943,9 @@ impl Block {
         // definite-init check for the cross-macro-hygiene shared binding.
         #[allow(unused_assignments)]
         let mut spec_litlen: u32 = 0;
-        // The marker-fast-loop litlen preload is the shipped
-        // default (the A/B kill-switch that reverted to `refill(); decode()` was
-        // removed); the load-before-refill software pipeline always runs.
+        // The marker-fast-loop litlen preload is unconditional: the
+        // load-before-refill software pipeline always runs (no A/B
+        // kill-switch).
         // Dist-preload: loop-invariant enable. The speculative
         // first-level dist lookup is hoisted to the top of the loop body ONLY
         // when the marker LUT dist path is the active decode arm (marker_dist_lut

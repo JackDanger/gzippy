@@ -50,21 +50,17 @@ pub(crate) fn is_likely_multi_member(data: &[u8]) -> bool {
     // Scan only the first 16 MiB of compressed data. This catches all
     // realistic multi-member streams: pigz / parallel gzip producers
     // default to ~128 KiB member sizes (~125 members per 16 MiB), and
-    // bgzip is detected upstream via `has_bgzf_markers`. Single-member
-    // files (which never contain a second magic) used to pay a full
-    // O(N) memchr scan against the whole input — measured at +3.80 pp
-    // of total CPU on a 162 MiB silesia fixture vs rapidgzip 0% (the
-    // `scan_detect` band in the 2026-05-19 profile diff).
+    // bgzip is detected upstream via `has_bgzf_markers`. The window avoids
+    // a full O(N) memmem scan of the whole input on single-member files —
+    // a 162 MiB silesia fixture measured that scan at +3.80 pp of total
+    // CPU (rapidgzip pays ~0 for the same detection).
     //
     // Trade-off: a multi-member stream whose SECOND member starts past
-    // byte 16 MiB is misrouted as single-member. This is SAFE for
-    // correctness: the single-member backends (ISA-L `decompress_gzip_stream`
-    // and `decompress_single_member_libdeflate`) consume-and-loop residual
-    // members, so a misrouted multi-member file still decodes in full. (This
-    // was NOT always true — before that fix, misrouting silently truncated to
-    // the first member; an earlier version of this comment wrongly claimed it
-    // failed loudly with a CRC mismatch. It did not: member 1 has a valid
-    // self-consistent trailer.) The misroute now only costs the parallel
+    // byte 16 MiB is misclassified as single-member by THIS predicate.
+    // `classify_gzip_prescanned` still guards that shape (see its
+    // dominant-first multi-member detection: a trailing member's ISIZE far
+    // smaller than the file triggers a full boundary scan and routes to a
+    // multi-member path), so this misroute costs only the parallel
     // multi-member path's speedup, never correctness. Such files are rare
     // (`cat big.gz small.gz`); pigz/bgzip members are ~128 KiB, detected here.
     const SCAN_LIMIT_BYTES: usize = 16 * 1024 * 1024;

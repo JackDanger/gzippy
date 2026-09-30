@@ -165,7 +165,7 @@ pub(super) fn record(
 ///
 /// **This is the instrument's fail-closed edge, and it fails closed on purpose.**
 /// MEASURED (`examples/split_headroom --levels 1,2,4,5,6,7,8 engine.wasm`,
-/// 2026-08-22, `cad4ae7e` + this branch): L1, L2 and L4 record TWO runs and NEITHER
+/// recorded in commit `cad4ae7e`): L1, L2 and L4 record TWO runs and NEITHER
 /// tiles the input — `PROBE_DUMP=1` on `text` L1 shows one arm emitting
 /// `start = 0, 65538, 131075 …` and another emitting `start = 32784, 98321,
 /// 163857, 229395(final)`, i.e. at least one L1/L2/L4 arm reports `block_start` in

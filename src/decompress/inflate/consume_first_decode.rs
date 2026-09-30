@@ -2166,7 +2166,7 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
         // sibling, which cites these lines) already scoped its reset this way;
         // this site did not.
         //
-        // RECEIPT (2026-08-22, `probe/stored-blocks`): our own `-1` output for
+        // RECEIPT: our own `-1` output for
         // `movie.mp4` and `tool.bin` — the only 2 of 115 corpus streams that
         // contain BTYPE=00 blocks — failed `decompress_raw_bytes` with
         // "Invalid repeat" / "Invalid distance" while `gzip -dc`,
@@ -2951,7 +2951,7 @@ mod tests {
     /// buffer still holds the SECOND block's header byte, which the old code
     /// discarded. It is not hypothetical — our own `-1` output for `movie.mp4`
     /// and `tool.bin` emits 65,536-byte stored blocks as 65,535 + 1 sub-blocks
-    /// and hit exactly this (2026-08-22, `probe/stored-blocks`); those streams
+    /// and hit exactly this; those streams
     /// decoded byte-exactly through `gzip`, `libdeflate-gzip` and `gzippy -dc`
     /// but NOT through `decompress_raw_bytes`, which silently blinded
     /// `examples/blockcensus` to every stored block we emit.
@@ -3298,13 +3298,11 @@ mod tests {
         assert_slices_eq!(&output[..size], original.as_slice());
     }
 
-    /// EXPERIMENTAL pure-Rust inflate benchmark on silesia.
+    /// Pure-Rust inflate benchmark on silesia.
     ///
-    /// NOTE (2026-09-26): inflate_consume_first() IS the production path —
-    /// the libdeflate C FFI it replaced was removed with the decode FFI
-    /// graph (bgzf.rs's inflate_into / inflate_into_pub doc). This bench
-    /// outlived its premise; kept for the historical progress line it
-    /// carries (it was the instrument that justified the switch).
+    /// inflate_consume_first() IS the production path (the libdeflate C FFI
+    /// decode graph is gone; see bgzf.rs's `inflate_into` doc). Despite the
+    /// file-test name, this is a plain perf bench over the production engine.
     ///
     /// Run with: cargo test --release bench_cf_silesia -- --nocapture
     #[test]
@@ -3312,15 +3310,13 @@ mod tests {
         run_bench("silesia", "benchmark_data/silesia-gzip.tar.gz");
     }
 
-    /// EXPERIMENTAL pure-Rust inflate benchmark on software archive.
-    /// See bench_cf_silesia for full context on why this is experimental.
+    /// Pure-Rust inflate benchmark on software archive.
     #[test]
     fn bench_cf_software() {
         run_bench("software", "benchmark_data/software.archive.gz");
     }
 
-    /// EXPERIMENTAL pure-Rust inflate benchmark on logs dataset.
-    /// See bench_cf_silesia for full context on why this is experimental.
+    /// Pure-Rust inflate benchmark on logs dataset.
     #[test]
     fn bench_cf_logs() {
         run_bench("logs", "benchmark_data/logs.txt.gz");

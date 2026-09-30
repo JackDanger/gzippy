@@ -2,7 +2,7 @@
 //!
 //! Cargo feature `anatomy-wall`, DEFAULT OFF. Sibling of `anatomy_counters`
 //! (semantic-work-unit VOLUME counters): this module answers "where does the
-//! TIME go" instead of "how much work happened". Built 2026-07-25 because
+//! TIME go" instead of "how much work happened", because
 //! neither existing `fulcrum anatomy` arm can answer that question:
 //! `--counters-from-stderr` (this crate's `anatomy-counters` feature) is
 //! EXACT but reports work volume, never time; `--exec` (host-side cachegrind)
@@ -115,7 +115,7 @@ macro_rules! define_wall_regions {
         /// requirement (same rationale as
         /// `anatomy_counters::AnatomyCounters`).
         ///
-        /// TWO NESTING LEVELS (added 2026-07-26). `root` is the encoder call
+        /// TWO NESTING LEVELS. `root` is the encoder call
         /// (`encode_gzip_slack_padded_to_vec`); `cli` is the whole end-to-end
         /// single-thread CLI compress, which STRICTLY CONTAINS `root`. INNER
         /// regions sit inside `root`; OUTER regions sit inside `cli` but
@@ -230,7 +230,7 @@ define_wall_regions!(
     huffman_table_ns / huffman_table_calls,
     huffman_encode_ns / huffman_encode_calls,
     crc_ns / crc_calls,
-    // Task C (2026-07-26 bucket-split-oracle session): `HcMatchfinder::new()`
+    // `HcMatchfinder::new()`
     // is a per-`run()`-call allocation (~256 KiB of scalar sentinel writes
     // across `hash3_tab`/`hash4_tab`/`next_tab` -- see `matchfinder/hc.rs`'s
     // `new()` doc comment). `run()` fires once per T1 whole-file parse but
@@ -240,7 +240,7 @@ define_wall_regions!(
     // timer per `run()` invocation (never per-position) -- cheapest
     // granularity in this module.
     mf_new_ns / mf_new_calls,
-    // Lever-0 (2026-09-25, agent-27's near-opt anatomy): the near-optimal
+    // The near-optimal
     // parser's chunk wall concentrates where no timer sat — the serial bt
     // FILL (per-position match-cache writes + split-stat observation) and the
     // per-block optimize+flush. These two regions split the split for real:

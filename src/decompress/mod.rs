@@ -111,11 +111,6 @@ pub enum DecodePath {
 #[allow(dead_code)] // referenced by tests + the legacy not(parallel_sm) gate
 pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 
-// (Removed) `MIN_PARALLEL_SM_THREADS` / `parallel_sm_min_threads`:
-// the parallel-SM engine is now the SOLE single-member decode path at every
-// thread count and size, so there is no thread floor below which a
-// C-FFI one-shot is chosen — there is no C-FFI one-shot in the decode graph.
-
 /// Compression ratio (uncompressed / compressed) below which the speculative
 /// parallel single-member pipeline is a NET LOSS and we route to the one-shot
 /// path instead.
@@ -239,16 +234,14 @@ pub(crate) fn classify_gzip_prescanned(
     // only scans the first 16 MiB, so a multi-member stream whose FIRST member is
     // larger than that (e.g. an 85%-dominant member) is misclassified as
     // single-member. The single-member decoders (ParallelSM / StoredParallel)
-    // CANNOT span members: they read the whole-file trailer (== the LAST member's
-    // ISIZE/CRC) and walk deflate blocks straight across member boundaries. The
-    // stale `is_likely_multi_member` comment assumes the single-member backend
-    // "consumes-and-loops residual members" — true of the old ISA-L/libdeflate
-    // one-shots, FALSE of StoredParallel. On a stored-dominant first member whose
-    // last deflate block is Huffman, `walk_stored_chain` returns a HuffmanTail
-    // with `prefix_out` == member-1 output, then `decode_with_huffman_tail`
-    // trips `prefix_out > expected_size` (expected == the small last member's
-    // ISIZE) and returns a TERMINAL SizeMismatch → EMPTY output, exit 1 on a
-    // file `gzip -dc`/rapidgzip decode fine (P0 correctness bug, both arches).
+    // cannot verify a trailing member correctly: they check the whole-file
+    // trailer (== the LAST member's ISIZE/CRC). On a stored-dominant first
+    // member whose last deflate block is Huffman, `walk_stored_chain` returns a
+    // HuffmanTail with `prefix_out` == member-1 output, then
+    // `decode_with_huffman_tail` trips `prefix_out > expected_size` (expected ==
+    // the small last member's ISIZE) and returns a TERMINAL SizeMismatch →
+    // EMPTY output, exit 1 on a file `gzip -dc`/rapidgzip decode fine (P0
+    // correctness bug, both arches).
     // So detect the multi-member shape HERE and route to a multi-member path at
     // EVERY thread count — T1 to the proven sequential walk, T>1 to the grid/par.
     //
@@ -446,7 +439,7 @@ fn decompress_multi_member_grid<W: Write>(
 // Test-facing production-entry wrapper: production callers reach the parallel-SM
 // path through `decompress_single_member_fd_prescanned` (io.rs) directly; this
 // self-scanning form is exercised by the routing/correctness tests. Dead in the
-// non-test lib build under `-D warnings`. (routing-unification cleanup: task #6.)
+// non-test lib build under `-D warnings`.
 #[allow(dead_code)]
 pub(crate) fn decompress_single_member_fd<W: Write>(
     data: &[u8],
@@ -554,7 +547,7 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
 // Test-facing production-entry wrapper: production callers reach this via
 // `decompress_single_member_prescanned` (io.rs) after the format scan; this
 // self-scanning form is exercised by the routing/correctness/selector tests.
-// Dead in the non-test lib build under `-D warnings`. (cleanup: task #6.)
+// Dead in the non-test lib build under `-D warnings`.
 #[allow(dead_code)]
 pub(crate) fn decompress_single_member<W: Write>(
     data: &[u8],
@@ -611,11 +604,9 @@ pub(crate) fn decompress_single_member_prescanned<W: Write>(
     }
 }
 
-/// Test-only pure-Rust single-member decode helper. After the C-FFI decode
-/// backends (libdeflate / zlib-ng one-shot) were removed, the unit tests that
-/// previously called those helpers route here instead, exercising the SAME
-/// pure-Rust single-member production path (`decompress_single_member`, T=1 →
-/// ParallelSM). It preserves the historical error semantics those tests assert
+/// Test-only pure-Rust single-member decode helper: the unit tests route
+/// through the SAME pure-Rust single-member production path as `decompress_single_member`
+/// (T=1 → ParallelSM). It preserves the error semantics those tests assert
 /// (corrupt / truncated single-member input → terminal `Err`).
 #[cfg(test)]
 pub(crate) fn decompress_single_member_pure<W: Write>(
@@ -734,9 +725,9 @@ fn decompress_single_member_for<W: Write>(
 /// build (no `parallel_sm`) it uses the scalar member walk (correct, just slower).
 ///
 /// Stops cleanly (returning the bytes decoded so far) on the first non-gzip /
-/// truncated / trailing bytes — matching gzip(1) and the historical
-/// libdeflate-based behavior, where trailing garbage after a valid member
-/// terminated the walk without erroring the already-written output. A member
+/// truncated / trailing bytes — matching gzip(1): trailing garbage after a
+/// valid member terminates the walk without erroring the already-written
+/// output. A member
 /// with a valid header but a corrupt body / mismatched trailer is a terminal
 /// `Err`.
 pub(crate) fn decompress_multi_member_sequential<W: Write>(
@@ -1079,11 +1070,10 @@ mod tests {
     }
 
     /// The single-member dispatcher decodes a parallel-eligible input purely
-    /// through the pure-Rust ParallelSM pipeline. The historical "no silent
-    /// libdeflate fallback" invariant is now enforced at COMPILE TIME: there is
-    /// no C-FFI one-shot decode backend left in the decode graph to fall back to
-    /// (the libdeflate/zlib-ng one-shot paths were deleted). This test asserts
-    /// byte-exact decode through the sole pure-Rust path.
+    /// through the pure-Rust ParallelSM pipeline — the "no silent libdeflate
+    /// fallback" invariant enforced at compile time: there is no C-FFI
+    /// one-shot decode backend in the decode graph to fall back to. This test
+    /// asserts byte-exact decode through the sole pure-Rust path.
     #[cfg(parallel_sm)]
     #[test]
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
@@ -1122,7 +1112,7 @@ mod tests {
     /// A single-member input *below* the old 10 MiB parallel gate routes
     /// deterministically. Under `parallel_sm` (the production build) the
     /// ParallelSM pipeline is the SOLE single-member path — below-gate inputs
-    /// route to it, NEVER to a C-FFI one-shot (task #8). That pipeline is
+    /// route to it, NEVER to a C-FFI one-shot. That pipeline is
     /// pure-Rust on gzippy-native; on gzippy-isal its clean tail uses ISA-L
     /// FFI. Under the legacy `not(parallel_sm)` build they route to the C-FFI
     /// one-shot.
@@ -1172,7 +1162,7 @@ mod tests {
         );
     }
 
-    /// Regression guard for the stored-block false-positive consumer bug (2026-06-12).
+    /// Regression guard for the stored-block false-positive consumer bug.
     ///
     /// **Root cause (fixed):** `chunk_fetcher.rs` consumer loop skipped stale
     /// spacing-guess blocks (`!block_is_confirmed && next_block_offset <

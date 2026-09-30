@@ -261,18 +261,17 @@ pub struct BlockBoundary {
 // from that boundary, traversing whatever blocks (including BTYPE=01)
 // follow without special finder support.
 //
-// DELETED 2026-06-09: the BTYPE=01 prefilter (FixedLitlenEntry,
-// fixed_litlen_lut, fixed_dist_lut, reverse_low_bits,
-// validate_fixed_block_prefix) — a deliberate divergence from vendor that
-// admitted fixed-Huffman candidates from the block finder. On bignasa
-// (820 MB, 10.4× web log, T8) random bytes parse as BFINAL=1/BTYPE=01
-// at the 4 MiB grid-base positions (1-in-8 per position), pass the cheap
-// 2-symbol prefilter, decode a 23–495-byte phantom final-block stream,
-// then are discarded at consume time when the predecessor's confirmed
-// boundary lands 19 288–85 273 bits later — each costing ~150 ms
-// head-of-line confirmed re-decode. 3–9 phantoms/run ≈ 39 % of T8 wall.
-// rapidgzip cannot make this error: its deflate finder is dynamic-only by
-// construction and scans forward to the true dynamic boundary instead.
+// A BTYPE=01 prefilter that admitted fixed-Huffman candidates from the
+// block finder was tried and REVERTED as a deliberate divergence from
+// vendor. On bignasa (820 MB, 10.4× web log, T8) random bytes parse as
+// BFINAL=1/BTYPE=01 at the 4 MiB grid-base positions (1-in-8 per position),
+// pass the cheap 2-symbol prefilter, decode a 23–495-byte phantom
+// final-block stream, then are discarded at consume time when the
+// predecessor's confirmed boundary lands 19 288–85 273 bits later — each
+// costing ~150 ms head-of-line confirmed re-decode. 3–9 phantoms/run ≈
+// 39 % of T8 wall. rapidgzip cannot make this error: its deflate finder
+// is dynamic-only by construction and scans forward to the true dynamic
+// boundary instead.
 
 /// Cheap structural prefilter before a full speculative trial decode.
 /// Used for the EOF tail byte walk in `speculative_decode_find_boundary`
@@ -677,12 +676,10 @@ impl<'a> DeflateBlockValidator<'a> {
                     // candidate emitted. Faithful to vendor
                     // blockfinder/DynamicHuffman.hpp (no fixed finder);
                     // fixed-block regions degrade to confirmed-chain decode
-                    // exactly as vendor. The BTYPE=01 prefilter was deleted
-                    // 2026-06-09: it produced phantom candidates at 4 MiB
-                    // grid-base positions on bignasa (BFINAL=1 random bytes
-                    // passing the 2-symbol prefilter → 23–495-byte phantom
-                    // final-block streams → ~150 ms confirmed re-decode per
-                    // phantom; 3–9/run ≈ 39 % of T8 wall).
+                    // exactly as vendor. Do NOT re-add a fixed-Huffman
+                    // prefilter here: phantom candidates on random bytes at
+                    // grid-base positions cost ~39% of the bignasa T8 wall
+                    // (see the module header).
                     reader.skip(1);
                     bit_offset += 1;
                 }
@@ -1099,7 +1096,7 @@ mod tests {
         assert!(lut[0b001] > 0);
 
         // BTYPE=01 (fixed) — dynamic-only finder, no candidate emitted
-        // (vendor DynamicHuffman.hpp parity; prefilter deleted 2026-06-09).
+        // (vendor DynamicHuffman.hpp parity; no fixed-Huffman prefilter).
         assert!(lut[0b010] > 0);
         assert!(lut[0b011] > 0);
 
@@ -1446,7 +1443,7 @@ mod tests {
     /// L9 pipelined compress. The tail partition (from 10 MiB bit offset)
     /// often contains only fixed-Huffman blocks.
     ///
-    /// NEW EXPECTATION (2026-06-09, vendor DynamicHuffman.hpp parity):
+    /// Vendor DynamicHuffman.hpp parity:
     /// The dynamic-only block finder produces NO fixed-Huffman candidates —
     /// this is the correct vendor behavior. Fixed-block tail regions are
     /// handled by the confirmed-chain re-decode path in the consumer.

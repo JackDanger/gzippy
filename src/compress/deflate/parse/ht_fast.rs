@@ -7,14 +7,11 @@
 //!
 //! # Why a separate parser, and why transliterate before deleting
 //!
-//! `docs/encoder-campaign-plan.md` §3 records the method that has actually won
-//! here, counted: vendor structural diff/port is 9 wins and 0 falsifications;
-//! shaving our own profile's top line is 0 wins and >= 17 falsifications. It
-//! also records the sequencing rule — *"Converge on the vendor's structure
-//! BEFORE deleting anything. Decode halved the igzip gap by faithful
-//! transliteration; only then did single-op deletions become visible and worth
-//! 5-10% each. Deleting first is what produced this campaign's
-//! falsifications."*
+//! `docs/encoder-campaign-plan.md` §3 records the sequencing rule *"Converge on
+//! the vendor's structure BEFORE deleting anything"* — vendor-faithful
+//! transliteration is the only method that has won here; shaving our own
+//! profile's top line has only produced regressions. Deleting first is what
+//! produced the falsifications this rule guards against.
 //!
 //! So this is step one of two, and step one is on purpose:
 //!   1. **(this)** stand up the vendor's shape beside ours, take the size

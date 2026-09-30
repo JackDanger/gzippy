@@ -75,8 +75,8 @@ impl ZopfliGzEncoder {
     /// Compress to a single-member gzip with full metadata preservation.
     /// `tuning.thread_budget` flows through unchanged — set by
     /// `ZopfliTuning::from_args` from `-p`/`--processes` (`-p1` → serial,
-    /// otherwise unbounded intra-block parallelism). Honoring the user's
-    /// CPU-cap request is Copilot review comment #4 on PR #83.
+    /// otherwise unbounded intra-block parallelism) so the user's
+    /// CPU-cap request is honored.
     fn compress_single<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         let deflate_data = compress_deflate(data, &self.tuning);
 

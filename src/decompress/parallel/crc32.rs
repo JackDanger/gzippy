@@ -136,7 +136,7 @@ pub fn combine_crc32(crc1: u32, crc2: u32, byte_stream_length: u64) -> u32 {
 // CRC32 byte-fold kernel (dispatched).
 // =====================================================================
 //
-// GATE-2 / asm-confirmed motivation (aarch64, 2026-06-21): crc32fast 1.5.0's
+// AARCH64 MOTIVATION: crc32fast 1.5.0's
 // aarch64 path threads ONE `crc32x` accumulator (`crc32x w8, w8, xN` 8-way
 // "unrolled" but a single w8 dependency chain) → latency-bound at ~8.5 GB/s on
 // M-series (CRC32 instr ~3-cycle latency). The removal-oracle sized this at
@@ -267,7 +267,7 @@ mod hw_crc {
 // aarch64 PMULL carry-less CRC32 fold (libdeflate crc32_arm_pmullx12 port).
 // =====================================================================
 //
-// GATE motivation (M1, 2026-06-28): gz's arm64 CRC = `hw_crc::fold3`, three
+// MOTIVATION: gz's arm64 CRC = `hw_crc::fold3`, three
 // interleaved `crc32x` chains, bounded by the M1's 1-crc32x/cycle throughput.
 // libdeflate uses PMULL (carry-less multiply, a SEPARATE execution resource on
 // Apple Silicon) folding 192 bytes (12 independent 128-bit accumulators) per
@@ -483,8 +483,7 @@ mod hw_pmull {
 // x86_64 VPCLMULQDQ CRC32 fold (DIVERGENCE from the crc32fast crate kernel).
 // =====================================================================
 //
-// GATE-1 motivation (Intel i7-13700T raptorlake, 2026-06-26, /dev/shm
-// microbench, byte-exact vs crc32fast across sizes/aligns/seeds): crc32fast
+// MOTIVATION (byte-exact vs crc32fast across sizes/aligns/seeds): crc32fast
 // 1.5.0's x86 kernel is a 128-bit fold-by-4 (SSE PCLMULQDQ, 64 B/iter). On
 // cache-resident data (16 KiB–1 MiB — the regime per-block CRC runs in) it
 // measures ~11 GB/s; ISA-L's crc32_gzip_refl is the SAME (~11 GB/s); but

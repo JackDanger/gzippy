@@ -31,7 +31,7 @@
 //! | `crc32`                | `gzip/crc32.hpp`                              |
 //! | `thread_pool`          | `ThreadPool`                                  |
 //!
-//! ## Multi-member routing (2026-07-05)
+//! ## Multi-member routing
 //!
 //! [`crate::decompress::DecodePath::MultiMemberChunked`] →
 //! [`sm_driver::read_parallel_sm_multi`] walks each member and inflates it with
@@ -44,7 +44,7 @@
 //! oversubscription at high T). The located dominant-member plateau needs the
 //! rapidgzip-faithful whole-file-block-finder cross-member port (one pool, one
 //! chunk grid spanning members, vendor `GzipChunk.hpp:468-654`) — the gate-phase
-//! core (see `scratchpad/MM-PARALLELSM-DESIGN.md`).
+//! core (see `docs/parallel-decode-architecture.md`, "Multi-member routing").
 
 #[cfg(parallel_sm)]
 pub mod apply_window;

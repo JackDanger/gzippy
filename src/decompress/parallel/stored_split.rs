@@ -24,7 +24,7 @@
 //!     (the un-parallelised Huffman tail is the remaining gap; parallelising it
 //!     needs the window-map machinery the speculative pipeline already has).
 //!
-//! Safety contract (correctness is sacred — see CLAUDE.md Rule 4 / Rule 5):
+//! Safety contract (correctness is sacred — see CLAUDE.md's Non-negotiables):
 //!   * The stored-chain walk is byte-exact: every stored block's extent comes
 //!     from its explicit `LEN`, never a guess. The Huffman tail is decoded by
 //!     the proven `lut_bulk_inflate` per-block decoder into the SAME output buffer
