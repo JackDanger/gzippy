@@ -165,7 +165,7 @@ $ gzippy --analyze Cargo.lock
 ## Library
 
 ```toml
-gzippy = "0.8"
+gzippy = "1.0"
 ```
 
 ```rust

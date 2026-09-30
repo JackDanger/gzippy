@@ -1,3 +1,14 @@
+gzippy (1.0.0-1) unstable; urgency=medium
+
+  * First major release of the one-encoder trunk: gzippy 0-9 routes through
+    one pure-Rust port (two measured exceptions), budget-48 promoted,
+    the len-3 machinery + good_match pair landed, the hc chain software-
+    pipelined, NEON/SSE2 lz extends, the ParallelSM decode stack.
+  * The release-cleanup waves: the README rewritten for v1.0, the man page's
+    routing facts, comment/polish passes across compress/decompress.
+
+ -- Jack Danger <github@jackdanger.com>  Wed, 30 Sep 2026 10:00:00 -0700
+
 gzippy (0.2.0-1) unstable; urgency=medium
 
   * New: gzippy --analyze FILE prints a compression fingerprint —
