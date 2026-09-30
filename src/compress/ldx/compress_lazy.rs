@@ -8,8 +8,11 @@
 //! the match. `lazy2` looks ahead two positions rather than one — slightly slower,
 //! slightly smaller.
 //!
-//! **This gates L5-L9**: lazy at (16,30), (35,65), (100,130) and lazy2 at (300,258),
-//! (600,258).
+//! **This backs libdeflate's lazy and lazy2 levels.** The level -> config map
+//! in `super::compress` sends L3 (the deliberate divergence — see the map),
+//! L5-L7 to `deflate_compress_lazy` while L2/L4 use greedy, and L8-L9 to
+//! `deflate_compress_lazy2`. Which of those levels the outer router actually
+//! routes here is `level_uses_ldx` in `src/compress/deflate/mod.rs`.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::choose_max_block_end;
@@ -69,12 +72,14 @@ fn bsr32(v: u32) -> i32 {
 /// The first recalculation happens 10,000 bytes in; after that the interval becomes the
 /// block's current length, so checks get rarer as the block grows and its literal
 /// statistics stabilise. Greedy never does this — only the lazy parsers do.
-/// L3 over-split split-hold constants — ported 1:1 from the legacy parser
-/// (`src/compress/deflate/parse/mod.rs`): after 8 completed blocks, if the
-/// running average block size is in the 50-65 KB band (the FASTQ over-split
-/// signature) with <= 20 blocks/MiB, arm a split hold for the rest of the
-/// file: non-ultra-sparse blocks are then held to 50 KB before the entropy
-/// split may fire.
+///
+/// # L3 over-split split-hold constants
+///
+/// Ported 1:1 from the legacy parser (`src/compress/deflate/parse/mod.rs`):
+/// after 8 completed blocks, if the running average block size is in the
+/// 50-65 KB band (the FASTQ over-split signature) with <= 20 blocks/MiB, arm
+/// a split hold for the rest of the file: non-ultra-sparse blocks are then
+/// held to 50 KB before the entropy split may fire.
 const L3_OVER_SPLIT_LATCH_BLOCKS: u32 = 8;
 const L3_NON_ULTRA_SPLIT_MIN_BYTES: usize = 50_000;
 const L3_OVER_SPLIT_AVG_BLOCK_MIN_BYTES: usize = 50_000;
@@ -250,11 +255,10 @@ pub(crate) fn deflate_compress_lazy_generic(
             in_max_block_end - in_next,
             max_search_depth,
         );
-        // MEASUREMENT-ONLY min-match floor override (ladder-tune feature; the
-        // residual board's access.log L5 card: the shipped content heuristic
-        // may be clamping min_len to 4+ where the RIVAL takes len-3 tokens —
-        // 50,210 of them on this corpus). `GZIPPY_LDX_MIN=<floor>` applies the
-        // explicit floor everywhere in this invocation.
+        // MEASUREMENT-ONLY min-match floor override (ladder-tune feature, never
+        // in shipped builds): `GZIPPY_LDX_MIN=<floor>` applies the explicit
+        // min-match floor everywhere in this invocation — the probe surface for
+        // the L5 len-3 card noted on the level map in `super::compress`.
         #[cfg(feature = "ladder-tune")]
         let mut min_len = if let Ok(raw) = std::env::var("GZIPPY_LDX_MIN") {
             core::cmp::min(raw.parse::<u32>().unwrap_or(min_len), min_len)

@@ -6,20 +6,14 @@
 //! splitting algorithm and just uses fixed length blocks. `c->max_search_depth` has no
 //! effect with this algorithm, as it is hardcoded in `ht_matchfinder.h`.
 //!
-//! # Why this function specifically
+//! # Why this function exists alongside the shipped L1
 //!
-//! Of the 17 T1 cells where we LOSE to libdeflate, **15 are L1** — and L1 is the one
-//! level where our encoder is not libdeflate's at all: we ship igzip's chainless
-//! finder (`deflate/parse/fast.rs`, 3,380 lines) where libdeflate runs this. Every
-//! other level is already a byte tie. So this pair of functions is very nearly the
-//! whole phase-1 parity gap.
-//!
-//! **This does not mean routing L1 here will close those cells.** Git history
-//! records two prior attempts, one dead on size and one dead on the T1 wall at
-//! 1.2662x on a cell `main` already ties; per the standing rule those records are
-//! not binding — re-measure. What this module changes is that a third attempt can
-//! be measured against the REAL libdeflate algorithm instead of against a
-//! derivative of it.
+//! Production L1 is our igzip-derived chainless finder
+//! (`deflate/parse/fast.rs`) — see `level_uses_ldx` in
+//! `src/compress/deflate/mod.rs` for the routing and why it wins. This port
+//! of libdeflate's own L1 lives here so that `ldx` covers every level 0-9
+//! with one lineage and the level-by-level differential runs against the
+//! REAL libdeflate algorithm instead of a derivative of it.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::flush::{Compressor, DeflateSequence};
@@ -293,9 +287,8 @@ mod tests {
     /// `libdeflate_deflate_compress` guarantees it by routing inputs of
     /// `max_passthrough_size` bytes or fewer — 51 at level 1 — to
     /// `deflate_compress_none` instead. Calling this function with a shorter input is
-    /// something the C never does; a first draft of this test started at 0 and
-    /// panicked in the cost model, which is how the passthrough got ported.
-    /// `compress::tests::level_1_passthrough_boundary_is_51_bytes` covers 0..=51.
+    /// something the C never does; `compress::tests::level_1_passthrough_boundary_is_51_bytes`
+    /// covers 0..=51.
     #[test]
     fn every_short_length_round_trips() {
         for n in 52..=400usize {

@@ -2,17 +2,17 @@
 //! `deflate_compress_greedy`, the "greedy" DEFLATE compressor. It always chooses the
 //! longest match.
 //!
-//! **This gates levels 2, 3 AND 4** — libdeflate uses greedy for all three (`:3931`,
-//! `:3936`, `:3941`), with `(max_search_depth, nice_match_length)` of (6,10), (12,14)
-//! and (16,30).
+//! **This gates levels 2 AND 4** — libdeflate uses greedy for both (`:3931`,
+//! `:3941`), with `(max_search_depth, nice_match_length)` of (6,10) and (16,30).
 //!
-//! # L3 is where we currently DIVERGE, and we win there
+//! # L3 runs the lazy parser instead, and that is deliberate
 //!
-//! Our shipping L3 is LAZY(12,14) against libdeflate's GREEDY(12,14) — same knobs,
-//! different parser — and ours is smaller on 20 of 22 files, median ~44 KB. So the
-//! differential at L3 is expected to match THEIR choice, which is phase-1 parity
-//! succeeding, not a regression. Our lazy L3 is a phase-2 win to re-layer once every
-//! cell is a tie. Do not "fix" the port to keep our L3.
+//! libdeflate's L3 is GREEDY(12,14); ours is LAZY(12,14) — same knobs, different
+//! parser — and smaller on nearly every file (the why lives with the level map
+//! in `super::compress`). A differential run at L3 is therefore EXPECTED to
+//! diverge from the C's parser choice; that is the deliberate branch, not a
+//! port regression. The greedy path above remains for the levels that use it
+//! and for per-function parity against the C.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::choose_max_block_end;

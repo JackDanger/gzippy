@@ -16,16 +16,9 @@
 //! That file adds a length-3 table which the C explicitly refuses (see the paragraph
 //! above, `ht_matchfinder.h:38-40`) and imports `HT_MAX_LEN3_OFFSET = 4096` from a
 //! DIFFERENT C function. It is a derivative, not a port, and it must not be diffed
-//! against this file as though it were one.
-//!
-//! Two prior attempts to route L1 through a ht-style finder are on record in git
-//! history: attempt 1 DIED ON SIZE (clause 3, 7 pass->fail flips) because `fast`'s
-//! `head3` length-3 table wins on BINARIES and `ht_matchfinder` has no length-3
-//! support; attempt 2 (2-way buckets AND a length-3 table) passed size and died on
-//! the T1 WALL at 1.2662x. Per the standing rule those records are NOT binding —
-//! re-measure instead of trusting a citation. This module is the FAITHFUL C, built
-//! so that a third attempt can at least be measured against the real thing rather
-//! than against a derivative.
+//! against this file as though it were one. This module is the FAITHFUL C, so
+//! `ldx` covers the vendor's whole L0-9 surface and the level-by-level
+//! differential runs against the real algorithm rather than a derivative.
 
 use super::matchfinder_common::{
     lz_extend, lz_hash, matchfinder_init, matchfinder_rebase, prefetchw, MfPos,
@@ -38,8 +31,8 @@ pub(crate) const HT_MATCHFINDER_HASH_ORDER: u32 = 15;
 pub(crate) const HT_MATCHFINDER_BUCKET_SIZE: usize = 2;
 /// C: `#define HT_MATCHFINDER_MIN_MATCH_LEN 4` (:52)
 ///
-/// **4, not DEFLATE's 3.** See the module docs — this is the design constraint that
-/// killed the first attempt to route L1 here.
+/// **4, not DEFLATE's 3.** See the module docs — the ht-style finder's own design
+/// constraint, and the reason a len-3 gate belongs in the parser instead.
 pub(crate) const HT_MATCHFINDER_MIN_MATCH_LEN: u32 = 4;
 /// C: `#define HT_MATCHFINDER_REQUIRED_NBYTES 5` (:54)
 ///
@@ -88,12 +81,8 @@ impl HtMatchfinder {
     }
 }
 
-/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
-/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
-/// past AArch64's 8 argument registers, so every call spilled to the stack.
-/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
-/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
-/// 1.34x. Matching the vendor's `forceinline`.
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`) — matched
+/// by `#[inline(always)]`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ht_matchfinder_longest_match(
@@ -145,9 +134,7 @@ pub(crate) fn ht_matchfinder_longest_match(
     // the TABLE from the vendor whenever slot-0 is out of window: a later
     // probe hashing this bucket then sees our stale copy where the C kept the
     // fresher candidate, which can change a match decision and the emitted
-    // bytes on the ht-matched paths. Found by review (vendor-order diff), not
-    // by a failing pin — exactly why the parity oracle runs even at exception
-    // levels.
+    // bytes on the ht-matched paths.
     if cand0 > cutoff {
         mf.hash_tab[s1] = cand0;
     }
@@ -214,14 +201,10 @@ pub(crate) fn ht_matchfinder_longest_match(
     best_len
 }
 
-/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`). Ours carried
-/// NO inline attribute, so this was a real ABI call — and it takes 10 arguments,
-/// past AArch64's 8 argument registers, so every call spilled to the stack.
-/// Measured: the deficit vs the C is call-shape-dependent — at L9 (depth 600,
-/// few long calls) we BEAT it 0.88x, at L2 (depth 6, many short calls) we lose
-/// 1.34x. Matching the vendor's `forceinline`.
-#[inline(always)]
 /// C: `ht_matchfinder_skip_bytes(...)` (:196)
+///
+/// C: `static forceinline` (`hc_matchfinder.h` / `ht_matchfinder.h`) — matched
+/// by `#[inline(always)]`.
 ///
 /// Insert `count` consecutive positions into the table without searching. Used after a
 /// match is taken, so the interior of the match is still indexed.
@@ -232,6 +215,7 @@ pub(crate) fn ht_matchfinder_longest_match(
 /// fewer than 5 bytes left, hashing would read past the input. Skipping the whole
 /// insert leaves those tail positions unindexed, which is why the last few bytes of a
 /// stream are always literals.
+#[inline(always)]
 pub(crate) fn ht_matchfinder_skip_bytes(
     mf: &mut HtMatchfinder,
     buf: &[u8],
@@ -304,9 +288,7 @@ fn load_u32(buf: &[u8], i: usize) -> u32 {
     // The C reads 4 bytes unchecked; its callers guarantee the room via
     // HT_MATCHFINDER_REQUIRED_NBYTES / the compressor's BUF_PAD. Our checked
     // form compiled to a never-taken cmp+jcc->panic cluster in the hottest
-    // loop, re-reading a stack-spilled `buf.len()` every iteration
-    // (attributed 2026-08-11: 57 such clusters = 59% of the port's Ir excess
-    // over the C, and this class is ~12M of 16.5M).
+    // loop, re-reading a stack-spilled `buf.len()` every iteration.
     //
     // SAFETY: every caller is inside a region that has already proven at least
     // 4 readable bytes at `i` — the tail-shortfall paths return before

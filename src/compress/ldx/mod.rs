@@ -26,8 +26,8 @@
 //! ~17,000 lines of core deflate path doing what libdeflate does in 4,155. That
 //! structural fact — not any single number — motivated the isolated port.
 //!
-//! **GOAL (user, 2026-08-01): perfectly copy libdeflate's exact implementation in
-//! pure Rust, performing exactly the same and producing the same output.**
+//! **The port's contract: copy libdeflate's exact implementation in pure Rust,
+//! performing exactly the same and producing the same output.**
 //!
 //! This is built as a NEW module rather than a refactor of `super::deflate` for two
 //! reasons that are both about keeping a measurement honest:
@@ -68,8 +68,7 @@
 //!
 //! # Port status
 //!
-//! See `PORT_STATUS.md` in the repo root for the live checklist. Order is dependency
-//! order, which is roughly the C's own file order:
+//! Ported in the C's own file order (dependency order):
 //!
 //! * [x] constants (this file)
 //! * [x] heap sort + `sort_symbols` + `build_tree` + `compute_length_counts`
@@ -80,10 +79,16 @@
 //! * [x] block-split stats (`init_block_split_stats` .. `should_end_block`)
 //! * [x] matchfinders: `hc_matchfinder.h`, `ht_matchfinder.h`, `bt_matchfinder.h`
 //! * [x] `deflate_compress_none` / `_fastest` / `_greedy` / `_lazy_generic`
-//! * [ ] near-optimal: costs, `deflate_find_min_cost_path`, `_compress_near_optimal`
 //! * [x] `libdeflate_alloc_compressor_ex` for levels 0-9 (the level -> config map)
-
-#![allow(dead_code)] // Ports land bottom-up; unused until the driver is ported.
+//! (Near-optimal parsing is deliberately not ported here; see the module split
+//! above.)
+#![allow(dead_code)]
+// Liveness differs per `--all-targets` compilation unit (the lib, the binary's
+// test compilation, the per-crate test units): items this port keeps for C
+// parity — the C's own constants and accessors — read as dead in one unit and
+// are used in another. A blanket allow at module scope is the only spelling
+// that stays truthful across all of them; per-item allows drift silently as
+// callers move. The blanket lives HERE ONLY, not in `super::deflate`.
 
 mod bitstream;
 mod codes;
@@ -220,42 +225,26 @@ pub const DEFLATE_MAX_LENS_OVERRUN: usize = 137;
 pub const DEFLATE_MAX_EXTRA_LENGTH_BITS: u32 = 5;
 pub const DEFLATE_MAX_EXTRA_OFFSET_BITS: u32 = 13;
 
-/// Compress `input` at `level` through the ported path and return the raw DEFLATE
-/// bytes, or `None` if that level is not ported yet.
+/// C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919)
 ///
-/// **The differential form is oracle-only; the production form is the
-/// pipeline's chunk engine.** `compress_for_diff` exists so the
-/// port's rung-3 gate — byte-for-byte against libdeflate's own
-/// `libdeflate_deflate_compress` — can be run from `examples/ldxdump.rs`.
-/// PRODUCTION entry point: compress `input` and APPEND the raw DEFLATE bytes to
-/// `out`, with no scratch buffer and no copy (`compress_into` is routed by
-/// `src/compress/deflate/mod.rs` at the non-exception levels, and the PR-3
-/// dict-chunk extension builds on it).
-///
-/// [`compress_for_diff`] is the divergence ORACLE and allocates
-/// `vec![0u8; input.len() * 2 + 65536]` — it ZEROES twice the input plus 64 KB on
-/// every call, then the caller copies the result out again. That is fine for a
-/// test; shipping it cost a 24.4 MB memset per compression on a 12 MB input, and
-/// it is a FIXED cost, so it dominated the fast levels and vanished at L9 —
-/// exactly the level pattern we could not explain (we lost 1.07-1.15x at L1-L6
-/// and WON 0.84-0.96x at L9 against the very C we are a port of).
-///
-/// The bound is libdeflate's own worst case for its stored fallback: the input
-/// plus 5 bytes of block header per 65535-byte sub-block plus framing slack.
-/// `spare_capacity_mut` hands the compressor uninitialised bytes — nothing is
-/// zeroed — and `set_len` commits only what it wrote.
-/// C: `c->max_passthrough_size = 55 - (compression_level * 4);` (:3919).
-///
-/// Inputs at or below this length never reach a parser in libdeflate — it emits an
-/// uncompressed block. Our streaming encoder does not, and is 3 bytes smaller there
-/// (e.g. n=1: ours 3, port 6). The router uses this to keep the port off inputs where
-/// it is strictly worse, which is what makes routing a level here a ZERO-size change
-/// rather than a trade.
+/// Inputs at or below this many bytes never reach a parser in libdeflate — it
+/// emits an uncompressed block, and the port reproduces that inside
+/// `LdxCompressor` (`super::compress` explains why the passthrough is
+/// load-bearing rather than just a fast path). This is the standalone helper
+/// mirroring the knob.
 #[inline]
 pub fn max_passthrough_size(level: u32) -> usize {
     55usize.saturating_sub((level as usize) * 4)
 }
 
+/// PRODUCTION entry point: compress `input` and APPEND the raw DEFLATE bytes to
+/// `out` — no scratch buffer, no zeroing, no copy. Routed by
+/// `src/compress/deflate/mod.rs` at the levels it sends to this port.
+///
+/// The bound below is libdeflate's own worst case for its stored fallback: the
+/// input plus 5 bytes of block header per 65535-byte sub-block plus framing
+/// slack. `spare_capacity_mut` hands the compressor uninitialised bytes —
+/// nothing is zeroed — and `set_len` commits only what it wrote.
 pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
     crate::compress::deflate::encode_census::port_encode();
     let Some(mut c) = compress::LdxCompressor::new(level) else {
@@ -283,6 +272,16 @@ pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Divergence ORACLE: compress `input` at `level` through the ported path and
+/// return the raw DEFLATE bytes, or `None` if that level is not ported yet.
+///
+/// This exists so the rung-3 gate — byte-for-byte against libdeflate's own
+/// `libdeflate_deflate_compress` — can be driven from
+/// `src/compress/ldx_oracle.rs` and the probe examples. It is deliberately not
+/// the production path: it allocates `vec![0u8; input.len() * 2 + 65536]`,
+/// zeroing twice the input plus 64 KB on every call, a fixed per-call memset
+/// that would dominate the fast levels. [`compress_into`] is the zero-copy
+/// production counterpart.
 pub fn compress_for_diff(level: u32, input: &[u8]) -> Option<Vec<u8>> {
     let mut c = compress::LdxCompressor::new(level)?;
     let mut out = vec![0u8; input.len() * 2 + 65536];

@@ -21,9 +21,8 @@ use super::{
 /// Temporary space for block flushing. In the C this shares storage with the "full"
 /// length codewords via a union, because the two are never live at once. We keep them
 /// as separate types: the union is a memory economy with no observable behaviour, and
-/// reproducing it in Rust would need `unsafe` for zero byte-identity benefit.
-/// (`PORT_STATUS.md` records this as a deliberate, behaviour-free divergence — the
-/// only category of divergence this port permits.)
+/// reproducing it in Rust would need `unsafe` for zero byte-identity benefit — the
+/// one category of divergence this port permits.
 pub(crate) struct Precode {
     pub(crate) freqs: [u32; DEFLATE_NUM_PRECODE_SYMS],
     pub(crate) codewords: [u32; DEFLATE_NUM_PRECODE_SYMS],
