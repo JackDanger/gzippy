@@ -1297,9 +1297,8 @@ mod tests {
         gz[len - 3] = 0;
         gz[len - 2] = 0;
         gz[len - 1] = 0;
-        // libdeflate checks CRC + ISIZE in the trailer, so this will fail.
-        // But decompress_single_member_libdeflate_pub uses gzip_decompress_ex
-        // which verifies the trailer. A wrong ISIZE = bad data.
+        // The pure-Rust single-member path (ParallelSM) verifies CRC32 + ISIZE
+        // in the trailer, so a corrupted ISIZE = bad data.
         let mut out = Vec::new();
         let result = crate::decompress::decompress_single_member_pure(&gz, &mut out);
         // Either error (CRC/ISIZE mismatch) or the data is wrong
@@ -1432,8 +1431,8 @@ mod tests {
 
     /// Regression (2026-05-29): a multi-member gzip whose SECOND member starts
     /// past the 16 MiB `is_likely_multi_member` detection window is misrouted
-    /// to the single-member backend. The single-member backends (ISA-L
-    /// `decompress_gzip_stream` and `decompress_single_member_libdeflate`) must
+    /// to the single-member backend. The single-member path (pure-Rust
+    /// ParallelSM — see docs/parallel-decode-architecture.md) must
     /// consume-and-loop residual members so the FULL output is produced — not
     /// silently truncated to member 1. Real-world shape: `cat big.gz small.gz`.
     /// Before the fix this produced member 1 only (silent corruption).

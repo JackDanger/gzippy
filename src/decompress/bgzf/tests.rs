@@ -748,9 +748,12 @@ fn test_multi_member_large() {
 }
 
 /// Main decompression benchmark - compares gzippy vs libdeflater crate
-/// Benchmarks raw deflate decompression using the PRODUCTION path (libdeflate C FFI).
-/// This is what inflate_into_pub() delivers — the function used by every production
-/// decode call (BGZF blocks, multi-member members, single-member stream).
+/// (the libdeflater reference arm, for wrapper-overhead accounting only).
+/// Benchmarks raw deflate decompression using the PRODUCTION path: the
+/// pure-Rust `inflate_consume_first` engine behind `inflate_into_pub()` —
+/// the function used by every production
+/// decode call (BGZF blocks, multi-member members, single-member stream);
+/// the libdeflate C FFI it replaced was removed with the decode FFI graph.
 ///
 /// Run with: cargo test --release bench_production_inflate -- --nocapture
 #[test]

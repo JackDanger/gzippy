@@ -1,7 +1,7 @@
 .\" gzippy(1) — the fastest gzip. Hand-written troff.
 .\" Lint:   mandoc -Tlint man/gzippy.1
 .\" Render: man -l man/gzippy.1
-.TH GZIPPY 1 2026-04-24 "gzippy 0.2.0" "User Commands"
+.TH GZIPPY 1 2026-09-30 "gzippy 0.2.0" "User Commands"
 .
 .SH NAME
 gzippy \- the fastest gzip
@@ -36,14 +36,14 @@ baked into your router.
 .PP
 gzippy aims to be the fastest gzip ever written. On a 14-core laptop it
 compresses a 211 MB log file in 0.07 seconds. Decompression runs at
-300\(en2000 MB/s depending on input and thread count. It uses libdeflate,
-zlib-ng, and ISA-L under the hood, picks the right one for your data, and
-spreads the work across every core you give it.
+300\(en2000 MB/s depending on input and thread count. One pure-Rust engine
+family does the compression \(em a port of libdeflate's encoder with
+igzip-class fast levels and a near-optimal parse at the top \(em and the
+work spreads across every core you give it.
 .PP
-Parallel output carries a small FEXTRA subfield identified by
-.BR \(dqGZ\(dq .
-Standard gzip readers ignore it; gzippy uses it to find block boundaries
-without inflating, enabling parallel decompression. The wire format is
+gzippy still parallel-decodes legacy \(dqGZ\(dq multi-block files, which
+carry a small FEXTRA subfield; standard gzip readers skip it. Current
+releases emit only standard single-member gzip. The wire format is
 documented in
 .BR gzippy-format (5).
 .PP
@@ -158,10 +158,10 @@ Alias for
 .BR -9 .
 .TP
 .BR --ultra
-Level 11 \(em libdeflate's near-zopfli mode at roughly pigz speed.
+Level 11 \(em gzippy's own near-optimal parse at roughly pigz speed.
 .TP
 .BR --max
-Level 12 \(em libdeflate's densest mode, closest to zopfli ratio.
+Level 12 \(em the densest of the near-optimal levels, closest to zopfli ratio.
 Slower than
 .BR --ultra .
 .TP
@@ -188,11 +188,9 @@ Write a single-entry ZIP archive. Default suffix changes to
 .BR -p ", " --processes " " \fIN\fR
 Use
 .I N
-threads. Default is every online CPU. With
-.BR -p1 ,
-gzippy emits a plain single-member gzip; with
-.B -p>1
-at levels 0\(en5 it emits the "GZ" multi-block format for parallel decode.
+threads. Default is every online CPU. Every level and thread count emits a
+plain single-member gzip; more threads simply run more encode workers on
+parallel blocks, reassembled into the one member.
 .TP
 .BR -b ", " --blocksize " " \fISIZE\fR
 Parallel block size. Accepts
@@ -268,33 +266,47 @@ Print license and exit.
 Print brief help and exit.
 .
 .SH ROUTING
-gzippy picks its encoder and decoder from the input, the flags, and the
-platform. You can see the decision at run time with
+One pure-Rust engine family routes every run; there are no C backends on
+the production graph. gzippy picks its parallel strategy from the input,
+the flags, and the thread count. You can see the decision at run time with
 .BR "GZIPPY_DEBUG=1" .
 .PP
 .nf
-\fBCompression\fR
-  -p1, -0 to -3, x86_64 with ISA-L .... ISA-L
-  -p>1,  -6 to -9 ....................... pipelined encoder, single-member
-  -p>1,  -0 to -5 ....................... parallel encoder, \(dqGZ\(dq multi-block
-  -p1, all other levels ................. flate2 single-threaded
+\fBCompression\fR (one encode per input)
+  -F / -I / -J ..................... zopfli port, single-member
+  -p1, levels 0\(en9 ................ pure single-member gzip.
+                                       Levels 0\(en9 are a port of
+                                       libdeflate's parser, except L1
+                                       (igzip-class arm) and L6 (legacy
+                                       arm), the two measured exceptions
+  -p1, levels 10\(en12 .............. near-optimal parse (own engine)
+  -p>1, all levels ................. pure parallel pipeline, standard
+                                       single-member gzip
 \fBDecompression\fR
-  \(dqGZ\(dq subfield present .................. parallel libdeflate FFI
-  Multi-member, -p1 ..................... sequential libdeflate
-  Multi-member, -p>1 .................... parallel libdeflate FFI
-  Single-member, x86_64 ................. ISA-L streaming inflate
-  Single-member, > 1 GB, no ISA-L ....... zlib-ng streaming
-  Single-member, default ................ libdeflate one-shot
+  \(dqGZ\(dq subfield present .................. parallel bgzf decode
+  Multi-member, -p1 ..................... sequential member walk
+  Multi-member, -p>1 .................... member grid / member-per-worker
+  Single-member ..................... ParallelSM pipeline (pure Rust),
+                                       the sole single-member path at
+                                       every thread count; stored-block
+                                       dominated input splits explicitly
+                                       (StoredParallel)
 .fi
 .PP
-This table is reproduced from the
-.I Production Routing
-section of the in-tree development guide; it is the source of truth for
-which function runs your data.
+The C backends (ISA-L, libdeflate) named by earlier releases survive only
+as differential test oracles, off the production graph.
+.PP
+The GZIPPY_DEBUG labels (\fBencode-path=\fR..., \fBpath=\fR...) come from
+the routing drivers themselves \(em \fIsrc/compress/mod.rs\fR and the
+\fBDecodePath\fR table in \fIsrc/decompress/mod.rs\fR, which are the
+source of truth for which function runs your data.
 .
 .SH THE "GZ" FEXTRA SUBFIELD
-Parallel output at levels 0\(en5 carries per-block metadata in an RFC 1952
-FEXTRA subfield:
+Current releases emit a standard single-member gzip at every level and
+thread count. The \(dqGZ\(dq parallel multi-block format is retired from
+the compression routes (kept only as a differential test oracle); gzippy
+still parallel-decodes files that carry it, whose per-block metadata lives
+in an RFC 1952 FEXTRA subfield:
 .PP
 .nf
     +----+----+----+----+----+----+----+----+

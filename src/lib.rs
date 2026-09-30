@@ -212,11 +212,14 @@ pub fn compress_to_writer_with_threads<R: std::io::Read, W: std::io::Write + Sen
 
 /// Decompress a gzip stream using all available CPUs.
 ///
-/// Automatically selects the best path — parallel bgzf, parallel
-/// multi-member, or the pure-Rust streaming decoder — based on
-/// the input format and available hardware (the decode-FFI graph — ISA-L
-/// single-member, libdeflate one-shot — was removed with Increment 7's
-/// pure-Rust decode rule).
+/// Pure-Rust end to end at every thread count: the "GZ" multi-block format
+/// takes the parallel bgzf scan, multi-member streams take the member grid
+/// or member-per-worker split (sequential at `threads = 1`), and
+/// single-member streams always take the pure-Rust ParallelSM pipeline —
+/// the sole single-member decode path (Increment 7 removed the C-FFI
+/// decode graph — ISA-L streaming, libdeflate one-shot; the C backends
+/// survive only as differential test oracles). See
+/// `docs/parallel-decode-architecture.md`.
 ///
 /// **Non-gzip input:** returns `Ok(Vec::new())`.
 pub fn decompress(data: &[u8]) -> GzippyResult<Vec<u8>> {

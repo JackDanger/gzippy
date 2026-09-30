@@ -240,10 +240,8 @@ pub(crate) fn classify_gzip_prescanned(
     // larger than that (e.g. an 85%-dominant member) is misclassified as
     // single-member. The single-member decoders (ParallelSM / StoredParallel)
     // CANNOT span members: they read the whole-file trailer (== the LAST member's
-    // ISIZE/CRC) and walk deflate blocks straight across member boundaries. The
-    // stale `is_likely_multi_member` comment assumes the single-member backend
-    // "consumes-and-loops residual members" — true of the old ISA-L/libdeflate
-    // one-shots, FALSE of StoredParallel. On a stored-dominant first member whose
+    // ISIZE/CRC) and walk deflate blocks straight across member boundaries. On a
+    // stored-dominant first member whose
     // last deflate block is Huffman, `walk_stored_chain` returns a HuffmanTail
     // with `prefix_out` == member-1 output, then `decode_with_huffman_tail`
     // trips `prefix_out > expected_size` (expected == the small last member's
