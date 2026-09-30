@@ -19,12 +19,25 @@
 #   before these budgets gate anything (still informational, continue-on-error).
 # RATCHET: an optimization re-pins LOWER in its own PR; never raise a budget
 # without a paired-wall receipt showing the wall did not regress.
+# APPEND (2026-09-30, agent-b1, residual-gap campaign): L4/L5 rows added
+# (the residual board's band: access.log L5 T1, data.sqlite L4 T1). Seeded
+# on 'runnervmtr4k5' (x86_64 valgrind, same host class as the re-pin above) at
+# gzippy @ 88a16b6, via the extended generators committed with this file.
+# Same ratchet rules as the header: tighten in the improving PR only.
 fixture	level	ir_per_b
 text	1	67.21
+text	4	85.94
+text	5	121.03
 text	6	236.79
 tabular	1	53.62
+tabular	4	61.56
+tabular	5	84.06
 tabular	6	106.82
 binary	1	87.65
+binary	4	76.05
+binary	5	102.56
 binary	6	123.49
 noise	1	117.06
+noise	4	91.85
+noise	5	128.67
 noise	6	126.35
