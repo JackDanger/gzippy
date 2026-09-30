@@ -269,6 +269,28 @@ impl LdxCompressor {
         let good_match = self.good_match;
         let far_len3_gate = self.far_len3_gate;
         let sparse_split_guard_mul = self.sparse_split_guard_mul;
+        // PROBE (zopfli #119, ladder-tune builds only — a shipped binary reads
+        // neither env): the length-graded len-3/4/5 accept surface at the
+        // residual board's priced levels (L4 greedy, L5 lazy). The tuple is
+        // (LEN_GRADE armed, MIN3 armed); `GZIPPY_LDX_MIN3=1` arms the gate —
+        // the content heuristic's min_len is relieved to give the sheet
+        // candidates (the b2eca3bc honest zero starved it to death) and every
+        // len-3 goes through the per-block cost sheet (near shadow priced,
+        // greedy's fixed >4096 far guard widened into it).
+        // `GZIPPY_LDX_LEN_GRADE=1` layers #119's length grades on top:
+        // margin-free len-3 within 1024, and the sheet catching near len-4
+        // beyond 2048 / len-5 beyond 4096.
+        #[cfg(feature = "ladder-tune")]
+        let ldx_probe: Option<(bool, bool)> = if matches!(self.compression_level, 4 | 5)
+            && std::env::var("GZIPPY_LDX_MIN3").ok().as_deref() == Some("1")
+        {
+            Some((
+                true,
+                std::env::var("GZIPPY_LDX_LEN_GRADE").ok().as_deref() == Some("1"),
+            ))
+        } else {
+            None
+        };
         match (&mut self.parser, self.compression_level) {
             (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
@@ -278,58 +300,127 @@ impl LdxCompressor {
                 &mut os,
                 nice_match_length,
             ),
-            // L2 and L4 stay on libdeflate's greedy parser; L3 runs the lazy
-            // parser (the measured divergence documented in the level map).
-            // The far-len-3 gate and split-hold knobs are lazy-parser
-            // machinery (L3) — the greedy parser takes no such parameters.
-            (ParserState::Greedy(p), 2 | 4) => deflate_compress_greedy(
-                &mut self.c,
-                p.get_or_insert_with(GreedyState::new),
-                r#in,
-                in_nbytes,
-                &mut os,
-                max_search_depth,
-                nice_match_length,
-                good_match,
-            ),
-            (ParserState::Greedy(p), 3) => deflate_compress_lazy(
-                &mut self.c,
-                p.get_or_insert_with(GreedyState::new),
-                r#in,
-                in_nbytes,
-                &mut os,
-                max_search_depth,
-                nice_match_length,
-                good_match,
-                far_len3_gate,
-                sparse_split_guard_mul,
-            ),
+            // L2 stays on libdeflate's greedy parser; L4 is the greedy arm of
+            // the #119 probe (data.sqlite L4 cell); L3 runs the lazy parser
+            // (the measured divergence documented in the level map) and is
+            // deliberately OUTSIDE the probe levels — its shipped far-len-3
+            // gate is a landed lever and must not move. The far-len-3 gate
+            // and split-hold knobs are lazy-parser machinery (L3) — the
+            // greedy parser takes no such parameters.
+            (ParserState::Greedy(p), 2 | 4) => {
+                #[cfg(feature = "ladder-tune")]
+                deflate_compress_greedy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    ldx_probe,
+                );
+                #[cfg(not(feature = "ladder-tune"))]
+                deflate_compress_greedy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                );
+            }
+            (ParserState::Greedy(p), 3) => {
+                #[cfg(feature = "ladder-tune")]
+                deflate_compress_lazy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                    ldx_probe,
+                );
+                #[cfg(not(feature = "ladder-tune"))]
+                deflate_compress_lazy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                );
+            }
             // C: `deflate_compress_lazy` is `_lazy_generic(..., false)` and
             // `deflate_compress_lazy2` is `_lazy_generic(..., true)`.
-            (ParserState::Greedy(p), 5..=7) => deflate_compress_lazy(
-                &mut self.c,
-                p.get_or_insert_with(GreedyState::new),
-                r#in,
-                in_nbytes,
-                &mut os,
-                max_search_depth,
-                nice_match_length,
-                good_match,
-                far_len3_gate,
-                sparse_split_guard_mul,
-            ),
-            (ParserState::Greedy(p), 8..=9) => deflate_compress_lazy2(
-                &mut self.c,
-                p.get_or_insert_with(GreedyState::new),
-                r#in,
-                in_nbytes,
-                &mut os,
-                max_search_depth,
-                nice_match_length,
-                good_match,
-                far_len3_gate,
-                sparse_split_guard_mul,
-            ),
+            (ParserState::Greedy(p), 5..=7) => {
+                #[cfg(feature = "ladder-tune")]
+                deflate_compress_lazy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                    ldx_probe,
+                );
+                #[cfg(not(feature = "ladder-tune"))]
+                deflate_compress_lazy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                );
+            }
+            (ParserState::Greedy(p), 8..=9) => {
+                #[cfg(feature = "ladder-tune")]
+                deflate_compress_lazy2(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                    ldx_probe,
+                );
+                #[cfg(not(feature = "ladder-tune"))]
+                deflate_compress_lazy2(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                    far_len3_gate,
+                    sparse_split_guard_mul,
+                );
+            }
             _ => unreachable!("parser state must match the immutable compression level"),
         }
 

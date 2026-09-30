@@ -1,0 +1,3 @@
+access.log	gzip5= 2775432	pigz5= 2781792
+data.sqlite	gzip5= 13255464	pigz5= 13255186
+minjs.min.js	gzip5= 1099357	pigz5= 1099533
