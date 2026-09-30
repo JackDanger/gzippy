@@ -323,6 +323,12 @@ pub(crate) unsafe fn lz_extend_sse(
 
 /// NEON-optimized match extension: compares 16 bytes at a time
 /// using XOR + vmaxvq_u8. Produces identical results to `lz_extend`.
+///
+/// When a 16-byte block contains a mismatch, the first differing byte is
+/// located directly with a per-byte equality bit-mask — the AArch64 stand-in
+/// for SSE's `_mm_movemask_epi8` (`lz_extend_sse` above) — instead of falling
+/// back to the scalar word/byte tails, which would re-verify up to all 15
+/// remaining bytes of the block.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) unsafe fn lz_extend_neon(
@@ -344,8 +350,9 @@ pub(crate) unsafe fn lz_extend_neon(
         let x = veorq_u8(a, b);
         let max_byte = vmaxvq_u8(x);
         if max_byte != 0 {
-            // Not all 16 bytes match; fall through to word tail
-            break;
+            // At least one byte in this block differs; locate it exactly.
+            len += first_mismatch_byte_neon(x);
+            return len;
         }
         len += 16;
     }
@@ -400,6 +407,47 @@ pub(crate) unsafe fn lz_extend_neon(
         len += 1;
     }
     len
+}
+
+/// AArch64 bit-extract for the NEON exact-mismatch locate: given an XOR block
+/// `x`, return the index of its first NONZERO byte (the first position where
+/// `strptr` and `matchptr` differ).
+///
+/// AArch64 has no `movemask`; the per-byte mask is built by ANDing each 0xFF
+/// equality byte with its positional weight and horizontally adding the two
+/// 8-byte halves into scalars (`vaddlv`): because the weights are powers of
+/// two, the sum *is* the bitmask, bit `i` set ⟺ byte `i` matched.
+///
+/// # Safety
+///
+/// Callers must have checked `vmaxvq_u8(x) != 0` first — i.e. at least one
+/// byte differs — so the mask cannot be `0xFFFF` and `trailing_ones` stays
+/// below 16.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn first_mismatch_byte_neon(x: core::arch::aarch64::uint8x16_t) -> u32 {
+    // Lane i contributes 2^(i mod 8); lanes 8..15 reuse the weights but land
+    // in the mask's high byte after the `<< 8` below. (This must be 16
+    // bytes: `vld1q_u8` reads the whole vector.)
+    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    use core::arch::aarch64::{
+        vaddlv_u8, vandq_u8, vceqzq_u8, vget_high_u8, vget_low_u8, vld1q_u8,
+    };
+
+    // vceqzq: 0xFF where x's byte is ZERO ⟺ strptr/matchptr AGREE there.
+    let eq = vceqzq_u8(x);
+    let weights = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
+    let bits = vandq_u8(eq, weights);
+    // Each half sums into its own bitmask (weights 2^lane, lanes 8..15 reuse
+    // weights 2^0..2^7 but land in the high bits after the `<< 8`).
+    let lo = vaddlv_u8(vget_low_u8(bits));
+    let hi = vaddlv_u8(vget_high_u8(bits));
+    // bit i of `mask` is set ⟺ byte i matched, so the first differing byte is
+    // the run of set bits from bit 0 (same polarity as `lz_extend_sse`'s
+    // `trailing_ones`). The caller's `vmaxvq_u8(x) != 0` guarantees a clear
+    // bit exists, so this is always a real locate, not a full-block match.
+    let mask = (lo | (hi << 8)) as u16;
+    mask.trailing_ones()
 }
 
 #[cfg(test)]
@@ -526,6 +574,46 @@ mod tests {
                     "run={run} max={max}"
                 );
             }
+        }
+    }
+
+    /// A NEON block that contains a mismatch must locate the FIRST differing
+    /// byte, with an earlier mismatch beating a later one — this pins the
+    /// `vceqzq_u8`/`vaddlv` bit-extract itself, not just `lz_extend`'s
+    /// composition of it. (aarch64 only: on x86 the helper is cfg'd out and
+    /// the SSE movemask path is exercised instead.)
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_exact_locate_finds_the_first_differing_byte() {
+        // XOR block with byte 1 differing (0xFF) and byte 6 ALSO differing:
+        // the locate must report the FIRST one.
+        let mut bytes = [0u8; 16];
+        bytes[1] = 0xFF;
+        bytes[6] = 0x55;
+        // SAFETY: `bytes` outlives the read and every value is a plain u8
+        // array, so reading it as a `uint8x16_t` cannot violate any layout
+        // constraint stronger than the alignment the read permits.
+        let x = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr() as *const core::arch::aarch64::uint8x16_t)
+        };
+        assert_eq!(unsafe { first_mismatch_byte_neon(x) }, 1);
+
+        // A mismatch at every one of the 16 in-block offsets, with a later
+        // decoy byte also differing, must each locate its own offset.
+        for idx in 0..16usize {
+            bytes[idx] = 0x11;
+            bytes[15] = 0x9C; // decoy at the far end (also idx 15's own mismatch)
+                              // SAFETY: as above.
+            let x = unsafe {
+                std::ptr::read_unaligned(bytes.as_ptr() as *const core::arch::aarch64::uint8x16_t)
+            };
+            assert_eq!(
+                unsafe { first_mismatch_byte_neon(x) },
+                idx as u32,
+                "mismatch at {idx} must win over the later decoy"
+            );
+            bytes[idx] = 0;
+            bytes[15] = 0;
         }
     }
 
