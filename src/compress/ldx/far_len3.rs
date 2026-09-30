@@ -1,12 +1,11 @@
 //! The far-len-3 cost gate (port of the legacy parser's `far_len3` module,
 //! `src/compress/deflate/parse/far_len3.rs`).
 //!
-//! The legacy L3 (zlib's deflate_slow, the campaign's winning T1 L3) accepts
-//! a len-3 match at far offsets only when a per-block cost model says the
-//! match beats the three literals it replaces; the libdeflate port's fixed
-//! ">8192 offset" guard donates up to ~7% on high-entropy content (deterministic
-//! 11-file corpus, 2026-09-01: tabular +18,886 B, text +6,831 B, binary
-//! +4,316 B — the L3 size gap that keeps L3 on the legacy routing exception).
+//! The L3 parser (zlib's `deflate_slow`) accepts a len-3 match at far
+//! offsets only when a per-block cost model says the match beats the three
+//! literals it replaces. libdeflate's fixed ">8192 offset" guard instead
+//! simply declines far len-3, which measured up to ~7% of size at L3 on
+//! high-entropy content — the reason L3 diverges from libdeflate here.
 //!
 //! Ported VERBATIM in behaviour: same evidence floors, same fixed-point log2,
 //! same margin, same fail-closed INERT. The slot arithmetic is identical to
@@ -62,6 +61,10 @@ pub(super) struct FarLen3Gate {
     /// `log2(total_litlen / freq)`; unseen bytes are priced as freq-1.
     lit_cost: [u32; DEFLATE_NUM_LITERALS],
     /// Frequency-weighted mean ideal literal cost (eighth-bits) for this block.
+    ///
+    /// Computed because `recalc` reproduces the legacy gate's state 1:1; the
+    /// accept test never reads it — the greedy-only slack arm that consumed it
+    /// is intentionally not ported (see `allows`).
     mean_lit_eighth: u32,
     /// False = every slot closed; lets the parser skip the lookups.
     any_open: bool,
@@ -155,6 +158,9 @@ impl FarLen3Gate {
         self.match_cost[deflate_get_offset_slot(offset) as usize] <= lits
     }
 
+    /// The gate's "do nothing" predicate (`any_open` false). This port's callers
+    /// gate through [`Self::allows`], which tests `any_open` itself, so the
+    /// accessor is carried only for parity with the legacy gate's API.
     #[inline(always)]
     pub(super) fn inert(&self) -> bool {
         !self.any_open

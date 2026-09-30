@@ -130,6 +130,9 @@ pub(crate) fn prefetchw<T>(addr: *const T) {
     let _ = addr;
 }
 
+/// Read-side prefetch hint for the software-pipelined HC chain walk — ours, not
+/// the C's; used only by the `ladder-tune` pipeline build of
+/// `hc_matchfinder_longest_match`. Hints only: no effect on the DEFLATE stream.
 pub(crate) fn prefetch_read<T>(addr: *const T) {
     #[cfg(target_arch = "x86")]
     unsafe {
@@ -624,7 +627,6 @@ mod tests {
     #[test]
     fn lz_extend_trusts_start_len() {
         let mut buf = vec![0u8; 128];
-        // Deliberately make the first 4 bytes differ.
         // Deliberately make the first 4 bytes differ.
         buf[0..4].copy_from_slice(&[1, 2, 3, 4]);
         buf[64..68].copy_from_slice(&[9, 9, 9, 9]);

@@ -14,10 +14,6 @@
 //! `DIV_ROUND_UP(0, 65535) - 1`, which underflows). The passthrough is what guarantees
 //! that never happens. A port that skips it appears to work on every non-empty input
 //! and then produces garbage — or, in Rust, panics — on the empty one.
-//!
-//! I found this by writing a test that compressed empty input through
-//! `deflate_compress_fastest` directly. It panicked in the cost model. The test was
-//! wrong, not the port: the C never makes that call.
 
 use super::bitstream::DeflateOutputBitstream;
 use super::compress_fastest::{deflate_compress_fastest, FastestState};
@@ -177,29 +173,26 @@ impl LdxCompressor {
             1 => (0, 32, 0),
             // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
             2 => (6, 10, 0),
-            // L3 DIVERGES FROM LIBDEFLATE ON PURPOSE (the campaign's measured L3
-            // win, re-layered onto the port 2026-09-01): libdeflate's L3 is
-            // GREEDY(12,14); the incumbent T1 L3 (origin/main) is ZLIB-STYLE
-            // LAZY(12,14) plus the far-len-3 cost gate (accept far len-3 when it
-            // beats the three literals it replaces) and the 224x sparse-blocks
-            // split hold. The config matches origin/main's L3 LevelParams
-            // EXACTLY (depth 12 — NOT 8: branch commit 37cb96c7 lowered the legacy
-            // arm's depth to 8 as a WALL tweak; that is a lost regression the port
-            // does not inherit — the port must reproduce the WINNING incumbent).
-            // Both arms' lazy parsers are Rust ports of the same C and agree
-            // byte-for-byte at equal configs (the L6/L7 receipts above).
+            // L3 DIVERGES FROM LIBDEFLATE ON PURPOSE: libdeflate's L3 is
+            // GREEDY(12,14); ours is ZLIB-STYLE LAZY(12,14) plus the far-len-3
+            // cost gate (accept far len-3 when it beats the three literals it
+            // replaces) and the 224x sparse-blocks split hold. The config
+            // matches origin/main's L3 LevelParams EXACTLY (depth 12 — NOT 8:
+            // branch commit 37cb96c7 lowered the legacy arm's depth to 8 as a
+            // WALL tweak; that is a lost regression the port does not inherit —
+            // the port must reproduce the winning incumbent). Both arms' lazy
+            // parsers are Rust ports of the same C and agree byte-for-byte at
+            // equal configs (see the L5-L7 note below).
             3 => (12, 14, 0),
             4 => (16, 30, 0),
             // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
-            // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) was
-            // measured MIXED at L5 (11-file probe: dovi -4,149 B, logs +134,778 B);
-            // the lever is L6/L7 only. L6-L7: the zlib arm's depth + good_match
-            // pair (legacy L6/L7 win config: good_length 8/32, chain 128/256).
-            // The 2026-09-01 probe shows port(128,65,8)/(256,130,32) is
-            // BYTE-IDENTICAL to the legacy L6/L7 arm on 11/11 files — the two
-            // Rust ports of the same C agree when the configs agree — which is
-            // what retires the L6/L7 routing exceptions (one encode, zero size
-            // change). Measured on the 23-file board corpus before the flip.
+            // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) lost
+            // the L5 probe (dovi -4,149 B, logs +134,778 B); the lever is L6/L7
+            // only. L6-L7: the zlib arm's depth + good_match pair (winning
+            // config: good_length 8/32, chain 128/256). The port and the legacy
+            // L6/L7 arm agree byte-for-byte when the configs agree; whether the
+            // router sends a level here is `level_uses_ldx` in
+            // `src/compress/deflate/mod.rs`.
             5 => (16, 30, 0),
             6 => (128, 65, 8),
             7 => (256, 130, 32),

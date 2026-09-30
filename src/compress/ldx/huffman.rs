@@ -16,6 +16,9 @@ use core::mem::MaybeUninit;
 // behaviour does not matter: exact duplicates are impossible, because the low bits
 // always disambiguate.
 pub(crate) const NUM_SYMBOL_BITS: u32 = 10;
+/// The frequency half of the packed pair; both halves named as in the C. The C
+/// consumes this name in its own `MAX_BLOCK_LENGTH` STATIC_ASSERT, which lives
+/// with the block-length constants in `super` — nothing in this module reads it.
 pub(crate) const NUM_FREQ_BITS: u32 = 32 - NUM_SYMBOL_BITS;
 pub(crate) const SYMBOL_MASK: u32 = (1 << NUM_SYMBOL_BITS) - 1;
 pub(crate) const FREQ_MASK: u32 = !SYMBOL_MASK;
@@ -288,14 +291,12 @@ pub(crate) fn build_tree(a: &mut [u32], sym_count: usize) {
 /// non-empty length and steals from it. That is a HEURISTIC rebalance, not the
 /// optimal length-limited code (package-merge would be optimal).
 ///
-/// This matters for the campaign and is worth stating precisely: this is a CLOSED
-/// CLASS per CLAUDE.md ("The needed margin is ~0.01%, and Huffman CONSTRUCTION
-/// cannot supply it"): the measurement built the exact package-merge code BOTH ways
-/// and found the unconditional swap a wash that OPENS cells, while the costed
-/// dual-candidate variant holds its size invariant at ~0.001% margin while costing
-/// 10-14% wall. So: this heuristic is the thing to COPY, not to improve.
-/// Replacing it with an exact limiter is a known-dead lever, and doing so would also
-/// break byte-identity, which is the entire point of this module.
+/// Worth stating precisely for future readers: this is a closed class per
+/// CLAUDE.md — "Huffman CONSTRUCTION cannot supply" the needed ~0.01% margin.
+/// The exact package-merge code was built and measured both ways: the
+/// unconditional swap was a wash that OPENS tied cells, and an exact limiter
+/// would also break byte-identity with the C, which is the entire point of
+/// this module. So: this heuristic is the thing to COPY, not to improve.
 #[inline(always)]
 pub(crate) fn compute_length_counts(
     a: &mut [u32],

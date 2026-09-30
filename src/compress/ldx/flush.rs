@@ -52,11 +52,10 @@ pub(crate) struct DeflateSequence {
 }
 
 /// The subset of C's `struct libdeflate_compressor` (:466) that the ported functions
-/// read. It grows as the port grows; the parser union and the matchfinders are not
-/// here yet.
+/// read: the shared frequency/code tables plus the `union o` arms. The compressor
+/// configuration and the parser union live on `compress::LdxCompressor`.
 ///
-/// `o_precode` and `o_length` are the two arms of the C's `union o`. See the note on
-/// [`Precode`] for why the union itself is not reproduced.
+/// See the note on [`Precode`] for why the union itself is not reproduced.
 pub(crate) struct Compressor {
     /// The frequency counters for the current block.
     pub(crate) freqs: DeflateFreqs,
@@ -108,11 +107,12 @@ impl Compressor {
 /// stream, and a broken tie on every cell where we currently match libdeflate
 /// byte-for-byte.
 ///
-/// # Not yet ported
+/// # Not ported
 ///
 /// The C has a `sequences == NULL` arm (:1935) that walks `c->p.n.optimum_nodes`
-/// instead, used only by near-optimal parsing. That arm lands with the near-optimal
-/// parser; taking `&[DeflateSequence]` rather than an `Option` keeps the gap visible
+/// instead, used only by near-optimal parsing. Near-optimal parsing deliberately
+/// stays in `super::deflate` (see the module docs on `super`), so that arm is not
+/// here; taking `&[DeflateSequence]` rather than an `Option` keeps the gap visible
 /// in the type instead of hiding it behind an `unimplemented!()`.
 pub(crate) fn deflate_flush_block(
     c: &mut Compressor,
@@ -734,12 +734,9 @@ mod tests {
         buf
     }
 
-    /// Decompress raw DEFLATE with our own (already-shipped, already-won) decoder.
+    /// Decompress raw DEFLATE with the independent vendored flate2 decoder.
     /// That is the total oracle CLAUDE.md names: sha-level round-trip, not `wc -c`.
     fn inflate_raw(deflate_bytes: &[u8]) -> Vec<u8> {
-        // Wrap in a minimal zlib-free gzip container so the shipping decoder path can
-        // read it: header, deflate data, CRC32, ISIZE.
-        // Simpler: use the flate2 backend already vendored for tests.
         use std::io::Read;
         let mut out = Vec::new();
         flate2::read::DeflateDecoder::new(deflate_bytes)

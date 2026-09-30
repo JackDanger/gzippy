@@ -35,13 +35,11 @@
 //!
 //! # Why every arithmetic width here is load-bearing
 //!
-//! `examples/blockspans` measured that gzip splits on a fixed ~34,000-symbol cadence
-//! (cv=0.023) while our spans run 8x longer at cv=0.373 — so where the boundaries
-//! fall is a live question for the campaign, and this heuristic is what answers it.
 //! `do_end_block_check` mixes `u32` wrapping arithmetic with ONE deliberate `u64`
-//! promotion, and widening the rest "for safety" changes where blocks end.
-//! `PORT_STATUS.md` records that our shipping `block_split.rs:192-200` computes the
-//! cutoff in `u64` where the C uses `u32`; this module is the C's widths.
+//! promotion, and widening the rest "for safety" changes where blocks end. Our
+//! shipping `deflate/block_split.rs` computes the cutoff in `u64` where the C
+//! uses `u32`; this module is the C's widths. (`examples/blockspans` is the
+//! span census for anyone revisiting where block boundaries fall.)
 
 use super::{MIN_BLOCK_LENGTH, NUM_OBSERVATIONS_PER_BLOCK_CHECK};
 

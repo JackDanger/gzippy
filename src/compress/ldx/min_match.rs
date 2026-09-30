@@ -70,9 +70,9 @@ pub(crate) fn choose_min_match_len(num_used_literals: u32, max_search_depth: u32
 ///   avoid short matches.
 /// * **Only the first 4 KiB is scanned**, as an initial approximation.
 ///   `recalculate_min_match_len` updates it later from the block's real frequencies.
-///   Scanning the whole block instead would be a different heuristic — and would be an
-///   instance of the trap recorded in `feedback_count_the_shipped_quantity`, where a
-///   whole-file literal count "validated" a rule the code applies per block.
+///   Scanning the whole block instead would be a different heuristic — and an
+///   instance of the classic measuring trap: a whole-file literal count validates a
+///   rule the code applies per block.
 pub(crate) fn calculate_min_match_len(data: &[u8], data_len: usize, max_search_depth: u32) -> u32 {
     let mut used = [0u8; 256];
     let mut num_used_literals: u32 = 0;
@@ -210,9 +210,9 @@ mod tests {
     fn recalculate_ignores_rare_literals() {
         let mut freqs = DeflateFreqs::new();
         // 200 literals that each appear once, plus one dominant literal. Order matters:
-        // the first draft set `litlen[b'a']` FIRST and then clobbered it in the loop
-        // (b'a' is 97, inside 0..200), so the "dominant" literal had frequency 1 and
-        // the test measured nothing.
+        // setting `litlen[b'a']` first and then clobbering it in the loop (b'a' is 97,
+        // inside 0..200) would leave the dominant literal at frequency 1, and the test
+        // would measure nothing.
         for i in 0..200 {
             freqs.litlen[i] = 1;
         }

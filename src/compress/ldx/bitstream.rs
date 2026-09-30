@@ -80,6 +80,9 @@ impl<'a> DeflateOutputBitstream<'a> {
     }
 
     /// C: `os->end` — one past the last writable byte.
+    ///
+    /// Carried as a method for port parity; Rust callers compare against
+    /// `buf.len()` directly.
     #[inline(always)]
     pub(crate) fn end(&self) -> usize {
         self.buf.len()
