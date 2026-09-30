@@ -504,6 +504,60 @@ jobs:
       - name: Ir ratio vs ldx (same-host, drift-cancelling — the promotable leg)
         run: cargo test --release --test ir_vs_ldx -- --nocapture
 
+  # ── TEMP (agent-b1, branch hw/l4l5-ir-instrument-rows) — SEED JOB — remove
+  # once the L4/L5 Ir rows are spliced in. ─────────────────────────────────
+  # The Ir instrument grids now cover L4/L5 (ir_budget print_current and
+  # ir_vs_ldx LEVELS); the rows themselves must be seeded by a valgrind host
+  # of the same class the existing pins came from (x86_64 Linux — the
+  # 2026-09-24 re-pin's 'runnervmtr4k5'). This runs the two generators and
+  # uploads their outputs; the follow-up commit splices ONLY the new L4/L5
+  # rows into the pin files, keeping every existing row byte-identical.
+  ir-seed-l4l5:
+    name: Ir seed L4/L5 rows (informational, TEMP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-x86_64-valgrind-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Regenerate ir_vs_ldx sheet (LEVELS now includes L4/L5)
+        run: >-
+          UPDATE_IR_VS_LDX=1 cargo test --release --test ir_vs_ldx
+          update_ldx_pins -- --ignored --nocapture
+
+      - name: Print ir_budget current values (grid now includes L4/L5)
+        run: >-
+          cargo test --release --test ir_budget print_current -- --ignored
+          --nocapture > ir_budget-seed.tsv || true
+
+      - name: Upload seed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ir-seed-l4l5
+          path: |
+            tests/fingerprints/ir_vs_ldx.tsv
+            ir_budget-seed.tsv
+          if-no-files-found: error
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

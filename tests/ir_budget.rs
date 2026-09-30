@@ -113,7 +113,10 @@ fn print_current() {
         let data = fixtures::generate(fixture);
         let path = dir.path().join(fixture);
         std::fs::write(&path, &data).unwrap();
-        for level in [1u32, 6] {
+        // The pinned set: L1/L6 plus L4/L5 — the residual board's band
+        // (access.log L5 T1, data.sqlite L4 T1) whose cells previously had
+        // no budget row and no Ir instrument at all.
+        for level in [1u32, 4, 5, 6] {
             if let Some(ir) = cachegrind_ir(
                 bin,
                 &[

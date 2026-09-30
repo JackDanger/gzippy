@@ -34,9 +34,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Levels the goal sheet covers: the two shipped fast levels, the default, and
-/// the deep end. Never generalise a margin across levels not in this set.
-const LEVELS: &[u32] = &[1, 2, 6, 9];
+/// Levels the goal sheet covers: the two shipped fast levels, the residual
+/// board's band (L4/L5 — the access.log L5 T1 and data.sqlite L4 T1 cells),
+/// the default, and the deep end. Never generalise a margin across levels not
+/// in this set.
+const LEVELS: &[u32] = &[1, 2, 4, 5, 6, 9];
 
 /// Tolerance on the ours/ldx RATIO. Both arms run on the same host in the same
 /// test invocation, so environment drift cancels; this covers cachegrind's

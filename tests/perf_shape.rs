@@ -7,7 +7,7 @@
 //! write count moved wall 0%). Two invariant families:
 //!
 //! 1. **Parallel-overhead budget** (`parallel_overhead_budget`): for every
-//!    synthetic fixture (src/fixtures.rs) x levels {1,2,6,9}, measure TOTAL
+//!    synthetic fixture (src/fixtures.rs) x levels {1,2,4,5,6,9}, measure TOTAL
 //!    counter work — the counters are one process-global set of atomics, so
 //!    an in-process T4 run sums over all threads/chunks by construction — at
 //!    T1 (`encode_gzip_bytes_to_vec`, the production T1 entry point, same as
@@ -90,8 +90,10 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// The pinned level grid for the overhead-budget family.
-const LEVELS: &[u32] = &[1, 2, 6, 9];
+/// The pinned level grid for the overhead-budget family. L4/L5 cover the
+/// residual board's band (the access.log L5 / data.sqlite L4 T1 cards, whose
+/// wall quote is the hc-chain walk the counters name below).
+const LEVELS: &[u32] = &[1, 2, 4, 5, 6, 9];
 
 /// T>1 thread count under test. 4 matches the campaign's canonical T4
 /// coordinate (the board's failing-class thread count).
@@ -290,7 +292,7 @@ fn tsv_header() -> String {
      # all threads/chunks; the counters are one process-global atomic set) for the\n\
      # production T1 entry point (encode_gzip_bytes_to_vec) and the production T>1\n\
      # pipeline (PipelinedGzEncoder::compress_buffer_pure, 4 threads, from memory)\n\
-     # per fixture (src/fixtures.rs) x level {1,2,6,9} x counter.\n\
+     # per fixture (src/fixtures.rs) x level {1,2,4,5,6,9} x counter.\n\
      #\n\
      # THE ASSERTION IS ONE-SIDED: current T4/T1 ratio <= pinned T4/T1 ratio\n\
      # (cross-multiplied exactly, no floats). Less overhead PASSES and asks for a\n\
