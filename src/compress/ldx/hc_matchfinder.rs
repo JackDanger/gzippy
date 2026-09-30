@@ -330,19 +330,58 @@ pub(crate) fn hc_matchfinder_longest_match(
         // `matchptr` keeps the base folded into the live pointer so the base is not
         // reloaded from the stack on every step.
         matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
-        loop {
-            bump!(local.attempts);
-            if unsafe { load_u32_ptr(matchptr) } == seq4 {
-                break;
+        #[cfg(not(feature = "ladder-tune"))]
+        {
+            loop {
+                bump!(local.attempts);
+                if unsafe { load_u32_ptr(matchptr) } == seq4 {
+                    break;
+                }
+
+                // The first 4 bytes did not match. Advance to the next node in the
+                // list, spending one step of the budget on the node we just loaded.
+                // The candidate pointer moves by the node delta, so the base is
+                // never reloaded per step.
+                bump!(local.chain_reads);
+                let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+                debug_assert!(ni < mf.tables.next_tab.len());
+                let prev = cur_node4;
+                cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+                if cur_node4 <= cutoff {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                depth_remaining -= 1;
+                if depth_remaining == 0 {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
             }
 
-            // The first 4 bytes did not match. Advance to the next node in the list,
-            // spending one step of the budget on the node we just loaded. The candidate
-            // pointer moves by the node delta, so the base is never reloaded per step.
+            // Found a match of length >= 4. Extend it to its full length.
+            best_matchptr = matchptr;
+            bump!(local.accepted);
+            best_len =
+                unsafe { lz_extend(buf, in_next, index_from_buf(buf, best_matchptr), 4, max_len) };
+            if best_len >= nice_len {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
+            }
+            // One more chain step to enter the >=5 search, spending the budget in C's
+            // order.
             bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
-            let prev = cur_node4;
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
@@ -359,39 +398,101 @@ pub(crate) fn hc_matchfinder_longest_match(
                     return best_len;
                 }
             }
-            matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
         }
 
-        // Found a match of length >= 4. Extend it to its full length.
-        best_matchptr = matchptr;
-        bump!(local.accepted);
-        best_len =
-            unsafe { lz_extend(buf, in_next, index_from_buf(buf, best_matchptr), 4, max_len) };
-        if best_len >= nice_len {
-            *offset_ret = offset_between(in_next_ptr, best_matchptr);
-            {
-                local.flush();
-                return best_len;
+        // SOFTWARE-PIPELINED CHAIN WALK — the `deflate/matchfinder/hc.rs` walk's
+        // link-load shape ported here (hc.rs:414-504). The NEXT link is loaded
+        // BEFORE the current candidate is compared, so the link load overlaps the
+        // probe latency instead of serialising behind each miss; on a hit the
+        // already-loaded link feeds the >=5 search without a second walk step. Each
+        // preload also hints the next candidate's data line one node ahead (the
+        // `prefetchw` at `matchfinder_common.rs:109`): a hint only, issued only for
+        // a LIVE node (the same cutoff test the next step would apply), so no
+        // address outside the walker's reachable window is ever formed.
+        //
+        // Visit order, cutoff/depth checks and every compare are IDENTICAL to the
+        // classic walk above — same nodes, same order, same returns — so the
+        // reported match and the stream are unchanged by construction. Counter
+        // totals stay event-for-event too (each preload site bumps `chain_reads`
+        // exactly where the classic walk's advance loads): the one exception is a
+        // `nice_len` exit, where the pipeline has already paid one extra chain
+        // load the classic walk defers — the same accounting the legacy walk has.
+        #[cfg(feature = "ladder-tune")]
+        {
+            bump!(local.chain_reads);
+            let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+            debug_assert!(ni < mf.tables.next_tab.len());
+            let mut next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+            if next_node > cutoff {
+                crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                    in_base_ptr.offset(next_node as isize)
+                });
             }
-        }
-        // One more chain step to enter the >=5 search, spending the budget in C's order.
-        bump!(local.chain_reads);
-        let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-        debug_assert!(ni < mf.tables.next_tab.len());
-        cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-        if cur_node4 <= cutoff {
-            *offset_ret = offset_between(in_next_ptr, best_matchptr);
-            {
-                local.flush();
-                return best_len;
+            loop {
+                bump!(local.attempts);
+                if unsafe { load_u32_ptr(matchptr) } == seq4 {
+                    break;
+                }
+
+                // Miss: consume the preloaded link, budget it, then register the
+                // following one. Same checks, same order, as the classic walk.
+                cur_node4 = next_node;
+                if cur_node4 <= cutoff {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                depth_remaining -= 1;
+                if depth_remaining == 0 {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+                bump!(local.chain_reads);
+                let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+                debug_assert!(ni < mf.tables.next_tab.len());
+                next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+                if next_node > cutoff {
+                    crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                        in_base_ptr.offset(next_node as isize)
+                    });
+                }
             }
-        }
-        depth_remaining -= 1;
-        if depth_remaining == 0 {
-            *offset_ret = offset_between(in_next_ptr, best_matchptr);
-            {
-                local.flush();
-                return best_len;
+
+            // Found a match of length >= 4. Extend it to its full length.
+            best_matchptr = matchptr;
+            bump!(local.accepted);
+            best_len =
+                unsafe { lz_extend(buf, in_next, index_from_buf(buf, best_matchptr), 4, max_len) };
+            if best_len >= nice_len {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
+            }
+            // Advance to the next node — already loaded (and prefetched) by the
+            // pipeline, replacing the classic one-more-chain-step load.
+            cur_node4 = next_node;
+            if cur_node4 <= cutoff {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
+            }
+            depth_remaining -= 1;
+            if depth_remaining == 0 {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
             }
         }
     } else if cur_node4 <= cutoff || best_len >= nice_len {
@@ -403,29 +504,77 @@ pub(crate) fn hc_matchfinder_longest_match(
     }
 
     // Check for matches of length >= 5.
-    loop {
-        // C-shaped inner chain walk: same budget order as the length-4 loop.
-        matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+    #[cfg(not(feature = "ladder-tune"))]
+    {
         loop {
-            // Already found a length 4 match. Try for a longer match; start by
-            // checking either the last 4 bytes and the first 4 bytes, or the last
-            // byte. (The last byte, the one which would extend the match length by 1,
-            // is the most important.)
-            bump!(local.attempts);
-            if unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
-                == unsafe { load_u32_ptr(in_next_ptr.add(best_len as usize - 3)) }
-                && unsafe { load_u32_ptr(matchptr) } == unsafe { load_u32_ptr(in_next_ptr) }
-            {
-                break;
+            // C-shaped inner chain walk: same budget order as the length-4 loop.
+            matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+            loop {
+                // Already found a length 4 match. Try for a longer match; start by
+                // checking either the last 4 bytes and the first 4 bytes, or the last
+                // byte. (The last byte, the one which would extend the match length
+                // by 1, is the most important.)
+                bump!(local.attempts);
+                if unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
+                    == unsafe { load_u32_ptr(in_next_ptr.add(best_len as usize - 3)) }
+                    && unsafe { load_u32_ptr(matchptr) } == unsafe { load_u32_ptr(in_next_ptr) }
+                {
+                    break;
+                }
+
+                // Continue to the next node in the list, spending one step of the
+                // budget on the node we just loaded. The candidate pointer moves by
+                // the node delta, so the base is never reloaded per step.
+                bump!(local.chain_reads);
+                let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+                debug_assert!(ni < mf.tables.next_tab.len());
+                let prev = cur_node4;
+                cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+                if cur_node4 <= cutoff {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                depth_remaining -= 1;
+                if depth_remaining == 0 {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
             }
 
-            // Continue to the next node in the list, spending one step of the budget
-            // on the node we just loaded. The candidate pointer moves by the node
-            // delta, so the base is never reloaded per step.
+            // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above,
+            // so the extension may start at 4 rather than 0.
+            let len = unsafe { lz_extend(buf, in_next, index_from_buf(buf, matchptr), 4, max_len) };
+            if len <= best_len {
+                // Passed the 4-byte test but did not beat the incumbent — the legacy
+                // accumulator calls this outcome `too_short`.
+                bump!(local.too_short);
+            }
+            if len > best_len {
+                bump!(local.accepted);
+                // This is the new longest match.
+                best_len = len;
+                best_matchptr = matchptr;
+                if best_len >= nice_len {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+            }
+
+            // Continue to the next node in the list, spending the budget in C's
+            // order.
             bump!(local.chain_reads);
             let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
             debug_assert!(ni < mf.tables.next_tab.len());
-            let prev = cur_node4;
             cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
@@ -442,49 +591,118 @@ pub(crate) fn hc_matchfinder_longest_match(
                     return best_len;
                 }
             }
-            matchptr = unsafe { matchptr.offset(cur_node4 as isize - prev as isize) };
         }
+    }
 
-        // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above, so
-        // the extension may start at 4 rather than 0.
-        let len = unsafe { lz_extend(buf, in_next, index_from_buf(buf, matchptr), 4, max_len) };
-        if len <= best_len {
-            // Passed the 4-byte test but did not beat the incumbent — the legacy
-            // accumulator calls this outcome `too_short`.
-            bump!(local.too_short);
+    // Length >= 5 walk, software-pipelined identically to the length-4 walk above:
+    // `cur_node4 > cutoff` and `depth_remaining > 0` hold on entry (both entry paths
+    // guarantee it), so the next chain link is precomputed BEFORE the first probe
+    // and each miss reuses it — the compare of the current candidate overlaps the
+    // link load and the next candidate's data prefetch. The classic walk's visit
+    // order, checks and returns are reproduced exactly, so bytes cannot change.
+    #[cfg(feature = "ladder-tune")]
+    {
+        bump!(local.chain_reads);
+        let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+        debug_assert!(ni < mf.tables.next_tab.len());
+        let mut next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+        if next_node > cutoff {
+            crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                in_base_ptr.offset(next_node as isize)
+            });
         }
-        if len > best_len {
-            bump!(local.accepted);
-            // This is the new longest match.
-            best_len = len;
-            best_matchptr = matchptr;
-            if best_len >= nice_len {
+        loop {
+            loop {
+                matchptr = unsafe { in_base_ptr.offset(cur_node4 as isize) };
+                // Already found a length 4 match. Try for a longer match; start by
+                // checking either the last 4 bytes and the first 4 bytes, or the
+                // last byte. (The last byte, the one which would extend the match
+                // length by 1, is the most important.)
+                bump!(local.attempts);
+                if unsafe { load_u32_ptr(matchptr.add(best_len as usize - 3)) }
+                    == unsafe { load_u32_ptr(in_next_ptr.add(best_len as usize - 3)) }
+                    && unsafe { load_u32_ptr(matchptr) } == unsafe { load_u32_ptr(in_next_ptr) }
+                {
+                    break;
+                }
+
+                // Miss: consume the preloaded link, budget it, then register the
+                // following one. Same checks, same order, as the classic walk.
+                cur_node4 = next_node;
+                if cur_node4 <= cutoff {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                depth_remaining -= 1;
+                if depth_remaining == 0 {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+                bump!(local.chain_reads);
+                let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+                debug_assert!(ni < mf.tables.next_tab.len());
+                next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+                if next_node > cutoff {
+                    crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                        in_base_ptr.offset(next_node as isize)
+                    });
+                }
+            }
+
+            // UNALIGNED_ACCESS_IS_FAST: the 4-byte prefix was just re-verified above,
+            // so the extension may start at 4 rather than 0.
+            let len = unsafe { lz_extend(buf, in_next, index_from_buf(buf, matchptr), 4, max_len) };
+            if len <= best_len {
+                // Passed the 4-byte test but did not beat the incumbent — the legacy
+                // accumulator calls this outcome `too_short`.
+                bump!(local.too_short);
+            }
+            if len > best_len {
+                bump!(local.accepted);
+                // This is the new longest match.
+                best_len = len;
+                best_matchptr = matchptr;
+                if best_len >= nice_len {
+                    *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                    {
+                        local.flush();
+                        return best_len;
+                    }
+                }
+            }
+
+            // Continue to the next node — already loaded (and prefetched) by the
+            // pipeline, replacing the classic advance load.
+            cur_node4 = next_node;
+            if cur_node4 <= cutoff {
                 *offset_ret = offset_between(in_next_ptr, best_matchptr);
                 {
                     local.flush();
                     return best_len;
                 }
             }
-        }
-
-        // Continue to the next node in the list, spending the budget in C's order.
-        bump!(local.chain_reads);
-        let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
-        debug_assert!(ni < mf.tables.next_tab.len());
-        cur_node4 = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
-        if cur_node4 <= cutoff {
-            *offset_ret = offset_between(in_next_ptr, best_matchptr);
-            {
-                local.flush();
-                return best_len;
+            depth_remaining -= 1;
+            if depth_remaining == 0 {
+                *offset_ret = offset_between(in_next_ptr, best_matchptr);
+                {
+                    local.flush();
+                    return best_len;
+                }
             }
-        }
-        depth_remaining -= 1;
-        if depth_remaining == 0 {
-            *offset_ret = offset_between(in_next_ptr, best_matchptr);
-            {
-                local.flush();
-                return best_len;
+            bump!(local.chain_reads);
+            let ni = (cur_node4 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize;
+            debug_assert!(ni < mf.tables.next_tab.len());
+            next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
+            if next_node > cutoff {
+                crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                    in_base_ptr.offset(next_node as isize)
+                });
             }
         }
     }
