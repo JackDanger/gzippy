@@ -424,7 +424,9 @@ pub(crate) fn hc_matchfinder_longest_match(
             debug_assert!(ni < mf.tables.next_tab.len());
             let mut next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if next_node > cutoff {
-                prefetchw(unsafe { in_base_ptr.offset(next_node as isize) });
+                crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                    in_base_ptr.offset(next_node as isize)
+                });
             }
             loop {
                 bump!(local.attempts);
@@ -456,7 +458,9 @@ pub(crate) fn hc_matchfinder_longest_match(
                 debug_assert!(ni < mf.tables.next_tab.len());
                 next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
                 if next_node > cutoff {
-                    prefetchw(unsafe { in_base_ptr.offset(next_node as isize) });
+                    crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                        in_base_ptr.offset(next_node as isize)
+                    });
                 }
             }
 
@@ -603,7 +607,9 @@ pub(crate) fn hc_matchfinder_longest_match(
         debug_assert!(ni < mf.tables.next_tab.len());
         let mut next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
         if next_node > cutoff {
-            prefetchw(unsafe { in_base_ptr.offset(next_node as isize) });
+            crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                in_base_ptr.offset(next_node as isize)
+            });
         }
         loop {
             loop {
@@ -643,7 +649,9 @@ pub(crate) fn hc_matchfinder_longest_match(
                 debug_assert!(ni < mf.tables.next_tab.len());
                 next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
                 if next_node > cutoff {
-                    prefetchw(unsafe { in_base_ptr.offset(next_node as isize) });
+                    crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                        in_base_ptr.offset(next_node as isize)
+                    });
                 }
             }
 
@@ -692,7 +700,9 @@ pub(crate) fn hc_matchfinder_longest_match(
             debug_assert!(ni < mf.tables.next_tab.len());
             next_node = unsafe { *mf.tables.next_tab.get_unchecked(ni) };
             if next_node > cutoff {
-                prefetchw(unsafe { in_base_ptr.offset(next_node as isize) });
+                crate::compress::ldx::matchfinder_common::prefetch_read(unsafe {
+                    in_base_ptr.offset(next_node as isize)
+                });
             }
         }
     }

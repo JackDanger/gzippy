@@ -130,6 +130,30 @@ pub(crate) fn prefetchw<T>(addr: *const T) {
     let _ = addr;
 }
 
+pub(crate) fn prefetch_read<T>(addr: *const T) {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        use core::arch::x86::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(addr.cast(), _MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // GCC's `__builtin_prefetch(addr, 1)` uses the same L1 write-prefetch
+        // operation on AArch64.
+        core::arch::asm!("prfm pstl1keep, [{addr}]", addr = in(reg) addr, options(nostack));
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = addr;
+}
+
 /// C: `lz_extend(strptr, matchptr, start_len, max_len)` (:178)
 ///
 /// Return the number of bytes at `matchptr` that match the bytes at `strptr`, up to a
