@@ -57,16 +57,20 @@ pub(crate) fn is_likely_multi_member(data: &[u8]) -> bool {
     // `scan_detect` band in the 2026-05-19 profile diff).
     //
     // Trade-off: a multi-member stream whose SECOND member starts past
-    // byte 16 MiB is misrouted as single-member. This is SAFE for
-    // correctness: the single-member backends (ISA-L `decompress_gzip_stream`
-    // and `decompress_single_member_libdeflate`) consume-and-loop residual
-    // members, so a misrouted multi-member file still decodes in full. (This
-    // was NOT always true — before that fix, misrouting silently truncated to
-    // the first member; an earlier version of this comment wrongly claimed it
-    // failed loudly with a CRC mismatch. It did not: member 1 has a valid
-    // self-consistent trailer.) The misroute now only costs the parallel
-    // multi-member path's speedup, never correctness. Such files are rare
-    // (`cat big.gz small.gz`); pigz/bgzip members are ~128 KiB, detected here.
+    // byte 16 MiB is classified single-member by this scan. This is SAFE
+    // for correctness today: the classifier's trailing-ISIZE gate re-scans
+    // whole-file member boundaries and routes dominant-first streams to the
+    // multi-member paths at every thread count (`classify_gzip_prescanned`),
+    // and the ParallelSM pipeline itself resumes past a member-1 boundary
+    // failure when a trailing member exists (per-member CRC32 + ISIZE
+    // verified), so a misclassified multi-member file still decodes in full.
+    // (This was NOT always true — before those fixes, misrouting silently
+    // truncated to the first member; an earlier version of this comment
+    // wrongly claimed it failed loudly with a CRC mismatch. It did not:
+    // member 1 has a valid self-consistent trailer.) The misclassification
+    // now only costs the parallel multi-member path's speedup, never
+    // correctness. Such files are rare (`cat big.gz small.gz`); pigz/bgzip
+    // members are ~128 KiB, detected here.
     const SCAN_LIMIT_BYTES: usize = 16 * 1024 * 1024;
     let scan_end = data.len().min(SCAN_LIMIT_BYTES);
     let finder = memmem::Finder::new(GZIP_MAGIC);
