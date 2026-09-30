@@ -138,6 +138,8 @@ fn l3_sparse_split_active(
 /// register-allocated functions, each reached through the `c->impl` function
 /// pointer. Collapsing them into one `match` arm, as we did, let LLVM merge both
 /// instantiations (and the greedy and fastest paths) into a single function.
+/// `probe` (ladder-tune builds only — the shipped parameter list is untouched)
+/// carries the #119 graded-len-3 probe booleans from the level dispatch.
 #[inline(never)]
 pub(crate) fn deflate_compress_lazy(
     c: &mut Compressor,
@@ -150,7 +152,24 @@ pub(crate) fn deflate_compress_lazy(
     good_match: u32,
     far_len3_gate: bool,
     sparse_split_guard_mul: u32,
+    #[cfg(feature = "ladder-tune")] probe: Option<(bool, bool)>,
 ) {
+    #[cfg(feature = "ladder-tune")]
+    deflate_compress_lazy_generic(
+        c,
+        p,
+        r#in,
+        in_nbytes,
+        os,
+        max_search_depth,
+        nice_match_length,
+        good_match,
+        far_len3_gate,
+        sparse_split_guard_mul,
+        false,
+        probe,
+    );
+    #[cfg(not(feature = "ladder-tune"))]
     deflate_compress_lazy_generic(
         c,
         p,
@@ -179,7 +198,24 @@ pub(crate) fn deflate_compress_lazy2(
     good_match: u32,
     far_len3_gate: bool,
     sparse_split_guard_mul: u32,
+    #[cfg(feature = "ladder-tune")] probe: Option<(bool, bool)>,
 ) {
+    #[cfg(feature = "ladder-tune")]
+    deflate_compress_lazy_generic(
+        c,
+        p,
+        r#in,
+        in_nbytes,
+        os,
+        max_search_depth,
+        nice_match_length,
+        good_match,
+        far_len3_gate,
+        sparse_split_guard_mul,
+        true,
+        probe,
+    );
+    #[cfg(not(feature = "ladder-tune"))]
     deflate_compress_lazy_generic(
         c,
         p,
@@ -208,6 +244,7 @@ pub(crate) fn deflate_compress_lazy_generic(
     far_len3_gate: bool,
     sparse_split_guard_mul: u32,
     lazy2: bool,
+    #[cfg(feature = "ladder-tune")] probe: Option<(bool, bool)>,
 ) {
     let mut in_next: usize = 0;
     let in_end: usize = in_nbytes;
@@ -265,6 +302,14 @@ pub(crate) fn deflate_compress_lazy_generic(
         // cadence as min_len — legacy `lazy.rs` sequence, verbatim.
         let mut far_len3 = FarLen3Gate::INERT;
         let mut next_recalc_far_len3 = next_recalc_min_len;
+        // PROBE (zopfli #119, ladder-tune builds only): GZIPPY_LDX_MIN3 opens
+        // the near-3 accept surface the blanket floor soaks; LEN_GRADE layers
+        // the graded sheet. `probe` is `Some` only at the residual board's
+        // probe levels (see the dispatch in `compress.rs`).
+        #[cfg(feature = "ladder-tune")]
+        let (min3_probe, len_grade) = probe.unwrap_or((false, false));
+        #[cfg(feature = "ladder-tune")]
+        let mut len_grade_sheet = super::far_len3::LenGradeSheet::INERT;
 
         loop {
             // Recalculate the minimum match length if it hasn't been done recently.
@@ -276,6 +321,13 @@ pub(crate) fn deflate_compress_lazy_generic(
                         min_len = core::cmp::min(v, min_len);
                     }
                 }
+                // PROBE: the sheet is dead without len-3 candidates — the
+                // "honest zero" finding (b2eca3bc) is exactly an armed gate
+                // starved by the content heuristic's min_len.
+                #[cfg(feature = "ladder-tune")]
+                if min3_probe {
+                    min_len = core::cmp::min(min_len, DEFLATE_MIN_MATCH_LEN);
+                }
                 next_recalc_min_len +=
                     core::cmp::min(in_end - next_recalc_min_len, in_next - in_block_begin);
             }
@@ -283,6 +335,10 @@ pub(crate) fn deflate_compress_lazy_generic(
             if in_next >= next_recalc_far_len3 {
                 if far_len3_gate {
                     far_len3 = FarLen3Gate::recalc(&c.freqs, FAR_LEN3_MARGIN_EIGHTH_BITS);
+                }
+                #[cfg(feature = "ladder-tune")]
+                if len_grade {
+                    len_grade_sheet = super::far_len3::LenGradeSheet::recalc(&c.freqs);
                 }
                 next_recalc_far_len3 +=
                     core::cmp::min(in_end - next_recalc_far_len3, in_next - in_block_begin);
@@ -311,6 +367,67 @@ pub(crate) fn deflate_compress_lazy_generic(
             // and the far-len-3 cost gate can still accept a refused far len-3
             // (legacy `far_len3` module). With the knobs off (every level but
             // the L3 config) this is exactly the original `> 8192` test.
+            // PROBE (ladder-tune, zopfli #119): the graded near shadow.
+            // MIN3 alone prices near len-3s with the SAME sheet the shipped
+            // far clause uses (the honest-zero card's "cost-aware near
+            // branch"). LEN_GRADE layers #119's grades: len-3 drops the
+            // margin inside 1024 (full credit), and the sheet also catches
+            // near len-4 past 2048 / len-5 past 4096 (their grades; far
+            // len-4/5 keep the shipped always-accept, matching upstream's
+            // emitter, which still emits score-3/4 matches past its grades).
+            // A live sheet refuses only where it prices the arc above the
+            // literals; an inert sheet rides out — identical to the shipped
+            // parser. The near boundary is the len-3 guard's 8192 (the
+            // ultra-sparse 4096 modulation is L3-only and keeps its own
+            // shipped clause).
+            #[cfg(feature = "ladder-tune")]
+            let probe_declined = if !min3_probe {
+                false
+            } else if !len_grade {
+                cur_len == 3
+                    && cur_offset <= 8192
+                    && !far_len3.inert()
+                    && !far_len3.allows(
+                        cur_offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                    )
+            } else if cur_len == 3 {
+                cur_offset <= 8192
+                    && len_grade_sheet.len3_active()
+                    && !len_grade_sheet.allows_len3(
+                        cur_offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                    )
+            } else if cur_len == 4 && cur_offset > 2048 {
+                cur_offset <= 8192
+                    && len_grade_sheet.len4_active()
+                    && !len_grade_sheet.allows_len4(
+                        cur_offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                        unsafe { *r#in.get_unchecked(in_next + 3) },
+                    )
+            } else if cur_len == 5 && cur_offset > 4096 {
+                cur_offset <= 8192
+                    && len_grade_sheet.len5_active()
+                    && !len_grade_sheet.allows_len5(
+                        cur_offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                        unsafe { *r#in.get_unchecked(in_next + 3) },
+                        unsafe { *r#in.get_unchecked(in_next + 4) },
+                    )
+            } else {
+                false
+            };
+            #[cfg(not(feature = "ladder-tune"))]
+            let probe_declined: bool = false;
             if cur_len < min_len
                 || (cur_len == DEFLATE_MIN_MATCH_LEN
                     && cur_offset > {
@@ -336,6 +453,7 @@ pub(crate) fn deflate_compress_lazy_generic(
                     } else {
                         false
                     })
+                || probe_declined
             {
                 // No match found. Choose a literal.
                 debug_assert!(in_next < r#in.len());

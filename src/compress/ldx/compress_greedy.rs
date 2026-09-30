@@ -76,6 +76,7 @@ pub(crate) fn deflate_compress_greedy(
     max_search_depth: u32,
     nice_match_length: u32,
     good_match: u32,
+    #[cfg(feature = "ladder-tune")] probe: Option<(bool, bool)>,
 ) {
     let mut in_next: usize = 0;
     let in_end: usize = in_nbytes;
@@ -99,8 +100,45 @@ pub(crate) fn deflate_compress_greedy(
             in_max_block_end - in_next,
             max_search_depth,
         );
+        // PROBE (ladder-tune, zopfli #119): GZIPPY_LDX_MIN3 at the data.sqlite
+        // L4 cell — the content heuristic's min_len is relieved so len-3
+        // candidates reach the sheet (greedy otherwise accepts no far len-3:
+        // the fixed guard refuses beyond 4096 outright). LEN_GRADE layers
+        // #119's grades; `probe` is `Some` only at the residual board's probe
+        // levels (see the dispatch in `compress.rs`).
+        #[cfg(feature = "ladder-tune")]
+        let (min3_probe, len_grade) = probe.unwrap_or((false, false));
+        #[cfg(feature = "ladder-tune")]
+        let min_len = if min3_probe {
+            core::cmp::min(min_len, DEFLATE_MIN_MATCH_LEN)
+        } else {
+            min_len
+        };
+        #[cfg(feature = "ladder-tune")]
+        let mut probe_far_len3 = super::far_len3::FarLen3Gate::INERT;
+        #[cfg(feature = "ladder-tune")]
+        let mut probe_len_grade_sheet = super::far_len3::LenGradeSheet::INERT;
+        #[cfg(feature = "ladder-tune")]
+        let mut probe_next_recalc = in_next + core::cmp::min(in_end - in_next, 10000);
 
         loop {
+            // PROBE: refresh the sheet(s) on the lazies' widening cadence
+            // (10,000 bytes in, then once per block length). Greedy owns no
+            // recalc cadence of its own — this one exists for the probe only.
+            #[cfg(feature = "ladder-tune")]
+            if min3_probe && in_next >= probe_next_recalc {
+                if !len_grade {
+                    probe_far_len3 = super::far_len3::FarLen3Gate::recalc(
+                        &c.freqs,
+                        super::far_len3::FAR_LEN3_MARGIN_EIGHTH_BITS,
+                    );
+                } else {
+                    probe_len_grade_sheet = super::far_len3::LenGradeSheet::recalc(&c.freqs);
+                }
+                probe_next_recalc +=
+                    core::cmp::min(in_end - probe_next_recalc, in_next - in_block_begin);
+            }
+
             adjust_max_and_nice_len(&mut max_len, &mut nice_len, in_end - in_next);
 
             let mut offset: u32 = 0;
@@ -118,7 +156,79 @@ pub(crate) fn deflate_compress_greedy(
                 &mut offset,
             );
 
-            if length >= min_len && (length > DEFLATE_MIN_MATCH_LEN || offset <= 4096) {
+            // PROBE (ladder-tune, zopfli #119): the graded sheet overrides the
+            // shipped guard clause. MIN3 alone prices the whole len-3 surface
+            // with the shipped sheet semantics (margin everywhere): a far arc
+            // behind the 4096 guard is RECRUITED only where the sheet accepts
+            // it, a near arc is sheet-priced before it walks in ungated.
+            // LEN_GRADE grades it per #119 (margin-free within 1024) and
+            // catches near len-4 past 2048 / len-5 past 4096 (same near
+            // window as the lazy parser's guard: (grade, 8192]; far len-4/5
+            // keep the shipped always-accept). An inert sheet rides out.
+            #[cfg(feature = "ladder-tune")]
+            let (probe_recruited_far3, declined_by_probe): (bool, bool) = if !min3_probe {
+                (false, false)
+            } else if !len_grade {
+                if length == 3 && !probe_far_len3.inert() {
+                    let sheet_ok = probe_far_len3.allows(
+                        offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                    );
+                    (offset > 4096 && sheet_ok, offset <= 4096 && !sheet_ok)
+                } else {
+                    (false, false)
+                }
+            } else if length == 3 {
+                if !probe_len_grade_sheet.len3_active() {
+                    (false, false)
+                } else {
+                    let sheet_ok = probe_len_grade_sheet.allows_len3(
+                        offset,
+                        unsafe { *r#in.get_unchecked(in_next) },
+                        unsafe { *r#in.get_unchecked(in_next + 1) },
+                        unsafe { *r#in.get_unchecked(in_next + 2) },
+                    );
+                    (offset > 4096 && sheet_ok, offset <= 4096 && !sheet_ok)
+                }
+            } else if length == 4 && offset > 2048 {
+                (
+                    false,
+                    offset <= 8192
+                        && probe_len_grade_sheet.len4_active()
+                        && !probe_len_grade_sheet.allows_len4(
+                            offset,
+                            unsafe { *r#in.get_unchecked(in_next) },
+                            unsafe { *r#in.get_unchecked(in_next + 1) },
+                            unsafe { *r#in.get_unchecked(in_next + 2) },
+                            unsafe { *r#in.get_unchecked(in_next + 3) },
+                        ),
+                )
+            } else if length == 5 && offset > 4096 {
+                (
+                    false,
+                    offset <= 8192
+                        && probe_len_grade_sheet.len5_active()
+                        && !probe_len_grade_sheet.allows_len5(
+                            offset,
+                            unsafe { *r#in.get_unchecked(in_next) },
+                            unsafe { *r#in.get_unchecked(in_next + 1) },
+                            unsafe { *r#in.get_unchecked(in_next + 2) },
+                            unsafe { *r#in.get_unchecked(in_next + 3) },
+                            unsafe { *r#in.get_unchecked(in_next + 4) },
+                        ),
+                )
+            } else {
+                (false, false)
+            };
+            #[cfg(not(feature = "ladder-tune"))]
+            let (probe_recruited_far3, declined_by_probe): (bool, bool) = (false, false);
+
+            if length >= min_len
+                && (length > DEFLATE_MIN_MATCH_LEN || offset <= 4096 || probe_recruited_far3)
+                && !declined_by_probe
+            {
                 // Match found.
                 deflate_choose_match(c, length, offset, true, &mut p.sequences, &mut seq_idx);
                 hc_matchfinder_skip_bytes(
