@@ -41,12 +41,12 @@ use crate::error::GzippyResult;
 /// closed const set so the `GZIPPY_DEBUG=1` diagnostic string can never drift
 /// from the code that emits it. Each name is printed at the exact call site
 /// of the encoder that is about to run (never from a routing/decision
-/// function that merely picks a path — see `docs`/CLAUDE.md Gate-4: the point
-/// is to observe what EXECUTED). Mirrors the existing decompress-side style
+/// function that merely picks a path — the point is to observe what
+/// EXECUTED). Mirrors the existing decompress-side style
 /// (`[gzippy] path=... threads=... bytes=...` in `src/decompress/mod.rs`).
 pub(crate) mod route {
-    /// Explicit zopfli tuning (`-F`/`-I`/`-J`) — pure-Rust `zopfli_pure`
-    /// (`ZopfliGzEncoder`), single-member, any thread count.
+    /// Explicit zopfli tuning (`-F`/`-I`/`-J`) — the pure-Rust
+    /// `parse/ultra` port (`ZopfliGzEncoder`), single-member, any thread count.
     pub const ZOPFLI: &str = "Zopfli";
     /// T1 pure-Rust single-member DEFLATE (`deflate::encode_gzip_reader_to_writer_sized`):
     /// read-to-end into one Vec, then the whole-buffer parse. `ldx` is
@@ -91,7 +91,7 @@ pub(crate) mod route {
 /// production compress path; no C-FFI compressor in the routing graph).
 ///
 /// Routing:
-///   -F / -I / -J (explicit zopfli tuning) → zopfli (pure `zopfli_pure`)
+///   -F / -I / -J (explicit zopfli tuning) → zopfli (pure `parse/ultra` port)
 ///   T1  L0–L12  → `deflate::encode_gzip_bytes_to_vec` (pure single-member gzip)
 ///   T>1 L0–L12  → `PipelinedGzEncoder::compress_buffer_pure` (pure parallel,
 ///                 standard single-member gzip)
@@ -129,7 +129,7 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     size_hint: Option<usize>,
 ) -> GzippyResult<u64> {
     // Explicit zopfli tuning flags (-F iterations / -I no-split / -J split-max)
-    // force the true zopfli encoder (the pure-Rust `zopfli_pure` port — NO
+    // force the true zopfli encoder (the pure-Rust `parse/ultra` port — NO
     // C-FFI). Plain `-11` does NOT: it falls through to the pure near-optimal
     // DEFLATE engine below, matching the pre-Inc7 ordering intent.
     let explicit_zopfli =

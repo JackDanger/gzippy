@@ -5,13 +5,14 @@
 //! - zlib-ng (via flate2 with zlib-ng feature) - statically linked
 //!
 //! Zopfli was previously linked as a vendored C library; since the
-//! pure-Rust port at `src/backends/zopfli_pure` reached parity (Steps
-//! 1–23 of plan.md) the C build is gone for production.
+//! pure-Rust port at `src/compress/deflate/parse/ultra` reached parity
+//! the C build is gone for production.
 //!
 //! The `oracle` cargo feature opts back into compiling
 //! `vendor/zopfli/src/zopfli/*.c` (gated to test builds only) so the
-//! Phase 11.2 corpus oracle can compare zopfli_pure's output to the C
-//! reference byte-for-byte. See `src/backends/zopfli_pure/oracle_tests.rs`.
+//! Phase 11.2 corpus oracle can compare the `parse/ultra` port's output
+//! to the C reference byte-for-byte. See
+//! `src/compress/deflate/parse/ultra/oracle_tests.rs`.
 //!
 //! Note: ISA-L FFI was attempted but the complex struct layout (200KB+ with
 //! nested Huffman tables) makes Rust FFI difficult. Since ISA-L uses pure C

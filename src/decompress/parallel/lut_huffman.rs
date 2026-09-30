@@ -1057,7 +1057,8 @@ impl LutLitLenCode {
     /// As `rebuild_from`, but with a caller-chosen multi-symbol packing flag.
     /// Production decode always uses `rebuild_from` (TRIPLE) — this is
     /// byte-identical for `multisym == TRIPLE_SYM_FLAG`. The bare-kernel
-    /// removal-oracle (examples/streaming_thin.rs `igzipbare`) uses
+    /// removal-oracle (the since-removed `examples/streaming_thin.rs`
+    /// harness, its `igzipbare` path) uses
     /// `SINGLE_SYM_FLAG` so igzip's `_04` reads unambiguous single-symbol
     /// entries (its asm speculative-literal path mis-handles gz's TRIPLE pack).
     pub fn rebuild_from_multisym(&mut self, code_lengths: &[u8], multisym: u32) -> bool {

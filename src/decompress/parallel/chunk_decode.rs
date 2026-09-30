@@ -1781,7 +1781,7 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for CleanTailSink<'
         // the convention the retired resumable_resync clean tail used. Drives
         // the split_chunk_size subchunk split for vendor-parity / the seekable
         // index (no production read site yet — locked by the
-        // UNSPLIT_BLOCKS_EMPLACED deletion trap in tests/routing.rs).
+        // UNSPLIT_BLOCKS_EMPLACED deletion trap in src/tests/routing.rs).
         self.chunk.append_block_boundary_at(
             encoded_offset_bits,
             decoded_offset,

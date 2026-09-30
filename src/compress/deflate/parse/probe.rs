@@ -212,7 +212,7 @@ pub fn covering_run(rec: Vec<ProbeBlock>, input_len: usize) -> Option<Vec<ProbeB
 /// `litlen_freqs` must NOT include the end-of-block symbol; this adds it, as
 /// `emit_block` does. Mirrors the T1 (`HeaderBudget::Lean`) path only: RLE
 /// shaping is a T>1-only candidate and this probe runs at T1.
-#[allow(dead_code)] // called from examples/tests; unused in the binary
+#[allow(dead_code)] // called only from tests + examples/split_headroom.rs; unused in the binary
 pub fn cost_span(
     litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
     offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],

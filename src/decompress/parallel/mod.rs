@@ -6,7 +6,7 @@
 //! # gzippy → rapidgzip ROLE MAP (which gz module ports which rg source)
 //!
 //! Faithful structural port of rapidgzip's chunked single-member decode. Vendor
-//! source: `vendor/rapidgzip/src/rapidgzip/`. When a gz module "works but looks
+//! source: `vendor/rapidgzip/librapidarchive/src/rapidgzip/`. When a gz module "works but looks
 //! structurally off", the cited vendor `file` is the reference.
 //!
 //! Upstream license: rapidgzip is Copyright (c) 2019-2023 Maximilian Knespel,

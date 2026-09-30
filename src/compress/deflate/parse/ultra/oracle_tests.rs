@@ -1,5 +1,5 @@
-//! Phase 11.2 corpus oracle: compare zopfli_pure's output to the
-//! vendored C zopfli reference byte-for-byte across a fixed corpus.
+//! Phase 11.2 corpus oracle: compare the pure-Rust zopfli port's (`parse/ultra`)
+//! output to the vendored C zopfli reference byte-for-byte across a fixed corpus.
 //!
 //! Gated on the `oracle` cargo feature so plain `cargo test` stays
 //! fast. Run via `cargo test --features oracle -- --include-ignored`
@@ -201,8 +201,8 @@ fn corpus_gzip_pareto_vs_c_zopfli() {
 
     if !failures.is_empty() {
         panic!(
-            "zopfli_pure failed the Pareto oracle vs vendor/zopfli on {} \
-             (corpus, opts) pair(s):\n{}",
+            "the pure-Rust zopfli port (`parse/ultra`) failed the Pareto \
+             oracle vs vendor/zopfli on {} (corpus, opts) pair(s):\n{}",
             failures.len(),
             failures.join("\n")
         );

@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(chunk.data_with_markers.at(3) as u8, window[0]);
         assert_eq!(chunk.data_with_markers.at(4) as u8, window[5]);
         // (CRC accounting moved to the consumer — verified by the
-        // routing-level round-trip tests in tests/routing.rs and the
+        // routing-level round-trip tests in src/tests/routing.rs and the
         // full bench's `output size mismatch` / md5 check.)
     }
 

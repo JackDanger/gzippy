@@ -681,7 +681,8 @@ impl Block {
     pub fn is_last_block(&self) -> bool {
         self.is_last_block
     }
-    /// MEASUREMENT-ONLY (kernel-isolation A/B harness, examples/kernel_ab_aarch64.rs):
+    /// MEASUREMENT-ONLY (kernel-isolation A/B harness; the harness file
+    /// `examples/kernel_ab_aarch64.rs` has since been removed):
     /// reset ONLY the per-block-body decode accounting (`at_end_of_block`,
     /// `decoded_bytes`) so the SAME real DEFLATE block can be re-decoded by
     /// `decode_clean_into_contig` in a loop WITHOUT re-parsing the header or

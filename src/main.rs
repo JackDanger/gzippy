@@ -273,7 +273,7 @@ fn run() -> Result<i32, GzippyError> {
     // parallel::chunk_fetcher::drive_impl), which drains FetcherStatistics +
     // ChunkFetcherStatistics + the deletion-trap counters to stderr at
     // end-of-decode. Mirror of vendor's `args.verbose` ->
-    // `setStatisticsEnabled(true)` at tools/rapidgzip.cpp:164. (Previously an
+    // `setStatisticsEnabled(true)` at vendor/rapidgzip/librapidarchive/src/tools/rapidgzip.cpp:164. (Previously an
     // internal env-var round-trip; replaced batch 4g.)
 
     // zcat/gzcat imply decompress-to-stdout

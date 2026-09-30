@@ -1,9 +1,8 @@
 //! Trace-parity correctness gate — all gzip-family archive formats.
 //!
 //! Every production route must yield byte-identical output at T=1,2,4,8
-//! (and T=16 for large single-member on x86_64). Run via:
+//! (and T=16 for large single-member on x86_64):
 //!   `cargo test --release trace_parity`
-//! or `scripts/trace_parity_check.sh`.
 
 #[cfg(test)]
 mod tests {

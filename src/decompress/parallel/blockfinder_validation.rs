@@ -791,7 +791,7 @@ impl<'a> DeflateBlockValidator<'a> {
     /// Check if lengths form a valid (canonical) Huffman code.
     ///
     /// Literal port of vendor's `checkHuffmanCodeLengths<MAX_CODE_LENGTH>`
-    /// at `src/huffman/HuffmanCodingBase.hpp:215-236`. Tests Kraft
+    /// at `vendor/rapidgzip/librapidarchive/src/huffman/HuffmanCodingBase.hpp:215-236`. Tests Kraft
     /// **equality** (full canonical tree, sum-of-leaves == 2^MAX_LEN),
     /// with the standard edge case allowing a single-symbol tree
     /// (`sum == 2^(MAX_LEN - 1)` AND no code length > 1).

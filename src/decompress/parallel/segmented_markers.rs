@@ -9,7 +9,7 @@
 //! ## Vendor blueprint
 //!
 //! Port of rapidgzip's `DecodedData::dataWithMarkers`
-//! (`vendor/rapidgzip/src/rapidgzip/DecodedData.hpp:238-275`): a
+//! (`vendor/rapidgzip/librapidarchive/src/rapidgzip/DecodedData.hpp:238-275`): a
 //! `std::vector<MarkerVector>` where each inner `MarkerVector` is a
 //! `FasterVector<uint16_t>` filled in [`SEGMENT_ELEMENTS`]-equal
 //! chunks via `appendToEquallySizedChunks` (DecodedData.hpp:238-275).
