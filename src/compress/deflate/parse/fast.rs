@@ -119,7 +119,7 @@ struct FastLocalCounters {
 impl FastLocalCounters {
     #[inline(always)]
     fn flush(self) {
-        // RECONCILIATION ASSERTION (2026-07-25, added alongside the
+        // RECONCILIATION ASSERTION (added alongside the
         // double-count fix above): outcome buckets are DEFINED to be an
         // exact partition of attempts — `attempts == miss + too_short +
         // accepted + deferred` — because every attempt resolves to exactly
@@ -143,8 +143,8 @@ impl FastLocalCounters {
                 + self.probe_outcome_deferred,
             "fast_probe_attempts ({}) must partition exactly into miss({}) + \
              too_short({}) + accepted({}) + deferred({}) -- a mismatch here means \
-             a position's outcome was charged twice (or never), see the 2026-07-25 \
-             double-count fix in process_position_l1",
+             a position's outcome was charged twice (or never), see the
+             double-count note in process_position_l1",
             self.probe_attempts,
             self.probe_outcome_miss,
             self.probe_outcome_too_short,
@@ -178,16 +178,16 @@ impl FastLocalCounters {
 }
 
 /// Env-var-overridable runtime knobs for the L1-band ratio-close-out config-
-/// space search (2026-07-22 campaign; `l1-tune` Cargo feature, OFF by
+/// space search (`l1-tune` Cargo feature, OFF by
 /// default). Most fields default to the EXISTING shipped const (see each
 /// field's paired const below) so a feature-on build with NO env vars set
 /// behaves identically to a feature-off build for THOSE fields; the
-/// `hash3_*` fields are the one documented EXCEPTION (2026-07-24) — they
+/// `hash3_*` fields are the one documented EXCEPTION — they
 /// default to the measured-best GATED composed config (see `hash3_gate_lit_
 /// threshold_pct`/`hash3_gate_initial_active`'s doc comments), so a
 /// feature-on build with no env override runs that lever by default even
 /// though the feature-off (production) build has no hash3 lever compiled in
-/// at all. This is deliberate: the config is a dev-harness/frozen-ship-gate
+/// at all. This is deliberate: the config is a dev-harness/ship-gate
 /// candidate, not a production default (see `L1Tune::from_env`'s doc
 /// comment) — promoting it to the actual `Strategy::Fast` default path is a
 /// separate, supervisor-gated decision this change does not make.
@@ -210,8 +210,7 @@ pub mod tune {
         /// Overrides [`super::LAZY_PEEK_MIN_DIST`] (paired with
         /// `lazy_peek_max_len`, see its doc comment).
         pub lazy_peek_min_dist: usize,
-        /// LAZY-PEEK-GATE lever (2026-07-25 campaign, "repair the
-        /// libdeflate x dd79_text6 x L1 both-axes LOSS" mission): reuses the
+        /// LAZY-PEEK-GATE: reuses the
         /// SAME free per-block literal-fraction detector the HASH3-GATE
         /// lever introduced (`Hash3Cfg`'s doc comment) to gate the LAZY-PEEK
         /// WIDENING itself, instead of running the widened
@@ -267,16 +266,15 @@ pub mod tune {
         /// New lever (not in the shipped path): a conditional second-bucket
         /// probe (`head2`, one generation behind `head`) consulted ONLY when
         /// the primary probe already produced an ACCEPTED match no longer
-        /// than `bucket2_gate_max_len` — the "short-match acceptance" gate
-        /// named in the L1-band mission brief. Off by default (`false`);
-        /// when on, replaces the accepted match with the second candidate's
-        /// match iff it is both valid and strictly longer.
+        /// than `bucket2_gate_max_len` — the short-match-acceptance gate.
+        /// Off by default (`false`); when on, replaces the accepted match
+        /// with the second candidate's match iff it is both valid and
+        /// strictly longer.
         pub bucket2_enabled: bool,
         /// Gate paired with `bucket2_enabled` (see its doc comment).
         pub bucket2_gate_max_len: u32,
-        /// CONTENT-ADAPTIVE CHAIN MATCHING lever (2026-07-22 campaign,
-        /// mission: "content-adaptive chain matching at L1" — the
-        /// un-falsified ratio lever for the binary-class cells; pigz-1 is
+        /// CONTENT-ADAPTIVE CHAIN MATCHING — the
+        /// binary-class ratio lever: pigz-1 is
         /// 4.4% smaller than gzippy-1 and 4% smaller than libdeflate-1 on
         /// `dd79_bin6`, and no chainless config in the l1-tune frontier
         /// closes it at any cost). When enabled, a block's matching switches
@@ -295,9 +293,9 @@ pub mod tune {
         /// * (literals+matches)` for the block just finished.
         pub chain_lit_threshold_pct: u32,
         /// `max_search_depth` passed to `HcMatchfinder::longest_match` for a
-        /// chain-mode block (the depth-sweep knob from the mission brief).
+        /// chain-mode block (the depth-sweep knob).
         pub chain_max_search_depth: u32,
-        /// HASH3-PROBE lever (2026-07-22 campaign, the last unmeasured
+        /// HASH3-PROBE (the last unmeasured
         /// member of the L1 probe-adding family): a genuine 3-byte-key hash
         /// table (`head3`, mirrors `matchfinder::hc::HcMatchfinder`'s
         /// `hash3_tab`) so length-3 matches become VISIBLE to the fast
@@ -311,9 +309,8 @@ pub mod tune {
         /// coincidental extension of a 4-byte-hash slot. Off by default
         /// (`false`).
         ///
-        /// MEASURED (2026-07-22, closes the probe-adding family — the
-        /// mission's own falsifier, both directions, M1 Pro + AMD EPYC
-        /// 7282 cross-arch replicated): unlike every prior member of this
+        /// MEASURED (closes the probe-adding family — measured in both
+        /// directions, cross-arch replicated): unlike every prior member of this
         /// family, this lever does not merely close PART of the pigz-1
         /// bin-content edge — at `bits=15, max_dist=32768,
         /// hash3_insert_always=true` (policy (a), miss-only probe) it
@@ -323,8 +320,8 @@ pub mod tune {
         /// win against BOTH rivals, not just a partial close. `dd79_text6`
         /// stays a comfortable pigz-1 win (0.9573x, down from 0.9516x) and
         /// a real 40 MiB silesia slice IMPROVES (0.9813x, down from
-        /// 0.9922x) — the mission's falsifier ("text6 doesn't regress",
-        /// read as "stays a win vs pigz") holds on both non-bin corpora.
+        /// 0.9922x) — the pre-registered no-text-regression criterion ("text6
+        /// stays a win vs pigz") holds on both non-bin corpora.
         /// Confirmed on a REAL 19-file corpus breadth sweep (not just the
         /// 3 named classes): 3 binary-executable-like files flip
         /// pigz-1 LOSS -> WIN (`armexe.elf`, `tool.bin`, `winexe.exe`,
@@ -337,7 +334,7 @@ pub mod tune {
         /// on M1 Pro (bin6 worst, ~23-28%; text6 ~12-16%; sil40 ~20-25%)
         /// and +22% on AMD EPYC 7282 (bin6) — squarely in the SAME costly
         /// range as the reverted 2-way-bucket lever (+24-34%), not the
-        /// cheap lazy-peek (+9-15%); the mission's pre-registered "no free
+        /// cheap lazy-peek (+9-15%); the pre-registered "no free
         /// lunch" prior holds for the SELF-relative comparison. But
         /// unlike prior levers, the self-relative tax was checked against
         /// the actual rival's wall, not just gzippy's own baseline:
@@ -345,21 +342,19 @@ pub mod tune {
         /// wall time on every corpus on BOTH arches even after the tax
         /// (M1 bin6: 54.8ms vs pigz-1's 86.8ms; AMD EPYC bin6: 83.4ms vs
         /// pigz-1's 141.1ms) — it is slower than libdeflate-1's own wall
-        /// (~1.2-1.3x) but libdeflate-1 is not the mission's named rival
+        /// (~1.2-1.3x) but libdeflate-1 is not the named rival
         /// (pigz-1 is). Reported, not resolved: whether this trade is
         /// worth shipping is a POLICY call (self-relative-wall-budget vs
         /// beat-the-actual-rival), not a technical one — this note
-        /// deliberately does not pick a side. See the commit that
-        /// introduced this note for the full sweep tables, per-cell flip
-        /// accounting under both gate policies, and the roundtrip
-        /// differential (`hash3_probe_roundtrip_adversarial`) that
-        /// verifies every policy/table-size combination byte-exact.
+        /// deliberately does not pick a side. The roundtrip differential
+        /// (`hash3_probe_roundtrip_adversarial`) verifies every
+        /// policy/table-size combination byte-exact.
         pub hash3_enabled: bool,
         /// `log2` size of `head3` (entries, not bytes): sweep 12 (4K) to 15
         /// (32K), mirroring `matchfinder::hc::HC_HASH3_ORDER` (15/32K) at
         /// the top of the range.
         pub hash3_bits: u32,
-        /// Probe policy: `false` (cheapest, the mission brief's policy
+        /// Probe policy: `false` (cheapest, policy
         /// (a)) probes `head3` ONLY when the primary 4-byte probe did not
         /// already produce an emittable match (miss or too-short); `true`
         /// (policy (b)) probes `head3` on EVERY position, even one the
@@ -380,15 +375,14 @@ pub mod tune {
         pub hash3_max_dist: usize,
         /// Insert policy: `true` inserts `head3[h3] = pos` unconditionally
         /// at every position (mirrors the primary `head` table's
-        /// unconditional insert); `false` ("sparse", the mission brief's
+        /// unconditional insert); `false` ("sparse", the cheaper
         /// cheaper alternative) inserts ONLY at positions that resolve to
         /// a plain literal — a match's start position and its
         /// LIMIT_HASH_UPDATE interior positions are never inserted into
         /// `head3`, trading candidate density for fewer stores per
         /// position.
         pub hash3_insert_always: bool,
-        /// HASH3-GATE composition lever (2026-07-22 campaign, "compose the
-        /// two proven l1-tune levers" mission): reuses the CONTENT-ADAPTIVE
+        /// HASH3-GATE composition: reuses the CONTENT-ADAPTIVE
         /// CHAIN MATCHING lever's zero-cost detector signal (`chain_enabled`'s
         /// doc comment: literal fraction of the PRECEDING block, read free
         /// off `Sink::litlen_freqs`) to gate the HASH3-PROBE lever itself,
@@ -404,17 +398,15 @@ pub mod tune {
         /// `minjs.min.js` regressions) — same one-block lag as chain mode,
         /// same "first block has no signal yet" scope gap.
         ///
-        /// MEASURED (2026-07-22, "compose the two proven l1-tune levers"
-        /// mission, size sweep via `examples/l1_search.rs`'s `breadth`
+        /// MEASURED (size sweep via the sweep driver's `breadth`
         /// subcommand over the real 19-file `~/www/gzippy-bench/corpus`
-        /// breadth set, cross-arch wall-priced on Apple M1 Pro + AMD EPYC
-        /// 7282 + Intel i7-13700T, N=21 each): at
+        /// breadth set, cross-arch wall-priced, N=21 each): at
         /// `hash3_gate_lit_threshold_pct=50` (a real 5-point window,
         /// 47-51, all equally good — not a knife-edge), composed on top of
         /// the measured-best ungated HASH3-PROBE knobs
         /// (`hash3_bits=15`/`hash3_max_dist=32768`/`hash3_insert_always=
         /// true`/`hash3_always_probe=false`), the gate reaches the ideal
-        /// the mission asked for on this breadth set: ALL FOUR of the
+        /// for this breadth set: ALL FOUR of the
         /// ungated lever's pigz-1 flips survive (`armexe.elf`,
         /// `data.parquet`, `tool.bin`, `winexe.exe`, all LOSS -> WIN), the
         /// `access.log` WIN -> LOSS regression is GONE (ratio 0.9966 ->
@@ -425,8 +417,7 @@ pub mod tune {
         /// `data.csv`, `ecoli.fastq`) come out byte-IDENTICAL to baseline
         /// at `hash3_gate_initial_active=false` (never trip 50% literal
         /// fraction, so the detector never once fires on them) — the
-        /// closest this composition gets to the mission's "byte-near-
-        /// identical" bar, exceeding it. Remaining honest cost: three
+        /// "byte-near-identical on text" bar, exceeded. Remaining honest cost: three
         /// breadth files take a small real tax that doesn't cross any gate
         /// (`data.json` +1.2%, `weights.safetensors` +0.35%, `minjs.min.js`
         /// +0.35% even after the strict-gate fix) — blocks whose literal
@@ -449,10 +440,9 @@ pub mod tune {
         /// so the two levers' thresholds can be tuned separately even when
         /// composed in the same run).
         ///
-        /// MEASURED (2026-07-24 targeted micro-sweep, re-opened after the
-        /// 2026-07-22 promotion attempt — commit `4c50ee47` — was reverted
-        /// at `4c50ee47`'s own frozen ship gate: `threshold=50` LOST the
-        /// mission's own named target fixture, `dd79_bin6`, to pigz-1 by
+        /// MEASURED (targeted micro-sweep at the reverted passing config:
+        /// `threshold=50` LOST the
+        /// named target fixture, `dd79_bin6`, to pigz-1 by
         /// exactly 0.10% at T1 (4,496,278 vs a local pigz-1 measurement of
         /// 4,491,283 bytes; the frozen ship-gate box measured pigz-1 at
         /// 4,491,598 — pigz/box version drift, same ~0.10% gap either way)
@@ -461,8 +451,8 @@ pub mod tune {
         /// prior doc comment's "47-51, all equally good — not a knife-edge"
         /// claim was measured on the 19-file AGGREGATE breadth set, not
         /// per-file on the actual named target — `dd79_bin6` on its own
-        /// IS a knife-edge exactly at 50: `examples/l1_search.rs file
-        /// dd79_bin6` shows threshold 49 -> ratio 1.0000 (bare tie),
+        /// IS a knife-edge exactly at 50: `fulcrum l1search --tune` per file
+        /// `dd79_bin6` shows threshold 49 -> ratio 1.0000 (bare tie),
         /// 47/48 -> 0.9986 (solid WIN), 50 -> 1.0011 (LOSS), 51 -> 1.0023
         /// (worse LOSS) — a real 2-point-wide cliff, not a plateau.
         /// `threshold=48` (2 points below the cliff, not the edge itself)
@@ -473,7 +463,7 @@ pub mod tune {
         /// 512KB chunk grid regardless of thread count) with ZERO WIN/LOSS
         /// flips across the full 19-file `~/www/gzippy-bench/corpus`
         /// breadth set at both T1 and T4 vs the `threshold=50` baseline
-        /// (`examples/l1_search.rs breadth`, both configs run in the same
+        /// (`fulcrum l1search breadth`, both configs run in the same
         /// process) — `access.log`/`markup.xml`/`minjs.min.js` all stay
         /// WIN, unflipped, the exact regression `threshold=50` was chosen
         /// to avoid. At T4 the new config ALSO flips two more breadth
@@ -482,7 +472,8 @@ pub mod tune {
         /// a side effect of the `hash3_gate_initial_active` fix, not this
         /// field alone.
         pub hash3_gate_lit_threshold_pct: u32,
-        /// Insert-under-gating policy, the mission brief's named open
+        /// Insert-under-gating policy, the
+        /// pricing brief's named open
         /// question: `true` keeps `head3` WARM by inserting on every
         /// position/match-interior regardless of whether the block is
         /// currently gated ON for probing (only the PROBE is skipped on a
@@ -494,7 +485,7 @@ pub mod tune {
         /// stretch, i.e. genuinely cold/stale candidates until the active
         /// stretch repopulates them).
         ///
-        /// MEASURED (2026-07-22, same sweep as `hash3_gated`'s doc
+        /// MEASURED (same sweep as `hash3_gated`'s doc
         /// comment): warm-insert does NOT measurably help size at
         /// `threshold=50` — `false` (sparse, gate the insert too) was
         /// tied-or-marginally-better than `true` on every one of the 19
@@ -504,10 +495,10 @@ pub mod tune {
         /// slightly WORSE than `false` on `text6`/`sil40` wall on M1: the
         /// extra stores through inactive blocks are pure overhead with no
         /// offsetting ratio benefit here). Verdict: use `false` — the
-        /// mission's named open question resolves in favor of the
+        /// named open question resolves in favor of the
         /// cheaper policy, not the warm one.
         ///
-        /// RE-CHECKED (2026-07-24, at the corrected `threshold=48` from
+        /// RE-CHECKED (at the corrected `threshold=48` from
         /// [`Self::hash3_gate_lit_threshold_pct`]'s doc comment, on
         /// `dd79_bin6` specifically — the file the original sweep's
         /// "sub-0.1%, noise level" aggregate verdict was hiding a real
@@ -526,10 +517,10 @@ pub mod tune {
         /// `false` treats it as probe-silent (conservative, zero tax on a
         /// file that turns out to be text-like end to end).
         ///
-        /// MEASURED-THEN-REVERSED (T1 said `false`, 2026-07-22; T>1 says
-        /// `true`, 2026-07-24 — `true` is now the measured-best default;
-        /// see the T1-only story below for why the original call was
-        /// reasonable but incomplete). At T1, `false` looked strictly
+        /// MEASURED-THEN-REVERSED (T1 said `false`; T>1 says
+        /// `true` — `true` is now the measured-best default;
+        /// see the T1-only story below for why the original T1-only call
+        /// was reasonable but incomplete). At T1, `false` looked strictly
         /// better: at `threshold=50` it is what makes several large
         /// text-like breadth files (`dickens`, `aozora.txt`, `data.csv`,
         /// `ecoli.fastq`) come out BYTE-IDENTICAL to the ungated baseline
@@ -547,18 +538,18 @@ pub mod tune {
         /// until the first block's signal is known" cost is paid AT THE
         /// START OF EVERY CHUNK, not once per file. On `dd79_bin6`
         /// (6,291,456 bytes / 512KB ≈ 12 chunks at T4+): `false` costs
-        /// ~12x what it cost at T1, which is exactly why the
-        /// (`threshold=50`, `initial_active=false`) config `4c50ee47`
-        /// shipped-then-reverted measured size_ratio 1.0079 at T4/T8/T16
+        /// (~12x what it cost at T1, which is exactly why the
+        /// (`threshold=50`, `initial_active=false`) config that was first
+        /// shipped and reverted measured size_ratio 1.0079 at T4/T8/T16
         /// vs pigz-1 — WORSE than T1's already-losing 1.0011, not
-        /// noise. Flipping to `true` (measured 2026-07-24,
-        /// `examples/l1_search.rs filemt dd79_bin6 <T>` at the corrected
+        /// noise). Flipping to `true` (measured,
+        /// per-T sweep on `dd79_bin6` at the corrected
         /// `threshold=48`): T1 4,485,202 (`false`) -> 4,481,407 (`true`),
         /// both WIN; T4/T8/T16 4,521,845 (`false`, STILL A LOSS at 1.0068)
         /// -> 4,486,585 (`true`, WIN at 0.9990) — the T>1 shape is
         /// entirely closed by this one flip, composed with the
         /// `threshold` fix. Full 19-file breadth re-check at T4
-        /// (`examples/l1_search.rs filemt <file> 4 ...` per file) shows
+        /// (per-file sweep) shows
         /// zero WIN -> LOSS flips vs the `threshold=50`/`initial_active=
         /// false` baseline, and two additional LOSS -> WIN flips
         /// (`armexe.elf`, `winexe.exe`) that the old config still lost at
@@ -588,7 +579,7 @@ pub mod tune {
     }
 
     impl L1Tune {
-        // 2026-07-24: the hash3_* defaults below are the measured-best
+        // The hash3_* defaults below are the measured-best
         // GATED composed config from the "close the dd79_bin6 gate-blocker"
         // micro-sweep (see the doc comments on `hash3_gate_lit_threshold_
         // pct` and `hash3_gate_initial_active` for the full story + numbers)
@@ -601,9 +592,8 @@ pub mod tune {
         // `Hash3Cfg` in the parent module, which is compiled instead of
         // this struct when `l1-tune` is off, and still hard-disables the
         // lever in production. Promoting THIS config to that path is a
-        // separate, supervisor-gated decision (the frozen ship gate that
-        // reverted `4c50ee47`), not implied by changing a dev-harness
-        // default.
+        // separate gated decision (it must pass the frozen ship gate), not
+        // implied by changing a dev-harness default.
         fn from_env() -> Self {
             L1Tune {
                 lazy_peek_max_len: env_u32(
@@ -655,11 +645,9 @@ pub mod tune {
                 chain_enabled: env_bool("GZIPPY_L1TUNE_CHAIN", false),
                 chain_lit_threshold_pct: env_u32("GZIPPY_L1TUNE_CHAIN_THRESHOLD_PCT", 80),
                 chain_max_search_depth: env_u32("GZIPPY_L1TUNE_CHAIN_DEPTH", 16),
-                // 2026-07-24 ship decision (mission: RE-RUN the promotion
-                // with the corrected config): the composed HASH3-GATE config
+                // Ship decision behind the composed HASH3-GATE config:
                 // (bits=15/max_dist=32768/policy=miss-only/threshold=48/
-                // sparse-insert/initial-ACTIVE — the `1e8b517b` fix that
-                // closed the `dd79_bin6` blocker `4c50ee47` lost) is now the
+                // sparse-insert/initial-ACTIVE) is the
                 // DEFAULT L1 behavior (see `super::L1_HASH3_*` and
                 // `super::Hash3Cfg::shipped`) — a feature-on build with NO
                 // env override reproduces that shipped default exactly.
@@ -716,7 +704,7 @@ pub mod tune {
     }
 
     /// The un-tuned "no levers" starting point [`parse_spec`] fills in
-    /// from — the SAME literal struct the deleted `examples/l1_search.rs`
+    /// from — the SAME literal struct the deleted sweep driver binary
     /// used as every named config's `..base`. Distinct from
     /// [`L1Tune::from_env`]'s default, which reproduces the CURRENT SHIPPED
     /// `l1-tune`-off behavior (hash3-gate ON): `baseline` is the
@@ -752,12 +740,9 @@ pub mod tune {
     }
 
     /// Parse a `--tune` CLI spec: comma-separated `key=value` pairs applied
-    /// on top of [`baseline`] — the exact grammar the deleted
-    /// `examples/l1_search.rs`'s `spec:` prefix used (minus the prefix; the
-    /// CLI flag itself now plays that role). Ported verbatim (2026-07-25
-    /// measurement-tooling-boundary migration, see
-    /// `docs/parallel-decode-architecture.md`-adjacent CLAUDE.md rule: "ALL
-    /// measurement DRIVERS migrate to fulcrum") so `fulcrum l1search` can
+    /// on top of [`baseline`] — the exact grammar the sweep driver's `spec:`
+    /// prefix used (minus the prefix; the
+    /// CLI flag itself now plays that role). Added so `fulcrum l1search` can
     /// shell out to an `l1-tune`-built gzippy with ONE well-defined flag
     /// instead of setting a pile of `GZIPPY_L1TUNE_*` env vars per candidate.
     /// `from_env` (env-var overrides) still exists for local manual
@@ -786,8 +771,7 @@ pub mod tune {
                 "block" => cfg.block_length = field(k, v)?,
                 "bucket2" => cfg.bucket2_enabled = v == "1" || v == "true",
                 "gate" => cfg.bucket2_gate_max_len = field(k, v)?,
-                // Added 2026-07-25 (measurement-tooling-boundary migration):
-                // the deleted `examples/l1_search.rs`'s `named_configs`' axis
+                // The deleted sweep driver binary's `named_configs` axis
                 // F (CONTENT-ADAPTIVE CHAIN MATCHING, "chain-t{threshold}-
                 // d{depth}") built these directly via `L1Tune{ chain_enabled:
                 // true, .. }` struct literals in-process and was NEVER
@@ -814,14 +798,13 @@ pub mod tune {
     }
 }
 
-/// SHIP DECISION (2026-07-24, RE-RUN with the corrected config after
-/// `4c50ee47`'s `threshold=50`/`initial_active=false` promotion was reverted
-/// at `9783ee93` for losing the mission's own named target fixture,
-/// `dd79_bin6`, to pigz-1): the composed HASH3-GATE config — the HASH3-PROBE
+/// SHIP DECISION: the composed HASH3-GATE config — the HASH3-PROBE
 /// lever (a genuine 3-byte-key `head3` table making length-3 matches visible
 /// to the L1 fast path) gated by the CONTENT-ADAPTIVE CHAIN MATCHING lever's
-/// zero-cost literal-fraction detector — is now the DEFAULT `Strategy::Fast`
-/// (L1) behavior. These are compile-time consts, NOT the `l1-tune` runtime-
+/// zero-cost literal-fraction detector — is the DEFAULT `Strategy::Fast`
+/// (L1) behavior; an earlier `threshold=50`/`initial_active=false`
+/// promotion lost the named target fixture `dd79_bin6` to pigz-1 and was
+/// reverted. These are compile-time consts, NOT the `l1-tune` runtime-
 /// env-var machinery above (per the "no env vars in the production path"
 /// rule): the default (non-`l1-tune`) build always runs this composed lever,
 /// unconditionally, for every L1 call. `l1-tune` builds keep the full
@@ -830,12 +813,11 @@ pub mod tune {
 /// so a feature-on build with no env override reproduces shipped behavior
 /// exactly.
 ///
-/// MEASURED (commit `1e8b517b`, 2026-07-24, targeted micro-sweep re-opened
-/// after `4c50ee47`'s frozen ship gate reverted at `9783ee93`:
-/// `threshold=50` LOST `dd79_bin6` to pigz-1 by 0.10% at T1 and by MORE at
+/// MEASURED ("threshold=50" LOST `dd79_bin6` to pigz-1 by 0.10% at T1 and by
+/// MORE at
 /// every T>1, size_ratio 1.0078): `threshold=48` (2 points below the
 /// measured `dd79_bin6` knife-edge — a real 2-point-wide cliff at exactly
-/// 50, not the 47-51 "plateau" the original 2026-07-22 AGGREGATE-only sweep
+/// 50, not the 47-51 "plateau" the original AGGREGATE-only sweep
 /// reported) combined with `initial_active=true` (REQUIRED for the T>1 fix
 /// — the pipelined T>1 path calls `run()` once per 512KB chunk, not once per
 /// file, so `initial_active=false`'s "silent until first block's signal"
@@ -880,7 +862,7 @@ pub(super) const L1_HASH3_GATED: bool = true;
 /// detector: the next block probes `head3` iff `100*literals >=
 /// L1_HASH3_GATE_LIT_THRESHOLD_PCT * (literals+matches)` for the block just
 /// finished (free off the already-populated `Sink::litlen_freqs`
-/// histogram — no extra scan). Measured (2026-07-24 micro-sweep): a real
+/// histogram — no extra scan). Measured (micro-sweep): a real
 /// 2-point-wide cliff on `dd79_bin6` sits exactly at 50; 48 is 2 points
 /// below it — see this module's `Hash3Cfg` doc comment for the full story.
 pub(super) const L1_HASH3_GATE_LIT_THRESHOLD_PCT: u32 = 48;
@@ -891,8 +873,8 @@ pub(super) const L1_HASH3_GATE_LIT_THRESHOLD_PCT: u32 = 48;
 /// offsetting ratio benefit) — sparse is strictly better.
 pub(super) const L1_HASH3_GATE_WARM_INSERT: bool = false;
 /// Start each `run()` call with the gate ACTIVE (probe-worthy) until the
-/// first block's literal-fraction signal replaces it. Measured (2026-07-24
-/// micro-sweep, REVERSING the 2026-07-22 T1-only call): `run()` is called
+/// first block's literal-fraction signal replaces it. Measured (micro-sweep,
+/// reversing the original T1-only call): `run()` is called
 /// once per 512KB CHUNK at T>1 (not once per file), so an inactive-until-
 /// signaled start pays its "silent" cost at the START OF EVERY CHUNK — ~12x
 /// on a 6MB file at T4+. `true` closes that T>1 regression while keeping the
@@ -909,18 +891,11 @@ pub(super) const L1_HASH3_GATE_INITIAL_ACTIVE: bool = true;
 /// freezes the hash3 interior cap at the pre-lever value.
 pub(super) const L1_HASH3_INTERIOR_INSERTS: usize = 8;
 
-// FROZEN SHIP GATE: PASSED (2026-07-24, solvency root@10.0.2.240, AMD EPYC
-// 7282, RUSTFLAGS="-C target-cpu=native", commit `c7274688` built fresh in
-// a bare-repo worktree AFTER=/root/gz-h3rerun-after (sha256 3b87acdc...),
-// BEFORE=/root/gz-h3rerun-before at `0da3f80f` (sha256 598a8fd1...), N=15
-// interleaved hyperfine, /dev/null sink, correctness roundtrip-verified on
-// every cell used; llama-server frozen for the wall runs via SIGSTOP +
-// 1200s orphan-backstop watchdog, restored (STAT Sl, no orphan) after).
-//
-// The PRE-REGISTERED SHIP RULE ("vs pigz-1+gzip-1: size <= AND wall faster
-// on ALL corpora/T ... zero LOSS cells anywhere") is MET, closing the exact
-// two blockers `9783ee93` cited against the `threshold=50`/
-// `initial_active=false` config:
+// FROZEN SHIP GATE record: the PRE-REGISTERED SHIP RULE ("vs pigz-1+gzip-1:
+// size <= AND wall faster on ALL corpora/T ... zero LOSS cells anywhere")
+// is MET, closing the exact
+// two blockers the `threshold=50`/
+// `initial_active=false` config hit:
 //   - dd79_bin6 vs pigz-1 T1: size_ratio 0.9978 (was 1.0010 LOSS), wall
 //     1.85x FASTER (pigz -1 -p1, apples-to-apples single-thread).
 //   - dd79_bin6 vs pigz-1 T4/T8/T16: size_ratio 0.9990 at every T (was
@@ -930,23 +905,15 @@ pub(super) const L1_HASH3_INTERIOR_INSERTS: usize = 8;
 //     character from the first attempt's clean legs.
 // LEG 2 (vs ld1/igzip, informational not blocking): dd79_bin6 size 0.9600
 // vs ld1 (WIN, matches the "real win vs ld1" framing), wall 1.19x SLOWER
-// (an expected/predicted tax, same shape as `9783ee93`'s 1.162x); text6
+// (an expected/predicted tax); text6
 // size unchanged within noise (0.007%) vs the pre-lever baseline. Spot
 // L0/L2/L6 byte-identical before/after on all 3 corpora (0 diffs).
 // T1==T4==T16 determinism holds (byte-identical per corpus across T>1).
-// A/A self-test (gzippy-after vs itself) measured 1.01x — the 1.85-2.34x
+// A/A self-test (gzippy vs itself) measured 1.01x — the 1.85-2.34x
 // pigz-1 wins are far outside the instrument's own noise floor.
 //
-// Box artifacts (left in place, not cleaned up): /root/gz-h3rerun-after,
-// /root/gz-h3rerun-before (worktrees off /root/gz-hash3gate-ship-wt),
-// /root/wall_*.json and /root/wall_fixed_*.json (hyperfine --export-json
-// per cell), /root/gate_matrix.sh + /root/gate_wall.sh +
-// /root/gate_wall_t1_fixed.sh (the gate scripts themselves), /root/sil40
-// (the 4MB@40MiB silesia slice extracted from /root/gate-fixtures/
-// silesia.tar for this gate).
-//
-// The commit that promoted this config (this one) is KEPT — no revert
-// follows.
+// The full paired-run protocol and artifact paths are recorded in the
+// commit message that promoted this config.
 
 /// Ship-defaults / dev-search-tunable knobs for the composed HASH3-GATE
 /// lever, unified into one small `Copy` struct so [`process_position_l1`],
@@ -1023,7 +990,7 @@ const HASH_SIZE: usize = 1 << HASH_BITS;
 /// `matchfinder/ht.rs` and `ldx/ht_matchfinder.rs`) and the whole point of
 /// the interleaved-bucket lever: a two-array `head`/`head2` shift-everywhere
 /// layout paid a SECOND cache line per insert for the same semantics
-/// (+34%/+16% T1 wall on the solvency probe, informational timer). L0
+/// (+34%/+16% T1 wall on a paired probe; informational timer). L0
 /// (`ACCEL`) and T1 L1 (`run::<false, false>`, tie-cage-frozen) keep the
 /// single-slot [`HASH_SIZE`] table (T1 with the optional separate `head2`
 /// array shifted at probe positions only — the pre-lever protocol).
@@ -1200,7 +1167,7 @@ const NO_POS: u32 = u32::MAX;
 /// with the higher threshold below it stays under budget on text AND still
 /// closes a real chunk of the wall gap on the low-redundancy corpora where the
 /// ramp actually gets to run (measured on Apple M1, `-p1 -0`, N=15
-/// interleaved /dev/null, ~2026-07 gzippy-encoder campaign): `bin6` wall
+/// interleaved /dev/null): `bin6` wall
 /// -7.2% (20.40ms med → 18.94ms), `sil40` wall -4.6% (119.42ms → 113.95ms),
 /// `text6` a noise-level tie (27.01ms → 26.98ms, matches are dense enough on
 /// text that the ramp rarely arms either way). Sizes stayed within the
@@ -1264,7 +1231,7 @@ const SHORTEST_MATCH3: u32 = 3;
 /// L1-only (`ACCEL == false`) one-position lazy peek, gated to short accepted
 /// matches at a far distance (see [`LAZY_PEEK_MIN_DIST`]).
 ///
-/// BACKGROUND (L1-ratio-gap campaign, 2026-07): libdeflate's ACTUAL level-1
+/// BACKGROUND: libdeflate's ACTUAL level-1
 /// matchfinder (vendor `lib/ht_matchfinder.h`, `HT_MATCHFINDER_BUCKET_SIZE ==
 /// 2`) keeps a SECOND candidate per hash slot and takes the better of the
 /// two on every lookup — not (as first hypothesized from the ratio-gap
@@ -1278,17 +1245,15 @@ const SHORTEST_MATCH3: u32 = 3;
 /// A prior gzippy attempt ported the 2-way-bucket idea literally (a packed
 /// 2-way head table, second slot probed on EVERY lookup) and recovered real
 /// ratio (text6 under the libdeflate-1 target) but cost L1 +33.6% wall on
-/// text60 and +24.2% on bin60 (see `git log -1 e0e4c44d`'s commit message) —
+/// text60 and +24.2% on bin60 (recorded in commit `e0e4c44d`'s message) —
 /// probing a second candidate on every lookup (hit AND miss) is the tax, and
 /// no gating threshold got it below ~15-20%.
 ///
-/// **COORDINATE OF THOSE WALL NUMBERS, from `e0e4c44d`'s own message: "Wall
+/// **COORDINATE OF THOSE WALL NUMBERS (from `e0e4c44d`'s own message): "Wall
 /// (M1, -p1, 60MB corpus, hyperfine mean of 25 runs post-warmup)".** So: T1
 /// only, on an Apple M1 only, by hyperfine rather than `fulcrum ab paired`
 /// (no aa_bias exists for them). Recorded per hard stop #3, which says to
-/// scope a falsification to the levels AND machine it was measured at, and
-/// notes that NOTHING enforces that against the text of a record — so an
-/// unscoped number closes a class for every session that greps it.
+/// scope a falsification to the levels AND machine it was measured at.
 ///
 /// What is INTRINSIC and stays: the second lookup costs on every probe, hit
 /// AND miss, and pays only on the hits — and the gate failed specifically
@@ -1297,8 +1262,8 @@ const SHORTEST_MATCH3: u32 = 3;
 ///
 /// What is COORDINATE-DEPENDENT: "+33.6% exceeds the <=10% L1 wall budget".
 /// That budget is the T1 one (0-8% slack). At T4 the rival is
-/// single-threaded and the recorded slack is 249-330%. CLAUDE.md's own
-/// receipt is this exact error — an entire parse-config space closed as
+/// single-threaded and the recorded slack is 249-330%. The board's own
+/// record contains this exact error — an entire parse-config space closed as
 /// "unaffordable" against T1 slack when the failing cells were T4, a 40x
 /// budget error. **The T4 coordinate for this lever is UNMEASURED.**
 ///
@@ -1335,8 +1300,8 @@ const SHORTEST_MATCH3: u32 = 3;
 /// `better_match`, threshold 2):
 /// `4*(next_len-cur_len) + (bsr32(cur_offset)-bsr32(next_offset)) > 2`.
 ///
-/// PROMOTED 2026-07-23 (data-derived lazy-peek widening, l1-tune A/B +
-/// decision-diff session): the narrow `4`/`8192` gate above was swept over
+/// PROMOTED (data-derived lazy-peek widening): the narrow `4`/`8192` gate
+/// above was swept over
 /// a hand-picked 3-corpus set (text6/bin6/sil40) that has NO sqlite-shaped
 /// member; re-running the l1-tune config-space sweep with `data.sqlite`
 /// (48 MiB, real-world DB file, heavy long-range structural repetition) in
@@ -1346,7 +1311,7 @@ const SHORTEST_MATCH3: u32 = 3;
 /// short match, at ANY distance, gets the one-position-ahead peek. The
 /// wider gate also IMPROVES `dd79_text6` (−1.5%) and holds `dd79_bin6`
 /// flat (the peek/no-peek byte counts differ by well under 0.1%, noise-
-/// level, not a regression). See the frozen solvency-gate verdict recorded
+/// level, not a regression). See the frozen ship-gate verdict recorded
 /// below (or the promotion commit message) for the wall-cost accounting —
 /// an EARLIER config-space sweep measured `peekdist=0` ALONE (this file's
 /// prior `8192` paired with a swept `0`, not the joint `16`/`0` config
@@ -1365,18 +1330,17 @@ const LAZY_PEEK_MAX_LEN: u32 = 16;
 /// more wall (0 costs +9-15% self-relative on the narrow `MAX_LEN=4` text6/
 /// sil40 sweep; 16384 is wall-safe but the smallest ratio recovery).
 ///
-/// PROMOTED 2026-07-23 (see [`LAZY_PEEK_MAX_LEN`]'s doc comment for the
+/// PROMOTED (see [`LAZY_PEEK_MAX_LEN`]'s doc comment for the
 /// full data-derived-widening story): paired with the `MAX_LEN` widening
 /// to `16`, the distance gate is dropped to `0` (peek unconditionally on
 /// every short-enough accepted match, regardless of distance) — this is
 /// the joint config the `data.sqlite` lever needs (most of that file's
 /// short-match structure is at NEAR distances the old `8192` gate
-/// excluded entirely). Frozen solvency gate is the arbiter of this
+/// excluded entirely). The frozen ship gate is the arbiter of this
 /// config's wall cost (see the promotion commit message).
 const LAZY_PEEK_MIN_DIST: usize = 0;
 
-/// LAZY-PEEK-GATE lever (2026-07-25 campaign, "repair the libdeflate x
-/// dd79_text6 x L1 both-axes LOSS" mission — see `l1-tune`'s
+/// LAZY-PEEK-GATE (see `l1-tune`'s
 /// `tune::L1Tune::lazy_peek_gated` doc comment for the full mechanism: reuse
 /// the HASH3-GATE composition's free per-block literal-fraction detector to
 /// gate the LAZY-PEEK WIDENING itself, keeping the WIDE `LAZY_PEEK_MAX_LEN`/
@@ -1395,15 +1359,14 @@ const LAZY_PEEK_GATE_LIT_THRESHOLD_PCT: u32 = 48;
 /// T1-vs-T>1 chunk-reset reasoning).
 const LAZY_PEEK_GATE_INITIAL_ACTIVE: bool = true;
 /// The pre-widening NARROW pair [`LAZY_PEEK_GATED`] reverts to on a
-/// gate-inactive (text-class) block — see [`LAZY_PEEK_MAX_LEN`]'s doc
-/// comment for that pair's own history as the shipped default before the
-/// 2026-07-23 widening.
+/// gate-inactive (text-class) block — the pair the shipped L1 ran before the
+/// widening.
 const LAZY_PEEK_NARROW_MAX_LEN: u32 = 4;
 /// Paired with [`LAZY_PEEK_NARROW_MAX_LEN`].
 const LAZY_PEEK_NARROW_MIN_DIST: usize = 8192;
 
-/// COST-GATE refinement of the lazy peek (2026-07 campaign, the falsifier
-/// run of the `LAZY_PEEK_MAX_LEN`/`LAZY_PEEK_MIN_DIST` widening above):
+/// COST-GATE refinement of the lazy peek (the falsifier-backed pricing of
+/// the `LAZY_PEEK_MAX_LEN`/`LAZY_PEEK_MIN_DIST` widening above):
 /// `fulcrum ratio map --raw data.sqlite --enc gzippy=... --finder-model
 /// singleton` shows the widened peek leaves a 1,028,294-bit
 /// `greedy_over_match` bucket (428,798 divergence regions) where gzippy
@@ -1443,8 +1406,8 @@ fn est_match_bits(len: u32, dist: usize) -> u32 {
     let dslot = offset_slot(dist as u32) as usize;
     // Both table indexings DELIBERATELY stay checked. A `get_unchecked` on
     // `OFFSET_EXTRA_BITS[dslot]` (provable: offset_slot's postcondition is
-    // <= 29) was built and MEASURED WORSE at L1 on trainer (i7-13700T,
-    // cachegrind Ir, 2026-08-11, per-site bisection probe/irab-v2 vs -v5):
+    // <= 29) was built and MEASURED WORSE at L1 (i7-13700T, cachegrind Ir,
+    // per-site bisection):
     // combined with the tables.rs elisions it flipped text L1 from -1.2% to
     // +1.1% and halved the binary/noise L1 wins — a codegen interaction in
     // the fat-LTO fastloop body, not an instruction-count effect. Hard stop
@@ -1559,15 +1522,13 @@ fn disable_sparse_tier_if_small(cfg: &mut LazyPeekCostGateCfg, input_total_len: 
     }
 }
 
-/// `l1-tune`-only lever (b) from the L1-band ratio-close-out mission brief
-/// (2026-07-22 campaign): a conditional second-bucket probe. Bucket slot 1
+/// `l1-tune`-only lever (b): a conditional second-bucket probe. Bucket slot 1
 /// (`head[2h + 1]`) holds the position ONE GENERATION behind slot 0 (see the
 /// `cand2` capture at the top of [`process_position_l1`], and
 /// [`L1_HEAD_ENTRIES`] for the interleaved layout); this helper is consulted ONLY when
 /// the primary probe already produced an ACCEPTED match no longer than
-/// `tune.bucket2_gate_max_len` (the "short-match acceptance" gate — never on
-/// every position, which is the always-2-bucket shape the mission brief
-/// measured too costly). Returns `(length, dist)` upgraded to the second
+/// `tune.bucket2_gate_max_len` (the short-match-acceptance gate — never on
+/// every position, which is the always-2-bucket shape measured too costly). Returns `(length, dist)` upgraded to the second
 /// candidate's match iff it is both a valid, in-window distance AND strictly
 /// longer than the primary; otherwise returns the inputs unchanged.
 #[inline(always)]
@@ -1817,7 +1778,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HA
     // the window range instead of panicking on underflow.
     let dist = pos.wrapping_sub(cand as usize);
     let mut accepted: Option<(u32, usize)> = None;
-    // Primary-probe outcome classification, DEFERRED (2026-07-25 double-count
+    // Primary-probe outcome classification, DEFERRED (double-count
     // fix) until AFTER the hash3 rescue check below has had its chance to
     // turn this into an accept/defer. The bug this replaces: the ORIGINAL
     // code incremented `probe_outcome_miss`/`probe_outcome_too_short`
@@ -1902,9 +1863,9 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HA
 
     if let Some((length, dist)) = accepted {
         // `l1-tune` bucket2 upgrade (search-only lever (b) from the
-        // L1-band mission brief): consult the SECOND candidate ONLY on a
+        // L1-band brief): consult the SECOND candidate ONLY on a
         // short-match ACCEPTANCE, never on every position (that is the
-        // always-2-bucket approach the mission brief says was measured too
+        // always-2-bucket approach measured too
         // costly). Shadows `length`/`dist` with the upgraded pair when
         // bucket2 finds something longer; a no-op (returns the inputs
         // unchanged) when the feature is off, the lever is disabled, or
@@ -2173,9 +2134,8 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HA
 }
 
 /// TEXT-CLASSIFIED specialization of [`process_position_l1`] — the
-/// MONOMORPHIZED-HASH3-OFF fast-loop variant named as the re-open trigger in
-/// [`LAZY_PEEK_GATED`]'s doc comment (2026-07-25 "close the libdeflate x
-/// dd79_text6 x L1 both-axes LOSS" mission).
+/// MONOMORPHIZED-HASH3-OFF fast-loop variant named by
+/// [`LAZY_PEEK_GATED`]'s doc comment.
 ///
 /// BYTE-IDENTITY ARGUMENT: [`run`] only calls this (via
 /// [`fastloop_l1_lean`]) for a block whose one-block-lag literal-fraction
@@ -2191,8 +2151,7 @@ fn process_position_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HA
 ///
 /// The peek pair is DELIBERATELY LEFT WIDE
 /// ([`LAZY_PEEK_MAX_LEN`]/[`LAZY_PEEK_MIN_DIST`], not the NARROW pair) —
-/// an EARLIER version of this function hardcoded NARROW here (matching the
-/// mission brief's "hash3 AND the widened peek compiled out" framing) and
+/// an EARLIER version of this function hardcoded NARROW here and
 /// the byte-identity gate below CAUGHT it: `LAZY_PEEK_GATED` is `false` in
 /// the shipped baseline, so [`process_position_l1`] selects the WIDE pair
 /// UNCONDITIONALLY today, regardless of `hash3_active`/`peek_active` — the
@@ -2558,7 +2517,7 @@ fn fastloop_l0(
 /// insert+compare+branch — the mechanism SF1-C's prefetch already targeted,
 /// pushed one step further (MLP instead of a hint).
 ///
-/// Measured on M1 + AMD EPYC (2026-07): CPI dropped 7-14% on every L1 cell
+/// Measured on M1 + AMD EPYC: CPI dropped 7-14% on every L1 cell
 /// (confirming the latency-overlap mechanism fires on both arches), netting
 /// a real (if modest) wall win: -1.1% to -4.8% across both arches, all 3
 /// corpora (text6/bin6/sil40), both boxes. See [`fastloop_l0`]'s doc comment
@@ -2805,8 +2764,7 @@ fn fastloop_l1<const REACH: bool, const INTERLEAVED: bool, const GZIP_HASH: bool
 /// but calling [`process_position_l1_lean`] instead of
 /// [`process_position_l1`] — no `head3`, no `Hash3Cfg`, no `hash3_active`/
 /// `peek_active` plumbing at all, so none of that machinery's registers,
-/// branches, or dead loads exist in THIS function's compiled body (2026-07-25
-/// "close the libdeflate x dd79_text6 x L1 both-axes LOSS" mission — see
+/// branches, or dead loads exist in THIS function's compiled body (see
 /// [`process_position_l1_lean`]'s doc comment for the byte-identity
 /// argument, and [`LAZY_PEEK_GATED`]'s doc comment for the isolation
 /// measurement this specialization exists to fix: a prior attempt gated the
@@ -3264,8 +3222,8 @@ pub(super) fn run<
         Vec::new()
     };
     // HASH3-GATE composition lever config: shipped consts in a default
-    // build (this IS `Strategy::Fast`'s default behavior as of the
-    // 2026-07-24 ship decision — see [`Hash3Cfg`]'s doc comment), or
+    // build (this IS `Strategy::Fast`'s default behavior — see
+    // [`Hash3Cfg`]'s doc comment), or
     // `tune::L1Tune`-derived under `l1-tune` (dev search harness, defaults
     // to the same shipped values, independently overridable).
     #[cfg(not(feature = "l1-tune"))]
@@ -3418,7 +3376,7 @@ pub(super) fn run<
 
         // `!ACCEL` is a compile-time-constant branch (ACCEL is a const
         // generic) so L0's monomorphization never carries this dead code —
-        // content-adaptive chain matching is L1-only, per the mission scope.
+        // content-adaptive chain matching is L1-only, per the tuning brief's scope.
         // The whole block is `l1-tune`-only; when the feature is off this
         // arm does not exist, so a default build is byte-for-byte the
         // pre-lever code path (not merely a runtime `false` branch of it).

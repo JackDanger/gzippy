@@ -858,9 +858,9 @@ fn bench_production_inflate() {
 
         // === BENCH: inflate_into_pub() → pure-Rust inflate_consume_first ===
         // This is the function called for every block in production
-        // (BGZF blocks, multi-member members, single-member inflate);
-        // the libdeflate C FFI it replaced was removed with the decode
-        // FFI graph (see the module doc on inflate_into above).
+        // (BGZF blocks, multi-member members, single-member inflate) —
+        // the pure-Rust engine (the libdeflate C FFI decode graph is
+        // gone; see the module doc on inflate_into above).
         for _ in 0..WARMUP {
             let _ = inflate_into_pub(deflate, &mut output);
         }

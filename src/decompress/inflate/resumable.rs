@@ -774,7 +774,7 @@ impl<'a> ResumableInflate2<'a> {
                         ),
                     ));
                 }
-                // CLAUDE.md "no fallbacks" + vendor GzipReader contract:
+                // The vendor GzipReader chunk-boundary contract:
                 // parallel-SM chunk boundaries land at block boundaries,
                 // so a dynamic header that straddles `encoded_until_bits`
                 // is a contract violation. Surface loudly rather than
@@ -1867,8 +1867,8 @@ mod tests {
 
     // Stored block whose LEN claims more bytes than
     // the input has. The truncated-stored branch in
-    // resume_decode_stored_resumable returns UnexpectedEof — until this
-    // test landed it was uncovered.
+    // resume_decode_stored_resumable must return UnexpectedEof loud and
+    // clean (terminal EOF at a stored payload, not a silent truncation).
     #[test]
     fn stored_block_truncated_input_errors() {
         let payload = b"ten bytes!"; // LEN = 10
@@ -1880,9 +1880,6 @@ mod tests {
         let err = inflate.read_stream(&mut output).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
-
-    // (The pending-sentinel test was deleted now that dynamic
-    // Huffman is wired. Tests below cover real dynamic-block behavior.)
 
     // ---- fixed-Huffman + window-stitched match copy ---------------
 
@@ -2217,7 +2214,7 @@ mod tests {
     }
 
     // Dynamic block straddling `encoded_until_bits`.
-    // Per CLAUDE.md "no fallbacks" + vendor GzipReader contract
+    // Per the vendor GzipReader chunk-boundary contract
     // (parallel-SM boundaries land at block boundaries), this MUST be
     // a loud Err — not silent stop and not infinite loop. The
     // post-parse check in try_enter_next_block + the no-progress guard

@@ -861,8 +861,8 @@ mod tests {
 // Mechanism fingerprints
 // ---------------------------------------------------------------------------
 
-/// A structural fingerprint of a gzip stream, decomposed along the axes this
-/// campaign has measured to be the real mechanisms: parse decisions (tokens),
+/// A structural fingerprint of a gzip stream, decomposed along the axes
+/// measured to be the real mechanisms: parse decisions (tokens),
 /// entropy coding (header vs data bits), framing (empty seam blocks), and
 /// shape (block types, members). Every field is deterministic — no timing —
 /// so a fingerprint diff is a machine-behavior diff that runs anywhere.

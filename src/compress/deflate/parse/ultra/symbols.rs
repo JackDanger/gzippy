@@ -9,7 +9,7 @@ pub const ZOPFLI_MAX_MATCH: usize = 258;
 pub const ZOPFLI_MIN_MATCH: usize = 3;
 pub const ZOPFLI_WINDOW_SIZE: usize = 32_768;
 pub const ZOPFLI_WINDOW_MASK: usize = ZOPFLI_WINDOW_SIZE - 1;
-// MASTER-5MB (crown-caps, 2026-07-20): bumped from 1_000_000 to match ECT's
+// MASTER-5MB (crown-caps): bumped from 1_000_000 to match ECT's
 // master-block granularity (util.h:61). At 1MB, gzippy forces a block
 // boundary at every megabyte regardless of what the (now-uncapped) splitter
 // would have chosen, which is a structural cap on cross-boundary block

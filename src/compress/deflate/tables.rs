@@ -142,7 +142,7 @@ pub fn length_slot(len: u32) -> u8 {
     // Elided bound (measured as a live `len=259` panic guard in the release
     // binary's `parse_tail`/`parse::compress`): the caller contract is
     // `len <= DEFLATE_MAX_MATCH_LEN (258)` and the table has 259 entries.
-    // Callers (audited 2026-08-11, all uphold 3..=258):
+    // Callers (audited — all uphold 3..=258):
     //   * `Sink::push_match`/`push_match_fast` (parse/mod.rs) — both
     //     `debug_assert!((DEFLATE_MIN_MATCH_LEN..=DEFLATE_MAX_MATCH_LEN)
     //     .contains(&length))` before calling; their own callers feed

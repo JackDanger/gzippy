@@ -1,6 +1,6 @@
 //! Per-block block-TYPE cost probe (`block-cost-probe`, DEFAULT OFF).
 //!
-//! THE BLOCKED QUESTION (2026-08-22, `probe/stored-blocks`): `examples/blockcensus`
+//! THE BLOCKED QUESTION: `examples/blockcensus`
 //! shows we emit ZERO stored (BTYPE=00) blocks at L3 on all 23 corpus files while
 //! `gzip -3` emits stored blocks on 4 of them (`sil40` 1, `movie.mp4` 146,
 //! `data.csv.gz` 8, `tool.bin` 2). A zero count has two possible causes that a
@@ -30,8 +30,8 @@
 //! shipped blocks. Every line is still a real block-type decision made on real
 //! frequencies; only the shipped SUBSET is smaller.
 //!
-//! WHAT IT MEASURED (2026-08-22, 53,737 decisions over 23 files x L1/L2/L3/L6/L9,
-//! `-p1`; aggregation scripts in the session scratchpad):
+//! WHAT IT MEASURED (53,737 decisions over 23 files x L1/L2/L3/L6/L9,
+//! `-p1`):
 //!
 //!   * The stored candidate is costed on 100% of decisions — `site=e` on every one.
 //!     It is NOT dead code: it WINS 26 times at L1 (`movie.mp4` 22, `tool.bin` 4).

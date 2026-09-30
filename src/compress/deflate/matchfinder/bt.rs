@@ -203,8 +203,8 @@ impl BtMatchfinder {
     ) -> usize {
         let in_next = (in_base as isize + cur_pos) as usize;
         let mut depth_remaining = max_depth;
-        // LEVER bt-probebudget (feature `near-opt-bt-probebudget`, IN
-        // DEFAULT since the 2026-09-27 promotion; shipped default 48): the
+        // bt-probebudget (feature `near-opt-bt-probebudget`; shipped
+        // default 48): the
         // per-descent probe budget, clamped to at least one probe
         // (the same minimum `max_depth >= 1` already carries) and to the
         // walk's depth cap (a budget >= depth is the unrestricted walk).

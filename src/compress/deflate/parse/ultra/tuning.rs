@@ -44,8 +44,7 @@ impl ZopfliTuning {
     /// `thread_budget`: `-p1` → serial, anything else → unbounded
     /// intra-block parallelism (the natural cap is the chunk count per
     /// master block, typically 5-15). This makes `--ultra -p1` actually
-    /// honor the user's "use one CPU" request — see plan.md Phase 11
-    /// and Copilot review comments #1/#2/#4 on PR #83.
+    /// honor the user's "use one CPU" request.
     pub fn from_args(args: &GzippyArgs) -> Self {
         Self {
             iterations: args.zopfli_iterations.unwrap_or(15),

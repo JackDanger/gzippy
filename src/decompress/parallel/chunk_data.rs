@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// pre-existing parallel-module dead code from the default-feature flip; delete in a dedicated cleanup
 
 //! Port of `rapidgzip::ChunkData` (ChunkData.hpp, especially lines 80-400)
 //! plus its nested `Subchunk` and `Statistics`.
@@ -79,8 +79,8 @@ pub struct ChunkConfiguration {
     /// Member-level output/compressed expansion ceiling: `ceil((ISIZE /
     /// compressed_len) × 1.25)` as an integer factor, minimum 2. Set once per
     /// gzip stream from the footer ISIZE and total compressed length in
-    /// `sm_driver`; 0 = unknown → `finish_decode_chunk_isal_oracle` falls back
-    /// to the historical 8× factor.
+    /// `sm_driver`; 0 = unknown → `compute_initial_reserve` falls back
+    /// to the legacy 8× factor.
     ///
     /// Purpose: size the ISA-L clean-tail upfront output reserve proportionally
     /// to the actual data ratio instead of a fixed 8×. On near-incompressible
@@ -222,11 +222,11 @@ pub struct ChunkData {
     /// CRC32 of `narrowed`, computed on the post-process worker (parallel)
     /// instead of on the consumer (serial). Vendor parity: `ChunkData::
     /// applyWindow` (vendor/.../ChunkData.hpp:313-328) fuses the CRC32
-    /// pass into apply_window on the worker; gzippy previously deferred
-    /// this to `drain_one_pending` and paid pclmulqdq cycles on the
-    /// single-threaded consumer. Move to the worker so it parallelizes
-    /// across the 16-thread pool — for silesia (~400 MB marker bytes /
-    /// pclmulqdq ~15 GB/s) saves ~25 ms of consumer-serial wall.
+    /// pass into apply_window on the worker — the old consumer-serial
+    /// deferral to `drain_one_pending` paid pclmulqdq cycles on the
+    /// single-threaded consumer; for silesia (~400 MB marker bytes /
+    /// pclmulqdq ~15 GB/s) computing on the worker saves ~25 ms of
+    /// consumer-serial wall.
     ///
     /// `default()` is the empty-stream CRC sentinel; valid for chunks
     /// with no narrowed bytes (where the consumer skips the append).

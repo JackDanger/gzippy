@@ -10,10 +10,9 @@
 //! bit.** The bucketing is blind by construction to which literal inside a
 //! class, to match LENGTH beyond short/long, and to match DISTANCE entirely.
 //!
-//! PR #342 (`lever/cost-model-block-split`, commits `fc721c28` + `9c4cccb6`)
-//! demoted that check from DECIDER to PROPOSER and adjudicated with exact bits;
-//! it closed the online-retrospective form of that design and left one named,
-//! unmeasured fact behind (`9c4cccb6`, point 3):
+//! A prior design iteration demoted that check from DECIDER to PROPOSER and
+//! priced it with exact bits (landed on main); its own record left one named,
+//! unmeasured fact behind:
 //!
 //! > zopfli has NO proposer — it searches for the minimum. A confirm-only design
 //! > is ceilinged by the proposer's recall, and the 10-bucket proxy is blind to
@@ -58,8 +57,8 @@
 //!   cut beats merging the two blocks back together. Profitable = **TRUE
 //!   POSITIVE**, otherwise **FALSE POSITIVE**.
 //!
-//! LIMITS, stated because a retrospective boundary price has already produced one
-//! self-contradictory model on this campaign:
+//! LIMITS, stated because an earlier retrospective boundary price already
+//! produced one self-contradictory model:
 //!
 //! 1. The TOKEN STREAM IS FIXED — it is the one the shipped splitter produced.
 //!    Moving a boundary changes `recalculate_min_match_len` (per-block literal
@@ -92,7 +91,7 @@
 //! zlib) would interleave several parses' recordings. The resulting stream is
 //! round-tripped through the decoder before any number is reported.
 //!
-//! ROUTE ASSERTION (measured 2026-08-22, `scratchpad/route2.sh`): at L3 and L9 —
+//! ROUTE ASSERTION (verified byte-for-byte): at L3 and L9 —
 //! neither of which is a pick-min level — this is EXACTLY the stream the shipped
 //! CLI writes at `-p1`, from a file and from a pipe alike, byte for byte on
 //! engine.wasm / dickens / data.json / dd79_bin6 / symbols.dwarf (delta 0 on all

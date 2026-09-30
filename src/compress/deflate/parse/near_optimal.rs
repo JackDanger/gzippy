@@ -464,7 +464,7 @@ impl Optimizer {
             None,
         );
 
-        // Lever-#3 freshness-chain probe (2026-09-25): the flip rate of the
+        // Freshness-chain probe: the flip rate of the
         // only-literals selection that feeds the NEXT block's
         // `min_match_len`. feature-off builds compile both to zero bytes.
         crate::anatomy_count!(near_opt_flush_blocks);
@@ -559,15 +559,15 @@ pub(super) fn bt_forced() -> bool {
     crate::compress::deflate::matchfinder::near_opt_probe::bt_forced()
 }
 
-// ── `near-opt-bt-probebudget` knob (LEVER #4 / bt, the probe-budget class) ──
+// ── `near-opt-bt-probebudget` knob (the probe-budget class) ──
 // The per-descent probe budget, PROMOTED to being the shipped parse shape
-// (PR #401 probe + PR #402 census verdicts + the frozen-c7a box: 0.981x wall
+// (priced: 0.981x wall
 // at −1,251 B against the pigz floor; the official cell reads 1.076 → 1.055).
 // The static below is the measured joint winner — 48 — and the feature sits
 // in the DEFAULT feature set, so every production build carries the budget.
 // `run` reads it once per run and threads it into every bt descent via the
-// cfg'd parameter (see `bt.rs`'s get_matches); the bgz-surface history:
-// the mission's e.g. ABIT 24 binds hardest (anatomy probe: 3.68% of descents
+// cfg'd parameter (see `bt.rs`'s get_matches); the pricing history:
+// the ABIT 24 budget binds hardest (anatomy probe: 3.68% of descents
 // / 16.8% of descent probe-volume lives beyond it) but pays +31,130 B
 // (+0.048%); 48 pays −745 B (−0.001%) on the M1 and −1,251 B on the frozen
 // census box for −6.3% (M1) / −1.9% (box) wall. "Byte-clean" here = inside
@@ -600,9 +600,9 @@ pub(super) fn probe_budget() -> u32 {
 }
 
 // ===========================================================================
-// LEVER #3 — block-parallel `optimize_and_flush` (feature
-// `near-opt-parallel-flush`, DEFAULT OFF). Docs/board/sprint-2026-09-25.md,
-// "Lever ledger" row 3.
+// Lever — block-parallel `optimize_and_flush` (feature
+// `near-opt-parallel-flush`, DEFAULT OFF; see
+// `docs/board/sprint-2026-09-25.md`).
 // ===========================================================================
 
 /// The flush-dispatch instrument for [`run`] (feature-gated; compiles to
@@ -631,8 +631,8 @@ pub(super) fn probe_budget() -> u32 {
 /// N-1's end-of-fill stats, taken after the previous flush but not BY it);
 /// `params`/`statics` (shared immutable inputs); `is_first`/`is_final`.
 ///
-/// **One input is NOT fill-produced, and the mission's carrier list omits
-/// it**: `self.costs` at flush entry. For every non-first block,
+/// **One input is NOT fill-produced (the carrier list above omits
+/// it)**: `self.costs` at flush entry. For every non-first block,
 /// `set_initial_costs` runs `adjust_costs`, which BLENDS the entering cost
 /// model toward the block's default costs (`costs.rs:320-348` —
 /// `adjust_impl` reads the current `self.literal[i]` / `self.length[len]` /
@@ -642,7 +642,7 @@ pub(super) fn probe_budget() -> u32 {
 /// b5281a96 spike cleared the freshness chain's OTHER carrier
 /// (`prev_block_used_only_literals`, 0 flips / 47 flushes); this one is
 /// structural — it carries data on every similar-block pair, i.e. exactly on
-/// the campaign corpora. Two flushes of the same chunk therefore cannot run
+/// real corpora. Two flushes of the same chunk therefore cannot run
 /// CONCURRENTLY and stay byte-exact.
 ///
 /// The design is consequently the pipelined shape the lever itself names:
@@ -653,7 +653,7 @@ pub(super) fn probe_budget() -> u32 {
 /// wall; the flush share does NOT divide by the worker count, and this
 /// module documents why instead of silently producing shifted bytes.
 ///
-/// ## Writeback (mission contract #3)
+/// ## Writeback contract
 ///
 /// Each flush runs into its own `BitWriter::from_vec(Vec::new())` and reports
 /// `finish_unaligned()`'s `(bytes, pad_bits)` — the per-block pending state.
@@ -665,9 +665,9 @@ pub(super) fn probe_budget() -> u32 {
 /// 3-bit header + `align_to_byte` + verbatim tail). The concatenation is
 /// bit-identical to one writer having produced the whole chunk, pinned whole-
 /// chunk by `tests/l9_t4_chunk_cost_probe.rs::parallel_flush_*` on the probe
-/// corpus and the four campaign corpora.
+/// corpus and the four bench corpora.
 ///
-/// ## The stale-flag guard (mission contract #4)
+/// ## The stale-flag guard
 ///
 /// `finish_and_write` tallies the chunk's `used_only_literals` returns —
 /// exactly the condition behind the `near_opt_flush_blocks` /
@@ -681,16 +681,16 @@ pub(super) fn probe_budget() -> u32 {
 /// quarantines rather than what it can repair, which is exactly why the
 /// count must stand at chunk end.
 ///
-/// ## Deviation from the mission's thread-shape letter
+/// ## Deviation from the thread-shape brief
 ///
-/// The mission says "std::thread scope". The pool uses plain
+/// The brief says "std::thread scope". The pool uses plain
 /// `std::thread::spawn` + `JoinHandle`s joined at write-back, with fully
 /// owned jobs (block bytes + cache-region copies, `LevelParams` copied into
 /// the job — it is `Copy`). Sharing `&buf`/`&LevelParams` through a
 /// `thread::scope` closure would have required moving the entire ~300-line
 /// fill loop inside the scope body (reindenting every line of the hot loop
 /// the feature must not touch); owned jobs keep the fill loop untouched
-/// (mission constraint #6) at the cost of one bounded snapshot copy per
+/// at the cost of one bounded snapshot copy per
 /// flushed block (~1.3 MB typical, worst case ~6 MB at the match-cache
 /// overflow cap). Teardown is deterministic all the same: dispatch never
 /// leaks a worker; `finish_and_write` joins every handle before returning.
@@ -713,13 +713,13 @@ mod parallel_flush {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Arc, Condvar, Mutex};
 
-    /// Process-wide stale-flag latch (mission contract #4): a chunk whose
+    /// Process-wide stale-flag latch (the stale-flag contract): a chunk whose
     /// parallelized flushes used the only-literals strategy vetoes the pool
     /// for the rest of the process. The b5281a96 finding (0 flips across 47
-    /// flushes) means this never fires on the campaign corpora.
+    /// flushes) means this never fires on the bench corpora.
     static STALE_FLAG: AtomicBool = AtomicBool::new(false);
-    /// One-shot stderr note for the first latch (mission contract #4: log
-    /// once per process, not once per chunk).
+    /// One-shot stderr note for the first latch (logs once per process, not
+    /// once per chunk).
     static STALE_FLAG_LOGGED: AtomicBool = AtomicBool::new(false);
     /// Test/observability toggle: force the pool off regardless of CPU count
     /// or the stale flag, without a second build. Same rationale as the
@@ -733,7 +733,7 @@ mod parallel_flush {
     /// the module doc — an identity test must prove its parallel arm ran).
     static WRITES: AtomicU64 = AtomicU64::new(0);
 
-    /// `min(2, cpus - 1)` extra flush workers (mission contract #2). A
+    /// `min(2, cpus - 1)` extra flush workers (the worker-count contract). A
     /// single-CPU host gets 0 and never spawns the pool (pure serial bytes
     /// fall out of the `None` arm).
     fn worker_count() -> usize {
@@ -1018,8 +1018,8 @@ mod parallel_flush {
             }
             note_parallel_flush_write();
             if flips > 0 {
-                // Mission contract #4: the runtime guard. The zero-flip
-                // finding makes this unreachable on the campaign corpora;
+                // The stale-flag guard's runtime half. The zero-flip
+                // finding makes this unreachable on the bench corpora;
                 // when it does fire the process latches to serial.
                 STALE_FLAG.store(true, Relaxed);
                 if !STALE_FLAG_LOGGED.swap(true, Relaxed) {
@@ -1183,7 +1183,7 @@ mod parallel_flush {
 
 /// The block loop's loop-carried fill state of [`run`], hoisted verbatim from
 /// the ~13 stack locals it used to thread across DEFLATE blocks
-/// (audit-2026-09-26 §E3 / ranked plan item #8; docs/board/audit-2026-09-26.md).
+/// (audit §E3 / ranked plan item #8; `docs/board/audit-2026-09-26.md`).
 /// A FIELD HOIST, not a redesign: every field is one pre-hoist local — same
 /// name, same initial value, same update sites — so the fill loop, the flush
 /// sites, and the lever-0 anatomy regions behave exactly as before.
@@ -1538,11 +1538,12 @@ pub(super) fn run(
 
             #[cfg(feature = "near-opt-parallel-flush")]
             let prev_used_only_literals = match flush_pipe.as_mut() {
-                // LEVER #3 dispatch: hand the flush sub-phase to a pool
+                // The parallel-flush dispatch: hand the flush sub-phase to a
+                // pool
                 // worker with fill-instant snapshots of every carrier; the
                 // only chunk-visible boolean result (the only-literals
-                // backedge) is ASSUMED false here — the b5281a96 zero-flip
-                // finding makes the assumption true on the campaign corpora,
+                // backedge) is ASSUMED false here — the zero-flip
+                // finding makes the assumption true on the bench corpora,
                 // and finish_and_write's chunk-end guard is what keeps it
                 // honest (see the parallel_flush module doc).
                 Some(pipe) => {

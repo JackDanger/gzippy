@@ -49,7 +49,7 @@ pub trait FetchingStrategy {
     /// offsets). Those offsets feed `BlockFetcher::prefetch_new_blocks`,
     /// which emits sub-partition prefetches vendor never emits.
     /// Empirically: on silesia-large 16T, this gap is 26 sub-partition
-    /// emits worth ~50 ms wall (falsification commit aba6b59).
+    /// emits worth ~50 ms wall (recorded in commit aba6b59's message).
     ///
     /// Default no-op for strategies that don't track per-index history.
     fn split_index(&mut self, _index_to_split: usize, _split_count: usize) {}

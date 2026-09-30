@@ -9,8 +9,7 @@
 //! Increment 3 adds the near-optimal (L10-12) strategy; Increment 4 adds the
 //! igzip-class one-pass FAST strategy for L1 (chainless single-probe hash table
 //! + per-block cheapest-of-{dynamic,static,stored} Huffman coding — a port of
-//! igzip `isal_deflate_body_base`). Increment 5 (ratio-hole fix, 2026-07)
-//! gives L0 the SAME chainless matchfinder as L1 (`Strategy::Fast0`), but
+//! igzip `isal_deflate_body_base`). Increment 5 gives L0 the SAME chainless matchfinder as L1 (`Strategy::Fast0`), but
 //! skips the per-block dynamic-Huffman evaluation (always static-or-stored) —
 //! cheaper than L1, and a real compressor instead of L0's old pure
 //! stored-block passthrough.
@@ -27,8 +26,7 @@ pub enum Strategy {
     /// length-limiting) that [`Strategy::Fast`] does is skipped entirely,
     /// which is the ratio/speed trade that makes L0 cheaper than L1. This
     /// replaces the old pure stored-block passthrough (which never
-    /// compressed at all — see the L0 fix in the compression-ratio
-    /// campaign).
+    /// compressed at all).
     Fast0,
     /// Level 1: igzip-class one-pass fast path — chainless single-probe
     /// hash-table matchfinder + per-block cheapest-of-{dynamic,static,stored}
@@ -42,19 +40,6 @@ pub enum Strategy {
     /// Lazy2 parse: look ahead two positions.
     Lazy2,
     /// Near-optimal parse: bt matchfinder + iterative min-cost-path DP (L10-12).
-    //
-    // A 12-line doc comment describing a `LazyGated` DETECTOR-GATED LAZY-L3
-    // strategy used to sit HERE, above `NearOptimal`, with the one real
-    // `NearOptimal` line tacked on its end — so rustdoc rendered
-    // `NearOptimal` as "per-block GREEDY-vs-LAZY dispatch under a two-sided
-    // content detector". The `LazyGated` variant and `parse/gated.rs` were
-    // deleted by user order (non-negotiable #3: no content detector chooses a
-    // parser); the retraction reached the level-3 ARM (see its ⚠ STALE
-    // marker) but not this enum, so the stale text outlived its variant by
-    // attaching itself to the next one. That is the CLAUDE.md working rule
-    // "a retraction must reach the ROOT" failing in the smallest possible
-    // way: a deletion that removes a variant must also remove the doc
-    // comment that was above it, or Rust silently re-parents the prose.
     NearOptimal,
 }
 
@@ -85,7 +70,7 @@ pub struct LevelParams {
     ///
     /// THE REASON IS THE WALL BUDGET, NOT BYTE-IDENTITY. T1 output happening to stay identical
     /// to `main` is a CONSEQUENCE of this gating, not a goal, and must never become one:
-    /// byte-identity with libdeflate is the cage `CLAUDE.md` and the campaign memory both name
+    /// byte-identity with libdeflate is the cage `CLAUDE.md` names
     /// as the thing that keeps us running their algorithm slower than they do. On SIZE this
     /// candidate is strictly better at T1 too (49 of 49 cells smaller, 0 worse, non-worse by
     /// construction) and we would take those bytes gladly. We decline them only because
@@ -107,8 +92,8 @@ pub struct LevelParams {
     /// skipped byte, exactly libdeflate's `ht_matchfinder_skip_bytes` — since
     /// the interleaved-bucket lever made full maintenance one cache line per
     /// insert. L1 T1 keeps the shipped cap of 8 (the maintenance bill is
-    /// ~6-15% of L1 wall on match-dense files and T1's slack is thin — PR
-    /// #296's clause-5 adjudication). Non-L1 levels keep the igzip-style
+    /// ~6-15% of L1 wall on match-dense files and T1's slack is thin).
+    /// Non-L1 levels keep the igzip-style
     /// small cap (only the fast path reads this).
     pub fast_hash_update_inserts: usize,
     /// **T1-ONLY (L1): MATCH REACH.** Selects the `REACH == true`
@@ -121,12 +106,11 @@ pub struct LevelParams {
     ///
     /// `false` at T>1 BY CONSTRUCTION, and the reason is the WALL BUDGET, not
     /// byte-identity — the same shape as [`Self::try_exact_huffman`] with the
-    /// thread counts swapped. Scoped adjudication of the unscoped lever
-    /// (solvency, `try-l1-reach/try.json`, 208 in-scope cells) closed all four
-    /// record-file size cells and then failed clause 3 on ONE cell:
-    /// `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail, cross-layout CONFIRMED
-    /// REAL at median ln +0.1186. That is a T4 cell, in the thin-margin
-    /// pigz-at-T4 class that also convicted #310, and the dense insert's
+    /// thread counts swapped. The scoped re-pricing of the lever closed all
+    /// four record-file size cells and then failed the wall clause on ONE
+    /// cell: `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail, cross-layout
+    /// CONFIRMED REAL at median ln +0.1186. That is a T4 cell, in the
+    /// thin-margin pigz-at-T4 class, and the dense insert's
     /// maintenance cost lands hardest exactly where pigz's margin is thinnest.
     /// The two cells the lever closes at T1 —
     /// `libdeflate:{access.log,ecoli.fastq}:L1:T1:size` — do not need T>1 to
@@ -171,8 +155,8 @@ pub struct LevelParams {
     /// accept a len-3 match past the fixed offset-4096 guard when the block's
     /// running frequencies price it under the three literals it replaces.
     /// L2-only. NOT enabled at L4 (the other Greedy level): symbols.dwarf L4
-    /// is a libdeflate byte-tie and the gate flips it +578 B (this box,
-    /// 2026-08-09) — one cell, but the tie cage refuses any flip. Re-judge
+    /// is a libdeflate byte-tie and the gate flips it +578 B — one cell, but
+    /// the tie cage refuses any flip. Re-judge
     /// L4 if the gate's model ever prices the whole-block code externality.
     pub far_len3_gate: bool,
     /// L2-only: far len-3 at offset > 4096 goes through the shadow probe
@@ -224,20 +208,22 @@ fn apply_l1_fast_shared_knobs(p: &mut LevelParams) {
 ///
 /// The mechanism below is INTRINSIC and holds at every thread count. The
 /// SCOPE is a coordinate-dependent verdict and holds only where it was
-/// measured. The unscoped lever (PR #319) was adjudicated on solvency
-/// (`try-l1-reach/try.json`, scoped `levels=1`, 208 in-scope cells graded):
-/// clause 4 closed ALL FOUR record-file cells,
-/// `libdeflate:{access.log,ecoli.fastq}:L1:{T1,T4}:size`, and clause 3 then
+/// measured. The unscoped lever was priced under the promotion clauses
+/// (`docs/promotion-rule.md`; scoped `levels=1`, in-scope cells graded):
+/// the size clause closed ALL FOUR record-file cells,
+/// `libdeflate:{access.log,ecoli.fastq}:L1:{T1,T4}:size`, and the wall
+/// clause then
 /// failed on ONE cell — `pigz:ecoli.fastq:L1:T4:wall`, pass -> fail,
 /// cross-layout CONFIRMED REAL, median ln +0.1186 (6-10x the layout floor).
-/// Clause 3 is absolute, so the whole lever was NO-SHIP.
+/// The wall clause is absolute, so the whole lever was NO-SHIP.
 ///
 /// Every cell in that flip is at T>1, and the T1 half of the win needs
 /// nothing from T>1. Gating here keeps `libdeflate:access.log:L1:T1:size` and
 /// `libdeflate:ecoli.fastq:L1:T1:size` closing while leaving the T4 bitstream
 /// IDENTICAL — so `pigz:ecoli.fastq:L1:T4:wall` cannot flip BY CONSTRUCTION,
-/// not by a re-measurement that might come back differently. This is the
-/// #310 pattern inverted: #310 kept T1 and paid at T4; here the margin is at
+/// not by a re-measurement that might come back differently. The pattern is
+/// inverted from the earlier interleaved slot decision (that one kept T1 and
+/// paid at T4); here the margin is at
 /// T4, so T4 is what we keep.
 ///
 /// The Ir cost lands on the T1 side and is real, not free: trainer
@@ -258,11 +244,11 @@ fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
     // every accepted match and inserts all of them — libdeflate's L1 table is
     // dense at 1.000 inserts/byte. Ours was NOT: measured with
     // `--features anatomy-counters` on `e8_p8192_long_a256_r0` at L1/T1
-    // (M1, 2026-08-13), 181,096 head writes over 1,048,576 bytes = **0.173
+    // (M1), 181,096 head writes over 1,048,576 bytes = **0.173
     // inserts/byte**, because 940,664 of those bytes (89.7%) sit inside an
     // accepted match whose interior past position 8 we never indexed. That is
-    // the same 0.276-vs-1.000 structural gap the deleted `ht_fast.rs:200`
-    // record's replacement measurement found; this is its cause.
+    // the same structural gap the `ht_fast.rs` port measurement
+    // found; this is its cause.
     //
     // WHY IT COSTS SIZE. A position that was never inserted cannot be FOUND as
     // a match source later, so on content whose repeats are longer than the
@@ -303,23 +289,23 @@ fn apply_l1_match_reach_t1_knobs(p: &mut LevelParams) {
 }
 
 /// L1 knobs for the T>1 route ONLY: the shared set plus vendor-exact bucket
-/// maintenance (PR #296, re-scoped to T>1).
+/// maintenance.
 ///
 /// Insert EVERY interior (match-skip) byte, shifting the interleaved 2-slot
 /// bucket on each write — vendor `ht_matchfinder_skip_bytes` semantics. The
 /// old cap of 8 plus shift-free interior overwrites left the bucket holding
-/// stale generations; measured on solvency (2026-08-09, L1, main@03200049)
-/// the pair of fixes flips access.log (-70,953 B vs libdeflate) and
+/// stale generations; measured (L1) the pair of fixes flips access.log
+/// (-70,953 B vs libdeflate) and
 /// ecoli.fastq (-7,579 B) and collapses the diff_dist divergence class to
 /// exactly 0. See `parse/fast.rs`'s `L1_HEAD_ENTRIES` for the layout that
 /// makes this affordable.
 ///
-/// T>1-ONLY because the maintenance bill is REAL at T1: #296's solvency
-/// adjudication measured insert-every-interior-byte at ~6-15% of L1 T1 wall
-/// on match-dense files (data.json L1:T1 0.548 -> 0.638), a clause-5
-/// NO-SHIP against T1's thin slack, while the same bill at T4 is absorbed
+/// T>1-ONLY because the maintenance bill is REAL at T1: the T1 pricing
+/// measured insert-every-interior-byte at ~6-15% of L1 T1 wall
+/// on match-dense files (data.json L1:T1 0.548 -> 0.638), a NO-SHIP against
+/// T1's thin slack, while the same bill at T4 is absorbed
 /// by 249-330% slack (and several T4 wall cells got FASTER). Pay where the
-/// slack lives — the #297 pattern. The two L1 T1 size cells this leaves
+/// slack lives. The two L1 T1 size cells this leaves
 /// open (libdeflate:{access.log,ecoli.fastq}:L1:T1) revive on a CHEAPER T1
 /// maintenance scheme (batched/prefetched interior inserts), not on
 /// re-widening this knob.
@@ -347,7 +333,7 @@ pub fn params(level: u32) -> LevelParams {
 
 /// libdeflate-table knobs (streaming / segmented / pick-min baseline).
 pub(crate) fn params_baseline(level: u32) -> LevelParams {
-    // ⭐ L5/L6/L7 KEEP THEIR SECOND ARM'S KNOBS AS THEIR ONLY KNOBS (2026-08-23).
+    // ⭐ L5/L6/L7 KEEP THEIR SECOND ARM'S KNOBS AS THEIR ONLY KNOBS.
     //
     // Deleting pick-min made `params(6)` the single encode, and the ledger
     // (`won_cells_stay_won`, append-only) immediately regressed FOUR cells:
@@ -443,8 +429,8 @@ pub fn params_parallel(level: u32) -> LevelParams {
 fn default_params_parallel_route(level: u32) -> LevelParams {
     // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
     // routing decision (the map is free to change; CLAUDE.md "Every technique is
-    // in scope"), measured in the crown-at-lower-levels study (2026-08-09, M1
-    // laptop, synthetic fixtures, main@af5503f1):
+    // in scope"), measured in the crown-at-lower-levels study (M1,
+    // synthetic fixtures):
     //
     //   size, 8 MiB fixtures, `-p4` (gzip container):
     //     text     ours-L9-pickmin 2,445,673 -> near-opt-chunked 2,260,495
@@ -473,8 +459,8 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // (+2,057 B at 1 MiB, would OPEN cells); L11/L12 are smaller than L9
     // everywhere measured, and L12's extra passes buy ~nothing (<0.01%) here.
     //
-    // L8 JOINS L9 (nearoptimal-down-ladder probe, 2026-08-11, M1 laptop, same
-    // 8 MiB fixtures, `-p4`, main@bee336b9 + this branch). L8 was the WEAKEST
+    // L8 JOINS L9 (nearoptimal-down-ladder probe, same 8 MiB fixtures,
+    // `-p4`). L8 was the WEAKEST
     // T>1 level: excluded from depth scaling (the engine.wasm clause-3 flip
     // documented below), so its T4 triple pick-min shipped whole_t1 bytes that
     // LOSE to gzip -8 on the match-rich classes, and ran its three candidates
@@ -495,11 +481,11 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
     // near-optimal-class wall for worse bytes. Scope stops at L8.
     if level == 9 {
-        // L9-only retune (per-cell size census 2026-09-25: silesia.tar +0.0061%,
+        // L9-only retune (per-cell size census: silesia.tar +0.0061%,
         // +3,942 B of 64,701,600 — inside the <=1% authorized spend; local chunk
         // probes: passes1 −28% wall, passes2 −16% for +0.6%, depth a no-op on
         // dense corpora). Near-opt at matched depth with passes 2. L8 is NOT
-        // retuned (agent-19: silent scope creep) — it keeps the L11-knob route.
+        // retuned (scope guard: no silent creep) — it keeps the L11-knob route.
         let mut p = default_params_parallel_route(11);
         p.near_optimal.max_optim_passes = 2;
         return p;
@@ -508,17 +494,18 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
-    // DEPTH, NOT STRATEGY. The first attempt took one step of parse strategy
-    // (Greedy->Lazy, Lazy->Lazy2) and was NO-SHIP on clause 3: it flipped
+    // DEPTH, NOT STRATEGY. A parser-strategy step (Greedy->Lazy,
+    // Lazy->Lazy2) alone was NO-SHIP on the wall clause: it flipped
     // igzip:weights.safetensors:L2:T4 from 0.9998 to 1.0002. Mechanism, measured: on
     // near-incompressible data (90 MB of float tensors) LAZY defers matches and emits more
     // literals than GREEDY, costing +32,975 B on that file. Lazy is not uniformly stronger;
     // it is stronger only where matches are dense.
     //
-    // ⚠ CORRECTED 2026-08-01: the sentence that stood here — "Scaling max_search_depth has
-    // no such failure mode — a deeper chain can only find a match at least as good" — is
-    // FALSE, and was falsified by isolating the two mechanisms on engine.wasm L8 T4
-    // (trainer, vanilla builds, deterministic bytes, libdeflate -8 = 396,254):
+    // ⚠ NOT MONOTONE: the sentence that once stood here — "Scaling
+    // max_search_depth has no such failure mode — a deeper chain can only
+    // find a match at least as good" — is FALSE, falsified by isolating the
+    // two mechanisms on engine.wasm L8 T4
+    // (vanilla builds, deterministic bytes, libdeflate -8 = 396,254):
     //     main                        396,096  PASS
     //     depth x4 ONLY (exact OFF)   396,307  FAIL   <- the depth scaling alone
     //     try_exact_huffman ONLY      396,092  PASS   <- monotone, and 4 B smaller
@@ -602,8 +589,7 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // it is the OPTIMUM of the family. Every other level either opens a cell or adds
     // nothing. Do not re-derive this by extending the arm.
     //
-    // (superseded note kept for the reasoning chain)
-    // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP — measured, clause 3 clean.
+    // L4 IS A STRATEGY STEP AT T>1, NOT A DEPTH STEP.
     //
     // L4 is the only `Greedy` above L2 (L3 and L5 are both `Lazy`), so it enters T>1 with
     // no size margin at all, and the T>1 seam then costs it cells by 55-370 B. Stepping
@@ -618,17 +604,17 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     //           zero-headroom seam cells.
     p.try_exact_huffman = true;
     // L1 AT T>1: enable the 2-way bucket inside `parse::fast` (search-only lever
-    // (b) from the L1-band mission brief, gated to short accepts). Keeps lazy
+    // (b) from the L1-band brief, gated to short accepts). Keeps lazy
     // peek/defer — unlike `ht_fast`'s greedy accept-all, which flipped tabular.
     //
     // ⚠ AND NOTHING MORE. `apply_l1_match_reach_t1_knobs` — the dense
     // match-interior insert + bucket shift — is called by `params_baseline`
     // (T1) and DELIBERATELY NOT HERE, so L1 T>1 keeps igzip's
     // `fast_hash_update_inserts = 8`, keeps `fast_dense_interior_insert =
-    // false`, and emits byte-for-byte what `main` emits. Reason, adjudicated
-    // on solvency: the unscoped lever flipped `pigz:ecoli.fastq:L1:T4:wall`
-    // pass -> fail, cross-layout CONFIRMED REAL (median ln +0.1186), which is
-    // clause 3 and therefore absolute. Read
+    // false`, and emits byte-for-byte what `main` emits. Reason (the wall
+    // clause is absolute, see `docs/promotion-rule.md`): the unscoped lever
+    // flipped `pigz:ecoli.fastq:L1:T4:wall`
+    // pass -> fail, cross-layout CONFIRMED REAL (median ln +0.1186). Read
     // `apply_l1_match_reach_t1_knobs`'s doc comment before adding a line
     // here; the T>1 revival is the wall-budget-scoped density, NOT this flag.
     if level == 1 {
@@ -641,8 +627,9 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
 /// MEASUREMENT-ONLY level→params override, for deriving our own ladder instead of
 /// inheriting libdeflate's (see the `ladder-tune` feature comment in `Cargo.toml`).
 ///
-/// WHY THIS EXISTS. A full T1 size census (`/root/sizeboard-all-12fcd0ed/census.json`,
-/// 22 corpus files x L1-9 x 4 rivals) found that against libdeflate we are an EXACT
+/// WHY THIS EXISTS. A full T1 size census (22 corpus files x L1-9 x 4 rivals;
+/// the census JSON lives with that run's records) found that against
+/// libdeflate we are an EXACT
 /// BYTE TIE on 154 of 198 cells — 22/22 files at every one of L2, L4, L5, L6, L7, L8,
 /// L9 — because `params_inner` transliterates their preset table. A tie is not a win:
 /// it leaves zero size headroom, so all 109 T4 cells that fail vs libdeflate fail by
@@ -795,59 +782,10 @@ fn params_inner(level: u32) -> LevelParams {
             hash3_chain_depth: 0,
             near_optimal: NONE_NO,
         },
-        // ⚠ STALE BELOW, KEPT FOR THE HISTORY ONLY: `Strategy::LazyGated` and
-        // `parse::gated.rs` NO LONGER EXIST (deleted by user order — `CLAUDE.md`
-        // non-negotiable #3 forbids content detectors choosing a parser). L3 routes to
-        // `Strategy::Lazy` unconditionally; see the `3 => LevelParams` arm below, which
-        // is the fact. The original note read:
-        // L3 = DETECTOR-GATED LAZY (`Strategy::LazyGated` -> `parse::gated::run`,
-        // per-block GREEDY-vs-LAZY dispatch under a two-sided literal-fraction
-        // content detector — see `parse::gated`'s module doc comment).
-        // Knobs unchanged from the prior plain-Greedy L3 (max_search_depth=12,
-        // nice_match_length=14); the gate's own params (two-sided 34/95 pct
-        // thresholds, 300KB detection block, initial_lazy=false) are
-        // `parse::gated`'s `L3_GATE_*` constants, unconditionally in effect —
-        // `l3-tune` no longer selects WHETHER L3 uses this strategy, only
-        // whether those constants are env-var-overridable (see below).
-        //
-        // PROMOTION HISTORY (full campaign in git log; `2c7f9444` plain-lazy
-        // -> `992c5837` strict-Pareto FAIL (ecoli.fastq/weights.safetensors
-        // regress) -> `2c7f9444`-successor `parse::gated` composition fixes
-        // both -> `2b566fcb` self-tax-vs-Greedy wall gate FAILS (wrong
-        // rival) -> `88cf1b09` re-gated against the REAL rivals, pigz-3/
-        // gzip-3, which is the record this promotion is adjudicated from).
-        //
-        // ADJUDICATION (2026-07-23, supervisor, promoting `88cf1b09`'s
-        // frozen record — AMD EPYC 7282 Zen2 solvency, `/root/gz-l3final` +
-        // `/root/l3final/{wall_results,wall_ld_results}.jsonl`, N=15
-        // paired-diff/A/A-controlled, `/dev/null` sink, 6-file corpus x
-        // T1/4/8/16 x {pigz-3, gzip-3}):
-        //   - SIZE: strictly SMALLER than shipped Greedy on every file
-        //     (the L3 campaign's original goal). Smaller than libdeflate-gzip-3
-        //     on every file including `dd79_bin6` (was byte-EQUAL to ld-3
-        //     under Greedy, a faithful-port confirmation, not a routing bug).
-        //   - WALL: beats pigz-3/gzip-3 by 12-62% on all 30 (file x T x
-        //     rival) cells, every 95% CI excluding 1.0 and clearing the ~1%
-        //     A/A spread — INCLUDING `dd79_bin6` (21-45% faster) at every T.
-        //   - ZERO class regressions: L2/L4/L6 byte-identical
-        //     Greedy-vs-LazyGated builds; roundtrip byte-exact all files x
-        //     T1/4/8/16; T4==T16 output byte-identical; `cargo test
-        //     --release` green + clippy/fmt clean both feature states.
-        //   - The ONE failing sub-leg — `dd79_bin6` size vs pigz-3/gzip-3
-        //     (+0.445-0.767%, deterministic, zero-variance, narrowed from
-        //     Greedy's 1.339% miss but not closed) — is a conjunctive-rule
-        //     miss on a cell that is SPEED-ONLY today (L3 has never been the
-        //     ship default on a size-vs-rivals basis; `dd79_bin6` already
-        //     lost this same size comparison under Greedy) and remains
-        //     SPEED-ONLY after this flip. Its residual is the SAME
-        //     `match_diff` parse-quality gap `2c7f9444`'s own fulcrum
-        //     diagnosis located (an optimal-frontier match-choice question,
-        //     not an accept-vs-defer one lazy/greedy toggling reaches) —
-        //     independent of this promotion and not a regression it
-        //     introduces. Adjudicated PROMOTE: every gating leg (size vs
-        //     shipped default, size vs ld-3, wall vs both real rivals at
-        //     every T, zero-regression legs) clears; the recorded miss is
-        //     out of this change's causal reach.
+        // L3 routes to `Strategy::Lazy` UNCONDITIONALLY. (A detector-gated
+        // lazy-L3 variant once lived here; it was removed — `CLAUDE.md`
+        // non-negotiable #3 forbids content detectors choosing a parser.
+        // Its promotion history lives in git log.)
         3 => LevelParams {
             try_exact_huffman: false,
             fast_bucket2: BUCKET2_OFF.0,
@@ -873,18 +811,20 @@ fn params_inner(level: u32) -> LevelParams {
             hash3_chain_depth: 0,
             near_optimal: NONE_NO,
         },
-        // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on 11 of 11
-        // TUNE files (772,154 B total vs libdeflate-4, ZERO cells opened, clause 3 fully
-        // satisfied) and FAILS clause 5 on 9 of 11 at T4. See the L4 sections of
-        // docs/encoder-campaign-plan.md. Depths 6 and 8 are cheaper on the wall but OPEN
-        // cells (clause 3); 10 and 12 satisfy clause 3 and cost too much wall. The
-        // monotone cost/size relation leaves no interior point satisfying both, so this
-        // is closed on the promotion rule AS WRITTEN — not on the encoder, and not on a
-        // coordinate. The size win is intrinsic and does not expire; if the wall budget
-        // ever changes, this is the configuration to re-measure FIRST.
+        // PARKED, NOT SHIPPED — `Lazy` with max_search_depth 10 wins SIZE on
+        // 11 of 11 TUNE files (772,154 B total vs libdeflate-4, ZERO cells
+        // opened) and fails the wall clause on 9 of 11 at T4. See the L4
+        // sections of docs/encoder-campaign-plan.md. Depths 6 and 8 are
+        // cheaper on the wall but OPEN cells; 10 and 12 satisfy the size
+        // clauses and cost too much wall. The monotone cost/size relation
+        // leaves no interior point satisfying both — closed under the
+        // promotion rule AS WRITTEN (`docs/promotion-rule.md`), not on the
+        // encoder, and not on a coordinate. The size win is intrinsic and
+        // does not expire; if the wall budget ever changes, this is the
+        // configuration to re-measure FIRST.
         //     4 => Strategy::Lazy, max_search_depth: 10, nice_match_length: 30
-        // symbols.dwarf is strictly Pareto-dominant there: 6,553 B smaller AND 4.8%
-        // faster at T4 (wall ratio 0.9519).
+        // symbols.dwarf is strictly Pareto-dominant there: 6,553 B smaller
+        // AND 4.8% faster at T4 (wall ratio 0.9519).
         4 => LevelParams {
             try_exact_huffman: false,
             fast_bucket2: BUCKET2_OFF.0,
@@ -1154,8 +1094,7 @@ pub fn max_passthrough_size(level: u32) -> usize {
 mod tests {
     use super::*;
 
-    /// Probe 3 (final-lap lever #364 pigz-L9-T4 investigation, agent-16):
-    /// pins the T1-vs-T>1 routing asymmetry at L8/L9 so the depth-x4 leak onto
+    /// Pins the L8/L9 T1-vs-T>1 routing asymmetry so the depth-x4 leak onto
     /// the near-optimal parser (the 1.38-1.48x loss vs pigz -9 -p4) is a
     /// red/green fact, not a code-reading inference. The unification PR must
     /// flip these deliberately if it changes the params_parallel routing.
@@ -1169,10 +1108,10 @@ mod tests {
             Strategy::Lazy2,
             "T>1 L9 must not silently share the T1 engine"
         );
-        // 2026-09-25 replacement invariant (the passes-curve + per-cell size
+        // Replacement invariant (the passes-curve + per-cell size
         // census led to a L9-only passes2 retune): L9 keeps near-opt at matched
-        // depth with passes 2; L8 stays on the L11-knob route (agent-19 task 4:
-        // the retune is level-conditional, not riding the 8/9 recursion).
+        // depth with passes 2; L8 stays on the L11-knob route (the retune is
+        // level-conditional, not riding the 8/9 recursion).
         let par8 = params_parallel(8);
         assert_ne!(
             format!("{par:?}"),
@@ -1197,12 +1136,6 @@ mod tests {
         assert_eq!(params(0).strategy, Strategy::Fast0);
         assert_eq!(params(1).strategy, Strategy::Fast); // igzip-class one-pass
 
-        // ⚠ STALE: LazyGated is deleted; L3 is `Strategy::Lazy`. Original note:
-        // L3 = LazyGated unconditionally since the 2026-07-23 supervisor
-        // adjudication of the frozen cell gate (see the level-3 arm's
-        // promotion-history comment); `l3-tune` only makes the gate's
-        // constants env-overridable for the search harness. L2/L4 stay
-        // Greedy either way.
         assert_eq!(params(2).strategy, Strategy::Greedy, "level 2");
         assert_eq!(params(3).strategy, Strategy::Lazy, "level 3");
         assert_eq!(params(4).strategy, Strategy::Greedy, "level 4");
@@ -1217,19 +1150,11 @@ mod tests {
         }
     }
 
-    // DELETED 2026-07-31: `vendor_knob_values`, which asserted
+    // A former `vendor_knob_values` test asserted
     //     params(6).max_search_depth == 35   params(9).max_search_depth == 600
-    //
-    // IT WAS A CAGE, AND IT BEAT THE DOCUMENTATION. `CLAUDE.md` says the level->config
-    // map "is currently a copy of libdeflate's, which is why we run their algorithm
-    // slower than they do; it is free to change." This test said the opposite, in the
-    // only medium that fails closed: touch the map, turn a test red. When a doc and a red
-    // test disagree, the test wins every time, and it won for weeks —
-    // `.git/logs/HEAD:235-237` records `probe/l5-depth` created and abandoned 102 seconds
-    // later with no commit.
-    //
-    // Raising L5-L9 to zlib-ng's chain depths — the change this test forbade — closed 84
-    // failing size cells (2026-07-31, full board, 1,320 measured, 0 VOID).
+    // as a hard equality. That was a cage against a map `CLAUDE.md` declares
+    // "free to change": raising L5-L9 to zlib-ng's chain depths — the change
+    // that test forbade — closed 84 failing size cells on the full board.
     //
     // A knob that is DECLARED FREE TO CHANGE must not be pinned by an equality assertion.
     // What is worth testing is the INVARIANT, not the value: depth must not decrease as
@@ -1259,18 +1184,14 @@ mod tests {
 
     #[test]
     fn near_optimal_effort_is_monotonic_in_level() {
-        // DELETED 2026-07-31: `near_optimal_knob_values`, which asserted
+        // A former `near_optimal_knob_values` test pinned the
         //     params(10).max_search_depth == 35, .nice_match_length == 75,
         //     .max_optim_passes == 2, params(12).max_search_depth == 300, etc.
-        //
-        // SECOND INSTANCE OF THE CAGE. `vendor_knob_values` was deleted earlier today for
-        // pinning L6/L9 depths that `CLAUDE.md` declares free to change; this pinned the
-        // L10-L12 knobs the same way, and non-negotiable #5 now forbids it outright:
-        // an equality assertion beats a sentence in a doc, because only one fails closed.
-        // Found by an adversarial review after the first one was fixed — the pattern
-        // repeats, so test the INVARIANT, not the VALUE.
-        //
-        // The invariant a typo would actually break is that effort rises with level.
+        // values as equalities — the same cage pattern as `vendor_knob_values`
+        // (see `search_effort_is_monotonic_in_level`): an equality assertion
+        // on a knob `CLAUDE.md` declares free to change defeats the doc. The
+        // invariant a typo would actually break is that effort
+        // rises with level.
         for l in 11..=12u32 {
             let prev = params(l - 1);
             let cur = params(l);
@@ -1294,10 +1215,11 @@ mod tests {
     }
 
     /// The L1 MATCH-REACH knobs are T1-ONLY; the interleaved-bucket lever is
-    /// T>1-ONLY. This is the assertion the whole clause-3 argument for REACH
+    /// T>1-ONLY. This is the assertion the wall-clause argument for REACH
     /// rests on: `pigz:ecoli.fastq:L1:T4:wall` flipped when the two-array
-    /// REACH route ran at T>1 (PR #319). #310's interleaved route is a
-    /// different monomorphization and was adjudicated separately.
+    /// REACH route ran at T>1 (recorded under the unscoped-lever commit).
+    /// The interleaved route is a different monomorphization, priced
+    /// separately.
     #[test]
     fn l1_match_reach_is_t1_only() {
         let t1 = params(1);
@@ -1324,8 +1246,8 @@ mod tests {
         assert!(
             !t_gt_1.fast_dense_interior_insert,
             "T>1 L1 picked up the match-reach bucket shift. That is the \
-             two-array REACH route whose unscoped adjudication failed clause 3 \
-             on pigz:ecoli.fastq:L1:T4:wall."
+             two-array REACH route whose unscoped pricing failed the wall \
+             clause on pigz:ecoli.fastq:L1:T4:wall."
         );
         assert!(
             t_gt_1.fast_interleaved_bucket,

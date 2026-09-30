@@ -1,6 +1,6 @@
 #![cfg(parallel_sm)]
 #![allow(dead_code)]
-// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
+// pre-existing parallel-module dead code from the default-feature flip; delete in a dedicated cleanup
 
 //! Segmented `Vec<u16>` replacement for `ChunkData::data_with_markers`,
 //! plus its IN-PLACE resolve-to-u8 step that eliminates the separate

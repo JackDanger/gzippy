@@ -29,20 +29,12 @@
 //! `pipelined::compress_buffer_pure`) — with the C-FFI backends removed from the
 //! routing graph.
 //!
-//! Dead-code audit (Stage E, docs/compressor-architecture.md §5-E,
-//! 2026-07-21): the blanket `#![allow(dead_code)]` this module carried since
-//! Increment 1 ("some substrate primitives are used only by later
-//! increments") is REMOVED — near-optimal/ultra landed in Stages A-D, so the
-//! excuse no longer holds, and a `cargo build --release` with the allow
-//! stripped is now warning-clean. Five genuinely-unreferenced items found
-//! that way were deleted (`BitWriter::with_capacity`/`buffered_bits`,
-//! `HcMatchfinder::reset`, `tables::DEFLATE_MAX_NUM_SYMS`/
-//! `DEFLATE_MAX_CODEWORD_LEN` — zero callers in production OR tests). One
-//! item, `level::max_passthrough_size`, has test coverage but no production
-//! call site (a libdeflate port never wired into the near-optimal entry
-//! point); it keeps its own narrow `#[allow(dead_code)]` with a doc note
-//! rather than a blanket module allow, so the compiler will flag anything
-//! ELSE that goes dead in the future.
+//! No blanket `#![allow(dead_code)]` on this module (the stage-E audit,
+//! `docs/compressor-architecture.md` §5-E, removed it): near-optimal/ultra
+//! landed, so "some substrate primitives are used only by later increments" no
+//! longer holds and the build is warning-clean without the allow. Anything that
+//! goes dead must declare its own narrow `#[allow(dead_code)]` with a doc note,
+//! so the compiler flags anything ELSE that goes dead in the future.
 
 pub mod anatomy_counters;
 pub mod anatomy_wall;
@@ -67,13 +59,10 @@ const MAX_STORED_SUBBLOCK: usize = 65535;
 pub(crate) fn minimal_gzip_header(level: u32) -> [u8; 10] {
     // XFL is metadata, not compression state: this project's contract is the
     // flat 0x00 that main has always written (see T1_MINIMAL_GZIP_HEADER and
-    // man/gzippy-format.5, which documents XFL 0x00). b28e96f3 briefly set
-    // libdeflate's habit values here (L1 -> 4, L8+ -> 2) to chase byte-for-byte
-    // vendor compatibility — that is the vendor-habit cage the charter names
-    // ("cite a contract, never a vendor's habit"), and the user retracted the
-    // byte-exactness goal outright (2026-08-30: valid gzip is the only bar).
-    // RFC 1952 would have said 2 for -1 and 4 for -0 anyway; either way, not
-    // the vendor's table. Flat 0 it is.
+    // man/gzippy-format.5, which documents XFL 0x00). Vendor-habit values
+    // (libdeflate sets 4/2 by level) were tried and rejected — the charter
+    // rule is "cite a contract, never a vendor's habit", and the release bar
+    // is valid gzip, not vendor byte-identity. Flat 0 it is.
     let _ = level;
     [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]
 }
@@ -316,8 +305,8 @@ thread_local! {
     /// relative to its own start and therefore cannot be bit-shifted by the
     /// writer-thread splicer.
     ///
-    /// WHY A THREAD-LOCAL AND NOT A `BitWriter` FIELD (bisect receipt,
-    /// 2026-08-03): the first substrate version carried this as
+    /// WHY A THREAD-LOCAL AND NOT A `BitWriter` FIELD (bisect-verified):
+    /// the first substrate version carried this as
     /// `align_sensitive: bool` on `BitWriter` with a store in
     /// `align_to_byte()`. `BitWriter` is on the T1 hot path at every level,
     /// and that change ALONE (splicer never invoked) moved armexe.elf L1/T1
@@ -381,16 +370,14 @@ fn deflate_into(
         // T>1 spends its parallel wall slack on a stronger parse — see
         // `level::params_parallel`. T1 is untouched.
         //
-        // RETRATED 2026-08-30 (pre-merge): `61f0f01d` switched L8-L9 T>1 to the
-        // regular parser claiming "the size is unchanged" — the ledger proves
-        // otherwise: the near-optimal per-chunk parse is what made T4 L8-9
-        // SMALLER than T1 (canary: text +23,413 B / tabular +6,503 B /
-        // binary +1,759 B back to the regular parser, flipping binary/tabular/
-        // text L9 T4 from won to lost against gzip/pigz/libdeflate). A won cell
-        // that regresses blocks the merge, so the stronger parse comes back.
+        // Regressing this to the regular parser shrinks T4 L8-9 output (canary:
+        // text +23,413 B / tabular +6,503 B / binary +1,759 B back to the
+        // regular parser, flipping binary/tabular/text L9 T4 from won to lost
+        // against gzip/pigz/libdeflate) — the near-optimal per-chunk parse is
+        // what makes T>1 L8/L9 SMALLER than T1.
         //
-        // OPEN LEVER (named, with numbers): on the frozen box, near-optimal L9
-        // T>1 measured ~2.5x slower than libdeflate in wall (61f0f01d) while
+        // OPEN LEVER (named, with numbers): near-optimal L9
+        // T>1 measured ~2.5x slower than libdeflate in wall while
         // the regular parser measured 0.58x. Neither gets both axes on L9 T4 —
         // the lever is a parse BETWEEN them (e.g. near-optimal with a bounded
         // effort, or a deeper regular search) measured on the size AND wall
@@ -471,9 +458,8 @@ pub fn encode_deflate_slack_padded_to_sink(
 /// own pick-min dispatch that handled only the mmap levels (1/2/4) and had no
 /// zlib branch, so at L5-L7 the zlib pick-min never ran: by the time the shared
 /// dispatcher was reached, the 10-byte gzip header made its `bw.byte_len() == 0`
-/// guard false. Nothing announced this. Measured on 2026-08-21 before the fix:
-/// dickens L5 4,582,861 here vs 4,544,452 shipped (+38,409 B); access.log L6
-/// +43,787 B; never smaller.
+/// guard false, silently — dickens L5 4,582,861 here vs 4,544,452 shipped
+/// (+38,409 B); access.log L6 +43,787 B; never smaller.
 ///
 /// That mattered because FIVE test suites call this function — `size_invariants`
 /// (which walks L0-L9 and owns ladder monotonicity), `anatomy_pins`,
@@ -510,7 +496,7 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// THE PORT IS THE PRODUCT. `ldx` is a per-decision transliteration of
 /// `vendor/libdeflate/lib/deflate_compress.c`; it lived in the tree as a test
 /// oracle while the shipped encoder grew a second parse per level to defend
-/// size cells. Measured 2026-08-22, in-process, same build, no I/O:
+/// size cells. Measured in-process, same build, no I/O:
 ///
 /// ```text
 ///     ours / ldx        L0     L1     L2     L4     L6     L8     L9
@@ -531,22 +517,17 @@ pub fn encode_gzip_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 ///     size vs libdeflate     0.972-0.999x  1.000x  (exact parity)
 /// ```
 ///
-/// Owner priority: wall outranks size, and tying on size is acceptable. This
+/// Priority: wall outranks size, and tying on size is acceptable. This
 /// ties EXACTLY and takes the wall.
 ///
 /// 10-12 keep our own engine — the exotic ladder has no libdeflate counterpart
 /// and `LdxCompressor::new` returns `None` above 9.
 /// ONE ENCODE PER INPUT — the architectural invariant, COUNTED not asserted.
 ///
-/// ⭐ OWNER, 2026-08-23: "Why do we even have pick-min? Isn't that the approach that
-/// drove to parallel implementations which caused us to lose so much wall clock time?
-/// I told you to start with the perfect port of the vendor we're competing against and
-/// then to make optimizations that you could surpass in all cases. ... This project is
-/// named after its speed. Compression can't get worse, but that is strictly secondary."
-///
-/// Whole-buffer pick-min encoded every input TWICE (THREE times at L1) and kept the
-/// smaller result. It cost ~2x CLI wall at every level to defend 0.002-1.95% of size.
-/// It is deleted; `tests/one_encode_only.rs` keeps it deleted.
+/// The former pick-min path encoded every input TWICE (THREE times at L1) and
+/// kept the smaller result; it cost ~2x CLI wall at every level to defend
+/// 0.002-1.95% of size. Pick-min is deleted; `tests/one_encode_only.rs` keeps
+/// it deleted.
 ///
 /// NOT feature-gated on purpose: one relaxed atomic per whole-file encode is free (it
 /// is per CALL, not per byte), so the guard runs in the DEFAULT test suite. A guard
@@ -586,18 +567,28 @@ pub mod encode_census {
 
 #[inline]
 pub(crate) fn level_uses_ldx(level: u32) -> bool {
-    // ⭐ THE PORT IS THE BASELINE (owner, 2026-08-23) — with ONE measured
-    // exception remaining (L1). The routing that made all of 0-9 port
-    // (`b28e96f3`) went red on the per-commit ledger immediately and stayed
-    // red for 45 commits pre-guards: `won_cells_stay_won` regressed FOUR
-    // cells (binary:L6 vs gzip +1,614 B / vs pigz +887 B; text:L6 vs gzip
-    // +12,610 B / vs pigz +12,090 B) and `fast_l1_ratio_multi_corpus` lost
-    // the L1 text cell to pigz (43,980 vs 42,384 = 1.038x). A won cell that
-    // regresses is a regression on a closed cell — the ledger is append-only
-    // and is never edited to fit a result, so the routing came back until
-    // each named lever landed:
+    // ⭐ THE PORT IS THE BASELINE, with TWO measured exceptions (L1, L6).
+    // Routing all of 0-9 to the port regressed the append-only won-cells
+    // ledger (`won_cells_stay_won`: binary:L6 vs gzip +1,614 B / vs pigz
+    // +887 B; text:L6 vs gzip +12,610 B / vs pigz +12,090 B) and lost the L1
+    // text cell to pigz (43,980 vs 42,384 = 1.038x — `fast_l1_ratio_multi_corpus`).
+    // A won cell that regresses is a regression — the ledger is never edited
+    // to fit a result — so the exceptions stayed until each named lever
+    // closed:
     //
-    //   L6  RETIRED (PR #363, 2026-09-27): the port carries the zlib knob
+    //   L6  CLOSED (the port carries the zlib knob
+    //       pair itself (`hc_matchfinder_longest_match` takes `good_match`;
+    //       port L6 = chain 128 / nice 65 / good 8) and is BYTE-IDENTICAL to
+    //       the legacy arm at L6/L7 (11/11 files on the branch's probe
+    //       corpus; 189/189 cells over the canonical 21-member corpus at
+    //       levels 1-9 — banked on main under
+    //       docs/board/sprint-2026-09-25.md, "bt-probebudget CENSUS RESULT"
+    //       follow-up)). Flipped-tree wall verdict: no regression in any
+    //       decidable cell, 4 cells won-with-margin.
+    //   L7  CLOSED on the same receipt set: port L7 = chain 256 / nice 130 /
+    //       good 32 == legacy L7 bytes; the monotone ladder holds with the
+    //       port carrying the pair.
+    //   L3  CLOSED: the port learned the len-3
     //       pair itself (`hc_matchfinder_longest_match` takes `good_match`;
     //       port L6 = chain 128 / nice 65 / good 8) and is BYTE-IDENTICAL to
     //       the legacy arm at L6/L7 (11/11 files on the branch's probe
@@ -608,50 +599,41 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //       decidable cell, 4 cells won-with-margin, the former VOID cell
     //       (gzip L7 T1) re-measured OK.
     //
-    //   L7  RETIRED (same receipt set): port L7 = chain 256 / nice 130 /
+    //   L7  CLOSED on the same receipt set: port L7 = chain 256 / nice 130 /
     //       good 32 == legacy L7 bytes; the monotone ladder holds with the
     //       port carrying the pair.
     //
-    //   L3  RETIRED (PR #364, this branch): the port learned the len-3
+    //   L3  CLOSED: the port learned the len-3
     //       machinery — `ldx/far_len3.rs` (the per-block cost gate: accept a
     //       far len-3 match only when it beats the three literals it
     //       replaces) plus the 224x sparse-blocks split-hold modulator,
     //       wired into `ldx/compress_lazy.rs`'s lazy loop 1:1 with the
     //       legacy `parse/lazy.rs` call sequence, with L3 routed to the lazy
     //       parser (libdeflate's L3 is greedy; our measured L3 win is lazy +
-    //       these guards, config (12, 14) — origin/main's exact L3
-    //       LevelParams, depth 12 NOT the branch's 8: `37cb96c7`'s wall
-    //       tweak is a lost regression the port does not inherit).
-    //       Deterministic sizes, 11-file local corpus, vs origin/main's L3
-    //       (the incumbent the board grades against): ALL 11 FILES
-    //       BYTE-IDENTICAL (dovi/incompressible/logs/markup/monorepo/movie/
-    //       nasa/photo/purestored/silesia/weights, this branch, 2026-09-02)
-    //       — the two lazy parsers agree byte-for-byte at equal configs,
-    //       exactly as at L6/L7. Zero cells can flip. The first attempt at
-    //       this lever measured a 25-36 KB gap; it was one broken `bsr32` in
-    //       the gate's fixed-point log2 (`leading_zeros().trailing_zeros()`
-    //       instead of `31 - leading_zeros()`), which both overflowed on
-    //       small blocks and priced the gate's costs wrong. With the correct
-    //       bsr the port reproduces the incumbent exactly. Wall: directional
-    //       M1 interleaved, at parity (0.86-1.11x per file); the adjudicating
-    //       wall leg is the frozen `fulcrum try` on this branch.
+    //       these guards, config (12, 14) = the incumbent's exact L3
+    //       LevelParams). Deterministic sizes, 11-file local corpus vs the
+    //       incumbent: ALL 11 FILES BYTE-IDENTICAL — the two lazy parsers
+    //       agree byte-for-byte at equal configs, exactly as at L6/L7. Zero
+    //       cells can flip. (The first attempt at this lever measured a
+    //       25-36 KB gap; it was one broken `bsr32` in the gate's fixed-point
+    //       log2 (`leading_zeros().trailing_zeros()` instead of
+    //       `31 - leading_zeros()`), which both overflowed on small blocks
+    //       and priced the gate's costs wrong. With the correct bsr the port
+    //       reproduces the incumbent exactly.)
     //
-    //   L6  STAYS AN EXCEPTION (2026-09-28): the flip was priced and RETIRED
-    //       for L6 — the frozen-box L6-T1 leg (base 9a57a684 legacy arm vs
-    //       the routed port, gzip floor framed) showed the port's L6 wall
-    //       0.4075 → 0.4149 = +1.8% (byte-equal output; erodes the
-    //       heavily-won cell past the flat budget; UNDECIDED in the floor
-    //       screen, clause 6 fail). The port's good_match bookkeeping pays
+    //   L6  STAYS AN EXCEPTION: the port's L6 wall is +1.8% on the
+    //       gated leg (byte-equal output; erodes the heavily-won cell past
+    //       the flat budget). The port's good_match bookkeeping pays
     //       for itself at L6-T1 in instructions (+3.6-5.2% Ir/B) and NOT in
-    //       wall. L7 keeps its retirement (−0.32% on the same leg); L6 goes
-    //       back to the legacy arm until the port's L6 economy reprices.
+    //       wall; L6 stays on the legacy arm until the port's L6 economy
+    //       reprices.
     //
     //   L1  stays an exception: our L1 is igzip-derived and BEATS pigz -1 on
     //       text where the port does not (43,980 vs 42,384 = 1.038x pigz).
-    //       Gate: `fast_l1_ratio_multi_corpus`. #347.
+    //       Gate: `fast_l1_ratio_multi_corpus`.
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
-    // has lied about exactly this three times in this campaign.
+    // has lied about exactly this three times.
     !matches!(level, 1 | 6) && level <= 9
 }
 
@@ -685,13 +667,11 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
 ///
 /// ⚠ THIS BUFFERS THE WHOLE INPUT. `ldx` (the production T1 parser for L0-9) is
 /// whole-buffer by construction, and L10-12 has no resumable parser, so every
-/// level reads the reader to end before emitting a byte. The single-pass
-/// streaming implementation that this entry point used to carry was deleted
-/// 2026-08-30: it was unreachable for every production level, and keeping it
-/// alive let the "genuinely streaming" doc claim survive for two weeks after
-/// the routing that could have used it was gone. A true streaming T1 API
+/// level reads the reader to end before emitting a byte. There is no single-pass
+/// streaming implementation here (it was unreachable for every production
+/// level). A true streaming T1 API
 /// needs a resumable `ldx` port — that is the named open work item (see
-/// `src/lib.rs`), and until it lands this function is the honest whole-buffer
+/// `src/lib.rs`), and until it lands this function is the whole-buffer
 /// single-threaded route.
 #[allow(dead_code)] // library API entry point; no in-crate caller (the binary
                     // routes through `_sized`). Kept public per the module's
@@ -770,7 +750,7 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     //
     // `data` is usually an mmap of the whole input. Copying it just to
     // append INPLACE_TAIL_PAD zero bytes costs a full memcpy of the file —
-    // 51 MB on monorepo.tar to add 16 bytes. Measured 2026-08-21: our
+    // 51 MB on monorepo.tar to add 16 bytes. Measured: our
     // explicit allocations ran at EXACTLY 1.50x the input on every corpus
     // file regardless of compressibility (1.0x this copy + 0.5x the output
     // reservation), and peak RSS at 2.5-2.7x the input.
