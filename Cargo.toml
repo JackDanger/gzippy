@@ -401,7 +401,7 @@ global-rpmalloc = ["dep:rpmalloc"]
 # For local iteration ON fulcrum, override with an UNCOMMITTED patch in your
 # .cargo/config.toml: [patch."https://github.com/JackDanger/fulcrum.git"]
 #   fulcrum = { path = "../fulcrum" }
-fulcrum = { git = "https://github.com/JackDanger/fulcrum.git", optional = true }
+fulcrum = { version = "0.3", git = "https://github.com/JackDanger/fulcrum.git", optional = true }
 # Compression: flate2 with zlib-ng for maximum performance
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
