@@ -30,7 +30,7 @@ re-fetched or re-read later even after ref deletion.
 | `lever/ldx-len3` | **MERGED via PR #364** (84f22994) — the len-3 machinery + the L3 retirement; its landing carried the L6-revert re-pins |
 | `lever/one-encode-per-level` (PR #356) | closed with disposition (superseded by the stack, per the older census note) |
 | `lever/postparse-split` (PR #346) | closed NO-SHIP (measured-and-stopped) |
-| `lever/ldx-forceinline` (PR #368) | stays OPEN as the review vehicle per its own contract ("does NOT propose merging now") — reopen path documented in-PR (rebase onto the knob pair + len-3 wiring, round-3-style review, one frozen try) |
+| `lever/ldx-forceinline` (PR #368) | CLOSED 2026-09-28, landed-or-superseded (1.0.0-target PR census): the vendor forceinline landed re-measured (the matchfinders carry the `#[inline(always)]` markers + the 1.34x note at `hc_matchfinder.rs:114`); the ARM profiling tools landed (`scripts/campaign/profattr.py`, `profile-ldx.sh`); the bounds-elision pair superseded by the post-pivot matchfinder rework (pointer-resident cursors, C-shaped walk, hw/a1 pipelining) — hand-rolled numbers never had promotion authority per charter, so no residual-board card |
 | the #369 L2 carry | CLOSED superseded — the machinery it carried landed via #364; the L2 min-match-3 lever card lives on the residual board |
 
 ## Batch 3 — ARCHIVE-LATER (falsified / superseded / probes; no open PR, no live ref)
