@@ -1,5 +1,11 @@
 How testing/profiling runs on the neurotic x86_64 box
 
+⚠ SCOPE: this file describes the remote MEASUREMENT HARNESS (the clean-bench
+box and its clock-lock/bench scripts), not the repo's unit-test flow — for
+the everyday test commands see CONTRIBUTING.md. The scripts it names that
+live in this repo are under `scripts/`; the clean-bench lifecycle itself
+lives on the measurement host, not in the tree.
+
 1. The machine topology
 
 There are three hosts in the loop, two SSH hops:
@@ -22,7 +28,7 @@ I verified live: the guest hostname is trainer, /root/gzippy is present (current
 
 2. The "clean bench" harness — the one trustworthy A/B
 
-This is a 7-file lifecycle (committed at scripts/bench/ in git history, deployed to /root/gzippy-bench/ on the host). The design rule it encodes: never report a bare absolute MB/s (they swing ~2× with box load and have flipped this project's
+This is a 7-file lifecycle (not in this repo's tree — it was deployed to /root/gzippy-bench/ on the host). The design rule it encodes: never report a bare absolute MB/s (they swing ~2× with box load and have flipped this project's
 conclusions from the same binary), and never emit a timing row unless the clock lock is hardware-proven and every output sha matches.
 
 ┌─────────────────────────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -91,7 +97,7 @@ Runs after the host has locked + gated. Enforces provenance-or-no-numbers:
 1. Provenance gate — aborts if the working tree is dirty (gzippy's own tracked files + submodule pointers; edits inside vendor submodules like the rapidgzip trace patch are ignored via --ignore-submodules=dirty, but the exact submodule commit
 is recorded). --allow-dirty overrides but forces RUN_TRUSTWORTHY=false.
 2. Build the production binary: cargo build --release --no-default-features --features pure-rust-inflate (the pure-Rust inflate as the sole decode path).
-3. Assert routing: GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 8 ... must print path=ParallelSM, else abort. (GZIPPY_FORCE_PARALLEL_SM=1 forces the parallel-SM engine at every thread count.)
+3. Assert routing: GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 8 ... must print path=ParallelSM, else abort. (GZIPPY_FORCE_PARALLEL_SM=1 forced the parallel-SM engine at every thread count; the knob was later removed from the binary entirely — ParallelSM is now the sole single-member path at every thread count, so the assert works without it.)
 4. Reference sha: gzip -dc corpus | sha256sum is the correctness oracle; corpus prewarmed into page cache.
 5. Interleaved engine: per thread count, each iteration runs gzippy-baseline, gzippy-ORACLE, then rapidgzip back-to-back (so all three see identical per-trial contention; the ratio is jitter-immune). taskset pins to physical P-cores:
 T4=0,2,4,6, T8=0,2,4,6,8,10,12,14 (1 thread/P-core, the "headline cell"), T16=0-15 (SMT/oversubscribed). Iteration 0 is dropped (warmup), output to /dev/null, every run's sha must match the gzip(1) reference — one divergence makes the whole
@@ -116,7 +122,7 @@ whole tool channel once).
 Fulcrum is a separate repo (~/www/fulcrum, public JackDanger/fulcrum) — a cross-tool trace analyzer. The flow:
 
 - gzippy side: emits a Chrome-trace JSON via GZIPPY_TIMELINE=/tmp/out.json gzippy -d -c ... (and GZIPPY_LOG_FILE= for the parallel-SM span log). guest_bench.sh auto-saves timeline_base_T{N}.json / timeline_oracle_T{N}.json artifacts (saved,
-not auto-interpreted).
+not auto-interpreted). (These GZIPPY_TIMELINE/GZIPPY_LOG_FILE knob names are from the campaign era; current builds emit span-timing trace JSON via `FULCRUM_TRACE=<path>` when built with the `trace` feature.)
 - rapidgzip side: patched to emit the same trace vocabulary. scripts/rapidgzip_trace_patch/ (patch_vendor.sh + TraceV2.hpp) instruments the vendor and builds a build-trace variant at vendor/rapidgzip/librapidarchive/build-trace.
 - Analysis (on the laptop, offline, re-runnable): fulcrum vs A B (span-by-span busy + wall-critical diff), fulcrum flow (per-stage slack/serial/starved), fulcrum critpath, fulcrum causal, fulcrum decompose/memlife, fulcrum sweep capture/mine.
 

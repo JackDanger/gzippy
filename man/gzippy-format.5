@@ -1,5 +1,5 @@
 .\" gzippy-format(5) — the "GZ" FEXTRA subfield wire format.
-.TH GZIPPY-FORMAT 5 2026-04-24 "gzippy 0.2.0" "File Formats"
+.TH GZIPPY-FORMAT 5 2026-04-24 "gzippy 1.0.0" "File Formats"
 .
 .SH NAME
 gzippy-format \- the \(dqGZ\(dq FEXTRA subfield used by gzippy
@@ -14,6 +14,12 @@ gzippy-format is not a separate file format. It is a convention layered on
 top of RFC 1952 gzip. A gzippy file is a sequence of one or more gzip
 members. Each parallel block is one member. Each member carries an FEXTRA
 subfield that records the total size of the member.
+.PP
+Current gzippy releases emit only standard single-member gzip; the
+multi-block format below is legacy \(em it was what earlier
+parallel releases wrote, and current versions still DECODE files that
+carry the subfield (plus BGZF). The subfield stays documented here so a
+reader/writer of such archives has the wire contract.
 .PP
 Standard gzip readers ignore unknown FEXTRA subfields (RFC 1952 \(sc 2.3.1.1)
 and decode the file normally. gzippy uses the subfield to find block
