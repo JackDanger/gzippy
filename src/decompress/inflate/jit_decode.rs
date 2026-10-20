@@ -1,27 +1,16 @@
-//! JIT Huffman Decoder with Table Fingerprint Caching
+//! Huffman table fingerprints for the specialized decoders.
 //!
-//! This module implements a two-pass decoding strategy:
-//! 1. First pass: Scan block headers, fingerprint Huffman tables
-//! 2. Second pass: Use cached specialized decoders for each fingerprint
+//! [`TableFingerprint`] is the Huffman-table identity key: it hashes a
+//! block's code lengths with std's `DefaultHasher`; `combined` pads the
+//! litlen lengths to 286 symbols and the distance lengths to 30 so blocks
+//! that declare different hlit/hdist but carry identical codes share a key.
+//! `consume_first_decode` computes it per dynamic block header and
+//! `specialized_decode` keys its decoder cache on it.
 //!
-//! ## Mathematical Foundation
-//!
-//! Huffman tables are uniquely determined by their code lengths.
-//! We fingerprint tables using a polynomial hash over GF(2^64):
-//!
-//! ```text
-//! fingerprint = Σ (len[i] * prime^i) mod 2^64
-//! ```
-//!
-//! For Silesia (~3000 blocks), we observe only ~40-100 unique fingerprints,
-//! giving >97% cache hit rate.
-//!
-//! ## Specialized Decoder Generation
-//!
-//! For each unique table, we generate a specialized decoder where:
-//! - Symbol values are immediate constants (no table lookup)
-//! - Bit widths are compile-time constants (no width conditionals)
-//! - Subtable structure is baked in (no subtable checks)
+//! The remainder of the file is an analysis aid, not a decode path:
+//! `FingerprintStats` accumulates fingerprint statistics and
+//! `analyze_deflate_stream` scans a deflate stream to fill it. Its only
+//! callers are this module's unit tests.
 
 #![allow(dead_code)]
 
@@ -390,84 +379,6 @@ fn build_simple_table(lengths: &[u8], table_bits: usize) -> Vec<u16> {
     }
 
     table
-}
-
-// =============================================================================
-// Specialized Decoder Generation
-// =============================================================================
-
-/// A specialized decoder for a specific Huffman table
-/// Generated at runtime when a new fingerprint is encountered
-pub struct SpecializedDecoder {
-    pub fingerprint: TableFingerprint,
-    /// Litlen: For each 11-bit lookup, (symbol, total_bits, is_literal, is_eob)
-    /// Packed as: symbol(8) | extra_bits_base(8) | total_bits(8) | flags(8)
-    pub litlen_fast: Box<[u32; 2048]>,
-    /// Distance: For each 8-bit lookup, (base_dist, total_bits)
-    pub dist_fast: Box<[u32; 256]>,
-}
-
-impl SpecializedDecoder {
-    /// Generate a specialized decoder from code lengths
-    pub fn from_lengths(litlen_lens: &[u8], dist_lens: &[u8]) -> Self {
-        let fingerprint = TableFingerprint::combined(litlen_lens, dist_lens);
-
-        // Build fast lookup tables
-        // These are like libdeflate's tables but fully expanded
-        let litlen_fast = Box::new([0u32; 2048]);
-        let dist_fast = Box::new([0u32; 256]);
-
-        // TODO: Actually build the tables
-        // For now, this is a placeholder
-
-        Self {
-            fingerprint,
-            litlen_fast,
-            dist_fast,
-        }
-    }
-}
-
-/// Cache of specialized decoders keyed by fingerprint
-pub struct DecoderCache {
-    decoders: HashMap<TableFingerprint, SpecializedDecoder>,
-    hits: usize,
-    misses: usize,
-}
-
-impl DecoderCache {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            decoders: HashMap::new(),
-            hits: 0,
-            misses: 0,
-        }
-    }
-
-    /// Get or create a specialized decoder for the given table
-    pub fn get_or_create(&mut self, litlen_lens: &[u8], dist_lens: &[u8]) -> &SpecializedDecoder {
-        let fp = TableFingerprint::combined(litlen_lens, dist_lens);
-
-        if self.decoders.contains_key(&fp) {
-            self.hits += 1;
-        } else {
-            self.misses += 1;
-            let decoder = SpecializedDecoder::from_lengths(litlen_lens, dist_lens);
-            self.decoders.insert(fp, decoder);
-        }
-
-        self.decoders.get(&fp).unwrap()
-    }
-
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
-            0.0
-        } else {
-            self.hits as f64 / total as f64
-        }
-    }
 }
 
 #[cfg(test)]
