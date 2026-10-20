@@ -24,7 +24,7 @@ pub mod symbols;
 mod tuning;
 pub mod zlib;
 
-pub use tuning::{compress_deflate, ZopfliTuning};
+pub use tuning::{compress_deflate, compress_zlib, ZopfliTuning};
 
 #[cfg(test)]
 mod tests;

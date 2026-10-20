@@ -314,7 +314,7 @@ fn run() -> Result<i32, GzippyError> {
     // Rival flags we PARSE but whose documented semantics we do not deliver
     // are rejected LOUDLY before any work starts, instead of exiting 0 with
     // output that silently lacks the property the flag exists to provide
-    // (non-rsyncable "rsyncable" archives, gzip bytes under .zz/.zip names,
+    // (non-rsyncable "rsyncable" archives, gzip bytes under .zip names,
     // strategy flags that change nothing). Compress mode only: on
     // decompress/test/list these flags are inert for the rivals too, so a
     // `-d` pipeline that happens to carry them keeps working. Exit 2
@@ -328,11 +328,18 @@ fn run() -> Result<i32, GzippyError> {
         }
         match args.format {
             format::CompressionFormat::Zlib => {
-                eprintln!(
-                    "gzippy: -z/--zlib: zlib container output is not yet implemented (see issue #303). \
-                     Note: gzippy follows pigz's -z (zlib container), not igzip's -z (plain compress)."
-                );
-                return Ok(2);
+                // Implemented (issue #303): -z emits a real RFC 1950 zlib
+                // container. The only flag that cannot be honoured is a
+                // comment: zlib has no FCOMMENT field, so accepting `-C`
+                // would silently drop what the user typed.
+                if args.comment.is_some() {
+                    eprintln!(
+                        "gzippy: -z/--zlib cannot store a comment (zlib containers have no \
+                         comment field); refusing to silently drop it — write gzippy gzip \
+                         output with -C, or drop -C"
+                    );
+                    return Ok(2);
+                }
             }
             format::CompressionFormat::Zip => {
                 eprintln!("gzippy: -K/--zip: zip container output is not yet implemented (see issue #303)");
@@ -486,9 +493,16 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     let input_file = File::open(input_path)?;
     let mmap = unsafe { Mmap::map(&input_file)? };
 
-    // Decompress into a Vec (discarded after) to verify integrity
+    // Decompress into a Vec (discarded after) to verify integrity. Route by
+    // CONTENT: pigz -t verifies its own -z (.zz) files too, so a zlib stream
+    // goes to the zlib decoder; everything else keeps the gzip path (and its
+    // "not in gzip format" error for foreign bytes).
     let mut sink = Vec::new();
-    let result = decompress::decompress_gzip_to_writer(&mmap, &mut sink);
+    let result = if crate::compress::zlib_container::is_zlib_stream(&mmap) {
+        crate::decompress::decompress_zlib_turbo(&mmap, &mut sink)
+    } else {
+        decompress::decompress_gzip_to_writer(&mmap, &mut sink)
+    };
 
     match result {
         Ok(_) => {
@@ -522,7 +536,11 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
     }
 
     let mut sink = Vec::new();
-    let result = decompress::decompress_gzip_to_writer(&input_data, &mut sink);
+    let result = if crate::compress::zlib_container::is_zlib_stream(&input_data) {
+        crate::decompress::decompress_zlib_turbo(&input_data, &mut sink)
+    } else {
+        decompress::decompress_gzip_to_writer(&input_data, &mut sink)
+    };
 
     match result {
         Ok(_) => {
@@ -731,12 +749,12 @@ fn print_help() {
     println!("igzip compatibility: gzippy follows the gzip/pigz flag contract where they");
     println!("collide with igzip's. igzip's 0..3 level scale is NOT emulated: -0 stores");
     println!("(igzip's -0 is its fastest compressor) and -2/-3 are weak-fast gzip levels");
-    println!("(igzip's default/best). -z takes pigz's meaning (zlib container, currently");
-    println!("rejected — issue #303), not igzip's 'compress' no-op. See issue #305.");
+    println!("(igzip's default/best). -z takes pigz's meaning (zlib container, RFC 1950),");
+    println!("not igzip's 'compress' no-op. See issue #305.");
     println!();
     println!("Not yet implemented (rejected loudly rather than silently misbehaving):");
-    println!("  -R/--rsyncable (#302), -z/--zlib and -K/--zip containers (#303),");
-    println!("  -H/--huffman, -U/--rle, -i/--independent, -A/--alias");
+    println!("  -R/--rsyncable (#302), -K/--zip and -A/--alias (#303),");
+    println!("  -H/--huffman, -U/--rle, -i/--independent");
     println!();
     println!("Examples:");
     println!("  gzippy file.txt          Compress file.txt -> file.txt.gz");

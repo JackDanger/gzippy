@@ -59,6 +59,15 @@ pub fn compress_deflate(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
     compress(&tuning_to_options(tuning), ZopfliFormat::Deflate, data)
 }
 
+/// Compress data with zopfli, wrapped in an RFC 1950 zlib container.
+///
+/// The `-z/--zlib` counterpart of [`compress_deflate`] (issue #303): the same
+/// engine and tuning produce the same DEFLATE payload, framed with the
+/// CMF/FLG header and big-endian Adler-32 trailer (no FNAME/FCOMMENT field).
+pub fn compress_zlib(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
+    compress(&tuning_to_options(tuning), ZopfliFormat::Zlib, data)
+}
+
 fn tuning_to_options(tuning: &ZopfliTuning) -> ZopfliOptions {
     ZopfliOptions {
         verbose: 0,

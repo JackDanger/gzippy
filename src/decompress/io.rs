@@ -158,7 +158,18 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
     }
 
-    let format = detect_format(input_path);
+    // Content complement (issue #303): the extension usually routes (.zz →
+    // Zlib), but `-z` output redirected to any other name — or foreign zlib
+    // data under any name — previously reached the gzip arm, which emits an
+    // EMPTY output and still deletes the input. A valid zlib header (CM=8,
+    // no FDICT, FCHECK ok — same sniff the gzip path's `is_compressed` uses
+    // in one direction) routes to the zlib decoder; every other content
+    // keeps the extension-based verdict unchanged.
+    let format = if crate::compress::zlib_container::is_zlib_stream(&mmap) {
+        CompressionFormat::Zlib
+    } else {
+        detect_format(input_path)
+    };
 
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
