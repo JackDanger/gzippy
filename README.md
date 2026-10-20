@@ -144,9 +144,12 @@ gzippy --max precious.tar              # densest level (12)
 GZIPPY_DEBUG=1 gzippy -d mystery.gz    # show which decode route ran
 ```
 
-Flag honesty: `-R` (rsyncable), `-z` (zlib container), and `-K` (single-entry
-ZIP) output are parsed but rejected loudly with exit 2 rather than silently
-misbehaving — not yet implemented (issues #302 / #303). Manual:
+Flag honesty: `-z` (zlib container) emits a real RFC 1950 zlib stream at
+every level and thread count (`FILE.zz`, roundtrips through `gzippy -d`
+and any `zlib` decoder). `-R` (rsyncable), `-K` (single-entry ZIP),
+`-H`, `-U`, `-i` and `-A` are parsed but rejected loudly with exit 2
+rather than silently misbehaving — not yet implemented (issues #302 /
+#303). Manual:
 `man gzippy`, wire format: `man gzippy-format`, tuning: `man gzippy-tuning`.
 
 ## Analyze

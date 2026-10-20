@@ -166,12 +166,23 @@ Level 12 \(em the densest of the near-optimal parse levels (near-zopfli
 ratio, still parallel). Smaller than \fB-9\fR, not as small as
 .BR --ultra .
 .TP
-.BR -R ", " --rsyncable ", " -z ", " --zlib ", " -K ", " --zip ", " -H ", " --huffman ", " -U ", " --rle ", " -i ", " --independent ", " -A ", " --alias
+.BR -z ", " --zlib
+Compress to a zlib stream (RFC 1950) instead of gzip (pigz's \fB-z\fP
+meaning, container issue #303): output is a single zlib stream —
+2-byte CMF/FLG header, deflate payload, big-endian Adler-32 — at every
+level and thread count; file mode writes
+.IR FILE.zz .
+zlib carries no FNAME/FCOMMENT header fields, so \fB-N\fR/\fB-n\fR are
+inert and combining \fB-z\fR with \fB-C\fR is rejected loudly (exit 2).
+Decompression detects zlib by content (magic-header check, not by
+suffix), so renamed \fB.zz\fR files still decode.
+.TP
+.BR -R ", " --rsyncable ", " -K ", " --zip ", " -H ", " --huffman ", " -U ", " --rle ", " -i ", " --independent ", " -A ", " --alias
 Not yet implemented (rejected loudly rather than silently misbehaving):
 we parse these flags and exit 2 with a pointer to the tracking issue
-(#302 for \fB-R\fR, #303 for the \fB-z\fP/\fB-K\fP containers). Note that
-\fB-z\fP would take pigz's meaning (zlib container), not igzip's
-\(dqcompress\(dq no-op \(em see issue #305.
+(#302 for \fB-R\fR, #303 for the \fB-K\fP/\fB-A\fP zip container pair,
+#305 for the igzip scale the \fB-z\fP spelling would collide with —
+\fB-z\fP now takes pigz's meaning: the RFC 1950 zlib container above).
 .
 .SS Parallelism and blocks
 .TP
