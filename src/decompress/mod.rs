@@ -890,17 +890,31 @@ pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gz
         ));
     }
     let deflate_data = &data[2..data.len() - 4];
-    let mut output_buf = vec![0u8; data.len().saturating_mul(4).max(64 * 1024)];
-    match crate::decompress::bgzf::inflate_into_pub(deflate_data, &mut output_buf) {
-        Ok(size) => {
-            writer.write_all(&output_buf[..size])?;
-            writer.flush()?;
-            Ok(size as u64)
+    // zlib (RFC 1950) has no ISIZE trailer, so the output size is unknown up
+    // front. Start at the 4x heuristic and CUMULATIVELY RE-grow on the
+    // inflate engine's `WriteZero` (output exhausted) signal, exactly like
+    // `decompress_raw_bytes` below — high-ratio pipes such as a file of
+    // zeros would otherwise fail outright at the fixed-size first guess.
+    let mut output_len = data.len().saturating_mul(4).max(64 * 1024);
+    const OUTPUT_CAP: usize = 1 << 31; // 2 GiB ceiling, as in decompress_raw_bytes
+    loop {
+        let mut output_buf = vec![0u8; output_len];
+        match crate::decompress::bgzf::inflate_into_pub(deflate_data, &mut output_buf) {
+            Ok(size) => {
+                writer.write_all(&output_buf[..size])?;
+                writer.flush()?;
+                return Ok(size as u64);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && output_len < OUTPUT_CAP => {
+                output_len = output_len.saturating_mul(2).min(OUTPUT_CAP);
+            }
+            Err(e) => {
+                return Err(GzippyError::invalid_argument(format!(
+                    "zlib decompression failed: {}",
+                    e
+                )))
+            }
         }
-        Err(e) => Err(GzippyError::invalid_argument(format!(
-            "zlib decompression failed: {}",
-            e
-        ))),
     }
 }
 

@@ -35,6 +35,7 @@ use crate::cli::GzippyArgs;
 use crate::compress::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
+use crate::format::CompressionFormat;
 use crate::utils::preserve_metadata;
 
 /// Splices a full FNAME/MTIME gzip header over the minimal header the T1
@@ -356,8 +357,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // `--rsyncable` keeps its content-defined split (also pure now). The former
     // mmap SimpleOptimizer (flate2/libdeflate C-FFI) path is gone from routing
     // and survives only behind the dev `ffi-oracle` feature as an oracle.
+    // (-z/--zlib also uses this mmap T>1 route: the encoder carries the
+    // container, issue #303.)
     let explicit_zopfli =
         args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
+    let is_zlib = args.format == CompressionFormat::Zlib;
     let use_pure_parallel = use_mmap && !args.rsyncable && !explicit_zopfli;
 
     // T1 FILE inputs above the same threshold: mmap and parse whole-buffer
@@ -368,10 +372,14 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // so the mmap route's point is simply in-place parse with no input copy:
     // the stdin/pipe route reads to end into a Vec and parses the same way.
     // Output is byte-identical to the Read-based T1 route at every level.
+    // Gzip-only: this route splices FNAME over a fixed gzip header; `-z`
+    // (issue #303) falls through to `compress_with_pipeline_sized`, whose
+    // zlib branch frames the container.
     let use_t1_mmap = opt_config.thread_count == 1
         && file_size > 128 * 1024
         && !args.rsyncable
-        && !explicit_zopfli;
+        && !explicit_zopfli
+        && !is_zlib;
 
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
@@ -427,6 +435,12 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // -vv chunk-grid report (issue #259), same contract as the
         // `compress_with_pipeline_sized` T>1 fallback.
         encoder.set_report_chunk_grid(args.verbosity >= 2);
+        // Issue #303: the encoder carries the container, so this parallel
+        // fast path holds for `-z` too (no FNAME/FCOMMENT field exists in
+        // zlib; `header_info` and the minimal-header switch are inert then).
+        if is_zlib {
+            encoder.set_container(crate::compress::zlib_container::ContainerKind::Zlib);
+        }
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
             encoder
@@ -501,11 +515,13 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         )
     } else {
         let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-        if opt_config.thread_count == 1 && !explicit_zopfli {
+        if opt_config.thread_count == 1 && !explicit_zopfli && !is_zlib {
             // The T1 branch inside `compress_with_pipeline_sized` writes the
             // fixed minimal header; splice the full FNAME/MTIME header over
             // it (issue #309). The zopfli and T>1 branches build their own
-            // full header from `header_info` and must NOT be wrapped.
+            // full header from `header_info` and must NOT be wrapped. `-z`
+            // replaces that header with CMF/FLG upstream of the writer, so
+            // the splicer must never wrap it either.
             crate::compress::compress_with_pipeline_sized(
                 input_file,
                 HeaderSpliceWriter::new(
@@ -648,6 +664,11 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             // -vv chunk-grid report (issue #259), same contract as the
             // `compress_with_pipeline_sized` T>1 fallback.
             encoder.set_report_chunk_grid(args.verbosity >= 2);
+            // Issue #303: the container travels on the encoder, so the mmap'd
+            // stdin fast path holds for `-z` too (FNAME flags are inert).
+            if args.format == CompressionFormat::Zlib {
+                encoder.set_container(crate::compress::zlib_container::ContainerKind::Zlib);
+            }
             encoder.compress_buffer_pure(input_data, &mut counted)?;
             counted.flush()?;
             if verbose {

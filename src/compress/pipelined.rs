@@ -29,6 +29,7 @@
 #![cfg_attr(all(feature = "ffi-oracle", not(test)), allow(dead_code))]
 
 use crate::compress::parallel::GzipHeaderInfo;
+use crate::compress::zlib_container::{adler32, adler32_combine, ContainerKind};
 use crate::infra::scheduler::compress_parallel;
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
@@ -60,9 +61,9 @@ thread_local! {
 #[cfg(any(test, feature = "ffi-oracle"))]
 const DICT_SIZE: usize = 32 * 1024;
 
-struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
+struct CrcSlot<T>(UnsafeCell<MaybeUninit<T>>);
 // Safety: each slot is written by exactly one worker before all threads join.
-unsafe impl Sync for CrcSlot {}
+unsafe impl<T> Sync for CrcSlot<T> {}
 
 /// Largest parallel chunk. Each chunk pays exactly one CRC-combine and one
 /// sync-flush seam, so orchestration cost falls as the chunk grows; 512KB
@@ -240,6 +241,12 @@ pub struct PipelinedGzEncoder {
     /// in the encoder reads it back except the one-line report, so output
     /// bytes and grid decisions are identical with it on or off.
     report_chunk_grid: bool,
+    /// Which RFC container wraps the DEFLATE stream (issue #303). Default
+    /// `Gzip` — every pre-existing gzip path is byte-identical. `Zlib` swaps
+    /// only the framing: 2-byte CMF/FLG in, big-endian Adler-32 out, and no
+    /// FNAME/FCOMMENT fields (zlib has no such container fields, so
+    /// `-N`/`-n`/`-C` are inert or rejected upstream of the encoder).
+    container: ContainerKind,
 }
 
 impl PipelinedGzEncoder {
@@ -265,6 +272,7 @@ impl PipelinedGzEncoder {
             block_size_override: None,
             minimal_gzip_header: false,
             report_chunk_grid: false,
+            container: ContainerKind::Gzip,
         }
     }
 
@@ -278,6 +286,13 @@ impl PipelinedGzEncoder {
     /// naming the grid it actually used. Callers pass `verbosity >= 2`.
     pub fn set_report_chunk_grid(&mut self, on: bool) {
         self.report_chunk_grid = on;
+    }
+
+    /// Choose the RFC container wrapping the DEFLATE stream: `Gzip` (the
+    /// default, byte-identical to every pre-existing path) or `Zlib`
+    /// (issue #303).
+    pub fn set_container(&mut self, container: ContainerKind) {
+        self.container = container;
     }
 
     /// Honour the user's `-b`. Pass `None` (the default) to keep the computed grid.
@@ -305,6 +320,16 @@ impl PipelinedGzEncoder {
         self.header_info.to_member_header()
     }
 
+    /// Container-framing bytes that precede the DEFLATE payload: the fixed
+    /// 2-byte CMF/FLG for `Zlib`, or the (possibly FNAME-carrying) gzip
+    /// header for `Gzip`.
+    fn header_bytes(&self) -> Vec<u8> {
+        if self.container == ContainerKind::Zlib {
+            return crate::compress::zlib_container::header_bytes().to_vec();
+        }
+        self.gzip_header_bytes()
+    }
+
     /// Compress a pre-read buffer to a single-member gzip stream using the
     /// pure-Rust DEFLATE engine — the SOLE production T>1 compress path
     /// (Increment 7). Multi-threaded parallel-pipeline path; empty input yields
@@ -330,8 +355,9 @@ impl PipelinedGzEncoder {
             return self.compress_exact_to_writer(data, &mut writer);
         }
         if data.is_empty() {
-            // Header + one empty BFINAL stored block + CRC(0)/ISIZE(0).
-            writer.write_all(&self.gzip_header_bytes())?;
+            // Container header + one empty BFINAL stored block + trailer
+            // (CRC(0)/ISIZE(0) for gzip, Adler-32(1) for zlib).
+            writer.write_all(&self.header_bytes())?;
             let mut body = Vec::new();
             crate::compress::deflate::encode_deflate_segment_to_sink(
                 &[],
@@ -342,8 +368,15 @@ impl PipelinedGzEncoder {
                 false,
             );
             writer.write_all(&body)?;
-            writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
-            writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
+            match self.container {
+                ContainerKind::Gzip => {
+                    writer.write_all(&0u32.to_le_bytes())?; // CRC32 of empty input
+                    writer.write_all(&0u32.to_le_bytes())?; // ISIZE = 0
+                }
+                ContainerKind::Zlib => {
+                    writer.write_all(&adler32(data).to_be_bytes())?; // empty Adler-32 = 1
+                }
+            }
             return Ok(0);
         }
         if self.compression_level == 0 {
@@ -351,7 +384,7 @@ impl PipelinedGzEncoder {
             // matchfinder workers. Emit one stream so parallel chunk boundaries
             // cannot add stored-block framing. This is a single encode, not a
             // competing candidate.
-            writer.write_all(&self.gzip_header_bytes())?;
+            writer.write_all(&self.header_bytes())?;
             let mut body = Vec::with_capacity(data.len() + data.len() / 65535 + 16);
             crate::compress::deflate::encode_deflate_segment_to_sink(
                 data,
@@ -362,9 +395,16 @@ impl PipelinedGzEncoder {
                 false,
             );
             writer.write_all(&body)?;
-            let crc = crc32fast::hash(data);
-            writer.write_all(&crc.to_le_bytes())?;
-            writer.write_all(&(data.len() as u32).to_le_bytes())?;
+            match self.container {
+                ContainerKind::Gzip => {
+                    let crc = crc32fast::hash(data);
+                    writer.write_all(&crc.to_le_bytes())?;
+                    writer.write_all(&(data.len() as u32).to_le_bytes())?;
+                }
+                ContainerKind::Zlib => {
+                    writer.write_all(&adler32(data).to_be_bytes())?;
+                }
+            }
             return Ok(data.len() as u64);
         }
         self.compress_parallel_pipeline_pure(data, writer)?;
@@ -385,6 +425,17 @@ impl PipelinedGzEncoder {
     /// intentionally differ.
     fn compress_exact_to_writer<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
         let level = self.compression_level;
+        // Zlib container (issue #303): the identical engine selection as the
+        // gzip arm below — the port where it is the production encoder, the
+        // T1 whole-stream encoder otherwise — framed with CMF/FLG and the
+        // big-endian Adler-32 of the ORIGINAL input.
+        if self.container == ContainerKind::Zlib {
+            let raw = raw_deflate_body(data, level)?;
+            writer.write_all(&self.header_bytes())?;
+            writer.write_all(&raw)?;
+            writer.write_all(&adler32(data).to_be_bytes())?;
+            return Ok(data.len() as u64);
+        }
         if level <= 9 && crate::compress::deflate::level_uses_ldx(level) {
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
@@ -554,7 +605,7 @@ impl PipelinedGzEncoder {
 
         // Use a CRC combiner to compute final CRC
         // Each block's CRC is computed in parallel, then combined
-        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+        let crc_parts: Vec<CrcSlot<crc32fast::Hasher>> = (0..num_blocks)
             .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
             .collect();
 
@@ -664,13 +715,29 @@ impl PipelinedGzEncoder {
             );
         }
 
-        // Write gzip header before spawning threads (identical to the flate2 path).
-        writer.write_all(&self.gzip_header_bytes())?;
+        // Write container header before spawning threads (identical to the flate2 path).
+        writer.write_all(&self.header_bytes())?;
 
-        // Per-block CRC parts, combined in order after all workers join.
-        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
-            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
-            .collect();
+        // Gzip: per-block CRC32 parts, combined in order after all workers
+        // join. Zlib: per-block Adler-32 (raw `adler32(block)` values) folded
+        // in order with [`adler32_combine`] — the worker computes its own
+        // chunk's checksum, so NEITHER container adds a sequential pass over
+        // the input behind the pipeline.
+        let is_gzip = self.container == ContainerKind::Gzip;
+        let crc_parts: Vec<CrcSlot<crc32fast::Hasher>> = if is_gzip {
+            (0..num_blocks)
+                .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let adler_parts: Vec<CrcSlot<u32>> = if is_gzip {
+            Vec::new()
+        } else {
+            (0..num_blocks)
+                .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+                .collect()
+        };
 
         let mut writer = compress_parallel(
             data,
@@ -701,35 +768,56 @@ impl PipelinedGzEncoder {
                     data_len,
                 );
 
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(block);
-                // SAFETY: `compress_parallel` returns Ok only when every block
-                // was compressed (its debug_assert pins that invariant where
-                // the counter lives); the `?` below skips this combine loop on
-                // any cancelled/failed run, because a claimed-but-unfinished
-                // slot would leave `crc_parts` entries uninitialized.
-                unsafe {
-                    *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                if is_gzip {
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(block);
+                    // SAFETY: `compress_parallel` returns Ok only when every block
+                    // was compressed (its debug_assert pins that invariant where
+                    // the counter lives); the `?` below skips this combine loop on
+                    // any cancelled/failed run, because a claimed-but-unfinished
+                    // slot would leave `crc_parts` entries uninitialized.
+                    unsafe {
+                        *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                    }
+                } else {
+                    // SAFETY: as above — every block's worker ran to completion,
+                    // so each `adler_parts` slot is written exactly once.
+                    unsafe {
+                        *adler_parts[block_idx].0.get() = MaybeUninit::new(adler32(block));
+                    }
                 }
                 meta
             },
         )?;
 
-        // Combine CRCs in order.
-        let mut combined_hasher = crc32fast::Hasher::new();
-        for part in &crc_parts {
-            // SAFETY: compressor_parallel reported no error, so every block's
-            // worker ran to completion (see the debug_assert in
-            // `compress_parallel`) — every slot here is initialized.
-            let hasher = unsafe { (*part.0.get()).assume_init_read() };
-            combined_hasher.combine(&hasher);
-        }
-        let combined_crc = combined_hasher.finalize();
-
-        // Write gzip trailer (combined CRC32 + ISIZE over the whole input).
+        // Combine/emit the container trailer in block order.
         let isize = (data_len as u32).to_le_bytes();
-        writer.write_all(&combined_crc.to_le_bytes())?;
-        writer.write_all(&isize)?;
+        match self.container {
+            ContainerKind::Gzip => {
+                let mut combined_hasher = crc32fast::Hasher::new();
+                for part in &crc_parts {
+                    // SAFETY: compressor_parallel reported no error, so every block's
+                    // worker ran to completion (see the debug_assert in
+                    // `compress_parallel`) — every slot here is initialized.
+                    let hasher = unsafe { (*part.0.get()).assume_init_read() };
+                    combined_hasher.combine(&hasher);
+                }
+                let combined_crc = combined_hasher.finalize();
+                writer.write_all(&combined_crc.to_le_bytes())?;
+                writer.write_all(&isize)?;
+            }
+            ContainerKind::Zlib => {
+                let mut combined = 1u32; // the empty prefix: s1 = 1
+                for (idx, part) in adler_parts.iter().enumerate() {
+                    let chunk_len = data.chunks(block_size).nth(idx).map_or(0, |c| c.len());
+                    // SAFETY: `compress_parallel` reported no error, so every
+                    // block's worker ran to completion — every slot is initialized.
+                    let chunk_adler = unsafe { (*part.0.get()).assume_init_read() };
+                    combined = adler32_combine(combined, chunk_adler, chunk_len);
+                }
+                writer.write_all(&combined.to_be_bytes())?;
+            }
+        }
 
         Ok(())
     }
@@ -820,6 +908,30 @@ impl PipelinedGzEncoder {
 
         Ok(())
     }
+}
+
+/// Raw DEFLATE payload bytes for a whole-stream (T1-style) encode of `data`
+/// at `level`: the libdeflate port where it owns the level, otherwise the
+/// production T1 whole-stream encoder minus its fixed 10-byte gzip header.
+/// The zlib arm of `compress_exact_to_writer` (issue #303) frames exactly
+/// these bytes with CMF/FLG + Adler-32, so both containers are served by
+/// the same engine selection.
+fn raw_deflate_body(data: &[u8], level: u32) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    if level <= 9 && crate::compress::deflate::level_uses_ldx(level) {
+        if !crate::compress::ldx::compress_into(level, data, &mut body) {
+            return Err(io::Error::other(
+                "libdeflate port does not support this level",
+            ));
+        }
+    } else {
+        let gzip = crate::compress::deflate::encode_gzip_bytes_to_vec(data, level);
+        // Strip BOTH the fixed 10-byte gzip header and the 8-byte CRC32 +
+        // ISIZE trailer: this returns the raw DEFLATE payload only (the
+        // zlib container appends its own Adler-32, not gzip's trailer).
+        body.extend_from_slice(&gzip[10..gzip.len() - 8]);
+    }
+    Ok(body)
 }
 
 /// Compress a single block with optional dictionary
