@@ -98,8 +98,11 @@ jobs:
         run: |
           # Build the PRODUCT decode flavor: gzippy-native => pure-rust-inflate
           # => parallel_sm cfg, so the uploaded artifact AND the unit tests
-          # below exercise the shipped ParallelSM decoder. x86_64-linux also
-          # layers ISA-L *compression* (T1 L0–L3); the two features coexist.
+          # below exercise the shipped ParallelSM decoder. The compress routing
+          # graph is pure-Rust in every flavor: x86_64-linux's extra
+          # `isal-compression` only compiles the ISA-L compress ORACLE (dead in
+          # this production binary — see src/backends/mod.rs) + the rpmalloc
+          # chunk arenas the ParallelSM decoder runs on.
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
             cargo build --release --features gzippy-native,isal-compression
           else
