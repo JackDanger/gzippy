@@ -171,6 +171,13 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
                 "gzippy: using pure-Rust DEFLATE encoder (T1 L{})",
                 args.compression_level
             );
+            // -vv chunk-grid report (issue #259): the T1 route is
+            // whole-buffer by construction (`ldx` has no resumable parser),
+            // so its grid summary is always the same single chunk.
+            eprintln!(
+                "gzippy: chunk grid: route={} threads=1 chunks=1 (whole-buffer)",
+                route::PURE_T1
+            );
         }
         route::emit(route::PURE_T1, args.compression_level as u32, 1);
         // ONE call for every level 0-12. `encode_gzip_reader_to_writer_sized`
@@ -230,6 +237,10 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     });
     encoder.set_header_info(header_info.clone());
     encoder.set_minimal_gzip_header(args.stdout);
+    // -vv chunk-grid report (issue #259): the pipeline prints the grid it
+    // runs (route/threads/block size/chunk count) right where the numbers
+    // are computed; see `pipelined::set_report_chunk_grid`.
+    encoder.set_report_chunk_grid(args.verbosity >= 2);
     encoder.compress_buffer_pure(&input, writer)?;
     Ok(bytes)
 }
