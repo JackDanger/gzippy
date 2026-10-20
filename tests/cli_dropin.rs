@@ -10,11 +10,10 @@
 //! Behaviour was probed against GNU gzip 1.14 before writing each pin. Where
 //! gzippy DIVERGES from the gzip contract the test is `#[ignore]` with a
 //! `DIVERGENCE from gzip contract:` comment — those are triage candidates,
-//! not endorsed behaviour. Current divergence list:
-//!
-//!   1. `plain_decompress_names_output_from_on_disk_filename` — plain `-d`
-//!      restores the header-stored original filename; GNU gzip derives the
-//!      output name from the on-disk filename minus suffix unless -N is given.
+//! not endorsed behaviour. Current divergence list: NONE. The last one —
+//! plain `-d` restoring the header-stored filename — was fixed as issue #268:
+//! on decompression plain `-d` names its output after the on-disk file minus
+//! the suffix, and only an explicit `-N` consults the stored FNAME.
 //!
 //! All inputs are small synthetic bytes generated in-test; no corpus data.
 
@@ -431,6 +430,11 @@ fn stdin_stdout_pipe_roundtrips() {
 
 // ---------------------------------------------------------------------------
 // Original-filename semantics (-N / -n are documented in `gzippy --help`)
+//
+// gzip(1) contract (probed; issue #268): on decompression the stored FNAME is
+// consulted ONLY under an explicit -N; plain -d derives the output name from
+// the on-disk file minus the suffix. Compression still stores the original
+// name by default, so `gzippy foo` echoes gzip's header bytes.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -482,7 +486,7 @@ fn dash_lower_n_omits_name_so_decompress_uses_on_disk_name() {
     // gzip(1) -n: "When compressing, do not save the original file name ...
     // When decompressing ... the name of the file being decompressed is used"
     // (minus the suffix). With no stored name there is nothing to restore, so
-    // this holds on both sides of the divergence below.
+    // `-dN` would name it identically here.
     let d = tempdir();
     let data = sample_bytes();
     write_file(d.path(), "orig", &data);
@@ -498,14 +502,12 @@ fn dash_lower_n_omits_name_so_decompress_uses_on_disk_name() {
 }
 
 #[test]
-#[ignore]
-// DIVERGENCE from gzip contract: plain `gzippy -d renamed.gz` restores the
-// header-stored original filename ("orig"), while GNU gzip 1.14 (probed)
-// derives the output name from the on-disk filename minus suffix ("renamed")
-// unless -N is given. gzip(1): name restoration on decompression is the -N
-// behaviour, not the default. Un-ignore when gzippy matches; the current
-// behaviour produces a different filename than gzip for the same command
-// line, which can surprise scripts.
+// gzip(1) default naming clause (probed 1.14; issue #268): plain `-d` names
+// the output after the on-disk file minus the suffix — the header-stored
+// FNAME is ignored unless -N is passed. gzippy used to consult the FNAME
+// by default, restoring "orig" where gzip produces "renamed"; scripts
+// recompressing under a different filename got a different output filename
+// than gzip for the same command line.
 fn plain_decompress_names_output_from_on_disk_filename() {
     let d = tempdir();
     let data = sample_bytes();
