@@ -235,6 +235,11 @@ pub struct PipelinedGzEncoder {
     /// When true, emit the 10-byte libdeflate-style header (no FNAME). Set for
     /// `-c` / stdout so T>1 matches T1 mmap and libdeflate-gzip on `-c`.
     minimal_gzip_header: bool,
+    /// `-vv` chunk-grid report switch (issue #259). OFF by default; the CLI
+    /// callers set it from `args.verbosity >= 2`. Pure observation: nothing
+    /// in the encoder reads it back except the one-line report, so output
+    /// bytes and grid decisions are identical with it on or off.
+    report_chunk_grid: bool,
 }
 
 impl PipelinedGzEncoder {
@@ -259,12 +264,20 @@ impl PipelinedGzEncoder {
             header_info: GzipHeaderInfo::default(),
             block_size_override: None,
             minimal_gzip_header: false,
+            report_chunk_grid: false,
         }
     }
 
     /// `-c` / stdout: omit FNAME so size matches libdeflate-gzip on `-c`.
     pub fn set_minimal_gzip_header(&mut self, minimal: bool) {
         self.minimal_gzip_header = minimal;
+    }
+
+    /// `-vv` chunk-grid report (issue #259). When on,
+    /// [`Self::compress_parallel_pipeline_pure`] prints ONE stderr line
+    /// naming the grid it actually used. Callers pass `verbosity >= 2`.
+    pub fn set_report_chunk_grid(&mut self, on: bool) {
+        self.report_chunk_grid = on;
     }
 
     /// Honour the user's `-b`. Pass `None` (the default) to keep the computed grid.
@@ -617,6 +630,39 @@ impl PipelinedGzEncoder {
         let data_len = data.len();
         let block_size = self.grid_block_size(data_len, self.num_threads, level);
         let num_blocks = data_len.div_ceil(block_size);
+
+        // -vv chunk-grid report (issue #259): ONE stderr line naming the grid
+        // this run actually uses — route name, effective thread count, the
+        // per-chunk block size and its source (computed grid vs explicit
+        // `-b`), chunk count, avg + max chunk size. Read-only over the
+        // `block_size`/`num_blocks`/`data_len` values already computed above
+        // (avg/max are plain arithmetic on them, not a second grid call), so
+        // the encode below is untouched with the report on or off. The
+        // single-stream paths of `compress_buffer_pure` (empty input, level 0,
+        // the whole-buffer T1 route) use no chunk grid and stay silent; the T1
+        // routes report their whole-buffer summary from their own call sites.
+        if self.report_chunk_grid {
+            let block_source = if self.block_size_override.is_some() {
+                "explicit-b"
+            } else {
+                "computed"
+            };
+            // num_blocks >= 1 here: empty input is handled by the earlier
+            // empty-member branch of `compress_buffer_pure`, so the avg
+            // division never divides by zero.
+            let avg = data_len / num_blocks;
+            let max = block_size.min(data_len);
+            eprintln!(
+                "gzippy: chunk grid: route={} threads={} block={} block-source={} chunks={} avg={} max={}",
+                crate::compress::route::PURE_PARALLEL_PIPELINE,
+                self.num_threads,
+                block_size,
+                block_source,
+                num_blocks,
+                avg,
+                max,
+            );
+        }
 
         // Write gzip header before spawning threads (identical to the flate2 path).
         writer.write_all(&self.gzip_header_bytes())?;
