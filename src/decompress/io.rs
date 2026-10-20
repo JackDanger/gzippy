@@ -476,7 +476,14 @@ fn get_output_filename(input_path: &Path, args: &GzippyArgs, data: &[u8]) -> std
     if args.stdout {
         return input_path.to_path_buf();
     }
-    if args.name {
+    // gzip(1) contract, issue #268: on decompression the stored FNAME is
+    // honoured ONLY when the user passed -N/--name. `name` defaults to true —
+    // that is the compress-side default (store the original name by default) —
+    // so it cannot distinguish "user asked for name restoration" from "never
+    // asked"; `name_explicit` can. Plain -d names its output after the on-disk
+    // file minus the suffix below and ignores the header, and the gunzip
+    // alias is plain -d and keeps that default.
+    if args.name_explicit {
         if let Some(fname) = extract_gzip_fname(data) {
             if !fname.is_empty() {
                 let mut output = input_path.to_path_buf();

@@ -33,6 +33,15 @@ pub struct GzippyArgs {
     pub no_name: bool,
     pub no_time: bool,
     pub name: bool,
+    /// TRUE only when the user actually passed `-N`/`--name`. `name` defaults
+    /// to TRUE (compression stores the original name by default), so `name`
+    /// alone cannot distinguish "user asked for name restoration" from "never
+    /// asked" — and on decompression only an explicit `-N` consults the gzip
+    /// FNAME header; plain `-d` derives the output name from the on-disk
+    /// filename (gzip contract, issue #268). See
+    /// `decompress::io::get_output_filename`. Same pattern as
+    /// `block_size_explicit`, which has the identical default-true problem.
+    pub name_explicit: bool,
     pub time: bool,
     pub comment: Option<String>,
     pub alias: Option<String>,
@@ -91,6 +100,7 @@ impl Default for GzippyArgs {
             no_name: false,
             no_time: false,
             name: true,
+            name_explicit: false,
             time: true,
             comment: None,
             alias: None,
@@ -189,6 +199,7 @@ impl GzippyArgs {
                     "--no-name" => {
                         args.no_name = true;
                         args.name = false;
+                        args.name_explicit = false;
                         args.no_time = true;
                         args.time = false;
                     }
@@ -199,6 +210,7 @@ impl GzippyArgs {
                     "--name" => {
                         args.name = true;
                         args.no_name = false;
+                        args.name_explicit = true;
                         args.time = true;
                         args.no_time = false;
                     }
@@ -401,12 +413,14 @@ impl GzippyArgs {
                         'n' => {
                             args.no_name = true;
                             args.name = false;
+                            args.name_explicit = false;
                             args.no_time = true;
                             args.time = false;
                         }
                         'N' => {
                             args.name = true;
                             args.no_name = false;
+                            args.name_explicit = true;
                             args.time = true;
                             args.no_time = false;
                         }
