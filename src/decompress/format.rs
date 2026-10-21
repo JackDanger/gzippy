@@ -166,6 +166,74 @@ pub(crate) fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
     Some(pos)
 }
 
+/// gzip's get_method container boundary for bytes that CARRY the gzip magic
+/// (0x1f 0x8b), established agains the vendored source: get_method consumes
+/// the whole variable member header through get_byte() calls (gzip.c:1447+),
+/// so EOF before the header ends is read_error's "\ngzip: NAME: unexpected
+/// end of file" (util.c:394-402) — and a method byte other than DEFLATED(8)
+/// is get_method's own `unknown method %d -- not supported` (gzip.c:1449-
+/// 1456), a plain ERROR with NO leading blank line. Anything that parses
+/// through the header end hands the bytes to the decoder, whose own texts
+/// describe body-level failures (the decode-internal triage class).
+pub(crate) enum FirstMemberBoundary {
+    /// Complete header: proceed to decode.
+    Header,
+    /// EOF while reading/seeking a header field (read_error shape).
+    UnexpectedEof,
+    /// get_method's CM-byte refusal: "unknown method N -- not supported".
+    UnknownMethod(u8),
+}
+
+/// Classify the FIRST member header of `data` (already known to start with
+/// the gzip magic). Length-scan mirrors `parse_gzip_header_size`'s field
+/// walk but bounds-checks every step instead of assuming slack: gzip reads
+/// these fields byte-by-byte, so running out mid-field is precisely a
+/// read_error, never a decoder error.
+pub(crate) fn classify_first_member(data: &[u8]) -> FirstMemberBoundary {
+    // Callers establish the magic; the fixed 10-byte base header must fit.
+    if data.len() < 10 {
+        return FirstMemberBoundary::UnexpectedEof;
+    }
+    if data[2] != 0x08 {
+        return FirstMemberBoundary::UnknownMethod(data[2]);
+    }
+    let flags = data[3];
+    let mut pos = 10usize;
+    if flags & 0x04 != 0 {
+        // FEXTRA: 2-byte XLEN, then XLEN bytes (gzip.c:1458+).
+        if pos + 2 > data.len() {
+            return FirstMemberBoundary::UnexpectedEof;
+        }
+        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + xlen > data.len() {
+            return FirstMemberBoundary::UnexpectedEof;
+        }
+        pos += xlen;
+    }
+    if flags & 0x08 != 0 {
+        // FNAME: NUL-terminated original name.
+        match data[pos..].iter().position(|&b| b == 0) {
+            Some(nul) => pos += nul + 1,
+            None => return FirstMemberBoundary::UnexpectedEof,
+        }
+    }
+    if flags & 0x10 != 0 {
+        // FCOMMENT: same NUL-terminated shape.
+        match data[pos..].iter().position(|&b| b == 0) {
+            Some(nul) => pos += nul + 1,
+            None => return FirstMemberBoundary::UnexpectedEof,
+        }
+    }
+    if flags & 0x02 != 0 {
+        // FHCRC.
+        if pos + 2 > data.len() {
+            return FirstMemberBoundary::UnexpectedEof;
+        }
+    }
+    FirstMemberBoundary::Header
+}
+
 /// Read the ISIZE field from the gzip trailer (last 4 bytes), mod 2^32 per RFC 1952.
 #[inline]
 pub(crate) fn read_gzip_isize(data: &[u8]) -> Option<u32> {

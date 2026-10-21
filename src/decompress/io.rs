@@ -60,53 +60,113 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return decompress_stdin(args);
     }
 
-    let input_path = Path::new(filename);
-    if !input_path.exists() {
-        return Err(GzippyError::FileNotFound(filename.to_string()));
+    // gzip's whole OPEN contract for a decompress input — ELOOP link refusal
+    // ("Too many levels of symbolic links", ERROR class), the missing-file
+    // suffix ladder (a missing bare name resolves against `<name>.gz` etc.
+    // like gzip's open_input_file), and the RESOLVED input path for all
+    // downstream naming — is one helper (gzip.c:1072-1163; see utils docs).
+    let (input_file, resolved) = match crate::utils::open_gzip_input(
+        Path::new(filename),
+        true, // -d decompress: the suffix ladder applies (gzip.c:1100+)
+        args.stdout,
+        args.force,
+        &args.suffix,
+    ) {
+        Ok((f, p)) => (f, p),
+        Err(failure) => return Ok(crate::utils::report_open_failure(failure, args.quiet)),
+    };
+    let input_path: &Path = resolved.as_path();
+    let name = input_path.to_string_lossy().into_owned();
+
+    // stat of the OPENED file (gzip's fstat-after-open order, treat_file:717):
+    // a mode-000 DIRECTORY fails open first ("Permission denied") before the
+    // directory notice is reachable, exactly as in gzip.
+    let istat = match input_file.metadata() {
+        Ok(m) => m,
+        Err(e) => return Err(GzippyError::os(&e)),
+    };
+    let file_size = istat.len();
+
+    if istat.is_dir() {
+        // gzip treats a directory as an argument to recurse into (with -r) or
+        // ignores it as a WARNING (gzip.h:263-264 WARN bumps exit_code only
+        // when it is currently OK): "is a directory -- ignored", exit 2,
+        // treat_file gzip.c:728-733. Established by execution (gzip -d/-dc/-t/-l
+        // on a real directory), not by reading the source. Multi-file runs keep
+        // processing the rest.
+        if args.recursive {
+            return decompress_directory(filename, args);
+        }
+        if !args.quiet {
+            eprintln!("gzippy: {} is a directory -- ignored", name);
+        }
+        return Ok(2);
     }
-    if input_path.is_dir() {
-        return if args.recursive {
-            decompress_directory(filename, args)
-        } else {
-            // Same contract as compress_file (see comment there): gzip exits
-            // 2 (WARNING), prints this exact shape, never touches the
-            // directory. Established by executing gzip -d/-dc/-t/-l on a
-            // real directory, not by reasoning about it.
-            if !args.quiet {
-                eprintln!("gzippy: {} is a directory -- ignored", filename);
-            }
-            Ok(2)
-        };
-    }
-    if input_path.is_symlink() && !args.force {
+
+    // gzip.c:737-768: anything that is not a regular file (device, FIFO,
+    // socket) is skipped with this exact know-when-NOT-to-fire message —
+    // WARNING class ("-- ignored"), exit 2, and ONLY when not going to
+    // stdout (to_stdout reads through: `gzip -c /dev/null` compresses). -t/-l
+    // also set gzip's to_stdout, but they never reach this function.
+    if !args.stdout && !istat.is_file() {
         if !args.quiet {
             eprintln!(
-                "gzippy: {}: is a symbolic link -- skipping (use -f to force)",
-                filename
+                "gzippy: {} is not a directory or a regular file - ignored",
+                name
             );
         }
         return Ok(2);
     }
+    // gzip.c:740-768, continued — mode-bit refusals AFTER the regular-file
+    // check: setuid and setgid are refused regardless of -f, while the
+    // sticky bit and a hardlink count of 2+ yield to -f; same ladder as the
+    // compress arm (see that comment for the message-text generation note).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::FileTypeExt;
-        let ft = std::fs::symlink_metadata(input_path)?.file_type();
-        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
-            if !args.quiet {
-                eprintln!("gzippy: {}: is not a regular file -- skipping", filename);
+        use std::os::unix::fs::MetadataExt;
+        let mode = istat.mode();
+        if !args.stdout {
+            if mode & libc::S_ISUID != 0 {
+                if !args.quiet {
+                    eprintln!("gzippy: {} is set-user-ID on execution - ignored", name);
+                }
+                return Ok(2);
             }
-            return Ok(2);
+            if mode & libc::S_ISGID != 0 {
+                if !args.quiet {
+                    eprintln!("gzippy: {} is set-group-ID on execution - ignored", name);
+                }
+                return Ok(2);
+            }
+            if !args.force {
+                if mode & libc::S_ISVTX != 0 {
+                    if !args.quiet {
+                        eprintln!("gzippy: {} has the sticky bit set - file ignored", name);
+                    }
+                    return Ok(2);
+                }
+                if istat.nlink() > 1 {
+                    if !args.quiet {
+                        let other = istat.nlink() - 1;
+                        eprintln!(
+                            "gzippy: {} has {} other {} -- file ignored",
+                            name,
+                            other,
+                            if other == 1 { "link" } else { "links" },
+                        );
+                    }
+                    return Ok(2);
+                }
+            }
         }
     }
-
-    let input_file = File::open(input_path)?;
-    let file_size = input_file.metadata()?.len();
-    let mmap = unsafe { Mmap::map(&input_file)? };
+    let mmap = unsafe { Mmap::map(&input_file).map_err(|e| GzippyError::os(&e))? };
     let _ = mmap.advise(memmap2::Advice::Sequential);
 
     let is_compressed =
         mmap.len() >= 2 && ((mmap[0] == 0x1f && mmap[1] == 0x8b) || mmap[0] == 0x78);
 
+    // gzip.c:1461-1462: force + to_stdout passes the input through unchanged.
     if args.force && args.stdout && !is_compressed {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
@@ -114,11 +174,64 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         writer.flush()?;
         return Ok(0);
     }
+
+    // make_ofname (gzip.c:1184-1200), decompress arm — runs BEFORE any
+    // content read or decode (treat_file calls make_ofname at 774, get_method
+    // is only reached in the work loop): an input without a recognized gzip
+    // suffix is skipped as a WARNING — "unknown suffix -- ignored" — exit 2.
+    // -t/-l bypass this (make_ofname returns OK for them) and never reach
+    // this function; -c has no output NAME to protect (ofname := "stdout",
+    // gzip.c:1444-1445). The gzip.c:1189 gate on verbosity: "Avoid annoying
+    // messages with -r".
+    if !args.stdout && crate::utils::known_gzip_suffix(&name, &args.suffix).is_none() {
+        if args.verbose || (!args.recursive && !args.quiet) {
+            eprintln!("gzippy: {}: unknown suffix -- ignored", name);
+        }
+        return Ok(2);
+    }
+
+    // Container-boundary classification (BEFORE any decode), mirroring
+    // gzip's get_method taxonomy — both messages here are ERROR class,
+    // printed with a leading blank line exactly as gzip prints them
+    // (get_method gzip.c:1473-1475; read_error util.c:394-402; both probed
+    // against gzip 1.12):
+    //
+    //   * fewer than 2 bytes: EOF before a complete magic → "unexpected end
+    //     of file" (0- and 1-byte inputs);
+    //   * 2+ bytes that are neither a gzip magic (old or new) nor a zlib
+    //     container: "not in gzip format" (get_method's part_nb == 1 arm).
+    //
+    // With the magic present, get_method keeps consuming the variable
+    // header: EOF before the header's end stays read_error ("unexpected end
+    // of file", probed: `gzip -d 2-byte-1f8b` → exit 1), and a CM byte
+    // other than 8 is get_method's own "unknown method N -- not supported"
+    // (no blank line). Encode both with classify_first_member below;
+    // decode-internal corruption messages (truncated BODY, bad deflate
+    // data) are the decoder's own texts and are NOT re-mapped here.
     if !is_compressed {
-        return Err(GzippyError::invalid_argument(format!(
-            "{}: not in gzip format",
-            filename
-        )));
+        // ERROR-class messages print UNCONDITIONALLY: read_error and
+        // get_method's fprintf have no quiet gate (only WARN-class messages
+        // honor -q — gzip.h:263-265).
+        if mmap.len() < 2 {
+            eprintln!("\ngzippy: {}: unexpected end of file", name);
+        } else {
+            eprintln!("\ngzippy: {}: not in gzip format", name);
+        }
+        return Ok(1);
+    }
+    if mmap.len() >= 2 && mmap[0] == 0x1f && mmap[1] == 0x8b {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(&mmap) {
+            FirstMemberBoundary::UnexpectedEof => {
+                eprintln!("\ngzippy: {}: unexpected end of file", name);
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                eprintln!("gzippy: {}: unknown method {} -- not supported", name, cm);
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
     }
 
     let output_path = if args.stdout {
@@ -287,10 +400,14 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         &input_data_vec
     };
 
-    if input_data.is_empty() {
-        return Ok(0);
-    }
-
+    // Container-boundary classification, mirroring gzip's treat_stdin +
+    // get_method (both probed): EMPTY stdin decompresses to "unexpected end
+    // of file" (exit 1) unless -f passes it through; 2+ bytes with no
+    // gzip/zlib shape do NOT decode silently — "not in gzip format", exit 1
+    // (gzip names the peer "stdin"; the leading blank line is part of the
+    // observable message, get_method gzip.c:1473-1475 / util.c:394-402).
+    // -f copies the bytes through unchanged (gzip.c:1461-1462, `work = copy`)
+    // and exits 0.
     let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
     let is_zlib = input_data.len() >= 2 && input_data[0] == 0x78;
 
@@ -302,16 +419,45 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(0);
     }
 
-    let format = if is_gzip {
-        CompressionFormat::Gzip
-    } else if is_zlib {
-        CompressionFormat::Zlib
-    } else {
-        CompressionFormat::Gzip
-    };
+    if !is_gzip && !is_zlib {
+        // ERROR class: unconditional (read_error / get_method have no -q gate).
+        if input_data.len() < 2 {
+            eprintln!("\ngzippy: stdin: unexpected end of file");
+        } else {
+            eprintln!("\ngzippy: stdin: not in gzip format");
+        }
+        return Ok(1);
+    }
+    // With the magic present, the same get_method header walk as the file
+    // path applies to stdin (see that block for the citations): EOF before
+    // the header's end is read_error's blank-lined "unexpected end of
+    // file", a foreign CM byte is "unknown method N -- not supported".
+    // ERROR class: unconditional.
+    if is_gzip {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(input_data) {
+            FirstMemberBoundary::UnexpectedEof => {
+                eprintln!("\ngzippy: stdin: unexpected end of file");
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                eprintln!("gzippy: stdin: unknown method {} -- not supported", cm);
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
+    }
 
     let verbose = args.verbose && !args.quiet;
     let in_bytes = input_data.len() as u64;
+
+    // Exactly one of the two container shapes holds here (both garbage and
+    // empty stdin were routed above), so the format is unambiguous.
+    let format = if is_gzip {
+        CompressionFormat::Gzip
+    } else {
+        CompressionFormat::Zlib
+    };
 
     let stdout = stdout();
     let mut counted =
@@ -394,16 +540,24 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     use walkdir::WalkDir;
     let mut exit_code = 0;
+    // Same treat_dir contract as compress_directory (see the comment there):
+    // every readdir entry flows through — here gated by the archive-suffix
+    // convention (is_compressed_file is extension-only, never opening the
+    // path, so dangling links stay safe) — and a symlink INTO an archive is
+    // therefore handed to decompress_file and refused with open's ELOOP
+    // (ERROR class), like gzip's -r, instead of being silently skipped.
     for entry in WalkDir::new(dirname) {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() && crate::utils::is_compressed_file(path) {
+        if !entry.file_type().is_dir() && crate::utils::is_compressed_file(path) {
             let path_str = path.to_string_lossy();
             match decompress_file(&path_str, args) {
                 Ok(code) => {
-                    if code != 0 {
-                        exit_code = code;
-                    }
+                    // gzip's WARN-escalation ledger (gzip.h:263-264), same
+                    // rule as the top-level file loop: ERROR (1) wins
+                    // regardless of arrival order, WARNING (2) only sticks
+                    // when nothing worse is recorded.
+                    crate::utils::bump_exit_code(&mut exit_code, code);
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", path_str, e);

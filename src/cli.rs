@@ -64,7 +64,7 @@ pub struct GzippyArgs {
     /// when the crate is built with the `l1-tune` feature (a measurement/dev
     /// knob, never the production path); the arg-parse loop below gates
     /// recognition on `#[cfg(feature = "l1-tune")]`, so a feature-off build
-    /// falls through to the "Unknown option" error automatically. Replaces
+    /// falls through to the unrecognized-option error automatically. Replaces
     /// the `GZIPPY_L1TUNE_*` env-var pile as the sweep driver's channel —
     /// see `fulcrum l1search` (fulcrum repo), which shells out to an
     /// l1-tune-built gzippy with this flag per candidate config.
@@ -303,10 +303,15 @@ impl GzippyArgs {
                             }
                             #[cfg(not(feature = "l1-tune"))]
                             {
-                                return Err(GzippyError::invalid_argument(
-                                    "Unknown option: --tune (requires the l1-tune build feature)"
-                                        .to_string(),
-                                ));
+                                // A build without the dev-only l1-tune feature
+                                // must reject --tune exactly like any other
+                                // unknown long option (getopt_long prints the
+                                // token as typed: "unrecognized option
+                                // '--tune=x'") + try_help line (Usage).
+                                return Err(GzippyError::Usage(format!(
+                                    "unrecognized option '{}'",
+                                    arg
+                                )));
                             }
                         } else if arg == "--level"
                             || arg == "--blocksize"
@@ -320,8 +325,10 @@ impl GzippyArgs {
                         {
                             // These require the next argument
                             if i + 1 >= argv.len() {
-                                return Err(GzippyError::invalid_argument(format!(
-                                    "{} requires an argument",
+                                // GNU getopt_long: `option '--suffix' requires
+                                // an argument` (probed) + try_help (Usage).
+                                return Err(GzippyError::Usage(format!(
+                                    "option '{}' requires an argument",
                                     arg
                                 )));
                             }
@@ -368,8 +375,13 @@ impl GzippyArgs {
                                 _ => unreachable!(),
                             }
                         } else {
-                            return Err(GzippyError::invalid_argument(format!(
-                                "Unknown option: {}",
+                            // GNU getopt_long's exact line + try_help's
+                            // trailing line + exit 1 (Usage variant;
+                            // gzip.c:315-319, probed: `gzip --bar` prints
+                            // "unrecognized option '--bar'" then the Try
+                            // line and exits 1).
+                            return Err(GzippyError::Usage(format!(
+                                "unrecognized option '{}'",
                                 arg
                             )));
                         }
@@ -462,8 +474,10 @@ impl GzippyArgs {
                             } else {
                                 // Value is the next argument
                                 if i + 1 >= argv.len() {
-                                    return Err(GzippyError::invalid_argument(format!(
-                                        "-{} requires an argument",
+                                    // GNU getopt: `option requires an
+                                    // argument -- 'S'` (probed) + try_help.
+                                    return Err(GzippyError::Usage(format!(
+                                        "option requires an argument -- '{}'",
                                         opt_char
                                     )));
                                 }
@@ -507,10 +521,12 @@ impl GzippyArgs {
                             }
                         }
                         _ => {
-                            return Err(GzippyError::invalid_argument(format!(
-                                "Unknown option: -{}",
+                            // GNU getopt: `gzip -Q` prints `invalid option
+                            // -- 'Q'` (probed) + the try_help line (Usage).
+                            return Err(GzippyError::Usage(format!(
+                                "invalid option -- '{}'",
                                 chars[j]
-                            )))
+                            )));
                         }
                     }
                     j += 1;
