@@ -68,11 +68,11 @@
 //! | pigz -A/--alias xxx       | REJECTED in compress mode, exit 2, names issue #303 (was: silently ignored) | clean-reject |
 //! | pigz -F/--first           | collides: our -F takes a VALUE (zopfli iterations); consumes the next argv | misparse-but-errs MED |
 //! | pigz -I/--iterations n    | collides: our -I is a flag (no-block-split); n becomes a FILE operand | misparse-but-errs MED |
-//! | pigz -O/--oneblock        | clean reject ("Unknown option: -O")             | clean-reject |
+//! | pigz -O/--oneblock        | clean reject ("invalid option -- 'O'" + Try line)| clean-reject |
 //! | pigz -M/-m, -N/-n, -p, -S, -Y, -v, -q, -r, -t, -l, -L, -V, -d, -f, -k, -c, --fast, --best | supported | ok |
-//! | igzip -o FILE             | clean reject ("Unknown option: -o")             | clean-reject |
-//! | igzip -T/--threads n      | clean reject ("Unknown option: -T"; ours is -p) | clean-reject |
-//! | igzip --rm                | clean reject ("Unknown option: --rm")           | clean-reject |
+//! | igzip -o FILE             | clean reject ("invalid option -- 'o'" + Try line)| clean-reject |
+//! | igzip -T/--threads n      | clean reject ("invalid option -- 'T' + Try line; ours is -p") | clean-reject |
+//! | igzip --rm                | clean reject ("unrecognized option '--rm'" + Try line) | clean-reject |
 //! | igzip -0                  | STORE (gzip/pigz contract) + LOUD stderr warning naming issue #305 (was: silent) | divergence, loud |
 //! | igzip -2 / -3             | weak-fast gzip levels; igzip's default/best; documented in --help | divergence MED |
 //! | igzip -z                  | -z has the PIGZ meaning (zlib container, issue #303): compresses to .zz and roundtrips; the suffix redirect (.zz, not .gz) is the documented divergence | divergence, loud-doc |
@@ -722,7 +722,7 @@ fn pigz_iterations_flag_collision_errs_loudly() {
 fn pigz_oneblock_flag_clean_reject() {
     // pigz(1) -O / --oneblock: "Do not split into smaller blocks for -11".
     // Not supported here; must reject loudly, not misparse.
-    assert_clean_reject(&["-11", "-O", "-c"], "-O");
+    assert_clean_reject(&["-11", "-O", "-c"], "invalid option -- 'O'");
 }
 
 #[test]
@@ -755,14 +755,14 @@ fn igzip_output_file_flag_clean_reject() {
     // igzip_cli.c: `-o <file>  output file`. Not supported here (we follow
     // gzip's in-place/-c model). Must be a clean reject so an igzip script
     // fails loudly instead of compressing to the wrong place.
-    assert_clean_reject(&["-o", "out.gz", "-c"], "-o");
+    assert_clean_reject(&["-o", "out.gz", "-c"], "invalid option -- 'o'");
 }
 
 #[test]
 fn igzip_threads_flag_clean_reject() {
     // igzip_cli.c: `-T, --threads <n>`. Ours is -p (pigz's spelling). An
     // igzip script's `-T 8` must fail loudly, not silently single-thread.
-    assert_clean_reject(&["-T", "4", "-c"], "-T");
+    assert_clean_reject(&["-T", "4", "-c"], "invalid option -- 'T'");
 }
 
 #[test]
