@@ -531,6 +531,20 @@ jobs:
       - name: Run clippy
         run: cargo clippy --release --all-targets --features isal-compression -- -D warnings
 
+      # Dev-only feature flavors have NO other CI coverage (they are not part
+      # of any shipped build), exactly the rot class #260 recorded: the
+      # l1-tune flavor stopped compiling after the longest_match signature
+      # grew good_match/hash3_chain_depth (#363) and stayed broken for weeks.
+      # One cargo check per flavor — no tests, no release build — so rot is
+      # caught while the tape is fresh. Adds ~2-3 min on warm cache.
+      - name: Check dev-only feature flavors
+        run: |
+          for flavor in l1-tune ladder-tune near-opt-parallel-flush trace debug_decode coz; do
+            cargo check --quiet --features "$flavor" \
+              || { echo "::error::dev feature flavor '$flavor' fails to compile"; exit 1; }
+          done
+          echo "All dev-only feature flavors compile."
+
       - name: Check version consistency
         run: |
           VERSION=$(cat VERSION)

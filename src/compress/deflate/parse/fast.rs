@@ -1066,6 +1066,15 @@ fn chain_block(
             max_len,
             max_len,
             max_search_depth,
+            // Pre-#363 neutral values: no good-match early exit (`0`) and no
+            // len-3 chain sweep (`0` — hc's own contract: 1 would re-enable
+            // the singleton probe). This probe exists to bisect chain DEPTH
+            // alone, so both extensions stay off. This cfg-wide call was
+            // broken by the longest_match signature change until repaired
+            // 2026-10-21 (the flavor has no CI coverage — see the check
+            // added to the lint job).
+            0,
+            0,
             next_hashes,
         );
         if length >= SHORTEST_MATCH {
