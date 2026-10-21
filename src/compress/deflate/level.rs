@@ -88,7 +88,7 @@ pub struct LevelParams {
     /// `ht_matchfinder` probes both slots every lookup).
     pub fast_bucket2_probe_on_miss: bool,
     /// Hash inserts per accepted match interior. L1 T>1
-    /// ([`apply_l1_fast_parallel_knobs`]) ships `usize::MAX` — insert EVERY
+    /// (`apply_l1_fast_parallel_knobs` in this module) ships `usize::MAX` — insert EVERY
     /// skipped byte, exactly libdeflate's `ht_matchfinder_skip_bytes` — since
     /// the interleaved-bucket lever made full maintenance one cache line per
     /// insert. L1 T1 keeps the shipped cap of 8 (the maintenance bill is
@@ -101,7 +101,8 @@ pub struct LevelParams {
     /// 2-way bucket on every match-interior insert the way the vendor's
     /// `ht_matchfinder_skip_bytes` does. Paired with
     /// [`Self::fast_hash_update_inserts`] `== usize::MAX`; the two are one
-    /// lever and are set together by [`apply_l1_match_reach_t1_knobs`], whose
+    /// lever and are set together by `apply_l1_match_reach_t1_knobs` in this
+    /// module, whose
     /// doc comment holds the whole measurement.
     ///
     /// `false` at T>1 BY CONSTRUCTION, and the reason is the WALL BUDGET, not
@@ -122,10 +123,10 @@ pub struct LevelParams {
     /// i.e. the cost-model direction — NOT a second constant here.
     pub fast_dense_interior_insert: bool,
     /// T>1-only: vendor-exact bucket MAINTENANCE for the L1 head table — the
-    /// INTERLEAVED 2-slot bucket layout (`parse/fast.rs`'s
-    /// [`L1_HEAD_ENTRIES`]) with a slot-shift on EVERY insert (probe,
+    /// INTERLEAVED 2-slot bucket layout (`parse/fast.rs`'s `L1_HEAD_ENTRIES`)
+    /// with a slot-shift on EVERY insert (probe,
     /// interior, warmup, tail), i.e. `ht_matchfinder`'s protocol. Set only by
-    /// [`apply_l1_fast_parallel_knobs`] (T>1); T1 keeps the two-array
+    /// `apply_l1_fast_parallel_knobs` in this module (T>1); T1 keeps the two-array
     /// `head`/`head2` layout where only PROBE-position inserts shift and
     /// interior/warmup/tail inserts overwrite slot 0 — byte-frozen by the
     /// tie cage (see `scripts/campaign/tie-guard.sh`). Selected as a const
@@ -148,8 +149,9 @@ pub struct LevelParams {
     /// Stop searching once a match this long is found (`c->nice_match_length`).
     pub nice_match_length: u32,
     /// zlib `good_length`: quarter the chain walk once `best_len_in >= good_match`
-    /// (`vendor/zlib-ng/match_tpl.h:75-77`). Set only on the T1 path — see
-    /// [`apply_zlib_t1_search_knobs`].
+    /// (`vendor/zlib-ng/match_tpl.h:75-77`). Set only on the T1 path, by the
+    /// zlib-arm knobs carried in the level-params table (`params_baseline` —
+    /// see that function's doc comment).
     pub good_match: u32,
     /// The far-len-3 cost gate (`parse/far_len3.rs`): let the greedy parser
     /// accept a len-3 match past the fixed offset-4096 guard when the block's
@@ -1076,7 +1078,7 @@ fn params_inner(level: u32) -> LevelParams {
 /// which are handled by their own passthrough).
 ///
 /// Ported (formula pinned by the tests below) but not yet wired into
-/// [`super::parse::near_optimal`]'s entry point — no call site skips the
+/// `super::parse::near_optimal`'s entry point — no call site skips the
 /// parser for tiny near-optimal-level inputs today. Left as a documented,
 /// tested residual (Stage E dead-code audit,
 /// docs/compressor-architecture.md §5-E) rather than deleted: wiring it in

@@ -62,7 +62,7 @@ mod sealed {
 ///
 /// - [`Clean`]: u8 output, no markers; used when the predecessor window is
 ///   known (parallel-SM Phase 2, BGZF, sequential SM).
-/// - [`Markers`] (`pub(crate)` until phase 4 enables it): u16 output, marker
+/// - `Markers` (`pub(crate)` until phase 4 enables it): u16 output, marker
 ///   emission for cross-chunk back-references; used by parallel-SM
 ///   speculative decode.
 pub trait DecodeMode: sealed::Sealed {

@@ -135,8 +135,9 @@ pub fn lz_extend(
 /// Prefetch the cache line at `ptr` into L1 for WRITING (port of libdeflate
 /// `prefetchw`, `common_defs.h:260-271`).
 ///
-/// Same purity and safety as [`prefetch_read`]: a pure hint that never faults
-/// and mutates nothing. Per-target reality: x86_64 issues the write/exclusive
+/// Same purity and safety as any read-side prefetch hint (`prefetch_read`): a pure
+/// hint that never faults and mutates nothing. Per-target reality: x86_64
+/// issues the write/exclusive
 /// hint (`_MM_HINT_ET0`, as the C does); aarch64 deliberately issues the LOAD
 /// hint `pldl1keep` (commit bbe56823, store->load for the ARM head table), so
 /// on ARM the line is NOT fetched exclusive and the "avoid a later

@@ -73,13 +73,13 @@ pub enum DecodePath {
     /// within-member parallel single-member engine and streamed in member order
     /// (pure-Rust, per-member CRC32 + ISIZE verified). Used as the DETERMINISTIC
     /// upfront route for a MIXED concatenation (a "GZ" first member followed by a
-    /// plain member — see [`crate::decompress::bgzf::gz_coverage_is_pure`]), which
+    /// plain member — see `crate::decompress::bgzf::gz_coverage_is_pure`), which
     /// the BGZF fast path would truncate. See
     /// [`crate::decompress::parallel::single_member::decompress_multi_member_chunked`].
     ///
     /// NOTE: this reuses the per-member parallel engine (member walk). It is
     /// NOT routed for plain dominant/few-member distributions — those take the
-    /// whole-file-grid cross-member port ([`MultiMemberGrid`]) instead.
+    /// whole-file-grid cross-member port ([`DecodePath::MultiMemberGrid`]) instead.
     MultiMemberChunked,
     /// STAGE-2d whole-file MULTI-MEMBER GRID: a plain multi-member stream decoded
     /// as ONE chunk grid spanning every member (the rapidgzip-faithful
@@ -87,7 +87,7 @@ pub enum DecodePath {
     /// ALL workers instead of pinning one worker (the `MultiMemberPar`
     /// member-per-worker plateau) or spinning up a per-member pipeline (the
     /// regressing `MultiMemberChunked` member-walk). Selected by
-    /// [`crate::decompress::bgzf::fast_path_ok`] for dominant/uneven size
+    /// `crate::decompress::bgzf::fast_path_ok` for dominant/uneven size
     /// distributions at T>1. Per-member CRC32 + ISIZE verified; pure-Rust. See
     /// [`crate::decompress::parallel::single_member::decompress_multi_member_grid`].
     MultiMemberGrid,

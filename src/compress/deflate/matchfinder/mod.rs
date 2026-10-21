@@ -19,7 +19,7 @@
 //!
 //! | Tier | Module | Levels | Consumer(s) | Output shape | Position/window model |
 //! |---|---|---|---|---|---|
-//! | **ht** (chainless single-probe) | fused into [`crate::compress::deflate::parse::fast`] — see below | L0-1 | `parse::fast::run` | inline locals (no return type at all) | `u32` head table, no chain, no `mf_pos_t` sentinel |
+//! | **ht** (chainless single-probe) | fused into `crate::compress::deflate::parse::fast` — see below | L0-1 | `parse::fast::run` | inline locals (no return type at all) | `u32` head table, no chain, no `mf_pos_t` sentinel |
 //! | **hc** (hash chains) | [`hc`] | L2-9 | `parse::greedy::run`, `parse::lazy::run`; Stage D adds `parse::ultra::greedy_hc` | `(length, offset)` — the ONE best match | `i16` `mf_pos_t` relative to a sliding `in_base`, saturating rebase |
 //! | **bt** (binary tree, single-best) | [`bt`] | L10-12 | `parse::near_optimal::run` | `&mut [LzMatch]`, sorted by strictly-increasing length | same `i16`/`in_base` model as `hc` |
 //! | **lzfind** (ECT BT4, full-Pareto) | [`lzfind`] | Ultra (`-F`/`-I`/`-J`) | `parse::ultra::squeeze::get_best_lengths` (the DP driver) | packed `&mut [u16]`, interleaved `len, dist, len, dist, …` | `u32` positions in a private padded owned buffer, no sentinel/rebase |

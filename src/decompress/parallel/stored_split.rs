@@ -30,8 +30,8 @@
 //!     the proven `lut_bulk_inflate` per-block decoder into the SAME output buffer
 //!     so its back-references resolve directly against the materialised prefix
 //!     (no separate 32 KiB window). On targets without that bulk decoder
-//!     (non-x86 / no isal-pure-rust) a Huffman tail makes us return
-//!     [`StoredSplitError::NotStoredDominated`] WITHOUT touching the writer, so
+//!     (non-x86 / no isal-pure-rust) a Huffman tail makes us return the
+//!     `StoredSplitError::NotStoredDominated` variant WITHOUT touching the writer, so
 //!     the dispatcher falls through to the safe one-shot path — same bytes.
 //!   * CRC32 + ISIZE are verified against the gzip trailer before any byte is
 //!     written; a mismatch is a terminal `Err` (no partial output, no fallback).

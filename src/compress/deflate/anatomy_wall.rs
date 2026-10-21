@@ -68,19 +68,20 @@
 //!     machinery at all), `BitWriter::finish()`'s final flush, the trailer
 //!     bytes, and this module's own timer overhead. Conservation
 //!     (`root_ns >= sum of named regions`, i.e. RESIDUAL >= 0) is asserted
-//!     at dump time, loudly, never silently — see [`reconcile`].
+//!     at dump time, loudly, never silently — see `reconcile` (below, behind
+//!     the `anatomy-wall` feature).
 //!
 //! ## Scope: T1 only (`-p 1`)
 //!
-//! The root/CRC timers wrap the T1 entry points ([`encode_gzip_bytes_to_vec`]/
-//! [`encode_gzip_slack_padded_to_vec`], `src/compress/deflate/mod.rs`) ONLY. At T>1 the
+//! The root/CRC timers wrap the T1 entry points ([`super::encode_gzip_bytes_to_vec`]/
+//! [`super::encode_gzip_slack_padded_to_vec`], `src/compress/deflate/mod.rs`) ONLY. At T>1 the
 //! CLI's default thread count is "all CPUs" (see `src/compress/mod.rs`'s
 //! `run` doc comment) and routes through `compress::pipelined::
 //! PipelinedGzEncoder::compress_buffer_pure`, which drives the SAME
 //! `parse_match`/`huffman_table`/`huffman_encode` regions per chunk but
 //! computes its own combined CRC and never calls either T1 entry point —
 //! so `root_ns`/`crc_ns` stay exactly 0 while the other regions accumulate,
-//! and [`reconcile`] correctly reports this as a FAILURE (named regions
+//! and `reconcile` correctly reports this as a FAILURE (named regions
 //! exceeding a zero root span), not a silently wrong share. This mirrors
 //! the EXISTING constraint `anatomy::is_gzippy_name`/`-p1`-pinning already
 //! enforces for `--counters-from-stderr` in fulcrum's `anatomy` command
@@ -496,7 +497,7 @@ macro_rules! anatomy_wall_root {
 /// regions (`read_input`, `write_out`). Exactly one call site, on the T1 CLI
 /// route in `compress::compress_with_pipeline`. Distinct from
 /// `anatomy_wall_root!` so the two nesting levels each get their own
-/// conservation check ([`reconcile`]); nesting a root inside a cli span is
+/// conservation check (`reconcile`); nesting a root inside a cli span is
 /// the INTENDED shape here, unlike root-inside-root.
 #[macro_export]
 macro_rules! anatomy_wall_cli {

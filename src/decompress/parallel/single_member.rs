@@ -645,7 +645,7 @@ const AARCH64_PRESTACK_RATIO_MAX: u64 = 8;
 pub static AARCH64_PRESTACK_CAP_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Counter proving the small-output serial floor (the all-marker-blowup guard,
-/// see [`PARALLEL_MIN_OUTPUT_BYTES_DEFAULT`]) fired on a real decode
+/// see `PARALLEL_MIN_OUTPUT_BYTES_DEFAULT` in this module) fired on a real decode
 /// (deletion-trap discipline; read by the routing test).
 #[cfg_attr(not(parallel_sm), allow(dead_code))]
 pub static SMALL_OUTPUT_SERIAL_FLOOR_APPLIED: AtomicU64 = AtomicU64::new(0);

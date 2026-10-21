@@ -59,8 +59,8 @@ pub struct CodeScratch {
     /// `good_for_rle` flag buffer. Caller-owned and reused per parser call.
     pub shape: ShapeScratch,
     /// What this encode path can afford to spend on the header. Defaults to
-    /// [`HeaderBudget::Lean`], so a site that never threads it keeps T1
-    /// behaviour byte-identical.
+    /// [`HeaderBudget::Lean`](crate::compress::deflate::encode_types::HeaderBudget::Lean),
+    /// so a site that never threads it keeps T1 behaviour byte-identical.
     pub budget: crate::compress::deflate::encode_types::HeaderBudget,
 }
 
