@@ -238,7 +238,10 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let ft = istat.file_type();
-        let mode = istat.mode();
+        // metadata()'s mode() is u32 in std on every unix; Darwin's mode_t is
+        // u16 (Linux's is u32) — normalize to mode_t so `mode & S_ISUID`
+        // (mode_t-typed constants in libc) compiles on both.
+        let mode = istat.mode() as libc::mode_t;
         if !args.stdout
             && (ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket())
         {

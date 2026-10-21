@@ -124,7 +124,9 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mode = istat.mode();
+        // Normalize u32 std mode() to mode_t (u16 on Darwin) so the libc
+        // S_IS* constants compile on both Unix flavors.
+        let mode = istat.mode() as libc::mode_t;
         if !args.stdout {
             if mode & libc::S_ISUID != 0 {
                 if !args.quiet {
