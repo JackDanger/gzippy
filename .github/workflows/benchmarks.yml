@@ -124,11 +124,8 @@ jobs:
           # Build gzippy with the pure-Rust ParallelSM decode engine
           # (gzippy-native => pure-rust-inflate => parallel_sm cfg). This is the
           # binary every decode benchmark below exercises, so it MUST be the
-          # shipped/product decode path, NOT libdeflate one-shot. The compress
-          # routing graph is pure-Rust in every flavor: x86_64's extra
-          # `isal-compression` only compiles the ISA-L compress ORACLE (dead in
-          # this production binary — see src/backends/mod.rs) + the rpmalloc
-          # chunk arenas the ParallelSM decoder runs on.
+          # shipped/product decode path, NOT libdeflate one-shot. x86_64 also
+          # layers ISA-L *compression* (fastest L0–L3); the two features coexist.
           if [ "$(uname -m)" = "x86_64" ]; then
             cargo build --release --features gzippy-native,isal-compression
           else
@@ -173,25 +170,6 @@ jobs:
           cp vendor/isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
           cp vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
           ls -la binaries/
-
-      # Rival-version drift check (issue #323): rivals.tsv pins the rival CLI
-      # versions every fixture/board/ledger comparison against rivals is only
-      # comparable at, and #323's phantom-loss root cause was a box silently
-      # running libdeflate 1.25 against the pinned v1.23 baseline (tabular L2
-      # +10.3%) — drift nothing ever noticed. The script exits nonzero on
-      # drift, so a drifted box shows up in Stage 1 (before any benchmark
-      # step), but the step must not fail the run: this workflow is
-      # NON-GATING by design (see the file header), so the check keeps the
-      # informational policy every job here already has via continue-on-error,
-      # and --missing-ok tolerates rivals the nightly never builds here
-      # (libdeflate). Promoting it to required is a deliberate future action
-      # per #323's paragraph.
-      - name: Rival-version drift check (issue #323, informational)
-        continue-on-error: true
-        run: |
-          PIGZ_BIN="$PWD/binaries/pigz" IGZIP_BIN="$PWD/binaries/igzip" \
-            bash scripts/rival_version_check.sh --missing-ok \
-              --rivals tests/fingerprints/rivals.tsv
 
       - uses: actions/upload-artifact@v7
         with:

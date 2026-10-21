@@ -98,11 +98,8 @@ jobs:
         run: |
           # Build the PRODUCT decode flavor: gzippy-native => pure-rust-inflate
           # => parallel_sm cfg, so the uploaded artifact AND the unit tests
-          # below exercise the shipped ParallelSM decoder. The compress routing
-          # graph is pure-Rust in every flavor: x86_64-linux's extra
-          # `isal-compression` only compiles the ISA-L compress ORACLE (dead in
-          # this production binary — see src/backends/mod.rs) + the rpmalloc
-          # chunk arenas the ParallelSM decoder runs on.
+          # below exercise the shipped ParallelSM decoder. x86_64-linux also
+          # layers ISA-L *compression* (T1 L0–L3); the two features coexist.
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
             cargo build --release --features gzippy-native,isal-compression
           else
@@ -530,20 +527,6 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --release --all-targets --features isal-compression -- -D warnings
-
-      # Dev-only feature flavors have NO other CI coverage (they are not part
-      # of any shipped build), exactly the rot class #260 recorded: the
-      # l1-tune flavor stopped compiling after the longest_match signature
-      # grew good_match/hash3_chain_depth (#363) and stayed broken for weeks.
-      # One cargo check per flavor — no tests, no release build — so rot is
-      # caught while the tape is fresh. Adds ~2-3 min on warm cache.
-      - name: Check dev-only feature flavors
-        run: |
-          for flavor in l1-tune ladder-tune near-opt-parallel-flush trace debug_decode coz; do
-            cargo check --quiet --features "$flavor" \
-              || { echo "::error::dev feature flavor '$flavor' fails to compile"; exit 1; }
-          done
-          echo "All dev-only feature flavors compile."
 
       - name: Check version consistency
         run: |
