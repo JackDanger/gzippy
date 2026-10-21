@@ -42,8 +42,8 @@ pub struct DynamicHeader<'s> {
 /// Reusable scratch storage for [`build_dynamic_header`], threaded through by
 /// `&mut` from a caller that persists across many blocks (one per `run()`
 /// invocation — i.e. one per chunk in the T>1 parallel path — mirroring how
-/// [`super::super::parse::Sink`] is already cleared-and-reused rather than
-/// reallocated every block).
+/// `parse::Sink` is already cleared-and-reused rather than reallocated every
+/// block).
 ///
 /// Both fields are pure scratch: `combined` is the contiguous litlen+offset
 /// codeword-length array `compute_precode_items` scans, and `items` is the

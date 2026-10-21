@@ -8,7 +8,7 @@
 //! [`super::block_split`] statistic, and the word-oriented [`super::bitstream`].
 //!
 //! Unlike the vendor, which streams symbols into a fixed sequence buffer and
-//! flushes with a bit-exact cost model, we accumulate a small [`Token`] stream
+//! flushes with a bit-exact cost model, we accumulate a small `Seq` stream
 //! per block and choose the cheaper of a dynamic-Huffman, static-Huffman, or
 //! stored block from computed bit costs. Any valid parse + valid Huffman coding
 //! roundtrips; the exact block-type decision only affects ratio, not

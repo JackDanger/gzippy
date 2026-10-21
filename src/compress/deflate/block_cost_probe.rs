@@ -12,7 +12,7 @@
 //! Distinguishing them needs the LOSING candidate's cost, which no output stream
 //! carries. This feature prints one line per emitted block:
 //!
-//!   BLOCKCOST len=<input bytes> stored=<bits> static=<bits> dyn=<bits> win=<s|f|d> site=<e|s>
+//!   `BLOCKCOST len=<input bytes> stored=<bits> static=<bits> dyn=<bits> win=<s|f|d> site=<e|s>`
 //!
 //! `dyn=-1` on the L0 (`emit_block_static_or_stored`) site, which never builds the
 //! dynamic candidate. `site=e` is `emit_block`, `site=s` is

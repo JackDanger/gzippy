@@ -29,10 +29,10 @@
 //! The decode engine (clean `run_contig`, A3 single-shot, ISA-L copy-free)
 //! requires ONE CONTIGUOUS buffer to write into and to resolve back-references
 //! against (`output[..out_pos]`). So decode keeps writing into a single
-//! contiguous bulk [`buf`]. Prepends — which only ever happen AFTER decode is
+//! contiguous bulk `buf`. Prepends — which only ever happen AFTER decode is
 //! complete (`finalize_with_deflate::clean_unmarked_data`, and the
 //! consumer-side `merge_resolved_markers_into_data` on the legacy/Folded
-//! path) — push onto [`front`], a small ordered list (typically 0-1 entries)
+//! path) — push onto `front`, a small ordered list (typically 0-1 entries)
 //! whose first element is the logical start of the chunk. No bulk byte is ever
 //! moved by a prepend; the clean tail is narrowed DIRECTLY into its destination
 //! front segment (one copy, mirroring vendor's single `std::transform`).
@@ -87,8 +87,8 @@ pub(crate) fn buf_append_memcpy(dst: &mut U8, src: &[u8]) {
 }
 
 /// View-list-shaped clean-data buffer (faithful port of vendor
-/// `std::vector<VectorView<uint8_t>>`). A contiguous decode bulk [`Self::buf`]
-/// plus an O(1)-prepend ordered front-segment list [`Self::front`].
+/// `std::vector<VectorView<uint8_t>>`). A contiguous decode bulk (`Self::buf`)
+/// plus an O(1)-prepend ordered front-segment list (`Self::front`).
 ///
 /// Cloned via the derived impl (deep clone of every owned segment) — used by
 /// `ChunkData::Clone` in the cache-promote path. The byte count cloned is

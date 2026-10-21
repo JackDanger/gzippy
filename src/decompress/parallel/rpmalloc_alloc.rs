@@ -19,7 +19,7 @@ mod arena {
 
     /// Stateless rpmalloc-backed allocator (vendor `RpmallocAllocator<T>`).
     ///
-    /// Huge allocations route through [`SlabAlloc`] (retain resident blocks
+    /// Huge allocations route through `SlabAlloc` (retain resident blocks
     /// instead of munmapping) when the size-aware T gate is on: auto-ON at
     /// decode T <= 2 for EVERY huge block (uncapped `T × largest_block_seen`
     /// budget ≈ one chunk buffer per active worker), and at 2 < T <= 64 ONLY

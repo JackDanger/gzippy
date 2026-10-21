@@ -215,9 +215,7 @@ impl SlidingWindow {
     }
 }
 
-/// Result of one `read_stream` call. Mirrors
-/// [`crate::decompress::inflate::consume_first_decode::InflateStreamResult`]
-/// but with no `session` semantics — `bytes_written` is exactly what landed
+/// Result of one `read_stream` call. `bytes_written` is exactly what landed
 /// in the caller's `output`.
 #[derive(Debug, Clone, Copy)]
 pub struct InflateStreamResult {
@@ -1415,7 +1413,7 @@ fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
     parse_dynamic_header_with_lens(bits, &mut litlen_lens, &mut dist_lens)
 }
 
-/// Variant of [`parse_dynamic_header`] that also captures the raw
+/// Variant of `parse_dynamic_header` that also captures the raw
 /// litlen/dist code lengths into caller-provided arrays. Used by
 /// try_enter_next_block to build the parallel ISA-L LUT alongside the
 /// libdeflate LUT without re-parsing the header.

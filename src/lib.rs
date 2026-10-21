@@ -32,12 +32,11 @@
 //!   a pure parallel encoder whose output is byte-identical across thread
 //!   counts
 //!
-//! gzippy's own "GZ" multi-block format ([`ParallelGzEncoder`]) still
+//! gzippy's own "GZ" multi-block format (`ParallelGzEncoder`) still
 //! exists and is still decompressible (see below), but it is not reachable
 //! from this crate's compress routing table — it is retained only as a
 //! differential test oracle behind the `ffi-oracle` feature.
 //!
-//! [`ParallelGzEncoder`]: compress::parallel::ParallelGzEncoder
 //! [`PipelinedGzEncoder`]: compress::pipelined::PipelinedGzEncoder
 //!
 //! # Decompression
@@ -330,7 +329,7 @@ pub fn decompress_deflate64(data: &[u8]) -> GzippyResult<Vec<u8>> {
 /// Decompress a raw Deflate64 stream into `writer`.
 ///
 /// Streaming variant of [`decompress_deflate64`] — avoids the intermediate
-/// allocation when the caller already has a [`Write`] target.
+/// allocation when the caller already has a [`std::io::Write`] target.
 ///
 /// Returns the number of decompressed bytes written.
 pub fn decompress_deflate64_to_writer<W: std::io::Write>(
