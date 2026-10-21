@@ -394,6 +394,58 @@ fn list_reads_two_points_not_the_body() {
 // error behaviors kept, flag interactions
 // ---------------------------------------------------------------------------
 
+/// The header prints lazily (do_list's first_time): a listing in which every
+/// file fails leaves stdout EMPTY (gzip probed: `gzip -l /nope/nope.gz
+/// 2>/dev/null | wc -c` == 0; gzippy used to print the 65-byte header before
+/// the file loop). With at least one listed row the header precedes it.
+#[test]
+fn list_header_prints_only_when_a_row_prints() {
+    let d = tempdir();
+
+    // All failing: nothing on stdout (errors go to stderr, exit 1).
+    let out = run(d.path(), &["-l", "/nope/nope.gz"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "orphan header not allowed: got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Mixed: a listed file's row still carries the header, and the failing
+    // file must not duplicate it.
+    write_file(
+        d.path(),
+        "m1.gz",
+        &gzip_member(b"orchard fixture bytes here", None),
+    );
+    let out = run(d.path(), &["-l", "noexist.gz", "m1.gz"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let header_count = text
+        .lines()
+        .filter(|l| l.contains("uncompressed_name"))
+        .count();
+    assert_eq!(
+        header_count, 1,
+        "exactly one header line even with a failed file: {text:?}"
+    );
+
+    // Verbose header is lazy the same way.
+    let out = run(d.path(), &["-lv", "/nope/nope.gz"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "verbose orphan header: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = run(d.path(), &["-lv", "m1.gz"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.lines().next(),
+        Some("method  crc     date  time    compressed uncompressed  ratio uncompressed_name"),
+        "verbose header precedes the row: {text:?}"
+    );
+}
+
 /// Existing verdicts aligned with real gzip (probed gzip 1.12): a 13-byte
 /// good-magic fragment is read_error's "\n...: unexpected end of file",
 /// NOT "not in gzip format" (the earlier assertion here had the wrong

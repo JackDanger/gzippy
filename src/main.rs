@@ -384,17 +384,15 @@ fn run() -> Result<i32, GzippyError> {
         // independent; last-flag-wins ordering is not mirrored.
         let verbose = args.verbose && !args.quiet;
         // gzip.c do_list (1504-1605): the header is first_time's `if (!quiet)`
-        // row; member rows print regardless of -q. gzippy's established -v
-        // header shape is kept as-is; the non-verbose header is copied
-        // verbatim from the vendored format string
-        // "%*.*s %*.*s  ratio uncompressed_name" at positive_off_t_width.
-        if verbose {
-            println!(
-                "method  crc     date  time    compressed uncompressed  ratio uncompressed_name"
-            );
-        } else if !args.quiet {
-            println!("{}", list_header_line());
-        }
+        // row; member rows print regardless of -q — and the header prints only
+        // when an actual row is about to print (do_list's first_time is set
+        // inside the per-file call, so `gzip -l /nope` prints NOTHING on
+        // stdout). gzippy's established -v header shape is kept as-is; the
+        // non-verbose header is copied verbatim from the vendored format
+        // string "%*.*s %*.*s  ratio uncompressed_name" at
+        // positive_off_t_width. `header_done` mirrors `first_time`. The -v
+        // header carries the fixed 9-column shape used since the gzip -v era.
+        let mut header_done = false;
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
         let mut last_header_bytes = 0u64;
@@ -409,7 +407,7 @@ fn run() -> Result<i32, GzippyError> {
                 crate::utils::bump_exit_code(&mut exit_code, 2);
                 continue;
             }
-            match list_file(file, &args) {
+            match list_file(file, &args, verbose, &mut header_done) {
                 Ok(Some((comp, uncomp, header_bytes))) => {
                     total_comp += comp;
                     total_uncomp += uncomp;
@@ -772,7 +770,12 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
 /// fopen-error shape) and the caller should just credit `1`; `Err` is
 /// reserved for errors the caller renders (`NotInGzipFormat`,
 /// `UnexpectedEof`, head-truncation IO).
-fn list_file(filename: &str, args: &GzippyArgs) -> Result<Option<(u64, u64, u64)>, GzippyError> {
+fn list_file(
+    filename: &str,
+    args: &GzippyArgs,
+    verbose: bool,
+    header_done: &mut bool,
+) -> Result<Option<(u64, u64, u64)>, GzippyError> {
     use std::io::{Read, Seek, SeekFrom};
 
     // gzip's -l open semantics: internally `case 'l': list = decompress =
@@ -881,6 +884,20 @@ fn list_file(filename: &str, args: &GzippyArgs) -> Result<Option<(u64, u64, u64)
     } else {
         list_output_name(filename, &args.suffix)
     };
+
+    // done_header (do_list's first_time): the header prints only when the
+    // first actual ROW is about to print — a failed listing leaves stdout
+    // empty (`gzip -l /nope/nope.gz 2>/dev/null | wc -c` == 0, probed).
+    if !*header_done {
+        if verbose {
+            println!(
+                "method  crc     date  time    compressed uncompressed  ratio uncompressed_name"
+            );
+        } else if !args.quiet {
+            println!("{}", list_header_line());
+        }
+        *header_done = true;
+    }
 
     // Same -q-clears-verbose mirror as the -l orchestration above (gzip.c
     // 553-556): a quieted run lists plain rows.
