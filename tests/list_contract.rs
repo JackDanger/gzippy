@@ -394,19 +394,22 @@ fn list_reads_two_points_not_the_body() {
 // error behaviors kept, flag interactions
 // ---------------------------------------------------------------------------
 
-/// Existing verdicts preserved: the 18-byte minimum and the non-gzip
-/// verdict both reject with exit 1 and no rows.
+/// Existing verdicts aligned with real gzip (probed gzip 1.12): a 13-byte
+/// good-magic fragment is read_error's "\n...: unexpected end of file",
+/// NOT "not in gzip format" (the earlier assertion here had the wrong
+/// wording for the good-magic-short case; cross-pinned with
+/// exit_ledger::list_of_truncated_archive_reports_unexpected_eof).
 #[test]
 fn list_preserves_min_size_and_verdict_errors() {
     let d = tempdir();
-    // 18-byte minimum: a 17-byte file that opens with gzip magic is still
-    // refused exactly as before (fs size check).
+    // Good magic + too few bytes: gzip's header scan runs out of input →
+    // read_error class, exit 1.
     let short = b"\x1f\x8b\x08\x00some junk";
     write_file(d.path(), "short.gz", short);
     let out = run(d.path(), &["-l", "short.gz"]);
-    assert_eq!(out.status.code(), Some(1), "17 bytes must stay exit 1");
+    assert_eq!(out.status.code(), Some(1), "short good-magic is exit 1");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("not in gzip format"),
+        String::from_utf8_lossy(&out.stderr).contains("unexpected end of file"),
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
     );
