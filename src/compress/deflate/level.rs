@@ -864,8 +864,20 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            max_search_depth: 24,
-            nice_match_length: 30,
+            // 2026-10-23 lever `perf/l5-gzip-knobs`: aligned to the vendor's
+            // OWN L5 row (`vendor/gzip/deflate.c:242-254`: L5 = good 8,
+            // max_lazy 16, nice 32, chain 32) — hard stop #1 vendor diff,
+            // AFTER the census mechanism was named by `fulcrum why
+            // gzip:minjs.min.js:L5:T1:size` (our L5 emits +13.3% literals
+            // vs gzip on minjs; see the tune census
+            // size-tune-4d2e2dea/summary.txt on owner-aarch64). Chains
+            // 24→32 and nice 30→32 stay ladder-monotone (L4 depth 16, L6
+            // depth 128, nice 65). SUPERSIZES the search at L5: the wall
+            // cost is measured per the promotion rule before this can be
+            // judged; exploration receipts from the tune census travel
+            // with the commit.
+            max_search_depth: 32,
+            nice_match_length: 32,
             good_match: 8,
             far_len3_gate: false,
             greedy_len3_shadow: false,
