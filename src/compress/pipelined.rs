@@ -368,17 +368,22 @@ impl PipelinedGzEncoder {
     /// ledger-won 304,252 B — is retired with PR #363: the port now carries
     /// the good_match pair and emits those same bytes at L6/L7.)
     /// The minimal-header case is byte-for-byte identical to
-    /// `libdeflate-gzip -c` at the port levels; file metadata may
-    /// intentionally differ.
+    /// `libdeflate-gzip -c` at the port levels EXCEPT L5's T1 row
+    /// (lever `perf/l5-zlib-lazy`: gzip's vendor lazy triple, closing the
+    /// census's minjs L5 cells — see ldx `compress.rs` `5 =>` receipt);
+    /// file metadata may intentionally differ.
     fn compress_exact_to_writer<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
         let level = self.compression_level;
         if level <= 9 && crate::compress::deflate::level_uses_ldx(level) {
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
-            // The T>1 chunk pipeline keeps the libdeflate level-5 row — the
-            // `5 =>` receipt block in ldx/compress.rs records why (confirmed
-            // T4 wall spend routed to the T1 entry instead).
-            if !crate::compress::ldx::compress_into(level, data, &mut body, 0) {
+            // The level-5 lazy row is thread-parameterized: T1 carries gzip's
+            // vendor triple so the library T1 route matches the production
+            // T1 route byte-for-byte (this is what `one_encode_only` pins);
+            // the T>1 chunk pipeline keeps the libdeflate row — the
+            // `5 =>` receipt block in ldx/compress.rs records why (the only
+            // confirmed wall spend, pigz:data.json:L5:T4, was routed out).
+            if !crate::compress::ldx::compress_into(level, data, &mut body, self.num_threads) {
                 return Err(io::Error::other(
                     "libdeflate port does not support this level",
                 ));
