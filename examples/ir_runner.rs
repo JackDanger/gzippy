@@ -38,7 +38,7 @@ fn main() {
             // Identical header to ours: magic, CM=8, FLG=0, MTIME=0, XFL=0,
             // OS=0xff (src/compress/deflate/mod.rs:78).
             out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
-            if !gzippy::compress::ldx::compress_into(level, &data, &mut out, 0) {
+            if !gzippy::compress::ldx::compress_into(level, &data, &mut out) {
                 panic!("ldx does not support level {level}");
             }
             // Identical trailer to ours: crc32fast over the input + ISIZE

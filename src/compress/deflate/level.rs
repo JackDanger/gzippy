@@ -864,11 +864,6 @@ fn params_inner(level: u32) -> LevelParams {
             fast_lazy_peek_sparse_guard_mul: FAST_LAZY_PEEK_SPARSE_OFF.0,
             fast_lazy_peek_sparse_margin_bits: FAST_LAZY_PEEK_SPARSE_OFF.1,
             strategy: Strategy::Lazy,
-            // 2026-10-23: the params_inner L5 row is INERT at production —
-            // level_uses_ldx(5) routes to the port, whose config lives in
-            // src/compress/ldx/compress.rs (the tune census measured
-            // byte-identical L5 output with these knobs changed). The real
-            // L5 lever moved to the ldx table (commit lever: L5 zlib-lazy).
             max_search_depth: 24,
             nice_match_length: 30,
             good_match: 8,

@@ -245,12 +245,9 @@ pub fn max_passthrough_size(level: u32) -> usize {
 /// input plus 5 bytes of block header per 65535-byte sub-block plus framing
 /// slack. `spare_capacity_mut` hands the compressor uninitialised bytes —
 /// nothing is zeroed — and `set_len` commits only what it wrote.
-/// `threads` carries the caller's thread context for the level-5 lazy row
-/// split (T1 = the gzip-vendor triple; T>1 = the libdeflate row — see the
-/// `5 =>` receipt block in `compress.rs`). Other levels ignore it.
-pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>, threads: usize) -> bool {
+pub fn compress_into(level: u32, input: &[u8], out: &mut Vec<u8>) -> bool {
     crate::compress::deflate::encode_census::port_encode();
-    let Some(mut c) = compress::LdxCompressor::new_with_threads(level, threads) else {
+    let Some(mut c) = compress::LdxCompressor::new(level) else {
         return false;
     };
     let bound = input.len() + input.len().div_ceil(65535) * 5 + 64;

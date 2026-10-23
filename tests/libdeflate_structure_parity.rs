@@ -58,8 +58,8 @@ fn t1_gzip_matches_the_libdeflate_port_at_every_vendor_level() {
                 "{name} L{level}: ISIZE"
             );
 
-            if matches!(level, 1 | 3 | 5 | 6) {
-                // Documented exceptions (L1/L3/L5/L6): these levels route to
+            if matches!(level, 1 | 3 | 6) {
+                // Documented exceptions (L1/L3/L6): these levels route to
                 // the legacy encoder (measured wins, see `level_uses_ldx`),
                 // so their body is NOT the port's. Pin what still holds: valid
                 // gzip that round-trips through an independent decoder. The
@@ -70,19 +70,6 @@ fn t1_gzip_matches_the_libdeflate_port_at_every_vendor_level() {
                 // path); L6's flip was measured and REVERTED (2026-09-28, the
                 // routed port's L6-T1 wall was +1.8% vs the legacy arm at
                 // byte-equal output), so its body is off the port again.
-                //
-                // L5 (2026-10-23 lever `perf/l5-zlib-lazy`): an INTENTIONAL
-                // divergence, not a routing retreat. The port carries the T1
-                // body with the gzip vendor's L5 lazy triple
-                // (vendor/gzip/deflate.c:242-254 — depth 32 / nice 32 /
-                // good 8) instead of libdeflate's (16, 30, 0): it closes
-                // minjs.min.js L5 (+0.21% vs gzip → −0.32%; the tune census
-                // goes 5→1 failing of 594) while T>1 stays byte-identical to
-                // libdeflate (the only CONFIRMED wall residual —
-                // pigz:data.json:L5:T4 +0.63% with layout floors — routes
-                // the T>1 leg back to the libdeflate row). What still holds
-                // at L5: gzip metadata, CRC32, ISIZE, independent-decoder
-                // roundtrip, and the one-encode census.
                 assert_eq!(
                     independent_roundtrip(&gzip),
                     input,
