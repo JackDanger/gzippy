@@ -375,7 +375,10 @@ impl PipelinedGzEncoder {
         if level <= 9 && crate::compress::deflate::level_uses_ldx(level) {
             writer.write_all(&self.gzip_header_bytes())?;
             let mut body = Vec::new();
-            if !crate::compress::ldx::compress_into(level, data, &mut body) {
+            // The T>1 chunk pipeline keeps the libdeflate level-5 row — the
+            // `5 =>` receipt block in ldx/compress.rs records why (confirmed
+            // T4 wall spend routed to the T1 entry instead).
+            if !crate::compress::ldx::compress_into(level, data, &mut body, 0) {
                 return Err(io::Error::other(
                     "libdeflate port does not support this level",
                 ));

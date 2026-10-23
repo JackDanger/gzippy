@@ -25,7 +25,7 @@ fn main() {
         let (t_ours, s_ours) = best(
             || {
                 buf.clear();
-                gzippy::compress::ldx::compress_into(l, &d, &mut buf);
+                gzippy::compress::ldx::compress_into(l, &d, &mut buf, 0);
                 buf.len()
             },
             7,

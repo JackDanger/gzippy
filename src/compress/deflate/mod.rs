@@ -649,8 +649,12 @@ pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u3
         // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
         // between the header written above and the CRC/ISIZE written below.
         // Append straight into `out` — no scratch buffer, no zeroing, no copy.
+        // This is the T1 whole-buffer entry: the level-5 lazy row is
+        // thread-parameterized (gzip's own L5 row at T1; libdeflate's row at
+        // T>1 — the pigz:data.json:L5:T4 wall spend is the only confirmed
+        // loss), recorded in `compress.rs`'s `5 =>` receipt block.
         if !(level_uses_ldx(level)
-            && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
+            && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out, 1))
         {
             encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
         }
