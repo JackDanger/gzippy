@@ -45,6 +45,7 @@ use super::{
     adjust_max_and_nice_len, calculate_min_match_len, choose_max_block_end, emit_block, Sink,
     StaticCodes,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MIN_MATCH_LEN: u32 = DEFLATE_MIN_MATCH_LEN;
 const MAX_MATCH_LEN: u32 = DEFLATE_MAX_MATCH_LEN;
@@ -104,6 +105,126 @@ struct Optimizer {
     /// call was the same waste class as the pre-fix `sink`.
     header_scratch: HeaderScratch,
     code_scratch: CodeScratch,
+}
+
+impl Optimizer {
+    /// Take-or-prime, mirroring [`Sink::acquire`](crate::compress::deflate::parse::Sink::acquire)
+    /// (`parse/mod.rs:286-351`).
+    ///
+    /// STRUCTURAL. `Optimizer::new()` churns ~11.2 MB per construction —
+    /// ~8.4 MB plain-loop zero (`match_cache` + `optimum_nodes`; std's
+    /// `vec![elem; n]` IsZero specialization is TYPE-based to the built-in
+    /// zeroables (u8/numeric/bool/char); a user struct never opts in,
+    /// regardless of `Copy` or trivial zeroability, so `LzMatch` clones
+    /// element-by-element and the calloc path does not apply;
+    /// `match_cache` = 1,500,513 × 4 B (6.0 MB), `optimum_nodes` =
+    /// 305,000 × 8 B (2.4 MB)), plus the 2.8 MB `Sink` seqs
+    /// sized-but-uninitialized (`Vec::with_capacity` in `Sink::new`,
+    /// `parse/mod.rs:354-361`). It is built ONCE PER CHUNK at T>1 (`parse/mod.rs:767`,
+    /// the `Strategy::NearOptimal` arm), so a 100 MB file at L9 runs ~50
+    /// chunks → 11.2 MB × ~50 ≈ 560 MB of churn under the workers' feet.
+    /// The flush workers already pool exactly this shape across jobs
+    /// (`flush_worker`, `:1162-1168`); this extends the same discipline
+    /// across chunks on each compression thread.
+    ///
+    /// BYTE-IDENTITY CONTRACT (the staleness audit): every field is rewritten
+    /// before it is read on the next chunk, EXCEPT `match_len_freqs`, whose
+    /// lifecycle is: zeroed after every block flush by BOTH flush branches
+    /// (the rewind arm and the straight-end arm) and carried across the
+    /// fill's `merge_stats` folds WITHIN one block, so the only zeroing it
+    /// inherited from fresh construction is its chunk-start one — acquire()
+    /// re-provides that explicitly (`Optimizer::new` init). The
+    /// read-boundedness receipts:
+    /// - `optimum_nodes[0..=block_length]` is rewritten by every
+    ///   `find_min_cost_path` call, and the overhang
+    ///   `[block_length..=hi]` is pinned to `0x8000_0000` by every
+    ///   `optimize_and_flush` call (its overhang pin, `:479-483`).
+    /// - `match_cache[0..cache_end)` is read only where the fill wrote this
+    ///   block — the fill's write-boundedness invariant (see the
+    ///   `find_min_cost_path` doc block); `cache_ptr` restarts at 0 for
+    ///   EVERY block: zero-init in `ChunkFillState::new`, reset in the
+    ///   straight-end arm (`fill.cache_ptr = 0`), compacted to 0 by the
+    ///   rewind arm's `cache_len_rewound` copy.
+    /// - `costs` restart at block 0: `is_first` → `set_default` overwrites
+    ///   every read slot (`costs.rs:175-185, 300-314`); `costs_saved` is
+    ///   written before every restore-read (`optimize_and_flush`,
+    ///   `:488`/`:520`); `offset_slot_full` is immutable after construction.
+    /// - `sink` calls `begin()` per block (`optimize_and_flush`, `:555`);
+    ///   `header_scratch`/`code_scratch` reuse is asserted by their field
+    ///   docs (`:102-107`).
+    pub(super) fn acquire(budget: HeaderBudget) -> PooledOptimizer {
+        let mut opt = OPTIMIZER_POOL
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_else(|| Optimizer::new(budget));
+        // The one field the fresh-construction zeroing used to provide:
+        // `match_len_freqs` is zeroed after every block flush by BOTH flush
+        // branches and carried across the fill's merge_stats folds within one
+        // block BY DESIGN, so at chunk start it must read as freshly zeroed
+        // (`Optimizer::new`, `:238`; the parallel-flush pool inherits the same
+        // chunk-start zero via the mailbox copy in `run_job`, `:1239`).
+        opt.match_len_freqs.fill(0);
+        // `code_scratch.budget` must track this call's budget: T>1 chunks and
+        // T1 streams can carry different HeaderBudgets at the same
+        // (thread, now) — rebuild the small scratch so the budget is the
+        // caller's, not the previous chunk's.
+        if opt.code_scratch.budget != budget {
+            opt.code_scratch = CodeScratch {
+                budget,
+                ..Default::default()
+            };
+        }
+        PooledOptimizer(Some(opt))
+    }
+}
+
+thread_local! {
+    /// One recycled [`Optimizer`] per thread — the same shape and reason as
+    /// [`SINK_POOL`](crate::compress::deflate::parse::SINK_POOL)
+    /// (`parse/mod.rs:297-299`): each `infra::scheduler` worker owns its slot,
+    /// so there is no cross-thread mutable state and no synchronisation.
+    static OPTIMIZER_POOL: std::cell::RefCell<Option<Optimizer>> =
+        const { std::cell::RefCell::new(None) };
+    /// Number of [`PooledOptimizer`] drops on this thread that recycled an
+    /// [`Optimizer`] into [`OPTIMIZER_POOL`] (test/observability; same shape
+    /// as `WRITES` in `parallel_flush` below — an identity test must prove
+    /// its pool engaged, so a silent revert of `acquire` to a per-chunk
+    /// `Optimizer::new` fails the pooled-reuse test even when a same-size
+    /// fresh alloc lands on the recycled address). Always-on Relaxed: one
+    /// add per drop, off the hot paths.
+    static OPTIMIZER_POOL_RECYCLES: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// RAII handle from [`Optimizer::acquire`]. `Deref`/`DerefMut` to
+/// [`Optimizer`] so existing field access at the `run` call site is unchanged.
+/// On drop the optimizer returns to this thread's [`OPTIMIZER_POOL`] instead
+/// of freeing ~11.2 MB of working arrays.
+struct PooledOptimizer(Option<Optimizer>);
+
+impl std::ops::Deref for PooledOptimizer {
+    type Target = Optimizer;
+    #[inline]
+    fn deref(&self) -> &Optimizer {
+        self.0.as_ref().expect("PooledOptimizer used after drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledOptimizer {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Optimizer {
+        self.0.as_mut().expect("PooledOptimizer used after drop")
+    }
+}
+
+impl Drop for PooledOptimizer {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            OPTIMIZER_POOL.with(|cell| {
+                *cell.borrow_mut() = Some(s);
+                // Engaged recycles only (see the thread_local's doc).
+                OPTIMIZER_POOL_RECYCLES.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+    }
 }
 
 impl Optimizer {
@@ -1245,8 +1366,9 @@ impl ChunkFillState {
     /// window cursors at 0, hash seeds zeroed, the first slide point
     /// `in_end.min(WINDOW_SIZE)`, a fresh stats/freqs zero-block (the
     /// `deflate_near_optimal_init_stats` shape: `split_stats` /
-    /// `new_match_len_freqs` zero; the Optimizer's `match_len_freqs` is
-    /// zeroing itself in `Optimizer::new`), `nice_len` capped by
+    /// `new_match_len_freqs` zero; the Optimizer's `match_len_freqs` —
+    /// zeroed at chunk start: `Optimizer::new` fresh, or `acquire()`'s
+    /// re-zero on the pooled path), `nice_len` capped by
     /// `MAX_MATCH_LEN`.
     fn new(in_end: usize, params: &LevelParams) -> Self {
         ChunkFillState {
@@ -1285,7 +1407,7 @@ pub(super) fn run(
     is_last: bool,
     budget: HeaderBudget,
 ) {
-    let mut opt = Box::new(Optimizer::new(budget));
+    let mut opt = Optimizer::acquire(budget);
     let mut fill_mf = NearOptFill::new();
 
     // LEVER #3 (feature `near-opt-parallel-flush`): the flush dispatcher.
@@ -1756,7 +1878,9 @@ mod tests {
     // near_optimal -> parse(super) -> deflate(super::super); encode_gzip_bytes_to_vec /
     // encode_deflate_bytes_to_vec live in deflate::mod.
     use super::super::super::{encode_deflate_bytes_to_vec, encode_gzip_bytes_to_vec};
+    use super::{HeaderBudget, LzMatch, Optimizer, OPTIMIZER_POOL_RECYCLES};
     use std::io::Read;
+    use std::sync::atomic::Ordering;
 
     fn decode(gz: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1796,5 +1920,109 @@ mod tests {
             l12 <= l9,
             "L12 near-optimal ({l12}) worse than L9 lazy2 ({l9})"
         );
+    }
+
+    #[test]
+    fn pooled_optimizer_is_reused_and_reset_to_fresh_read_state() {
+        // The pool must hand the SAME working array back on a second acquire
+        // (no re-zeroing alloc churn) and reset the one carried field:
+        // `match_len_freqs` is zeroed after every block flush by BOTH flush
+        // branches and carried across the fill's merge_stats folds within one
+        // block, so the zero a recycled optimizer must arrive with is the
+        // chunk-start one -- the state a fresh `Optimizer::new()` provided via
+        // vec![0u32; ...] (:238).
+        let mut a = Optimizer::acquire(HeaderBudget::Lean);
+        let a_ptr = a.match_cache.as_ptr() as usize;
+        assert!(
+            a.match_len_freqs.iter().all(|&v| v == 0),
+            "acquire did not reset match_len_freqs"
+        );
+        // Dirty the checked-out state the way a finished block leaves it, so
+        // drop -> re-acquire cannot pass a stale slot silently.
+        a.match_len_freqs.fill(7);
+        a.optimum_nodes[0].cost_to_end = 0x1111;
+        let recycles_before = OPTIMIZER_POOL_RECYCLES.with(|c| c.load(Ordering::Relaxed));
+        drop(a);
+        // Pool-ENGAGEMENT observable (`WRITES` precedent): a drop only bumps
+        // the counter when it recycled into `OPTIMIZER_POOL`, so a reverted
+        // per-chunk `Optimizer::new` fails here even if the fresh alloc lands
+        // on the recycled address.
+        let recycles_after = OPTIMIZER_POOL_RECYCLES.with(|c| c.load(Ordering::Relaxed));
+        assert!(
+            recycles_after > recycles_before,
+            "pool not engaged on drop (recycles {recycles_before} -> {recycles_after})"
+        );
+        let mut b = Optimizer::acquire(HeaderBudget::Lean);
+        assert_eq!(
+            a_ptr,
+            b.match_cache.as_ptr() as usize,
+            "pooled Optimizer was not reused"
+        );
+        assert!(b.match_len_freqs.iter().all(|&v| v == 0));
+        // The dirt in `optimum_nodes` is not bad on reclaim: acquire() leaves
+        // the DP's rewrite-before-read band intact. Seed a tiny all-literal
+        // cache and run the DP over [0..=block_length]; it must overwrite the
+        // dirt (zero-cost literal path, one item per position).
+        b.match_cache[..16].fill(LzMatch::default());
+        let _ = b.find_min_cost_path(16, 16);
+        assert_ne!(
+            b.optimum_nodes[0].cost_to_end, 0x1111,
+            "stale pooled optimum_nodes cost survived the DP rewrite"
+        );
+        assert_eq!(b.optimum_nodes[0].item, 1);
+        assert_eq!(b.optimum_nodes[16].cost_to_end, 0);
+        drop(b);
+        // Budget-flip leg: acquire() must rebuild code_scratch when the
+        // caller's HeaderBudget differs from the pooled slot's previous one.
+        let c = Optimizer::acquire(HeaderBudget::Generous);
+        assert_eq!(c.code_scratch.budget, HeaderBudget::Generous);
+    }
+
+    #[test]
+    fn overlapping_acquires_yield_distinct_allocations() {
+        // Two LIVE acquires on one thread must not alias: `acquire` hands the
+        // pool's single slot out at most once (it takes from the cell), so a
+        // second acquire while the first is checked out constructs fresh
+        // instead of re-entering the slot held under the other.
+        let seeding = Optimizer::acquire(HeaderBudget::Lean);
+        let pooled_ptr = seeding.match_cache.as_ptr() as usize;
+        drop(seeding);
+        let first = Optimizer::acquire(HeaderBudget::Lean);
+        assert_eq!(
+            first.match_cache.as_ptr() as usize,
+            pooled_ptr,
+            "first live acquire did not take the pooled slot"
+        );
+        let second = Optimizer::acquire(HeaderBudget::Lean);
+        assert_ne!(
+            second.match_cache.as_ptr() as usize,
+            pooled_ptr,
+            "second live acquire re-entered the pooled slot under the first"
+        );
+        assert_ne!(
+            first.match_cache.as_ptr() as usize,
+            second.match_cache.as_ptr() as usize,
+            "overlapping acquires aliased one allocation"
+        );
+    }
+
+    #[test]
+    fn pooled_reuse_emits_identical_bytes_run_to_run() {
+        // Two encodes of the same input on the SAME thread: the second rides
+        // the recycled Optimizer. The staleness contract (every big array
+        // rewritten-before-read; match_len_freqs re-zeroed on acquire)
+        // predicts byte identity -- any leak surfaces here first.
+        let mut data = Vec::new();
+        let phrase = b"the staleness audit: every big array is rewritten before read. ";
+        for i in 0..4000 {
+            data.extend_from_slice(phrase);
+            if i % 7 == 0 {
+                data.extend_from_slice(format!("[{}]", i % 300).as_bytes());
+            }
+        }
+        let first = encode_gzip_bytes_to_vec(&data, 11);
+        let second = encode_gzip_bytes_to_vec(&data, 11);
+        assert_eq!(first, second, "run2 (pooled) diverged from run1 (fresh)");
+        assert_eq!(decode(&second), data);
     }
 }
