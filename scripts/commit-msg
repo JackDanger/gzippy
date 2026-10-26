@@ -1,9 +1,11 @@
 #!/bin/bash
-# Mechanical enforcement of two CLAUDE.md hard stops. These are checks, not advice,
+# Mechanical enforcement of one CLAUDE.md hard stop (#4) and one working rule. These are checks, not advice,
 # because the advice versions were each violated in a single session on 2026-07-29
 # and the audit's finding was that this agent does not obey warnings it wrote itself.
 #
-# Install: git config core.hooksPath .githooks
+# Install: automatic — build.rs copies this hook to "$(git rev-parse --git-path hooks)"
+#          on every cargo build; there is no .githooks/ directory to wire up.
+# Verify:  ls "$(git rev-parse --git-path hooks)"
 # Bypass:  git commit --no-verify  (and say so in the PR — an unexplained bypass
 #          is the failure this exists to catch)
 set -uo pipefail
@@ -13,23 +15,69 @@ FAIL=0
 
 say() { printf '\033[1;31mcommit-msg: %s\033[0m\n' "$1" >&2; FAIL=1; }
 
-# Files staged in this commit.
-STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+# Files this commit touches — deliberately NOT --diff-filter=ACM: a deleted
+# .rs file must still be seen, or deleting the file is the one silent way to
+# discard its PARK records. Captured NUL-delimited into an array (-z +
+# read -d ''): the old `for f in $STAGED` word-split iteration silently dropped
+# every path containing spaces or quote characters — exactly the names Rule 1
+# counts. A staged set containing them is no longer invisible.
+STAGED=()
+while IFS= read -r -d '' f; do
+    STAGED+=("$f")
+done < <(git diff --cached --name-only -z)
+
+# dst -> src for staged renames/copies, off the same -z name-status stream
+# (tokens: status, path, and for R/C a second path). `git mv old.rs new.rs`
+# where new.rs is absent from HEAD made the Rule 1 baseline read a missing
+# HEAD:dst as 0 — so a rename that dropped PARK records silently passed with
+# fewer records than HEAD's copy of the SOURCE ever carried. When the staged
+# dst is not in HEAD, Rule 1 reads the count from HEAD:src instead.
+declare -A SRC_OF=()
+while IFS= read -r -d '' st; do
+    IFS= read -r -d '' a
+    case $st in
+        R*|C*)
+            IFS= read -r -d '' b
+            SRC_OF[$b]=$a
+            ;;
+    esac
+done < <(git diff --cached --name-status -z)
 
 # ── Rule 1: a PARK record is BINDING ──────────────────────────────────
 # A PARK is a MEASURED win that did not ship ("PARK monotone work; never DELETE
 # it"), so touching one silently discards a result someone paid for.
 #
+# The trip test is a CONTENT COUNT, not a diff-text grep: on a rename or a
+# restyled block the unidiff prints PARKED inside both the minus and the plus
+# halves and false-trips, while a crowded context can hide a record lost
+# elsewhere in the file. Count PARKED in HEAD's copy vs the staged copy
+# (git cat-file -p HEAD:$f vs git show :$f); only a DECREASE discards a
+# record — a rename carries its count over, additions only raise it, and a
+# deleted file reads as 0, so it trips. A rename whose destination is absent
+# from HEAD reads the baseline from HEAD:src (map above), not from the
+# missing destination read as 0.
+#
 # FALSIFY enforcement was REMOVED 2026-08-01 on the user's instruction: "delete all
 # of those falsify comments — they're just noise. Not a single one of them is more
 # valuable than simply running the tool with good instrumentation." Do not re-add it.
-if [ -n "$STAGED" ]; then
-    for f in $STAGED; do
+if [ "${#STAGED[@]}" -gt 0 ]; then
+    for f in "${STAGED[@]}"; do
         case "$f" in *.rs) ;; *) continue ;; esac
-        [ -f "$f" ] || continue
-        if git diff --cached -U40 -- "$f" | grep -q "PARKED"; then
+        # Reset at the TOP of each iteration, BEFORE both reads below: a NEW .rs
+        # (absent from HEAD, no rename source) takes neither branch, and
+        # otherwise 'before' stays whatever the PREVIOUS .rs left — HEAD:aaa.rs
+        # held N PARKED records, the new file holds 0, and 0 < N reads the new
+        # file as a record removal it never carried.
+        before=0
+        if git cat-file -e "HEAD:$f" 2>/dev/null; then
+            before=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep -c PARKED) || true
+        elif [ -n "${SRC_OF[$f]:-}" ]; then
+            before=$(git cat-file -p "HEAD:${SRC_OF[$f]}" 2>/dev/null | grep -c PARKED) || true
+        fi
+        after=$(git show ":$f" 2>/dev/null | grep -c PARKED) || true
+        if [ "${after:-0}" -lt "${before:-0}" ]; then
             if ! printf '%s' "$MSG" | grep -qE '^(REOPEN|RESTORE):'; then
-                say "touches a PARK record in $f without a 'REOPEN:' line."
+                say "removes a PARK record from $f without a REOPEN:/RESTORE: line."
                 say "  A PARK is a measured result that did not ship. State what changed."
             fi
             break

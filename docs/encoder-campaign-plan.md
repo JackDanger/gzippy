@@ -639,14 +639,19 @@ state needs the bound stated first.
 ## 8. Tooling
 
 Three git hooks, sourced from `scripts/` and installed by `build.rs` into the effective
-hooks dir: `pre-commit` (fmt/clippy/version), `pre-push` (refuses direct pushes to
-main), `commit-msg` (FALSIFY/`REOPEN:` discipline; an absolute figure and provenance
-beside any quoted ratio). **Do not set `core.hooksPath`** — it overrides `.git/hooks`
-and silently disabled the first two for part of 2026-07-29.
+hooks dir: `pre-commit` (a structure/symlink gate over the staged set, then
+fmt/clippy/version), `pre-push` (refuses direct pushes to main), `commit-msg` (PARK
+records: a drop in PARKED across any touched `.rs` refuses the commit unless the
+message opens with `REOPEN:`/`RESTORE:`; plus an absolute figure and provenance beside
+any quoted ratio — no FALSIFY discipline, that was removed on 2026-08-01). **Do not
+set `core.hooksPath`** — it overrides `.git/hooks` and silently disabled the first two
+for part of 2026-07-29.
 
-`commit-msg` is crude: it matches proximity to a FALSIFY note, not semantics. 3 correct
-refusals, 1 incorrect (it blocked a legitimate revert until `RESTORE:` was added as an
-escape). Expect misfires and fix it rather than routinely using `--no-verify`.
+Both gated checks are counts, not semantics: the structure gate reads staged statuses
+and 120000-symlink targets only (deleting a plain file passes; a 160000 gitlink,
+`.gitmodules`, or an absolute/`..`/self-pointing symlink target trips), and the PARK
+gate trips on a decrease only — renames carry their record count over. Expect
+misfires and fix the hooks rather than routinely using `--no-verify`.
 
 **How to measure anything — USE THE COMMITTED ENTRY POINT, and never hand-roll.**
 
