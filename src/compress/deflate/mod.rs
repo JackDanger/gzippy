@@ -250,9 +250,14 @@ pub fn encode_deflate_splice_chunk_to_sink(
 
     if dict.is_empty() {
         let cap = data.len() + parse::BUF_PAD;
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, cap);
-        let mut buf = Vec::with_capacity(cap);
+        let mut buf = acquire_chunk_buf(cap);
+        // Load-bearing: a taken buffer still holds the whole previous chunk
+        // (len == capacity == THAT chunk's cap, pad included), so without
+        // this clear the extends below would APPEND to the stale bytes;
+        // clear() empties it while keeping the allocation — an empty buffer
+        // with the capacity, exactly what the fresh `Vec::with_capacity`
+        // used to hand this block.
+        buf.clear();
         buf.extend_from_slice(data);
         buf.resize(data.len() + parse::BUF_PAD, 0);
         deflate_into(
@@ -270,9 +275,9 @@ pub fn encode_deflate_splice_chunk_to_sink(
         let dict_len = dict.len();
         let in_end = dict_len + data.len();
         let cap = in_end + parse::BUF_PAD;
-        crate::anatomy_count!(alloc_events);
-        crate::anatomy_count!(alloc_bytes, cap);
-        let mut buf = Vec::with_capacity(cap);
+        let mut buf = acquire_chunk_buf(cap);
+        // Same load-bearing clear as the headless arm.
+        buf.clear();
         buf.extend_from_slice(dict);
         buf.extend_from_slice(data);
         buf.resize(in_end + parse::BUF_PAD, 0);
@@ -321,6 +326,103 @@ thread_local! {
     /// [`encode_deflate_splice_chunk_to_sink`] (ultra's scoped threads
     /// produce LZ77 stores and join before any bit is written).
     static STORED_BLOCK_EMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// One recycled working buffer per thread, serving
+    /// [`encode_deflate_splice_chunk_to_sink`]'s `[dict |] data | pad` build —
+    /// the exact `Option`-slot + RAII-return shape `parse/mod.rs`'s
+    /// `SINK_POOL` (`parse/mod.rs:286-351`) established (and
+    /// `matchfinder/hc.rs`'s `HC_POOL` before it), and the encode-side mirror
+    /// of the DECODE side's own chunk-buffer pool
+    /// (`decompress/parallel/chunk_buffer_pool.rs`).
+    ///
+    /// STRUCTURAL. The splice-chunk path built this buffer FRESH ON EVERY
+    /// CALL, and its only caller (`pipelined.rs:648`, the T>1 chunk worker)
+    /// calls it once per CHUNK of the thread-free grid (`GRID_REF_THREADS ×
+    /// cpt`, `pipelined.rs:120`/`:193`): an alloc/free pair plus a full
+    /// memcpy on every chunk's wall. A worker's caps are uniform except at
+    /// its first/final chunk edges — headless `block_size + BUF_PAD`,
+    /// dict-bearing `2 · block_size + BUF_PAD` (`BUF_PAD = 16`,
+    /// `parse/mod.rs:156`) — so the per-chunk allocation was always the SAME
+    /// size, the textbook take-or-prime recycle: one allocation per WORKER
+    /// THREAD instead of one per CHUNK.
+    ///
+    /// Byte identity is by construction, not by tune: the take arm `clear()`s
+    /// the buffer (LOAD-BEARING — a taken buffer arrives with
+    /// `len == capacity == its previous cap`, so without the clear the
+    /// extends would APPEND to stale bytes) and then performs the UNCHANGED
+    /// memcpys + zero-pad resize, so `deflate_into` reads the exact
+    /// `[dict |] data | pad` bytes it always did. T1 never enters this
+    /// function (sole caller is the T>1 chunk worker), so its path is
+    /// untouched by construction.
+    ///
+    /// CENSUS (`alloc_events`/`alloc_bytes`, see `anatomy_counters.rs`'s
+    /// alloc bullet): the count pair moved from one event PER CHUNK (the two
+    /// former `Vec::with_capacity` sites at the pre-pool HEAD) to the PRIME
+    /// arm only — one counted allocation per worker thread. A take whose
+    /// pooled buffer is SMALLER than the current cap (a headless first
+    /// chunk before the thread's first dict-sized one) grows through
+    /// `extend_from_slice`'s amortized realloc, which this counter CANNOT
+    /// see; the uniform-grid steady state bounds that (a dict-bearing
+    /// non-final chunk is the largest cap this thread ever sees — capacity
+    /// never needs to grow back down). FALSIFIER for the whole pool: on a
+    /// T>1 anatomy run, post-warm-up `alloc_events` must sit at
+    /// O(#worker threads) plus rare growth steps — any per-chunk residual
+    /// count falsifies the take arm.
+    static CHUNK_BUF_POOL: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII handle from [`acquire_chunk_buf`]. `Deref`/`DerefMut` to the pooled
+/// `Vec<u8>` so the rewritten alloc blocks read like the originals (the
+/// `&buf` / `buf.extend_from_slice(..)` call shapes are unchanged). On drop
+/// the buffer goes back to this thread's [`CHUNK_BUF_POOL`] instead of being
+/// freed; the drop handler runs on every exit, `deflate_into` unwind
+/// included, so the slot cannot leak.
+struct PooledChunkBuf(Option<Vec<u8>>);
+
+impl std::ops::Deref for PooledChunkBuf {
+    type Target = Vec<u8>;
+    #[inline]
+    fn deref(&self) -> &Vec<u8> {
+        // SAFETY/invariant: `Some` for the whole lifetime outside `Drop::drop`.
+        self.0.as_ref().expect("PooledChunkBuf used after drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledChunkBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        self.0.as_mut().expect("PooledChunkBuf used after drop")
+    }
+}
+
+impl Drop for PooledChunkBuf {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            CHUNK_BUF_POOL.with(|cell| {
+                *cell.borrow_mut() = Some(b);
+            });
+        }
+    }
+}
+
+/// Take this thread's recycled chunk buffer, or prime the slot on this
+/// thread's first chunk. The `anatomy_count!` pair lives ONLY in the prime
+/// arm: a take receives a RECYCLED allocation (no malloc), so counting at
+/// the take would re-charge the same buffer once per chunk; priming is the
+/// only allocation this helper performs. See [`CHUNK_BUF_POOL`]'s census
+/// doc for the one growth path this counter cannot see.
+#[inline]
+fn acquire_chunk_buf(cap: usize) -> PooledChunkBuf {
+    let mut buf = CHUNK_BUF_POOL.with(|cell| cell.borrow_mut().take());
+    if buf.is_none() {
+        crate::anatomy_count!(alloc_events);
+        crate::anatomy_count!(alloc_bytes, cap);
+        buf = Some(Vec::with_capacity(cap));
+    }
+    PooledChunkBuf(buf)
 }
 
 /// Cold set-site hook for [`STORED_BLOCK_EMITTED`]. `pub(crate)` so ultra's

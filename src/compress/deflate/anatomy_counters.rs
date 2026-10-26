@@ -107,9 +107,22 @@
 //!   parsed` (every input byte is covered by exactly one literal or exactly
 //!   one position of exactly one match — the LZ77 parse invariant).
 //! - **`alloc_events`/`alloc_bytes`** — the `Vec::with_capacity` sites in
-//!   `deflate/mod.rs` (`:56` `encode_deflate_bytes_to_vec`, `:123`/`:133` the two padded-
-//!   working-buffer shapes, `:195`/`:218` the two gzip-wrapper output
-//!   buffers) and `huffman/header.rs:129` (combined code-length buffer).
+//!   `deflate/mod.rs` (`:94` `encode_deflate_bytes_to_vec`; `:165`/`:188` the two
+//!   padded-working-buffer shapes in `encode_deflate_segment_to_sink`; `:643` the
+//!   gzip-wrapper output buffer in `encode_gzip_slack_padded_to_vec`; `:778` the
+//!   in-place-tail slow-path input copy in `encode_gzip_unpadded_slice_to_writer`)
+//!   and `huffman/header.rs:179` (`build_dynamic_header`'s combined code-length
+//!   buffer). **WAVE-A LEVER 1 REWIRE:** the T>1 splice-chunk working buffer —
+//!   counted ONCE PER CHUNK at the pre-pool HEAD (both arms of
+//!   `deflate/mod.rs`'s `encode_deflate_splice_chunk_to_sink`, count sites at
+//!   `:253`/`:273` at that HEAD) — moved into `deflate/mod.rs`'s
+//!   `CHUNK_BUF_POOL`: its count pair now fires ONLY in the pool's prime arm
+//!   (`acquire_chunk_buf`), one event per worker thread when the slot is empty,
+//!   not one per chunk (the recycled take allocates nothing; the one growth path
+//!   the counter cannot see — an under-sized take meeting a larger chunk — is
+//!   documented on `acquire_chunk_buf`). Closed-loop effect on a T>1 run: the
+//!   chunk-path share of `alloc_events` collapses from `#chunks` to `#worker
+//!   threads` (rare warm-up growths aside); T1's per-call sites are unchanged.
 //!   **DEVIATION:** the spec's `deflate/mod.rs:273`/`:294` sites are inside
 //!   `#[cfg(test)] mod streaming_tests`'s `mixed_corpus`/`wrap_gzip` test
 //!   helpers (the spec's line numbers land there at HEAD) — never compiled
