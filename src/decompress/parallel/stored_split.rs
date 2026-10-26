@@ -47,9 +47,8 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::decompress::parallel::crc32::{combine_crc32, crc32};
+use crate::decompress::parallel::crc32::{combine_crc32, crc32, crc32_fold};
 use crate::decompress::parallel::gzip_format;
-use crc32fast::Hasher;
 
 /// Counter: number of pure-stored streams decoded via the chunked-streaming
 /// path that copies the verbatim input run slices straight to the writer with
@@ -735,16 +734,26 @@ fn fill_and_crc(
                 // Fused copy+CRC: hash each run's bytes while they are still
                 // hot in cache from the copy (one pass over `output`, not
                 // two). Runs within a partition are contiguous and ordered,
-                // so an incremental Hasher over them yields the exact same
-                // CRC32 as one `crc32(out_slice)` over the whole partition.
-                let mut hasher = Hasher::new();
+                // so a `crc32_fold` chain over them yields the exact same
+                // CRC32 as one `crc32(out_slice)` over the whole partition
+                // (`crc32_fold(0, ·)` equals the one-shot `crc32`; the
+                // kernel's differential pins cover boundary sizes × seeds ×
+                // alignments + a 4000-case proptest). This is the fold
+                // kernel instead of crc32fast's own fold-by-4 dispatch: x86
+                // VPCLMUL ~2x crc32fast on hot data (~11 vs ~21-22 GB/s,
+                // receipt crc32.rs:486-499); aarch64 crc32fast is
+                // latency-bound ~8.5 GB/s (~25 ms silesia leg at T1, receipt
+                // crc32.rs:139-149); the multi-accumulator kernel breaks
+                // that chain — ~2.6x measured (tree receipt a7cbacbc,
+                // M-series, crc leg 24.7->9.4 ms, gated).
+                let mut running = 0u32;
                 for r in runs_part {
                     let dst = r.out_off - local_base;
                     let s = r.src_off - base_off;
                     out_slice[dst..dst + r.len].copy_from_slice(&deflate[s..s + r.len]);
-                    hasher.update(&out_slice[dst..dst + r.len]);
+                    running = crc32_fold(running, &out_slice[dst..dst + r.len]);
                 }
-                *result = (hasher.finalize(), out_len);
+                *result = (running, out_len);
             });
         }
     });
@@ -791,15 +800,24 @@ fn crc_runs(
         for (part, result) in parts.iter().zip(results.iter_mut()) {
             let runs_part = &runs[part.clone()];
             scope.spawn(move || {
-                // Incremental hash over this partition's input slices, in order.
-                let mut hasher = Hasher::new();
+                // Fold chain over this partition's input slices, in order —
+                // the fold kernel instead of crc32fast's own fold-by-4
+                // dispatch (same value; x86 VPCLMUL ~2x crc32fast on hot
+                // data, ~11 vs ~21-22 GB/s, receipt crc32.rs:486-499;
+                // aarch64 crc32fast is latency-bound ~8.5 GB/s (~25 ms
+                // silesia leg at T1, receipt crc32.rs:139-149); the
+                // multi-accumulator kernel breaks that chain — ~2.6x
+                // measured (tree receipt a7cbacbc, M-series, crc leg
+                // 24.7->9.4 ms, gated); partition boundaries stay
+                // combine_crc32 as before).
+                let mut running = 0u32;
                 let mut len = 0usize;
                 for r in runs_part {
                     let s = r.src_off - base_off;
-                    hasher.update(&deflate[s..s + r.len]);
+                    running = crc32_fold(running, &deflate[s..s + r.len]);
                     len += r.len;
                 }
-                *result = (hasher.finalize(), len);
+                *result = (running, len);
             });
         }
     });
@@ -815,12 +833,12 @@ fn crc_runs(
 /// Inline (single-threaded) CRC32 over all run slices, read straight from the
 /// input. Equals `crc32` over the concatenation of the runs in output order.
 fn crc_runs_inline(deflate: &[u8], base_off: usize, runs: &[StoredRun]) -> u32 {
-    let mut hasher = Hasher::new();
+    let mut running = 0u32;
     for r in runs {
         let s = r.src_off - base_off;
-        hasher.update(&deflate[s..s + r.len]);
+        running = crc32_fold(running, &deflate[s..s + r.len]);
     }
-    hasher.finalize()
+    running
 }
 
 /// Stream every run's literal bytes DIRECTLY from the input to the writer with
@@ -890,13 +908,13 @@ fn copy_runs_fused_crc(
     base_off: usize,
     runs: &[StoredRun],
 ) -> u32 {
-    let mut hasher = Hasher::new();
+    let mut running = 0u32;
     for r in runs {
         let src = r.src_off - base_off;
         output[r.out_off..r.out_off + r.len].copy_from_slice(&deflate[src..src + r.len]);
-        hasher.update(&output[r.out_off..r.out_off + r.len]);
+        running = crc32_fold(running, &output[r.out_off..r.out_off + r.len]);
     }
-    hasher.finalize()
+    running
 }
 
 /// Sum of output bytes covered by a contiguous partition (run range).
