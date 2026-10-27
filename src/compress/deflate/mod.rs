@@ -252,8 +252,9 @@ pub fn encode_deflate_splice_chunk_to_sink(
         let cap = data.len() + parse::BUF_PAD;
         let mut buf = acquire_chunk_buf(cap);
         // Load-bearing: a taken buffer still holds the whole previous chunk
-        // (len == capacity == THAT chunk's cap, pad included), so without
-        // this clear the extends below would APPEND to the stale bytes;
+        // (its CAP is THAT chunk's cap, pad included — `len ==` the previous
+        // chunk's cap, `== capacity` only absent growth), so without this
+        // clear the extends below would APPEND to the stale bytes;
         // clear() empties it while keeping the allocation — an empty buffer
         // with the capacity, exactly what the fresh `Vec::with_capacity`
         // used to hand this block.
@@ -338,38 +339,52 @@ thread_local! {
     /// (`decompress/parallel/chunk_buffer_pool.rs`).
     ///
     /// STRUCTURAL. The splice-chunk path built this buffer FRESH ON EVERY
-    /// CALL, and its only caller (`pipelined.rs:648`, the T>1 chunk worker)
+    /// CALL, and its sole PRODUCTION caller (`pipelined.rs:648`, the T>1
+    /// chunk worker; `tests/l9_t4_chunk_cost_probe.rs` calls it directly)
     /// calls it once per CHUNK of the thread-free grid (`GRID_REF_THREADS ×
     /// cpt`, `pipelined.rs:120`/`:193`): an alloc/free pair plus a full
     /// memcpy on every chunk's wall. A worker's caps are uniform except at
     /// its first/final chunk edges — headless `block_size + BUF_PAD`,
-    /// dict-bearing `2 · block_size + BUF_PAD` (`BUF_PAD = 16`,
-    /// `parse/mod.rs:156`) — so the per-chunk allocation was always the SAME
-    /// size, the textbook take-or-prime recycle: one allocation per WORKER
-    /// THREAD instead of one per CHUNK.
+    /// dict-bearing `block_size + 32 KiB + BUF_PAD` (`BUF_PAD = 16`,
+    /// `parse/mod.rs:156`; the dictionary is the last 32768 bytes of input
+    /// before the chunk — `infra/scheduler.rs:498-502` — and
+    /// `MIN_PARALLEL_BLOCK_SIZE = 128 KiB` (`compress/pipelined.rs:78`) makes
+    /// that length constant for every non-headless chunk) — so the per-chunk
+    /// allocation was one of two uniform sizes, the textbook take-or-prime
+    /// recycle: one allocation per WORKER THREAD instead of one per CHUNK.
     ///
     /// Byte identity is by construction, not by tune: the take arm `clear()`s
-    /// the buffer (LOAD-BEARING — a taken buffer arrives with
-    /// `len == capacity == its previous cap`, so without the clear the
-    /// extends would APPEND to stale bytes) and then performs the UNCHANGED
-    /// memcpys + zero-pad resize, so `deflate_into` reads the exact
-    /// `[dict |] data | pad` bytes it always did. T1 never enters this
-    /// function (sole caller is the T>1 chunk worker), so its path is
-    /// untouched by construction.
+    /// the buffer (LOAD-BEARING — a taken buffer arrives with `len ==` the
+    /// previous chunk's cap (`== capacity` only absent growth), so without
+    /// the clear the extends would APPEND to stale bytes) and then performs
+    /// the UNCHANGED memcpys + zero-pad resize, so `deflate_into` reads the
+    /// exact `[dict |] data | pad` bytes it always did. T1's production path
+    /// never enters this function (sole production caller is the T>1 chunk
+    /// worker; `tests/l9_t4_chunk_cost_probe.rs` calls it directly), so its
+    /// path is untouched by construction.
     ///
-    /// CENSUS (`alloc_events`/`alloc_bytes`, see `anatomy_counters.rs`'s
-    /// alloc bullet): the count pair moved from one event PER CHUNK (the two
+    /// CENSUS (`alloc_events`/`alloc_bytes` plus the dedicated
+    /// `chunk_buf_pool_prime_events`, see `anatomy_counters.rs`'s alloc
+    /// bullet): the count pair moved from one event PER CHUNK (the two
     /// former `Vec::with_capacity` sites at the pre-pool HEAD) to the PRIME
     /// arm only — one counted allocation per worker thread. A take whose
     /// pooled buffer is SMALLER than the current cap (a headless first
-    /// chunk before the thread's first dict-sized one) grows through
-    /// `extend_from_slice`'s amortized realloc, which this counter CANNOT
-    /// see; the uniform-grid steady state bounds that (a dict-bearing
-    /// non-final chunk is the largest cap this thread ever sees — capacity
-    /// never needs to grow back down). FALSIFIER for the whole pool: on a
-    /// T>1 anatomy run, post-warm-up `alloc_events` must sit at
-    /// O(#worker threads) plus rare growth steps — any per-chunk residual
-    /// count falsifies the take arm.
+    /// chunk before the thread's first dict-sized one) can still grow — on
+    /// BOTH of its grow sites: `extend_from_slice`'s amortized realloc AND
+    /// the `resize` when capacity lands in `[in_end, in_end+BUF_PAD)` —
+    /// neither of which the counted sites see (growth reallocs happen
+    /// inside `Vec`, never at the `Vec::with_capacity` count site); a
+    /// thread that primes headless and then meets the 32 KiB dictionary
+    /// carries a one-time reserve overshoot (~2x its steady headless need)
+    /// held for the run — a dict-bearing non-final chunk is the largest cap
+    /// it ever needs (capacity never grows back down). FALSIFIER for the
+    /// whole pool, pointed at
+    /// `chunk_buf_pool_prime_events` and NOT at the alloc pair (`alloc_events`
+    /// still carries the per-chunk `HeaderScratch` growth, so a small
+    /// per-chunk residual there proves nothing): post-warm-up
+    /// `chunk_buf_pool_prime_events` must be O(#worker threads) — any
+    /// per-chunk residual on that counter falsifies the take arm
+    /// (`tests/perf_shape.rs`'s `chunk_buf_pool_prime_events_is_per_worker`).
     static CHUNK_BUF_POOL: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -409,17 +424,24 @@ impl Drop for PooledChunkBuf {
 }
 
 /// Take this thread's recycled chunk buffer, or prime the slot on this
-/// thread's first chunk. The `anatomy_count!` pair lives ONLY in the prime
-/// arm: a take receives a RECYCLED allocation (no malloc), so counting at
-/// the take would re-charge the same buffer once per chunk; priming is the
-/// only allocation this helper performs. See [`CHUNK_BUF_POOL`]'s census
-/// doc for the one growth path this counter cannot see.
+/// thread's first chunk. The `anatomy_count!` pair AND
+/// `chunk_buf_pool_prime_events` live ONLY in the prime arm: a take
+/// receives a RECYCLED allocation (no malloc), so counting at the take
+/// would re-charge the same buffer once per chunk; priming is the only
+/// allocation this helper performs. `chunk_buf_pool_prime_events` is the
+/// pool ENGAGEMENT witness — it settles at one per worker thread; any
+/// per-chunk residual on it falsifies the take arm (the alloc pair CANNOT
+/// play that role alone: `HeaderScratch` growth still charges it once
+/// per chunk). See [`CHUNK_BUF_POOL`]'s census doc for the growth paths
+/// these counters cannot see, and `tests/perf_shape.rs`'s
+/// `chunk_buf_pool_prime_events_is_per_worker` for the revert-detector.
 #[inline]
 fn acquire_chunk_buf(cap: usize) -> PooledChunkBuf {
     let mut buf = CHUNK_BUF_POOL.with(|cell| cell.borrow_mut().take());
     if buf.is_none() {
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
+        crate::anatomy_count!(chunk_buf_pool_prime_events);
         buf = Some(Vec::with_capacity(cap));
     }
     PooledChunkBuf(buf)

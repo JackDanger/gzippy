@@ -35,15 +35,20 @@
 //!    ("text"), same seeded generator (`fixtures::generate_sized`), at 1 MiB
 //!    and 8 MiB, T1 and T4, levels {1,6}: `alloc_events` must be O(1) in
 //!    input size at T1 (MEASURED: zero growth from 1 MiB to 8 MiB); at T4
-//!    the MEASURED current behavior (2026-08-08, post-#293) is ~2.7-3.6
-//!    counted allocation events per chunk, dominated by the per-chunk padded
-//!    `[dict|data|pad]` copy buffer (see the constants below for the
-//!    mechanism and the encoded tightest-true bound — allocation is NOT O(1)
-//!    at T4 today). `alloc_bytes` legitimately scales linearly with input
-//!    (the padded [data|pad] work buffer and the output-capacity estimate
-//!    are both O(n)) and carries a fixed per-worker pooled-table term, so
-//!    bytes are pinned as a fixed-allowance-plus-slope ceiling — said here
-//!    so nobody mistakes either term for a leak.
+//!    the MEASURED current behavior (2026-10-27, WAVE-A lever 1
+//!    post-chunk-buf-pool) is ~5.3 counted allocation events per chunk, ALL
+//!    of it HeaderScratch growth — the per-chunk padded `[dict|data|pad]`
+//!    copy buffer is GONE from the per-chunk set (deflate/mod.rs
+//!    `CHUNK_BUF_POOL` primes it once per worker thread; the
+//!    `chunk_buf_pool_prime_events_is_per_worker` test in this file is the
+//!    revert-detector) — see the constants below for the mechanism and the
+//!    encoded tightest-true bound (allocation is NOT O(1) at T4 today).
+//!    `alloc_bytes` legitimately scales linearly with input (the ~len/2
+//!    output-capacity estimate is O(n); the T1 input copy was elided by the
+//!    slack-padded path) and carries a fixed per-worker pooled-reserve term
+//!    (matchfinder tables + the chunk-buf pool prime), so bytes are pinned
+//!    as a fixed-allowance-plus-slope ceiling — said here so nobody
+//!    mistakes either term for a leak.
 //!
 //! ## Determinism gate
 //!
@@ -116,10 +121,16 @@ const REGEN_CMD: &str =
 /// (macos arm64, text:1MiB:L1:T4) measured run A 15 events / 2,328,086 B vs
 /// run B 17 events / 2,721,302 B — a delta of exactly 2 events / 393,216 B =
 /// one more participating worker's head (256 KiB) + len3 (128 KiB) tables.
+/// `chunk_buf_pool_prime_events` joined 2026-10-27 (WAVE-A lever 1): the
+/// splice-chunk buffer pool primes on the same worker-participation race — one
+/// prime per WORKER that claims its first chunk, so run-to-run it reads any
+/// value in [1, #workers]. Its bound is one-sided and enforced by the dedicated
+/// `chunk_buf_pool_prime_events_is_per_worker` test below, not a ratio pin.
 /// The allocation-invariance family still bounds these counters (one-sided
 /// ceilings over the max of two runs — see `alloc_arm`); only exact-ratio
 /// pinning is impossible.
-const T4_NONDETERMINISTIC_COUNTERS: &[&str] = &["alloc_events", "alloc_bytes"];
+const T4_NONDETERMINISTIC_COUNTERS: &[&str] =
+    &["alloc_events", "alloc_bytes", "chunk_buf_pool_prime_events"];
 
 /// Serializes the two tests in this binary against the one process-wide
 /// counter static. Poisoning is ignored deliberately: a panic in one test
@@ -549,56 +560,72 @@ const LARGE: usize = 8 * MIB; // 8 MiB
 /// events and fails loudly.
 const T1_EVENT_GROWTH_SLACK: u64 = 2;
 
-/// T4 `alloc_events` per chunk, ceiling. MEASURED 2026-08-08 (post-#293 main,
-/// aarch64-apple-darwin; text, 1 MiB -> 8 MiB = 4 -> 10 chunks): events grow
-/// 51 over 6 extra chunks at L1 (8.5/chunk) and 38 over 6 at L6 (6.3/chunk).
-/// Per-site attribution (temporary `anatomy_count!` site tracer over the
-/// exact cells above): the growth is dominated by `huffman/header.rs:179` —
-/// each chunk's parser invocation creates a FRESH `HeaderScratch`
-/// (fast.rs/lazy.rs `HeaderScratch::new()`), and since the Huffman candidate
-/// wave (#287 RLE-shaped header, #288 exact package-merge beside the
-/// heuristic) every block costs SEVERAL candidate headers, so the fresh
-/// scratch takes ~5-7 capacity-growth charges per chunk where the pre-wave
-/// encoder took ~1 (ceiling was 4/chunk then). One more event per chunk is
-/// the padded `[dict | data | pad]` copy `encode_deflate_splice_chunk_to_sink`
-/// builds. This is a REAL, measured violation of the charter's
-/// zero-per-chunk-allocation ideal (STEP 1 wording), now ~2x worse than at
-/// pin time — a per-worker HeaderScratch pool (the same pattern
-/// fast.rs uses for its head tables) is the named reclaim candidate — and it
-/// is encoded here as the tightest true integer bound so any FURTHER
-/// per-chunk allocation class fails the test.
-const T4_EVENTS_PER_CHUNK_CEILING: u64 = 9;
+/// T4 `alloc_events` per chunk, ceiling. MEASURED 2026-10-27 (WAVE-A lever 1
+/// post-chunk-buf-pool tip, aarch64-unknown-linux-gnu; fixtures text,
+/// 1 MiB -> 8 MiB = 4 -> 10 chunks at L6): events grow 32 over 6 added chunks
+/// at L6 — 5.33/chunk — and the 1 MiB -> 8 MiB L1 cell (a single added chunk
+/// on the current thread-free grid) reads 9.0/chunk, dominated by
+/// worker-participation jitter, not per-chunk mechanism (see
+/// T4_WORKER_EVENTS_ALLOWANCE). Per-site attribution: the growth is
+/// `huffman/header.rs` — each chunk's parser invocation creates a FRESH
+/// `HeaderScratch` (`fast.rs`/`lazy.rs` `HeaderScratch::new()`), and since the
+/// Huffman candidate wave (#287 RLE-shaped header, #288 exact package-merge
+/// beside the heuristic) every block costs SEVERAL candidate headers, so the
+/// fresh scratch takes ~5-7 capacity-growth charges per chunk where the
+/// pre-wave encoder took ~1 (ceiling was 4/chunk then). That is now THE
+/// surviving per-chunk allocation class — the per-chunk padded
+/// `[dict | data | pad]` copy `encode_deflate_splice_chunk_to_sink` used to
+/// build (1 event/chunk) is GONE: WAVE-A lever 1 pools it per worker thread
+/// (`CHUNK_BUF_POOL`, prime-only charging, one event per worker). This is
+/// still a REAL, measured violation of the charter's zero-per-chunk-
+/// allocation ideal (STEP 1 wording) — the per-worker HeaderScratch pool is
+/// the named reclaim candidate — encoded here as the tightest true integer
+/// bound so any FURTHER per-chunk allocation class fails the test. Fine-grain
+/// revert detection (a per-chunk copy buffer COMING BACK) is the dedicated
+/// counter's job, not this coarse ceiling's: `chunk_buf_pool_prime_events`
+/// sits at O(#workers) when the pool is intact and at #chunks the day the
+/// pool is reverted — see `chunk_buf_pool_prime_events_is_per_worker` below.
+const T4_EVENTS_PER_CHUNK_CEILING: u64 = 6;
 
 /// Scheduling-variance allowance on the T4 event ceiling: up to `T4` worker
-/// threads each pay a one-time 2-event thread-local pooled-table charge
-/// (head + len3, parse/fast.rs `acquire_head_table`) on the first chunk they
-/// happen to claim, and HOW MANY workers claim a chunk is a race (see
-/// `T4_NONDETERMINISTIC_COUNTERS` — measured run-to-run delta is exactly
-/// 2 events per extra participating worker). This term does NOT scale with
-/// chunks, so it must not be folded into the per-chunk ceiling.
-const T4_WORKER_EVENTS_ALLOWANCE: u64 = 2 * T4 as u64;
+/// threads each pay a one-time THREE-event thread-local charge on the first
+/// chunk they happen to claim — the head-table + len3-table pool charges
+/// (2 events, parse/fast.rs `acquire_head_table`) AND the one-event prime of
+/// the splice-chunk buffer pool (deflate/mod.rs `acquire_chunk_buf`) since
+/// WAVE-A lever 1 — and HOW MANY workers claim a chunk is a race (see
+/// `T4_NONDETERMINISTIC_COUNTERS` — measured run-to-run delta is exactly 2
+/// events per extra participating worker pre-pool, 3 with the pool prime).
+/// This term does NOT scale with chunks, so it must not be folded into the
+/// per-chunk ceiling.
+const T4_WORKER_EVENTS_ALLOWANCE: u64 = 3 * T4 as u64;
 
 /// `alloc_bytes` ceiling: a FIXED allowance plus a per-input-byte slope
 /// (both integer arithmetic; slope x1000). `alloc_bytes` legitimately scales
-/// linearly with input at BOTH thread counts — the padded work buffer is
-/// input-sized and the output-capacity estimate is ~len/2 at L1+
-/// (`estimate_output_cap`) — and since bit-splice + bucket2 it also carries a
-/// real input-INDEPENDENT term, so the honest bound is fixed + slope, not a
-/// pure ratio. MEASURED 2026-08-08 (post-#293 main, aarch64-apple-darwin;
-/// text, L1/L6, max of two runs):
-///   T1: 1,573,510 @ 1 MiB and 12,583,558 @ 8 MiB — pure 1.5004x-1.5006x
-///       slope (one input-sized padded copy + the ~len/2 output cap), fixed
-///       term nil.
-///   T4: 2,724,290 @ 1 MiB and 10,274,472 @ 8 MiB — slope ~1.03x (per-chunk
-///       padded copies + 32 KiB dictionary prefix per chunk) plus a ~1.7 MiB
-///       fixed term: up to 4 participating workers x 384 KiB of thread-local
-///       pooled matchfinder tables (256 KiB head + 128 KiB len3 since
-///       bucket2, #283) plus per-worker fragment scratch.
-/// Fixed allowance 2 MiB covers full 4-worker participation with slack;
-/// slope ceiling stays 1.5x + margin at 1.7x so ONE more whole-input copy
-/// (worst arm 1.5 -> 2.5) fails at 8 MiB where the fixed term is noise.
-const ALLOC_BYTES_FIXED_ALLOWANCE: u64 = 2 * 1024 * 1024;
-const BYTES_PER_INPUT_BYTE_CEILING_X1000: u64 = 1700;
+/// linearly with input at BOTH thread counts — T1 carries the output-
+/// capacity estimate ~len/2 at L1+ (`estimate_output_cap`; the input is
+/// compression-copied at T1 only via the SLACK-padded caller buffer) — and
+/// T>1 carries a real input-INDEPENDENT term, the per-worker pooled
+/// reserves (matchfinder head+len3 tables, per-worker fragment scratch, and
+/// since WAVE-A lever 1 the one-time chunk-buf POOL prime reserve, cap =
+/// that thread's first chunk's cap), so the honest bound is fixed + slope.
+/// MEASURED 2026-10-27 (WAVE-A lever 1 post-chunk-buf-pool tip,
+/// aarch64-unknown-linux-gnu; textures = fixtures text, max of two runs):
+///   T1: 524,917 @ 1 MiB and 4,194,933 @ 8 MiB — pure 0.5001x slope (the
+///       ~len/2 output cap; FIXED term nil — the old 1.5x "input-sized
+///       padded copy + output cap" shape predates the slack-padded T1 path,
+///       which elides the input copy entirely).
+///   T4: 3,774,648 @ 1 MiB and 9,928,766 @ 8 MiB at L1 — slope ~0.839x with
+///       a ~2.6 MiB fixed term (4 participating workers x pooled reserves);
+///       L6 measured 1,152,928 @ 1 MiB, 3,713,972 @ 8 MiB (slope ~0.349x,
+///       fixed ~0.75 MiB). The per-chunk dictionary-prefix bytes the
+///       pre-pool encoders charged are gone with the pool — the fixed term
+///       now bounds the per-worker reserves.
+/// Fixed allowance 3 MiB covers full 4-worker participation with slack
+/// (primes included); slope ceiling 1.0x covers the max measured slope
+/// 0.839x + margin, and still fails ONE more whole-input copy class on
+/// every arm (worst arm 0.839 -> 1.839 at L1 T4; T1 0.500 -> 1.500).
+const ALLOC_BYTES_FIXED_ALLOWANCE: u64 = 3 * 1024 * 1024;
+const BYTES_PER_INPUT_BYTE_CEILING_X1000: u64 = 1000;
 
 /// One measured allocation arm.
 struct AllocArm {
@@ -718,9 +745,12 @@ fn allocation_invariance() {
                          alloc_events   {SMALL} B input: {}   {LARGE} B input: {}   growth: {}\n    \
                          chunks         {} -> {} (growth {})\n    \
                          implied per-chunk allocations: {:.2}   ceiling: {} per chunk\n    \
-                         The T>1 pipeline budget is {} counted allocation(s) per chunk (the\n    \
-                         padded [dict|data|pad] copy buffer + header scratch — see\n    \
-                         T4_EVENTS_PER_CHUNK_CEILING). A NEW per-chunk allocation joined it.",
+                         The T>1 pipeline budget is {} counted allocation(s) per chunk (HeaderScratch\n    \
+                         growth — the surviving per-chunk allocation class; the per-chunk copy\n    \
+                         buffer is pooled since WAVE-A lever 1, see T4_EVENTS_PER_CHUNK_CEILING;\n    \
+                         if this fired WITHOUT a new per-chunk class, check\n    \
+                         chunk_buf_pool_prime_events in its dedicated test below). A NEW\n    \
+                         per-chunk allocation joined it.",
                         commas(a.events),
                         commas(b.events),
                         commas(event_growth),
@@ -765,6 +795,92 @@ fn allocation_invariance() {
          (see the constants' doc comments for the mechanism behind each number);\n\
          if a deliberate change legitimately moves one, update the constant in the\n\
          same PR with a comment naming the new mechanism.\n",
+        failures.join("\n\n")
+    );
+}
+
+/// The chunk-buf pool's revert-detector (WAVE-A lever 1, deflate/mod.rs
+/// `CHUNK_BUF_POOL`). The T>1 splice-chunk working buffer must be POOLED: one
+/// PRIME per worker thread, then take-or-reuse for every chunk after. Counted
+/// by the PRIME-arm-only `chunk_buf_pool_prime_events` (deflate/mod.rs
+/// `acquire_chunk_buf`; the alloc pair CANNOT be the witness alone — it still
+/// carries ~5-7 per-chunk HeaderScratch growth charges, see the ceiling doc
+/// above).
+///
+/// Contract, on an 8 MiB-class input at T4 that stretches the pipeline to
+/// >= 2x-thread chunk count (L6's grid: 1 MiB -> 4 chunks, 8 MiB -> 10):
+///   * `chunk_buf_pool_prime_events <= #worker threads + 1 slack` — the pool
+///     ENGAGEMENT witness; each worker thread primes its re-use slot at most
+///     once, no matter how many chunks it processes.
+///   * pre-pool truth, the day the pool is REVERTED, primes == #chunks (each
+///     chunk builds its buffer fresh) = 10 here — the assertion goes red and
+///     names the take arm as the thing that vanished.
+///
+/// MEASURED 2026-10-27 (this box/tree, max of two runs): primes read exactly
+/// 4 (= #workers, full participation) on every measured arm — 4-chunk (1 MiB)
+/// AND 10-chunk (8 MiB, L6, >= 2x threads) alike. Engagement is per worker,
+/// never per chunk; a reverted pool puts primes at #chunks (10 on the
+/// stretched arm) and turns this red. One-sided bounds only, so the
+/// double-run here is for the printed evidence, not an exact-agreement gate.
+#[test]
+fn chunk_buf_pool_prime_events_is_per_worker() {
+    let _guard = COUNTER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    warm_up();
+
+    let get = |m: &BTreeMap<String, u64>, k: &str| {
+        m.get(k)
+            .copied()
+            .unwrap_or_else(|| panic!("missing counter {k}"))
+    };
+
+    let mut failures = Vec::new();
+    for &level in ALLOC_LEVELS {
+        for &len in &[SMALL, LARGE] {
+            let data = fixtures::generate_sized("text", len);
+            let what = format!("buf-pool:text:{len}B:L{level}:T{T4}");
+            let compress = || compress_t4(&data, level);
+            let a = measure(&data, compress, &what);
+            let b = measure(&data, compress, &what);
+            let primes =
+                get(&a, "chunk_buf_pool_prime_events").max(get(&b, "chunk_buf_pool_prime_events"));
+            let events = get(&a, "alloc_events").max(get(&b, "alloc_events"));
+            let bytes = get(&a, "alloc_bytes").max(get(&b, "alloc_bytes"));
+            let chunks = {
+                let block = pipelined_block_size(data.len(), T4, level);
+                data.len().div_ceil(block) as u64
+            };
+            eprintln!(
+                "perf_shape buf-pool T{T4} L{level}: {len} B -> chunks {chunks}, \
+                 primes {primes}, alloc_events {events}, alloc_bytes {}",
+                commas(bytes),
+            );
+            // One-sided contract only: primes <= threads + 1 slack, asserted
+            // on every measured arm (priming is per WORKER, never per CHUNK);
+            // the >=2x-threads chunk-stretch precondition is part of the
+            // contract shape — on the stretched arm the value has nowhere to
+            // hide (L1's thread-free grid on this fixture yields 5 chunks,
+            // an input-to-grid fact, not a pool behavior, so the stretch is
+            // only meaningful at L6's deeper grid — printed, not asserted).
+            if primes > T4 as u64 + 1 {
+                failures.push(format!(
+                    "CHUNK BUF POOL REVERTED? {what}: chunk_buf_pool_prime_events \
+                     {primes} > #workers+1 ({}) while chunks {chunks}.\n    \
+                     Primes must be per WORKER THREAD (pool intact) — a value that scales\n    \
+                     with #chunks means encode_deflate_splice_chunk_to_sink is allocating\n    \
+                     its [dict|data|pad] buffer fresh per chunk again (the pre-pool shape).",
+                    T4 + 1,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{}\n\nThe chunk-buf pool's PRIME pattern moved: post-warm-up\n\
+         chunk_buf_pool_prime_events must sit at O(#worker threads) — any\n\
+         per-chunk residual on that counter falsifies the take arm\n\
+         (deflate/mod.rs CHUNK_BUF_POOL census doc). Reverting the pool puts\n\
+         primes at #chunks and turns this red.\n",
         failures.join("\n\n")
     );
 }

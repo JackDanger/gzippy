@@ -107,28 +107,43 @@
 //!   parsed` (every input byte is covered by exactly one literal or exactly
 //!   one position of exactly one match — the LZ77 parse invariant).
 //! - **`alloc_events`/`alloc_bytes`** — the `Vec::with_capacity` sites in
-//!   `deflate/mod.rs` (`:94` `encode_deflate_bytes_to_vec`; `:165`/`:188` the two
-//!   padded-working-buffer shapes in `encode_deflate_segment_to_sink`; `:643` the
-//!   gzip-wrapper output buffer in `encode_gzip_slack_padded_to_vec`; `:778` the
-//!   in-place-tail slow-path input copy in `encode_gzip_unpadded_slice_to_writer`)
+//!   `deflate/mod.rs` (`:96` `encode_deflate_bytes_to_vec`; `:167`/`:190` the two
+//!   padded-working-buffer shapes in `encode_deflate_segment_to_sink`; the
+//!   gzip-wrapper output Vec in `encode_gzip_slack_padded_to_vec` (`:768` at
+//!   the rewire's follow-up tip); the in-place-tail slow-path input copy in
+//!   `encode_gzip_unpadded_slice_to_writer` (`:903`, same tip))
 //!   and `huffman/header.rs:179` (`build_dynamic_header`'s combined code-length
 //!   buffer). **WAVE-A LEVER 1 REWIRE:** the T>1 splice-chunk working buffer —
 //!   counted ONCE PER CHUNK at the pre-pool HEAD (both arms of
 //!   `deflate/mod.rs`'s `encode_deflate_splice_chunk_to_sink`, count sites at
-//!   `:253`/`:273` at that HEAD) — moved into `deflate/mod.rs`'s
+//!   that HEAD's `:253`/`:273`) — moved into `deflate/mod.rs`'s
 //!   `CHUNK_BUF_POOL`: its count pair now fires ONLY in the pool's prime arm
 //!   (`acquire_chunk_buf`), one event per worker thread when the slot is empty,
-//!   not one per chunk (the recycled take allocates nothing; the one growth path
-//!   the counter cannot see — an under-sized take meeting a larger chunk — is
+//!   not one per chunk (the recycled take allocates nothing; the growth paths
+//!   the counter cannot see — an under-sized take meeting a larger chunk — are
 //!   documented on `acquire_chunk_buf`). Closed-loop effect on a T>1 run: the
 //!   chunk-path share of `alloc_events` collapses from `#chunks` to `#worker
 //!   threads` (rare warm-up growths aside); T1's per-call sites are unchanged.
-//!   **DEVIATION:** the spec's `deflate/mod.rs:273`/`:294` sites are inside
-//!   `#[cfg(test)] mod streaming_tests`'s `mixed_corpus`/`wrap_gzip` test
-//!   helpers (the spec's line numbers land there at HEAD) — never compiled
+//!   **`chunk_buf_pool_prime_events` (ADDED, this rewire, PRIME-arm-only):**
+//!   the allocation-independent pool ENGAGEMENT witness, counted inside the
+//!   SAME prime arm of `acquire_chunk_buf` (see the COUNTERS list below) —
+//!   settles at one per worker thread; a per-chunk residual on it falsifies
+//!   the take arm. Do NOT use the raw `alloc_events` for that falsifier: it
+//!   still carries the per-chunk `HeaderScratch` growth
+//!   (`huffman/header.rs`, `HeaderScratch::new()`), ~5-7 events/chunk at the
+//!   deep levels — the surviving per-chunk allocation class
+//!   (`tests/perf_shape.rs` pins the ceiling; its
+//!   `chunk_buf_pool_prime_events_is_per_worker` test owns the
+//!   revert-detector).
+//!   **DEVIATION:** the spec's `deflate/mod.rs:273`/`:294` sites are
+//!   `mixed_corpus`/`wrap_gzip`, the two `Vec`-building helpers inside
+//!   `deflate/mod.rs`'s `#[cfg(test)] mod streaming_tests` — never compiled
 //!   into a production/release build, so instrumenting them would count
-//!   test-fixture allocations, not production ones. Skipped; documented here
-//!   rather than silently dropped.
+//!   test-fixture allocations, not production ones. Skipped and documented
+//!   here rather than silently dropped; anchored by SYMBOL, not line number
+//!   (for archaeology: the helpers sat at `:847`/`:853`/`:875` on the
+//!   pre-pool parent, and the values drift again with every doc insert above
+//!   them — the symbols are the stable anchor).
 //!
 //! ## `fast_*` — L0/L1 single-probe matchfinder (`parse/fast.rs`)
 //!
@@ -415,6 +430,10 @@ define_counters!(
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,
+    // Chunk-buf pool PRIME arms (deflate/mod.rs acquire_chunk_buf) — pool
+    // ENGAGEMENT witness; settles at one per worker thread; a per-chunk
+    // residual falsifies the take arm.
+    chunk_buf_pool_prime_events,
 );
 
 /// Record one completed bt descent (bt-probebudget pricing): `probes` is the
