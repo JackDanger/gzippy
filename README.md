@@ -1,95 +1,12 @@
 # gzippy
 
-A parallel gzip compressor and decompressor in Rust. One binary answers to
-`gunzip`, `ungzippy`, `gzcat`, and `zcat` symlinks, reads and writes standard
-RFC 1952 streams, and uses every core you have.
+A parallel gzip.
+In Rust.
 
-## What it does
+One binary.
+Four names: `gzippy`, `gunzip`, `gzcat`, `zcat`.
 
-**Compression.** A single pure-Rust DEFLATE engine serves every level and
-thread count, and every input is encoded exactly once — no trial encodes,
-no keep-the-smaller-of-two. There is no C compressor on the production
-routing graph; the vendored C encoders remain in-tree only as differential
-test oracles.
-
-Levels 0–9 follow libdeflate's level ladder, and most of them are a
-decision-for-decision transliteration of
-`vendor/libdeflate/lib/deflate_compress.c` (`src/compress/ldx/`).
-Levels 1 and 6 stay on
-gzippy's own arm; that is measured, not accidental: our level 1 beats pigz -1
-on text where the transliteration does not, and level 6 is the one place the
-transliteration costs more wall than it saves. Levels 10–12 switch to a
-near-optimal parse — close to
-[Zopfli](https://github.com/google/zopfli)'s ratio at a fraction of its
-runtime. Every level and thread count emits a standard single-member gzip
-stream that any tool reads; no gzippy-specific output format is produced
-outside test oracles.
-
-**Decompression.** One pure-Rust engine handles every gzip stream in the
-wild: plain single-member files, pigz-style multi-member concatenations
-(`cat a.gz b.gz`), tabix/HTS [BGZF](https://samtools.github.io/hts-specs/SAMv1.pdf)
-blocks, and gzippy's own legacy pre-1.0 "GZ" multi-block format (read for
-backward compatibility; no writer emits it since v1.0). Parallel single-member
-files are read by a parallel marker pipeline — a structural port of
-[rapidgzip](https://github.com/mxmlnkn/rapidgzip) — that finds block
-boundaries in the compressed bytes and hands chunks to workers, so one big
-file's inflation spreads across every core. Every path verifies the trailing
-CRC32 and ISIZE before it claims success. There is no C in the decode graph
-at all; Deflate64 (ZIP method 9) is a separate library entry point.
-
-### Engine highlights
-
-- **One-encoder routing.** Which engine serves which level is one small
-  function (`level_uses_ldx`); `tests/one_encode_only.rs` counts encoder
-  entries so an encode-per-input regression is caught, not asserted.
-- **Parse budget 48.** The near-optimal parser's binary-tree descent stops
-  after 48 candidate probes per descent. Measured on a frozen cloud census:
-  1.9% faster at the `-9 -p4` route and 1,251 B smaller than the uncapped
-  shape it replaced, and the headline parallel wall comparison against pigz
-  moved from 1.084× to 1.055×.
-- **The `good_match` knob pair.** zlib's lazy-match tuning (chain depth,
-  nice length, good match) is carried explicitly by the port's hash-chain
-  matchfinder, which is what lets it match the old arms byte-for-byte at
-  levels 6–7 and retire them.
-- **Length-3 matches at level 3.** Level 3 runs the lazy parser with the
-  far-Length-3 gate: a long-distance 3-byte match is taken only when it
-  beats the three literals it replaces (`src/compress/ldx/far_len3.rs`).
-- **NEON / SSE match extension.** The kernel that extends a candidate match
-  compares 16 bytes at a time (NEON with exact-mismatch locate on
-  aarch64, SSE on x86) instead of byte-walking.
-- **Software-pipelined chain walk.** The hash-chain walk loads the next
-  chain node while still testing the current candidate, one node prefetched
-  ahead, in the `ldx` matchfinder.
-- **Pure-Rust parallel decode.** The parallel single-member pipeline
-  (`ParallelSM`) is the sole single-member decode path on every
-  architecture — the decode engine builds without any C FFI.
-
-## Performance
-
-We re-census sizes on frozen hardware and bank the receipts rather than
-quote numbers that rot. The banked board (AMD Zen2 cloud box, the canonical
-21-file corpus — 19 Silesia members and two other streams — levels 1–9 × 1
-and 4 threads, matched levels against gzip, pigz, and libdeflate):
-
-| axis | result |
-|---|---|
-| size, all 1,006 comparable cells | 12 fail (1.2%) — every one single-threaded, worst margin +1.07% |
-| size at 4 threads | zero failures |
-| byte-equal ties | 105 cells are byte-identical to a rival's own bytes |
-| wall, `silesia.tar -9 -p4` vs pigz | 1.055× (was 1.08× before the parse-budget change) |
-
-A cell here is one (file × level × thread count × rival) comparison; full
-definitions and per-cell receipts are in
-[docs/board/sprint-2026-09-25.md](docs/board/sprint-2026-09-25.md).
-
-For a feel rather than a census: on an M4 laptop, 211 MB of logs compress in
-0.07 s across 14 threads (0.53 s single-threaded, versus GNU gzip's 0.58 s).
-Decompression runs at 300–2000 MB/s depending on input and thread count.
-
-Run your own files through it. `man gzippy-tuning` covers the knobs, and
-[docs/board/](docs/board/) holds the campaign records behind everything
-claimed above — the frozen-box receipts, the per-cell definitions, and the
-residual loss list.
+Standard gzip streams. RFC 1952.
 
 ## Install
 
@@ -98,16 +15,16 @@ curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/scripts/inst
 ```
 
 <details>
-<summary>Per-platform</summary>
+<summary>Other platforms</summary>
 
-**macOS (Homebrew)**
+macOS:
 
 ```bash
 brew tap jackdanger/gzippy https://github.com/JackDanger/gzippy
 brew install jackdanger/gzippy/gzippy
 ```
 
-**Debian / Ubuntu**
+Debian / Ubuntu:
 
 ```bash
 curl -fsSL https://jackdanger.github.io/gzippy/gzippy-signing-key.asc \
@@ -117,47 +34,101 @@ echo "deb [signed-by=/etc/apt/keyrings/gzippy.gpg] https://jackdanger.github.io/
 sudo apt-get update && sudo apt-get install gzippy
 ```
 
-**Arch (AUR)**: `gzippy-bin`
+Arch: `gzippy-bin` (AUR).
 
-**From source**
+From source:
 
 ```bash
 git clone --recursive https://github.com/JackDanger/gzippy
-cd gzippy && cargo build --release
+cd gzippy
+cargo build --release
 ```
 
 </details>
 
-## Usage
-
-Same flags as gzip, plus parallelism and a few extras. `gunzip file.gz`,
-`zcat file.gz`, and `gzippy -9 file` all work; the extra names are one binary
-checking `argv[0]`. Existing scripts and pipelines run unchanged.
+## Compress
 
 ```bash
-gzippy -9 big.tar                      # keep-it-simple, every core
-gzippy -dc /var/log/prod-2026-04-22.gz | grep -i error
-find /var/log -name '*.log' -mtime +30 -print0 | xargs -0 gzippy -k -6
-tar c big-dir | gzippy --ultra > big-dir.tgz   # true zopfli (level 11): best ratio, slowest
-gzippy -p4 -9 backup.sql               # four threads, strong ratio
-pg_dump mydb | gzippy -6 | aws s3 cp - s3://bucket/dump.gz
-gzippy --max precious.tar              # densest level (12)
-GZIPPY_DEBUG=1 gzippy -d mystery.gz    # show which decode route ran
+gzippy -9 big.tar              # level 9, every core
+gzippy --ultra big.tar         # level 11, true zopfli parse
+gzippy --max precious.tar      # level 12, densest
+gzippy -p 4 big.tar            # four threads
 ```
 
-Flag honesty: `-z` (zlib container) emits a real RFC 1950 zlib stream at
-every level and thread count (`FILE.zz`, roundtrips through `gzippy -d`
-and any `zlib` decoder). `-R` (rsyncable), `-K` (single-entry ZIP),
-`-H`, `-U`, `-i` and `-A` are parsed but rejected loudly with exit 2
-rather than silently misbehaving — not yet implemented (issues #302 /
-#303). Manual:
-`man gzippy`, wire format: `man gzippy-format`, tuning: `man gzippy-tuning`.
+Rejected loudly, not silently wrong (issues #302, #303):
+`-R` rsyncable, `-z` zlib, `-K` zip.
+
+## Decompress
+
+Standard streams only, in and out.
+
+```bash
+gunzip big.tar.gz
+zcat file.gz | grep error
+gzippy -dc prod-2026-04-22.gz | grep -i error
+GZIPPY_DEBUG=1 gzippy -d mystery.gz    # print which decode route ran
+```
+
+Handles every gzip file we know of:
+
+- plain files
+- multi-member files (`cat a.gz b.gz`)
+- BGZF blocks (tabix/HTS)
+- our own multi-block GZ format
+
+Parallel by default on the first:
+
+- finds block boundaries in compressed bytes
+- spreads them across every core
+- port of rapidgzip's structure
+
+CRC32 and ISIZE verified every time.
+
+## The one-encode rule
+
+One encode per input.
+
+No trial runs. No keep-the-smaller-of-two.
+
+Which engine runs at which level:
+
+```text
+level_uses_ldx: 0, 2-5, 7-9   -> the libdeflate port
+level 1, 6                    -> our own arm (measured)
+level 10-12                   -> near-optimal parse
+```
+
+`tests/one_encode_only.rs` counts encoder entries.
+
+## How fast
+
+Frozen-box censuses, not benchmarks that rot.
+
+21-file corpus, 9 levels, 1 and 4 threads, matched levels vs gzip, pigz, libdeflate:
+
+| axis | result |
+|---|---|
+| size, 1006 cells | 12 fail. All single-threaded. Worst +1.07% |
+| at 4 threads | zero failures |
+| byte-identical to a rival | 105 cells |
+| silesia.tar -9 -p4 vs pigz | 1.055x wall |
+
+Full receipts: [docs/board/sprint-2026-09-25.md](docs/board/sprint-2026-09-25.md).
+
+A single laptop number for feel: 211 MB of logs on an M4, 0.07 s on
+14 threads, 0.53 s single-threaded (GNU gzip: 0.58 s). Decodes at
+300-2000 MB/s.
+
+Run your own files.
+`man gzippy-tuning` has the knobs.
 
 ## Analyze
 
-`gzippy --analyze FILE` prints a compression fingerprint of any file:
-entropy, LZ77 coverage, a color canvas of the bytes, match histograms,
-and a verdict.
+```bash
+gzippy --analyze FILE
+```
+
+Entropy. LZ77 coverage. Match histograms. A byte canvas. A verdict.
 
 ```
 $ gzippy --analyze Cargo.lock
@@ -167,7 +138,10 @@ $ gzippy --analyze Cargo.lock
   est. gzip  [█▅        ]  ~16% of raw
 ```
 
-## Library
+(One block, abridged — real output adds a banner, canvas, legends and
+histograms.)
+
+## As a library
 
 ```toml
 gzippy = "1.0"
@@ -177,36 +151,43 @@ gzippy = "1.0"
 let compressed = gzippy::compress(&data, 6)?;
 let restored = gzippy::decompress(&compressed)?;
 
-// Explicit worker count (parallel; buffers the whole input):
+// Explicit thread count (parallel; buffers the whole input):
 let out = gzippy::compress_with_threads(&data, 6, 4)?;
 
-// ⚠ Buffers the entire input — like every compression entry point in this
-// crate today (the whole-buffer encoder is the shipped design; a true
-// streaming path is open work). Peak memory is `input + output`.
-let n1 = gzippy::compress_to_writer(reader, writer, 6)?;
+// Streaming wrapper (also buffers the input today):
+let n = gzippy::compress_to_writer(reader, writer, 6)?;
 
-// Deflate64 (ZIP method 9), the same engine as the gz/zip container paths:
-let unzipped = gzippy::decompress_deflate64(&member)?;
+// Streams to a writer on the decode side:
+let n = gzippy::decompress_to_writer(&compressed, &mut out)?;
+
+// Deflate64 (ZIP method 9):
+let out = gzippy::decompress_deflate64(&member)?;
 ```
 
-`decompress_to_writer` streams the other direction.
-`gzippy::decompress` accepts gzip data only and checks the magic up front;
-full API: `cargo doc --open`.
+`decompress_to_writer` streams the decode direction.
+Full API: `cargo doc --open`.
+
+## Docs
+
+- `man gzippy`
+- `man gzippy-format`
+- `man gzippy-tuning`
+- [docs/board/](docs/board/) — the measurement records behind this file
 
 ## Credits
 
-Built on ideas and code from [pigz](https://zlib.net/pigz/) (Mark Adler),
-[libdeflate](https://github.com/ebiggers/libdeflate) (Eric Biggers),
-[Zopfli](https://github.com/google/zopfli) (Google),
-[zlib-ng](https://github.com/zlib-ng/zlib-ng),
-[rapidgzip](https://github.com/mxmlnkn/rapidgzip) (Maximilian Knespel),
-[ISA-L](https://github.com/intel/isa-l) (Intel), and
-[ECT](https://github.com/fhanau/Efficient-Compression-Tool) (Felix Hanau).
-Portions of this codebase are ports of those projects; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the per-project
-licenses, copyright notices, and the list of derived files.
+Ports and ideas from the giants. Per-file licenses:
 
-[zlib license](LICENSE) for gzippy's own code, with third-party-derived
-files under their upstream licenses (MIT, Apache-2.0, BSD-3-Clause, zlib —
-see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+- [pigz](https://zlib.net/pigz/) — Mark Adler
+- [libdeflate](https://github.com/ebiggers/libdeflate) — Eric Biggers
+- [Zopfli](https://github.com/google/zopfli)
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng)
+- [rapidgzip](https://github.com/mxmlnkn/rapidgzip) — Maximilian Knespel
+- [ISA-L](https://github.com/intel/isa-l) — Intel
+- [ECT](https://github.com/fhanau/Efficient-Compression-Tool) — Felix Hanau
+
+gzippy: the zlib license, [LICENSE](LICENSE).
+
 By [Jack Danger](https://github.com/jackdanger).
