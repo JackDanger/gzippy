@@ -32,10 +32,11 @@
 //!   a pure parallel encoder whose output is byte-identical across thread
 //!   counts
 //!
-//! gzippy's own "GZ" multi-block format ([`ParallelGzEncoder`]) still
-//! exists and is still decompressible (see below), but it is not reachable
-//! from this crate's compress routing table — it is retained only as a
-//! differential test oracle behind the `ffi-oracle` feature.
+//! The legacy "GZ" multi-block format (v0.x, with its FEXTRA block-size
+//! subfield) is neither reachable from the compress routing table nor writable
+//! by any code in the tree — and as of v1.0 the differential oracle no longer
+//! emits it either. The DECODE side still reads it for backward compatibility
+//! with pre-1.0 files.
 //!
 //! [`ParallelGzEncoder`]: compress::parallel::ParallelGzEncoder
 //! [`PipelinedGzEncoder`]: compress::pipelined::PipelinedGzEncoder
@@ -43,7 +44,8 @@
 //! # Decompression
 //!
 //! The decompressor handles all gzip variants automatically:
-//! - gzippy "GZ" multi-block streams (parallel bgzf path)
+//! - legacy pre-1.0 gzippy "GZ" multi-block streams (parallel bgzf scan;
+//!   no longer produced by any writer)
 //! - Standard multi-member streams (e.g. `cat a.gz b.gz`)
 //! - Single-member streams (standard gzip output)
 //!
@@ -212,8 +214,8 @@ pub fn compress_to_writer_with_threads<R: std::io::Read, W: std::io::Write + Sen
 
 /// Decompress a gzip stream using all available CPUs.
 ///
-/// Pure-Rust end to end at every thread count: the "GZ" multi-block format
-/// takes the parallel bgzf scan, multi-member streams take the member grid
+/// Pure-Rust end to end at every thread count: legacy pre-1.0 "GZ"
+/// multi-block files take the parallel bgzf scan, multi-member streams take the member grid
 /// or member-per-worker split (sequential at `threads = 1`), and
 /// single-member streams always take the pure-Rust ParallelSM pipeline —
 /// the sole single-member decode path (Increment 7 removed the C-FFI

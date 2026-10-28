@@ -87,10 +87,13 @@ mod tests {
 
     /// BGZF gzip (what gzippy produces — blocks with FEXTRA markers).
     fn compress_bgzf_gzip(data: &[u8]) -> Vec<u8> {
-        let mut output = Vec::new();
+        // Decode-side test of the LEGACY pre-1.0 "GZ" format: no writer
+        // emits it any more, so the fixture synthesizes the subfield onto a
+        // plain member (see `synthesize_legacy_gz_member`).
+        let mut plain = Vec::new();
         let header = GzipHeaderInfo::default();
-        compress_single_member(&mut output, data, 1, &header).unwrap();
-        output
+        compress_single_member(&mut plain, data, 1, &header).unwrap();
+        crate::compress::parallel::synthesize_legacy_gz_member(&plain)
     }
 
     /// Decompress using flate2 as a reference implementation.

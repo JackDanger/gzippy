@@ -28,7 +28,8 @@ outside test oracles.
 **Decompression.** One pure-Rust engine handles every gzip stream in the
 wild: plain single-member files, pigz-style multi-member concatenations
 (`cat a.gz b.gz`), tabix/HTS [BGZF](https://samtools.github.io/hts-specs/SAMv1.pdf)
-blocks, and gzippy's own "GZ" multi-block format. Parallel single-member
+blocks, and gzippy's own legacy pre-1.0 "GZ" multi-block format (read for
+backward compatibility; no writer emits it since v1.0). Parallel single-member
 files are read by a parallel marker pipeline — a structural port of
 [rapidgzip](https://github.com/mxmlnkn/rapidgzip) — that finds block
 boundaries in the compressed bytes and hands chunks to workers, so one big
