@@ -528,6 +528,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --release --all-targets --features isal-compression -- -D warnings
 
+      - name: Run clippy (workspace member: gzippy-inflate)
+        run: cargo clippy --release -p gzippy-inflate --all-targets -- -D warnings
+
       - name: Check version consistency
         run: |
           VERSION=$(cat VERSION)
