@@ -1465,6 +1465,87 @@ mod tests {
         assert_eq!(crc32fast::hash(&got), 0xf9ac_f2fe);
     }
 
+    /// WAVE-B OVERLAP OUTPUT WRITER route proof (hermetic, always runs).
+    ///
+    /// An fd decode at T8 must route the regular-file chunk writes through
+    /// the background overlap writer (`output_writer::submit_chunk`), i.e.
+    /// the route counter must bump — and the output FILE must be byte-exact
+    /// vs the encoder's plaintext (full parity through the writer route, the
+    /// same bytes the inline writev path used to land). The in-memory
+    /// (`gzippy::decompress`) roundtrip is covered by every existing parity
+    /// test; this test pins the fd-only overlap route.
+    #[test]
+    #[cfg(all(parallel_sm, unix, target_os = "linux"))]
+    fn fd_decode_at_t8_routes_through_overlap_output_writer() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering::Relaxed;
+        // 4-bit-entropy LCG payload — the compressible_parallel_fixture shape
+        // (decompress/mod.rs:948): 32 MiB → ~16 MiB compressed, clearing
+        // MIN_PARALLEL_COMPRESSED and the parallel_sm_unprofitable ratio gate
+        // so the classifier routes ParallelSM (NOT StoredParallel, which has
+        // its own inline fd drain).
+        let mut payload = vec![0u8; 32 * 1024 * 1024];
+        let mut state = 0xc0ffeeu64;
+        for b in &mut payload {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = ((state >> 32) as u8) & 0x0F;
+        }
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut enc = flate2::write::GzEncoder::new(
+                &mut compressed,
+                flate2::Compression::new(6),
+            );
+            enc.write_all(&payload)
+                .expect("gz encode (flate2 reference)");
+            enc.finish().expect("gz finish");
+        }
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed the parallel-SM compressed gate (got {} B)",
+            compressed.len()
+        );
+
+        // Mmap the compressed stream (CLI file-path shape).
+        let mut tf = tempfile::NamedTempFile::new().expect("compressed tempfile");
+        tf.write_all(&compressed).expect("write gz");
+        tf.flush().unwrap();
+        let file = std::fs::File::open(tf.path()).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap gz") };
+
+        // The route counter is monotonic (concurrent fd tests only ever bump
+        // it, never reset), so delta > 0 is a sound route assertion.
+        let before =
+            crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let mut sink = Vec::new();
+        let drain = tempfile::NamedTempFile::new().expect("drain tempfile");
+        let nbytes = crate::decompress::decompress_single_member_fd(
+            &mmap[..],
+            &mut sink,
+            Some(drain.as_raw_fd()),
+            8,
+            false,
+        )
+        .expect("mmap+fd parallel SM via overlap writer");
+        let after =
+            crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(nbytes, payload.len() as u64, "streamed size");
+        assert!(
+            after > before,
+            "overlap writer route not taken: fd decode at T8 must hand \
+             chunks to output_writer (counter did not move)"
+        );
+        // Byte parity of the FILE the writer wrote, vs the encoder reference.
+        let got = std::fs::read(drain.path()).expect("read drain file");
+        assert_eq!(got.len(), payload.len(), "fd output size");
+        assert_eq!(got, payload, "fd output bytes differ under the overlap writer");
+        assert_eq!(crc32fast::hash(&got), crc32fast::hash(&payload), "fd output CRC");
+    }
+
     /// High-entropy synthetic proxy (not the real silesia.tar.gz gate).
     ///
     /// PRNG-compressed-via-flate2-best is adversarial: dense literals,

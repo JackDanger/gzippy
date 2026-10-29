@@ -31,11 +31,31 @@
 //! the consumer (O(1) combine), so correctness of the trailer check is
 //! unaffected. A write error is captured and surfaced at `join`.
 //!
-//! The shipped default is the inline writev path (byte-identical); this
-//! overlap-writer machinery is currently unwired (the env-based A/B toggle
-//! was removed) and retained for a future re-enable. Linux +
-//! regular-fd only (the vmsplice/pipe path is unchanged — splice page-lifetime
-//! accounting needs the inline path).
+//! WIRE STATE (wave-B lever): production-wired. `drain_one_pending` routes the
+//! Linux regular-fd writev through `submit_chunk` whenever the consumer runs
+//! with pool threads (T>1); the T1 thin path and every in-memory writer keep
+//! the inline write/`Writer` path (the `Writer` trait cannot writev, and the
+//! fast path is fd-specific). The vmsplice/pipe path is unchanged — splice
+//! page-lifetime accounting needs the inline path.
+//!
+//! Channel: bounded `sync_channel(MAX_INFLIGHT_JOBS)`. Backpressure, not
+//! unbounded queueing: a lagging writer (slow/blocking sink) stalls the
+//! consumer at the bound instead of growing the live decoded-buffer set past
+//! the working set the decode already holds (BlockFetcher cache = max(16, T)
+//! + prefetch = 2·T chunks). At the intended T8 steady state the writer keeps
+//! up and the bound never binds.
+//!
+//! Buffer lifetime / pool accounting (verified against chunk_buffer_pool.rs):
+//! the chunk's buffers recycle on the writer thread AFTER its writev
+//! (`ChunkData::Drop` → `recycle_decoded_buffers`, chunk_data.rs:1862-1866;
+//! contract anticipated at chunk_data.rs:1667/1852). Returns
+//! (`return_u8_to_worker`, chunk_buffer_pool.rs:276) are Mutex-guarded statics
+//! keyed by owner worker — thread-safe from a foreign thread — and at T>1 the
+//! manual pool is DISABLED (`manual_buffer_pool_enabled` is the T1-scoped
+//! resident flag), so a writer-side drop frees to the allocator exactly like
+//! the inline `release_written_chunk` path it replaces (which is why the T>1
+//! gate also keeps the T1 resident-pool configuration on its synchronous
+//! inline path where deferral would race the single worker's refill).
 
 #![cfg(all(unix, parallel_sm))]
 // The overlap-writer machinery (`enabled`/`submit_chunk`/`OverlapWriter`/
@@ -45,12 +65,31 @@
 #![allow(dead_code)]
 
 use std::io;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use crate::decompress::parallel::chunk_data::ChunkData;
 use crate::decompress::parallel::fd_vectored_write;
+
+/// Route-assertion counter: one increment per chunk handed to the background
+/// overlap writer instead of the consumer-thread inline writev. A production
+/// fd decode at T>1 must bump this (see the routing test; same precedent as
+/// `THIN_T1_RUNS` in chunk_fetcher.rs).
+pub static OVERLAP_WRITER_SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Live-job bound of the submit channel (see the module doc's Channel note).
+/// Matches the BlockFetcher working-set anchors: cache = max(16, T),
+/// prefetch = 2·T — the writer-side hold never exceeds the depth the pending
+/// FIFO + prefetch cache already account for.
+const MAX_INFLIGHT_JOBS: usize = 16;
+
+fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
+}
 
 /// One owned chunk to write, in output order.
 struct WriteJob {
@@ -60,13 +99,18 @@ struct WriteJob {
 
 /// A live writer thread + its ordered job channel + captured error.
 pub struct OverlapWriter {
-    tx: Option<Sender<WriteJob>>,
+    tx: Option<SyncSender<WriteJob>>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl OverlapWriter {
     fn spawn() -> Self {
-        let (tx, rx): (Sender<WriteJob>, Receiver<WriteJob>) = std::sync::mpsc::channel();
+        // Bounded: submit() applies backpressure at MAX_INFLIGHT_JOBS live
+        // jobs instead of letting a lagging writer accumulate an unbounded
+        // live-decoded-buffer set. The writer thread never depends on the
+        // WRITER mutex, so a blocked send cannot deadlock against join().
+        let (tx, rx): (SyncSender<WriteJob>, Receiver<WriteJob>) =
+            std::sync::mpsc::sync_channel(MAX_INFLIGHT_JOBS);
         let handle = std::thread::Builder::new()
             .name("gzippy-out-writer".into())
             .spawn(move || -> io::Result<()> {
@@ -100,9 +144,13 @@ impl OverlapWriter {
     /// after the write.
     fn submit(&self, fd: i32, chunk: ChunkData) {
         if let Some(tx) = &self.tx {
-            // A send failure means the writer thread died (it captured an
-            // io::Error); the error is surfaced at `join`. Drop the chunk.
+            // Blocks only when the writer has MAX_INFLIGHT_JOBS jobs still
+            // queued (a genuinely slow sink — flow control, not the per-chunk
+            // inline write this exists to overlap). A send failure means the
+            // writer thread died (it captured an io::Error); the error is
+            // surfaced at `join`. Drop the chunk.
             let _ = tx.send(WriteJob { fd, chunk });
+            OVERLAP_WRITER_SUBMITS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -126,10 +174,17 @@ impl OverlapWriter {
 static WRITER: Mutex<Option<OverlapWriter>> = Mutex::new(None);
 
 /// Submit an owned chunk for an overlapped in-order writev. Spawns the
-/// writer thread on first use.
+/// writer thread on first use. Called from `drain_one_pending`'s Linux
+/// regular-fd arm ONLY when the consumer runs with pool threads (T>1) — the
+/// T1 thin path and in-memory writers keep the inline write path.
 pub fn submit_chunk(fd: i32, chunk: ChunkData) {
     let mut guard = WRITER.lock().unwrap();
     if guard.is_none() {
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] overlap output writer engaged (regular-fd drain, T>1)"
+            );
+        }
         *guard = Some(OverlapWriter::spawn());
     }
     guard.as_ref().unwrap().submit(fd, chunk);
@@ -143,8 +198,16 @@ pub fn finish() -> io::Result<()> {
         let mut guard = WRITER.lock().unwrap();
         guard.take()
     };
-    match w.as_mut() {
+    let res = match w.as_mut() {
         Some(writer) => writer.join(),
         None => Ok(()),
+    };
+    if debug_enabled() && !w.is_none() {
+        eprintln!(
+            "[gzippy] overlap output writer drained: chunks={} err={:?}",
+            OVERLAP_WRITER_SUBMITS.load(Ordering::Relaxed),
+            res.as_ref().err()
+        );
     }
+    res
 }

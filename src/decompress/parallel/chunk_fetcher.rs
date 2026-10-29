@@ -794,8 +794,9 @@ fn drive_impl<W: std::io::Write>(
     // Faithful overlap writer: drain + join the background output writer so
     // ALL bytes are on the fd and any write error becomes terminal BEFORE the
     // trailer CRC/ISIZE is returned for verification. No-op when the overlap
-    // writer was never used (inline writev path). Join even on a consumer
-    // error so the writer thread does not outlive the run.
+    // writer was never used (T1 thin path, in-memory writers, pipe/vmsplice
+    // arm). Join even on a consumer error so the writer thread does not
+    // outlive the run.
     #[cfg(all(unix, parallel_sm))]
     let writer_result = crate::decompress::parallel::output_writer::finish();
     // Record bytes streamed so far for the multi-member resume path. The
@@ -2749,6 +2750,16 @@ enum PendingWrite {
 #[cfg(parallel_sm)]
 struct RecycleDeferral {
     drain_lone: bool,
+    /// WAVE-B OVERLAP OUTPUT WRITER gate: route the Linux regular-fd writev
+    /// through the background writer (output_writer::submit_chunk) instead of
+    /// the consumer's inline writev. True only at T>1 — the shipped pool
+    /// accounting makes that the safe configuration (manual buffer pool is
+    /// T1-scoped, so writer-side recycles on a foreign thread are plain
+    /// frees, and the T1 resident-pool + lone-drain tuning stays on its
+    /// synchronous inline path; see output_writer.rs module doc). Derived
+    /// from the same pool_size as `drain_lone`, threaded exactly like
+    /// `member_verifier` to avoid signature churn on the hot drain path.
+    overlap_writer: bool,
     /// STAGE-2d MULTI-MEMBER GRID: the running per-member CRC32 + ISIZE
     /// verifier, fed each chunk in the in-order drain (`drain_one_pending`).
     /// `Some` only when the grid driver set `configuration.multi_member`; the
@@ -2766,8 +2777,12 @@ impl RecycleDeferral {
         // T1: drain lone (single inline worker, no worker-fill race).
         // T>1: hold lone (correctness — worker-fill race).
         let drain_lone = t1;
+        // Overlap writer engages on every T>1 consumer; T1 keeps the inline
+        // writev (thin path + resident-pool deferral correctness).
+        let overlap_writer = !t1;
         Self {
             drain_lone,
+            overlap_writer,
             member_verifier: None,
         }
     }
@@ -2940,6 +2955,21 @@ fn drain_one_pending<W: std::io::Write>(
             if fd_vectored_write::is_pipe_fd(fd) {
                 fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            } else if recycle_deferral.overlap_writer {
+                // WAVE-B OVERLAP ROUTE (prod): regular-fd writev off the
+                // consumer's serial critical path. The chunk moves ONLY after
+                // the full ordering region above — publish_subchunk_windows
+                // (:2887), the multi-member verify feed and the CRC +
+                // pipeline combine on the consumer — so output order and
+                // trailer accounting are unchanged. The writer thread owns
+                // the chunk for its writev and recycles the decode buffers on
+                // completion (ChunkData::Drop, chunk_data.rs:1862); at T>1
+                // the manual pool is off, so a foreign-thread recycle is a
+                // plain free (output_writer.rs doc, pool accounting). A
+                // write error is captured by the writer and surfaced
+                // terminally via output_writer::finish() at the end of
+                // `drive_impl`.
+                crate::decompress::parallel::output_writer::submit_chunk(fd, chunk);
             } else {
                 fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
                     .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
