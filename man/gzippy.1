@@ -92,7 +92,15 @@ Does not read from stdin.
 With no
 .I FILE
 (or with \fB-\fR as a file), gzippy reads standard input and writes
-standard output.
+standard output. Standard input behaves like a file argument of the same
+length: a piped input at
+.B \-p N
+(\fIN\fR > 1) is read to end and compressed by the same parallel pipeline a
+file argument takes, and a regular-file redirect
+.RB ( "gzippy \-p4 < " file )
+is parsed in place (mmap), like a file argument, at every thread count.
+Pipelines therefore parallelize instead of silently degrading to a single
+worker.
 gzippy refuses to write compressed data to a terminal; pass
 .B -f
 to force it anyway.

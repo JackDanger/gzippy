@@ -8,7 +8,7 @@
 //! preservation, stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufWriter, Cursor, Write};
+use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 struct CountingWriter<W: Write> {
@@ -558,7 +558,6 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 }
 
 pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
-    let can_parallelize = args.processes > 1;
     let verbose = args.verbose && !args.quiet;
 
     // Increment 7: the single-thread stdin fast path uses the pure-Rust DEFLATE
@@ -568,42 +567,57 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     // survives only behind the dev `ffi-oracle` feature as a differential oracle.
 
     // Try to mmap stdin when it's a regular file (< file redirection).
-    // For pipes, mmap_data stays None and we fall through to the
-    // whole-buffer `compress_with_pipeline` route.
+    // For pipes, stdin_mmap stays None and we fall through to the
+    // whole-buffer read-to-end route. The mapping carries (map, logical_len):
+    // the T1 mapping asks for the same TAIL_PAD slack `map_with_tail_pad`
+    // arranges on the file path so the T1 arm below can parse the redirect
+    // IN PLACE, exactly like a file argument does; the parallel arm reads
+    // straight off a plain map, where map length == logical length.
     #[cfg(unix)]
-    let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
+    let stdin_mmap: Option<(memmap2::Mmap, usize)> = {
         use std::os::unix::io::FromRawFd;
-        let meta = std::fs::File::from(unsafe {
+        let stdin_file = std::fs::File::from(unsafe {
             std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */)
         });
-        let is_regular = meta
+        let is_regular = stdin_file
             .metadata()
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
-        let result = if is_regular {
-            let m = unsafe { memmap2::Mmap::map(&meta) }.ok();
-            if let Some(ref mmap) = m {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
+        let len = stdin_file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        // Map only when it pays: T>1 always (the parallel pipeline reads the
+        // map directly), T1 above the same 128 KiB mmap threshold the file
+        // path uses (pinned in t1_mmap_route.rs) — below it the read-to-end
+        // route is the cheaper of the two, as it is for file args.
+        let result = if is_regular && (args.processes > 1 || len > 128 * 1024) {
+            if args.processes > 1 {
+                unsafe { memmap2::Mmap::map(&stdin_file) }.ok().map(|m| {
+                    let _ = m.advise(memmap2::Advice::Sequential);
+                    (m, len)
+                })
+            } else {
+                map_with_tail_pad(&stdin_file, len).ok()
             }
-            m
         } else {
             None
         };
-        std::mem::forget(meta);
+        std::mem::forget(stdin_file);
         result
-    } else {
-        None
     };
     #[cfg(not(unix))]
-    let mmap_data: Option<memmap2::Mmap> = None;
+    let stdin_mmap: Option<(memmap2::Mmap, usize)> = None;
 
     let header_info = GzipHeaderInfo::default();
     let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
+    let explicit_zopfli = args.zopfli_iterations.is_some()
+        || args.zopfli_no_split
+        || args.zopfli_split_max.is_some();
 
-    let in_bytes = if let Some(ref mmap) = mmap_data {
+    let in_bytes = if let Some((ref mmap, logical_len)) = stdin_mmap {
         // Regular-file stdin (< file): multi-threaded parallel compression.
-        let input_data = &mmap[..];
-        let file_size = input_data.len() as u64;
+        // Slice to `logical_len`: the map may carry TAIL_PAD slack past EOF
+        // (T1 map flavor) and the encoders must never see it as input.
+        let input_data = &mmap[..logical_len];
+        let file_size = logical_len as u64;
         let content_type = if input_data.len() >= 8192 {
             crate::compress::optimization::analyze_content_type(&input_data[..8192])
         } else if !input_data.is_empty() {
@@ -624,9 +638,6 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         // through `compress_with_pipeline` so the zopfli encoder runs. The former
         // PipelinedGzEncoder / ParallelGzEncoder C-FFI split (flate2/libdeflate)
         // is retained only behind the dev `ffi-oracle` feature as an oracle.
-        let explicit_zopfli = args.zopfli_iterations.is_some()
-            || args.zopfli_no_split
-            || args.zopfli_split_max.is_some();
 
         if opt_config.thread_count > 1 && !explicit_zopfli {
             let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
@@ -643,8 +654,45 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             }
             return Ok(0);
         }
-        // Single-threaded (or explicit zopfli) with mmap'd file: stream through
-        // compress_with_pipeline.
+        if opt_config.thread_count == 1 && !explicit_zopfli {
+            // T1 regular-file stdin: the SAME map_with_tail_pad arm the file
+            // path uses (in-place parse over the padded map, no input copy).
+            // `encode_gzip_unpadded_slice_to_writer` gets a mapping of
+            // logical_len + INPLACE_TAIL_PAD readable bytes when the kernel
+            // granted the pad, exactly as for a file argument; when the map
+            // is exact-length the encoder falls back to its copy path, which
+            // emits the same bytes. Byte-identical to the read-to-end route
+            // this arm replaces (`PureT1Mmap` vs `PureT1` differ in the
+            // input's home, never the encoder's output — route doc).
+            if args.verbosity >= 2 {
+                eprintln!(
+                    "gzippy: using pure-Rust DEFLATE encoder (T1 mmap L{})",
+                    args.compression_level
+                );
+            }
+            crate::compress::route::emit(
+                crate::compress::route::PURE_T1_MMAP,
+                compression_level,
+                1,
+            );
+            // Same anatomy-wall CLI span the file path's T1 mmap arm wraps the
+            // encoder in (feature default OFF; compiles to the body).
+            let bytes = crate::anatomy_wall_cli!({
+                crate::compress::deflate::encode_gzip_unpadded_slice_to_writer(
+                    input_data,
+                    logical_len,
+                    &mut counted,
+                    compression_level,
+                )?
+            });
+            counted.flush()?;
+            if verbose {
+                print_stdin_stats(bytes, counted.count, args);
+            }
+            return Ok(0);
+        }
+        // Single-threaded WITH explicit zopfli, or any other odd thread count:
+        // stream through compress_with_pipeline (it owns the zopfli route).
         let opt_config_t1 =
             OptimizationConfig::new(1, file_size, args.compression_level, content_type);
         crate::compress::compress_with_pipeline_sized(
@@ -656,18 +704,83 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             Some(input_data.len()),
         )?
     } else {
-        // Pipe stdin: whole-buffer (read-to-end into one Vec, then the T1
-        // parse — `ldx` is whole-buffer by construction; the 2026-08-30
-        // streaming deletion made buffering the honest contract). Single
-        // worker, so it is the cheapest T1 route for unknown-length input.
-        let opt_config = OptimizationConfig::new(1, 0, args.compression_level, ContentType::Binary);
-        crate::compress::compress_with_pipeline(
-            stdin(),
-            &mut counted,
-            args,
-            &opt_config,
-            &header_info,
-        )?
+        // Pipe stdin (`cat f | gzippy`). At -p N>1: read-to-end into one Vec,
+        // then ONE parallel PipelinedGzEncoder encode — the same engine the
+        // `< file` redirect arm above always had. pigz parallelizes the pipe
+        // case, and the former hardcoded-`OptimizationConfig::new(1, ..)`
+        // (its comment called that "the cheapest T1 route") silently shipped
+        // -p1 bytes and -p1 wall for every `-p N` pipeline — the live routing
+        // bug pinned by tests/pipe_parallel.rs. Output class changes from T1
+        // bytes to the standard parallel single-member stream: sanctioned
+        // (T>1 is not required to match T1's bytes).
+        if args.processes > 1 && !explicit_zopfli {
+            let mut input = Vec::new();
+            stdin().read_to_end(&mut input)?;
+            let input_len = input.len();
+            // Derive the thread count from the length we just learned — the
+            // same OptimizationConfig call the file path makes for a file of
+            // this size (never file_size=0, which halved the thread count on
+            // L2-5).
+            let opt_config = OptimizationConfig::new(
+                args.processes,
+                input_len as u64,
+                args.compression_level,
+                ContentType::Binary,
+            );
+            if opt_config.thread_count > 1 {
+                // ONE encode through the parallel pipeline — no pick-min, no
+                // competing candidate, the same engine the file path uses with
+                // `set_minimal_gzip_header` (stdout is minimal-header by
+                // contract, like every other stdin route).
+                let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+                    args.compression_level as u32,
+                    opt_config.thread_count,
+                );
+                encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
+                encoder.set_header_info(header_info.clone());
+                encoder.set_minimal_gzip_header(true);
+                encoder.compress_buffer_pure(&input, &mut counted)?;
+                counted.flush()?;
+                if verbose {
+                    print_stdin_stats(input_len as u64, counted.count, args);
+                }
+                return Ok(0);
+            }
+            // Requested -p N>1 but OptimizationConfig says 1 (core cap, or the
+            // L2-5 small-file halving): T1 bytes over the buffer we already
+            // hold, with the length as the size hint.
+            let opt_config1 = OptimizationConfig::new(
+                1,
+                input_len as u64,
+                args.compression_level,
+                ContentType::Binary,
+            );
+            crate::compress::compress_with_pipeline_sized(
+                Cursor::new(&input[..]),
+                &mut counted,
+                args,
+                &opt_config1,
+                &header_info,
+                Some(input_len),
+            )?
+        } else {
+            // T1 pipe (or explicit zopfli, any -p): the route below is
+            // byte-identical to what stdin has always shipped — keep it
+            // streaming (the encoder owns the read-to-end and the pad).
+            let opt_config = OptimizationConfig::new(
+                1,
+                0,
+                args.compression_level,
+                ContentType::Binary,
+            );
+            crate::compress::compress_with_pipeline(
+                stdin(),
+                &mut counted,
+                args,
+                &opt_config,
+                &header_info,
+            )?
+        }
     };
 
     counted.flush()?;

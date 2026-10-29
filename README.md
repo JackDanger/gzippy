@@ -141,9 +141,14 @@ find /var/log -name '*.log' -mtime +30 -print0 | xargs -0 gzippy -k -6
 tar c big-dir | gzippy --ultra > big-dir.tgz   # near-zopfli ratio, sane speed
 gzippy -p4 -R backup.sql               # rsync-friendly, four threads
 pg_dump mydb | gzippy -6 | aws s3 cp - s3://bucket/dump.gz
+cat traffic.log | gzippy -p4 > traffic.log.gz  # pipes parallelize too
 gzippy --max precious.tar              # densest level (12)
 GZIPPY_DEBUG=1 gzippy -d mystery.gz    # show which decode route ran
 ```
+
+`-p N` works on piped stdin the way it works on files: the pipe is read to
+end and compressed by the same parallel pipeline a file argument takes, and
+`gzippy -p4 < file` matches `gzippy -p4 -c file` byte for byte.
 
 For output, zlib (`-z`, `.zz`) and single-entry ZIP (`-K`) containers are
 also supported. Manual: `man gzippy`, wire format: `man gzippy-format`,

@@ -1,4 +1,4 @@
-//! Pipe-parallelism regression guard — and a LIVE BUG pin.
+//! Pipe-parallelism regression guard.
 //!
 //! The contract under test: `gzippy -p N` reading stdin must produce
 //! BYTE-IDENTICAL output to `gzippy -p N -c file` on the same bytes. This was
@@ -6,26 +6,28 @@
 //! single-threaded output and single-threaded wall while file arguments got
 //! the parallel path), and it was fixed — but, as this suite discovered on
 //! 2026-08-09, ONLY FOR SEEKABLE STDIN. There are two distinct stdin cases
-//! and they route differently today:
+//! and they route the same way as of wave-b (2026-10-29, branch
+//! `wave-b/stdin-parallel`):
 //!
 //!   1. REDIRECT stdin (`gzippy -p4 < file`): fd 0 is a regular file.
 //!      `compress_stdin` (src/compress/io.rs) mmaps it and takes the same
 //!      parallel path as a file argument. Byte-identical at p4/p8, equal
-//!      wall. FIXED — and `redirect_stdin_matches_file_arg_at_p4` below
-//!      guards it against regression.
+//!      wall. FIXED 2026-08-09 — and `redirect_stdin_matches_file_arg_at_p4`
+//!      below guards it against regression. At T1 the same rule now holds
+//!      above the 128 KiB mmap threshold: `< file` at -p1 takes the map arm
+//!      the file path takes (`PureT1Mmap`, in-place parse, byte-identical).
 //!
-//!   2. TRUE PIPE stdin (`cat file | gzippy -p4`): fd 0 is a FIFO. The mmap
-//!      probe fails and `compress_stdin` falls into its explicit
-//!      "Pipe stdin: ... Single-threaded" branch: `-p` is IGNORED, output is
-//!      T1 bytes (measured: pipe == `-p 1` output on 7 of 12 cells; the L6
-//!      cells differ from BOTH because the pipe branch also hardcodes
-//!      file_size=0 + ContentType::Binary into OptimizationConfig, landing a
-//!      third config), and wall is T1 wall (64 MiB Cargo.lock-repeat, M1:
-//!      truepipe@p4 0.269 s == truepipe@p1 0.269 s vs file@p4 0.087 s at L1;
-//!      0.323 vs 0.148 s at L6). pigz parallelizes this case fine. LIVE
-//!      ROUTING BUG — pinned by the #[ignore] test
-//!      `true_pipe_matches_file_arg_at_p4` below: un-ignore it when the
-//!      streaming-chunker path serves FIFOs, and it becomes the guard.
+//!   2. TRUE PIPE stdin (`cat file | gzippy -p4`): fd 0 is a FIFO. WAS the
+//!      live routing bug this suite pinned on 2026-08-09 (the pipe branch
+//!      hardcoded `OptimizationConfig::new(1, ...)`, `-p` was IGNORED, and
+//!      wall was -p1 wall: truepipe@p4 0.269 s == truepipe@p1 0.269 s vs
+//!      file@p4 0.087 s at L1; 0.323 vs 0.148 s at L6). FIXED in wave-b: the
+//!      pipe branch now reads to end and runs ONE parallel
+//!      PipelinedGzEncoder encode — the same engine the redirect arm uses —
+//!      so `cat f | gzippy -pN` output is byte-identical to
+//!      `gzippy -pN -c f`. T1 pipes keep the exact streaming route and bytes
+//!      they always shipped. `true_pipe_matches_file_arg_at_p4` below (its
+//!      #[ignore] removed) is now the guard.
 //!
 //! Why byte-identity with the FILE path proves the stdin path is PARALLEL:
 //! the file-arg path at -p 4 is known-parallel and its output differs from
@@ -164,8 +166,7 @@ fn assert_stdin_matches_file(
                         " (Confirmed: the stdin bytes MATCH the -p 1 output — routed T1.)"
                     } else {
                         " (The stdin bytes match NEITHER -p 4 nor -p 1 file output — a \
-                         third config; the pipe branch hardcodes file_size=0 + \
-                         ContentType::Binary.)"
+                         third config; check what compress_stdin routes for this flavor.)"
                     }
                 ));
             }
@@ -191,28 +192,21 @@ fn redirect_stdin_matches_file_arg_at_p4() {
     });
 }
 
-/// THE LIVE BUG, pinned (fails today — see the module doc for the full
-/// anatomy): `cat file | gzippy -p4` routes the explicit single-threaded
-/// pipe branch of `compress_stdin`, ignoring -p entirely. Every fixture x
-/// level {1,6,9} fails the identity, and wall equals -p1 wall. When the
-/// FIFO case is routed to a parallel (streaming-chunker) path, remove the
-/// #[ignore] and this becomes the permanent guard.
+/// THE GUARD (was the live bug pin, #[ignore]d 2026-08-09; un-ignored when
+/// wave-b routed the pipe branch): `cat file | gzippy -p4` reads to end and
+/// runs ONE parallel PipelinedGzEncoder encode, so its bytes equal
+/// `gzippy -p4 -c file` on every fixture x level, and wall is parallel wall.
 #[test]
-#[ignore = "LIVE ROUTING BUG: FIFO-pipe stdin ignores -p and routes single-threaded \
-            (src/compress/io.rs compress_stdin, the 'Pipe stdin' branch). \
-            Run: cargo test --test pipe_parallel -- --ignored"]
 fn true_pipe_matches_file_arg_at_p4() {
     assert_stdin_matches_file("FIFO-pipe", &|_path, data, level| {
         compress_pipe(data, level, THREADS)
     });
 }
 
-/// Even while the FIFO routing bug stands, pipe output must stay VALID and
-/// deterministic T1-shaped gzip: it roundtrips through flate2 (asserted for
-/// every cell here) and two runs emit identical bytes. If pipe output ever
-/// changes class (e.g. the FIFO fix lands and it becomes parallel output),
-/// the identity test above starts passing and this stays green — this test
-/// pins correctness, not routing.
+/// Even now that pipes route parallel, pipe output must stay VALID and
+/// deterministic: it roundtrips through flate2 (asserted for every cell
+/// here) and two runs emit identical bytes. This stays green across any
+/// future re-routing; it pins correctness, not routing.
 #[test]
 fn true_pipe_output_roundtrips_and_is_deterministic() {
     let mut cells = 0usize;
@@ -234,4 +228,132 @@ fn true_pipe_output_roundtrips_and_is_deterministic() {
         }
     }
     assert_eq!(cells, fixtures::NAMES.len() * LEVELS.len());
+}
+
+/// EXECUTED-route marker (the byte-identity test above proves PARALLELISM
+/// indirectly; this proves it observably): with `GZIPPY_DEBUG=1`, a `cat f |
+/// gzippy -6 -p4` run must print the route `route::emit` line naming
+/// `PureParallelPipeline` with the actual worker count — the same Gate-4
+/// marker the file-arg path prints (`t1_mmap_route.rs` style). The marker is
+/// printed INSIDE `compress_buffer_pure`, so seeing it means the parallel
+/// encoder executed, not merely that a branch was chosen.
+#[test]
+fn true_pipe_at_p4_prints_the_parallel_route_marker() {
+    let data = fixtures::generate("text");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .args(["-6", "-p", "4", "-c"])
+        .env("GZIPPY_DEBUG", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let data_owned = data.clone();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&data_owned).expect("write stdin");
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert!(out.status.success(), "pipe run failed: {out:?}");
+    assert_eq!(flate2_decode(&out.stdout), data, "roundtrip");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for token in [
+        "compress path=PureParallelPipeline",
+        "encode-path=PureParallelPipeline",
+        "threads=4",
+    ] {
+        assert!(
+            stderr.contains(token),
+            "expected `{token}` in GZIPPY_DEBUG stderr of a -p4 pipe run:\n{stderr}"
+        );
+    }
+    // And the OLD T1 marker must be gone from the pipe route: the former
+    // pipe branch was exactly this bug (PureT1 printed on every -p run).
+    assert!(
+        !stderr.contains("encode-path=PureT1 "),
+        "-p4 pipe must not execute the T1 route.\n{stderr}"
+    );
+}
+
+/// T1 redirect stdin (`gzippy -p1 < file`) above the 128 KiB mmap threshold
+/// must run the same map arm the file path runs (`PureT1Mmap`, in-place
+/// parse) and emit byte-identical output to `gzippy -p1 -c file`; below the
+/// threshold it keeps the read-to-end `PureT1` route — the same threshold
+/// split the file path owns (pinned in t1_mmap_route.rs).
+#[test]
+fn redirect_stdin_at_t1_takes_the_mmap_route_above_the_threshold() {
+    let mut corpus = Vec::with_capacity(2 * 1024 * 1024);
+    let mut s: u32 = 0x9E37_79B9;
+    for _ in 0..2 * 1024 * 1024 {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let r = (s >> 16) as u8;
+        corpus.push(if (corpus.len() / 4096) % 3 == 0 {
+            r
+        } else {
+            b'a' + (r % 26)
+        });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.bin");
+    std::fs::write(&path, &corpus).unwrap();
+
+    // Above the threshold: mmap route, bytes identical to the file -c route.
+    let via_file = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .args(["-6", "-p1", "-c"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(via_file.status.success());
+    let gdfd = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .args(["-6", "-p1", "-c"])
+        .env("GZIPPY_DEBUG", "1")
+        .stdin(Stdio::from(std::fs::File::open(&path).unwrap()))
+        .output()
+        .unwrap();
+    assert!(gdfd.status.success(), "redirect run failed: {gdfd:?}");
+    let stderr = String::from_utf8_lossy(&gdfd.stderr).to_string();
+    assert!(
+        stderr.contains("encode-path=PureT1Mmap level=6 threads=1"),
+        "redirect `< file` at -p1 above the threshold must execute PureT1Mmap:\n{stderr}"
+    );
+    assert_eq!(
+        gdfd.stdout, via_file.stdout,
+        "redirect stdin at -p1 must be byte-identical to `gzippy -p1 -c file`"
+    );
+    assert_eq!(flate2_decode(&gdfd.stdout), corpus, "roundtrip");
+
+    // Below the threshold: the read-to-end route (no mmap), like a file arg.
+    let small = &corpus[..64 * 1024];
+    let small_path = dir.path().join("small.bin");
+    std::fs::write(&small_path, small).unwrap();
+    let via_file_small = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .args(["-6", "-p1", "-c"])
+        .arg(&small_path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(via_file_small.status.success());
+    let red = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .args(["-6", "-p1", "-c"])
+        .env("GZIPPY_DEBUG", "1")
+        .stdin(Stdio::from(std::fs::File::open(&small_path).unwrap()))
+        .output()
+        .unwrap();
+    assert!(red.status.success(), "small redirect failed: {red:?}");
+    let stderr = String::from_utf8_lossy(&red.stderr).to_string();
+    assert!(
+        stderr.contains("encode-path=PureT1 level=6 threads=1"),
+        "sub-threshold redirect must stay on PureT1 (read-to-end):\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("PureT1Mmap"),
+        "sub-threshold redirect must not take the mmap route:\n{stderr}"
+    );
+    assert_eq!(flate2_decode(&red.stdout), small, "small roundtrip");
+    assert_eq!(
+        red.stdout, via_file_small.stdout,
+        "sub-threshold redirect must stay byte-identical to the file -c route"
+    );
 }
