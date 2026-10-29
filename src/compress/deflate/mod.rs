@@ -639,19 +639,51 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
     crate::anatomy_wall_root!({
-        let cap = estimate_output_cap(logical_len, level, 32);
+        // L1 TINY-INPUT STORED PASSTHROUGH (wave-B C3). libdeflate routes any
+        // input of `max_passthrough_size` = 55 - 4*level bytes or fewer to a
+        // stored block without running a parser (`ldx/compress.rs:252`; 51 at
+        // L1), but production L1 never carried the gate — the legacy engine
+        // parsed a static/dynamic block out of even a 3-byte input, spending
+        // its whole cost on table setup for output that a memcpy would beat.
+        // Below the threshold, emit a stored member directly: one BTYPE=00
+        // block per ≤65535-byte sub-block through the ONE stored-block
+        // emitter (`emit_stored_block`, same framing `deflate_into` uses for
+        // empty input — the empty-input member bytes (0x01 00 00 FF FF) are
+        // the logical_len == 0 degenerate case of exactly this path). T1 ONLY:
+        // `encode_gzip_slack_padded_to_vec` is the T1 entry point (the T>1
+        // pipeline drives `deflate_into` per chunk directly), so every other
+        // level and thread count is untouched, and L6 keeps its own legacy arm.
+        // Size cost, itemized: a ≤51-byte static-Huffman body becomes the
+        // stored body — 5 bytes/sub-block framing + a literal copy; for the
+        // tiniest files that is ≤ +2 B on a 4-byte input (4 B static ->
+        // 6 B stored), an authorized ≤1% spend on files this small — the
+        // same class of wire bytes the vendor ships below its own threshold.
+        //
+        // Output cap: a stored member is its own size formula (header 10 +
+        // 5/sub-block + the bytes + trailer 8), NOT the `len/2` guess the
+        // compressed levels use.
+        let is_tiny_l1 = level == 1 && logical_len <= crate::compress::ldx::max_passthrough_size(1);
+        let cap = if is_tiny_l1 {
+            10 + (logical_len.div_ceil(MAX_STORED_SUBBLOCK).max(1)) * 5 + logical_len + 8
+        } else {
+            estimate_output_cap(logical_len, level, 32)
+        };
         crate::anatomy_count!(alloc_events);
         crate::anatomy_count!(alloc_bytes, cap);
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(&minimal_gzip_header(level));
 
-        // ONE production encoder for 0-9: our libdeflate port.
-        // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
-        // between the header written above and the CRC/ISIZE written below.
-        // Append straight into `out` — no scratch buffer, no zeroing, no copy.
-        if !(level_uses_ldx(level)
+        if is_tiny_l1 {
+            let mut bw = BitWriter::from_vec(std::mem::take(&mut out));
+            emit_stored_block(&mut bw, &buf[..logical_len], true);
+            out = bw.finish();
+        } else if !(level_uses_ldx(level)
             && crate::compress::ldx::compress_into(level, &buf[..logical_len], &mut out))
         {
+            // ONE production encoder for 0-9: our libdeflate port.
+            // `compress_for_diff` emits RAW DEFLATE, which is exactly what belongs
+            // between the header written above and the CRC/ISIZE written below.
+            // Append straight into `out` — no scratch buffer, no zeroing, no copy.
             encode_deflate_slack_padded_to_sink(buf, logical_len, level, &mut out);
         }
 

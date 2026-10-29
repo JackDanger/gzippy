@@ -54,10 +54,20 @@ fn inputs() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// EVERY level, at T1, must reach the encoder EXACTLY ONCE.
+/// EVERY level, at T1, must reach a parser AT MOST ONCE.
 ///
 /// A second entry means a second parse of the same bytes — pick-min, a retry, or a
 /// "just try it both ways" arm. That is the thing this project removed.
+///
+/// ZERO entries is legal in exactly one production cell: L1 inputs at or below
+/// `max_passthrough_size` (51 B — wave-B C3, `encode_gzip_slack_padded_to_vec`)
+/// emit a stored member directly, the production wiring of the vendor's own
+/// passthrough (`ldx/compress.rs` wires the identical gate). No parse runs, so
+/// neither counter moves; any OTHER zero-entry cell would mean the routing lost
+/// the encode and is reported as its own failure below. (At every other level
+/// the tiny inputs still count exactly one entry — L2-L9 through the port's
+/// own `deflate_compress_none` passthrough, L6 through the legacy arm — so the
+/// neat total==1 shape is unchanged there.)
 #[test]
 fn every_level_encodes_each_input_exactly_once() {
     let _guard = census_lock();
@@ -68,11 +78,20 @@ fn every_level_encodes_each_input_exactly_once() {
             let out = encode_gzip_bytes_to_vec(&data, level);
             let (port, legacy) = encode_census::snapshot();
             let total = port + legacy;
-            if total != 1 {
+            let tiny_l1_passthrough =
+                level == 1 && data.len() <= gzippy::compress::ldx::max_passthrough_size(1);
+            if total > 1 {
                 failures.push(format!(
                     "{name} L{level}: {total} encoder entries (port={port} legacy={legacy}), \
-                     expected exactly 1 — a second encode of the same input is pick-min \
+                     expected at most 1 — a second encode of the same input is pick-min \
                      by another name. Output was {} B.",
+                    out.len()
+                ));
+            } else if total == 0 && !tiny_l1_passthrough {
+                failures.push(format!(
+                    "{name} L{level}: ZERO encoder entries (port={port} legacy={legacy}) \
+                     outside the tiny-L1 stored passthrough — the routing lost the encode \
+                     entirely. Output was {} B.",
                     out.len()
                 ));
             }
@@ -83,7 +102,9 @@ fn every_level_encodes_each_input_exactly_once() {
         "\nMORE THAN ONE ENCODE PER INPUT — the pick-min architecture is back:\n  {}\n\n\
          This is not a tuning regression. Encoding twice and keeping the smaller output \
          costs ~2x wall on every cell to buy a fraction of a percent of size, and it is \
-         what this project deleted on 2026-08-23. Fix the routing, do not relax this test.\n",
+         what this project deleted on 2026-08-23. (A zero-entry row outside the tiny-L1 \
+         passthrough means the encode went missing instead — also a routing defect.) \
+         Fix the routing, do not relax this test.\n",
         failures.join("\n  ")
     );
 }
