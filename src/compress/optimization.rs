@@ -1,5 +1,3 @@
-use std::io::Read;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
     Text,
@@ -54,18 +52,12 @@ impl OptimizationConfig {
     }
 }
 
-/// Detect content type by analyzing the first chunk of data
-pub fn detect_content_type<R: Read>(reader: &mut R) -> std::io::Result<ContentType> {
-    let mut sample = vec![0u8; 8192]; // 8KB sample
-    let bytes_read = reader.read(&mut sample)?;
-
-    if bytes_read == 0 {
-        return Ok(ContentType::Binary);
-    }
-
-    sample.truncate(bytes_read);
-    Ok(analyze_content_type(&sample))
-}
+// `detect_content_type` (read an 8 KiB sample off a reader) was removed with
+// the file-mode content-type sampler (wave-B C4, src/compress/io.rs): its
+// only production caller was the second open+8 KiB read in `compress_file`,
+// and the value reached nothing but the quarantined C-FFI oracle and the -vv
+// print. `analyze_content_type` survives for the mmap'd-stdin arm, whose
+// sample is already in memory (no extra syscall).
 
 pub fn analyze_content_type(sample: &[u8]) -> ContentType {
     if sample.is_empty() {

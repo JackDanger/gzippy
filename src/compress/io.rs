@@ -32,7 +32,7 @@ impl<W: Write> Write for CountingWriter<W> {
 }
 
 use crate::cli::GzippyArgs;
-use crate::compress::optimization::{detect_content_type, ContentType, OptimizationConfig};
+use crate::compress::optimization::{ContentType, OptimizationConfig};
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
 use crate::utils::preserve_metadata;
@@ -313,12 +313,19 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
     let file_size = input_file.metadata()?.len();
 
-    let content_type = if args.processes <= 1 || args.compression_level <= 3 {
-        ContentType::Binary
-    } else {
-        let mut sample_file = File::open(input_path)?;
-        detect_content_type(&mut sample_file).unwrap_or(ContentType::Binary)
-    };
+    // CONTENT-TYPE SAMPLER, REMOVED (wave-B C4). This used to open `input_path`
+    // a SECOND time (the handle above is already open here) and read up to
+    // 8 KiB through `detect_content_type`, feeding bytes the produced value
+    // reaches nothing: `OptimizationConfig::content_type` flows only into
+    // `optimal_buffer_size` / `choose_compression_backend` (the `backend` and
+    // `buffer_size` fields), both read exclusively by the quarantined
+    // `SimpleOptimizer` C-FFI oracle (behind ffi-oracle) and the -vv print
+    // below; every production routing decision derives from
+    // `optimal_thread_count`, which ignores content type entirely. The two
+    // syscalls (one open, one read; plus the two the mmap arms below saved
+    // only by coincidentally re-opening the file) bought nothing. Hard-wired
+    // Binary — the -vv line keeps its exact shape, now constant per run.
+    let content_type = ContentType::Binary;
 
     // (-i/--independent used to cap levels 7-9 to an L6 OptimizationConfig
     // here; -i is now rejected up front in run() — flag honesty, it never
@@ -381,7 +388,10 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         if args.verbosity >= 2 {
             eprintln!("gzippy: using rsyncable compression");
         }
-        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        // Map the ALREADY-OPEN handle (`input_file`, opened above for the
+        // precondition checks) — C4 removed the last re-open of the input on
+        // this path, so a T>1 file compress opens the input exactly once.
+        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
         if args.stdout {
             crate::compress::rsyncable::compress_rsyncable(
                 &mmap,
@@ -411,8 +421,10 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
         // SAFETY: the input file is opened read-only and mapped for the
         // duration of this compression; it is not mutated concurrently by
-        // gzippy, matching every other mmap read path in this module.
-        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        // gzippy, matching every other mmap read path in this module. The
+        // handle is the ONE open this compress performs (C4 removed the
+        // second open the sampler and this arm used to pay).
+        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
