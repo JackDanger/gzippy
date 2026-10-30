@@ -2,6 +2,112 @@
 # Pre-commit hook — auto-installed by build.rs on every cargo build.
 set -euo pipefail
 
+# Structure guard. The per-file filters below are all --diff-filter=ACM, so a
+# staged TYPECHANGE (T) or deletion commits silently: git add -A in a linked
+# worktree stages vendor/isal-rs as 160000 gitlink -> 120000 symlink pointing
+# at /home/termag/..., and a committed absolute-symlink "submodule" is dead in
+# every other clone of this repo. T and U are unconditional rejects. A blanket
+# D-reject would criminalize routine deletion (measured: 9 deletion-only
+# commits, 89 commits touching deletions), so D trips only when the deleted
+# entry IS structure
+# itself: ls-tree HEAD shows mode 160000 (gitlink), or the path is .gitmodules
+# — and a FAILING ls-tree trips too: an unjudgeable deletion is not a pass.
+# A rename/copy whose SOURCE is a gitlink in HEAD trips the same gate: git mv
+# on a submodule vacates the pinned path under plain-work status tokens.
+# After the status triage, every staged path whose index entry is mode 120000
+# must be a symlink to a RELATIVE target that is not the path itself — A, C,
+# M, and R are all allowed statuses, so the blob content is the only place
+# that class can be caught. No `|| true` and no fused pipeline: a failing
+# `git diff` must exit loudly, not pass this guard as an empty string.
+name_status=$(git diff --cached --name-status) || {
+    echo "❌ git diff --cached --name-status failed — refusing to judge the tree blind." >&2
+    exit 1
+}
+bad_status=$(printf '%s\n' "$name_status" | while IFS=$'\t' read -r status path _; do
+    [ -n "$status" ] || continue
+    case $status in
+        A|M|A[0-9]*|M[0-9]*)
+            ;; # plain work, same tokens the per-file gates below expect
+        R|C|R[0-9]*|C[0-9]*)
+            # A move/copy of a 160000 gitlink is the deleted-submodule silence
+            # spelled as plain work: the pin vacates its path, .gitmodules
+            # still names the old one, and no status elsewhere says so.
+            # :(literal) on every path probe: an un-prefixed pathspec is a glob,
+            # so a staged file literally named 'weird[1]' zero-matches itself and
+            # over-matches the plain 'weird1' sibling — the gate reads the wrong
+            # entry and the symlink slips through as plain work.
+            if ! mode_line=$(git ls-tree HEAD -- ":(literal)$path"); then
+                printf '%s\t%s\n' "$status" "$path" # ls-tree failed — fail closed
+                continue
+            fi
+            mode=${mode_line%% *}
+            if [ "$mode" = "160000" ]; then
+                printf '%s\t%s\n' "$status" "$path"
+            fi
+            ;;
+        D)
+            mode=""
+            # Pathspec literal magic here too — same glob shadowing as above.
+            if ! mode_line=$(git ls-tree HEAD -- ":(literal)$path"); then
+                # Fail closed: a failing ls-tree must trip, not swallow stderr
+                # and pass the deletion as an empty result.
+                printf 'D\t%s\n' "$path"
+                continue
+            fi
+            mode=${mode_line%% *}
+            if [ "$mode" = "160000" ] || [ "$path" = ".gitmodules" ]; then
+                printf 'D\t%s\n' "$path"
+            fi
+            ;;
+        *) # T, U, and anything unrecognized — fail closed on structure
+            printf '%s\t%s\n' "$status" "$path"
+            ;;
+    esac
+done)
+
+# Symlink targets, straight off the index. Status triage above cannot see this
+# class — A, C, M, and R are all allowed statuses — so the check reads the
+# staged entries themselves: `git ls-files -s` mode 120000 is a symlink in this
+# commit, and `git cat-file -p <blob-sha>` is the exact bytes it points at. An
+# absolute target is dead in every other clone; a target equal to the path
+# itself is a dangling name; and a relative target with `..` as a path
+# component climbs out of the tree — `esc -> ../../etc/passwd` is the same
+# hostage path an absolute target is, merely spelled portably. Feeds the same
+# structural-change exit below.
+bad_symlink=$(git diff --cached --name-only -z | while IFS= read -r -d '' f; do
+    ls_line=$(git ls-files -s -- ":(literal)$f")
+    case $ls_line in
+        120000\ *) ;;
+        *) continue ;;
+    esac
+    target=$(git cat-file -p "$(printf '%s\n' "$ls_line" | awk 'NR==1 {print $2}')")
+    case $target in
+        /*) printf '%s -> %s (absolute symlink target)\n' "$f" "$target" ;;
+        ..|../*|*/..|*/../*)
+            # Whole-target and slash-anchored only: 'foo..bar' and '...' are
+            # ordinary names, not climbs.
+            printf '%s -> %s (symlink target climbs out of the tree via ..)\n' "$f" "$target" ;;
+    esac
+    if [ "$target" = "$f" ]; then
+        printf '%s -> %s (symlink points at itself)\n' "$f" "$target"
+    fi
+done)
+
+if [ -n "$bad_status$bad_symlink" ]; then
+    echo "❌ Staged structural change — status outside plain {A,M,R,C}, or structure deleted:"
+    echo "$bad_status$bad_symlink" | sed 's/^/    /'
+    echo "   A T is a flipped symlink (file/gitlink <-> symlink) landing in history, e.g."
+    echo "   vendor/ rewritten to an absolute symlink that breaks every other clone."
+    echo "   Plain file deletion passes — that is routine here; deleting a 160000"
+    echo "   gitlink or .gitmodules is the gated case: it must be deliberate, not"
+    echo "   an accidental git add -A. The same gate holds for renaming a 160000"
+    echo "   gitlink path (the pin vacates its .gitmodules entry silently) and for"
+    echo "   a staged symlink whose target is absolute, climbs out of the tree"
+    echo "   via .., or is the path itself."
+    echo "   Restore the on-disk structure, or --no-verify and explain in the commit."
+    exit 1
+fi
+
 changed_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 changed_yaml=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true)
 changed_version=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^(VERSION|Cargo\.toml)$' || true)
