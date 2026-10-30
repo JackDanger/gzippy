@@ -181,9 +181,7 @@ pub fn submit_chunk(fd: i32, chunk: ChunkData) {
     let mut guard = WRITER.lock().unwrap();
     if guard.is_none() {
         if debug_enabled() {
-            eprintln!(
-                "[gzippy] overlap output writer engaged (regular-fd drain, T>1)"
-            );
+            eprintln!("[gzippy] overlap output writer engaged (regular-fd drain, T>1)");
         }
         *guard = Some(OverlapWriter::spawn());
     }

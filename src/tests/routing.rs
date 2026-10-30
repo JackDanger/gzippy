@@ -1478,7 +1478,6 @@ mod tests {
     #[cfg(all(parallel_sm, unix, target_os = "linux"))]
     fn fd_decode_at_t8_routes_through_overlap_output_writer() {
         use std::os::unix::io::AsRawFd;
-        use std::sync::atomic::Ordering::Relaxed;
         // 4-bit-entropy LCG payload — the compressible_parallel_fixture shape
         // (decompress/mod.rs:948): 32 MiB → ~16 MiB compressed, clearing
         // MIN_PARALLEL_COMPRESSED and the parallel_sm_unprofitable ratio gate
@@ -1493,10 +1492,8 @@ mod tests {
         let mut compressed = Vec::new();
         {
             use std::io::Write as _;
-            let mut enc = flate2::write::GzEncoder::new(
-                &mut compressed,
-                flate2::Compression::new(6),
-            );
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::new(6));
             enc.write_all(&payload)
                 .expect("gz encode (flate2 reference)");
             enc.finish().expect("gz finish");
@@ -1516,9 +1513,8 @@ mod tests {
 
         // The route counter is monotonic (concurrent fd tests only ever bump
         // it, never reset), so delta > 0 is a sound route assertion.
-        let before =
-            crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+        let before = crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut sink = Vec::new();
         let drain = tempfile::NamedTempFile::new().expect("drain tempfile");
         let nbytes = crate::decompress::decompress_single_member_fd(
@@ -1529,9 +1525,8 @@ mod tests {
             false,
         )
         .expect("mmap+fd parallel SM via overlap writer");
-        let after =
-            crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+        let after = crate::decompress::parallel::output_writer::OVERLAP_WRITER_SUBMITS
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         assert_eq!(nbytes, payload.len() as u64, "streamed size");
         assert!(
@@ -1542,8 +1537,15 @@ mod tests {
         // Byte parity of the FILE the writer wrote, vs the encoder reference.
         let got = std::fs::read(drain.path()).expect("read drain file");
         assert_eq!(got.len(), payload.len(), "fd output size");
-        assert_eq!(got, payload, "fd output bytes differ under the overlap writer");
-        assert_eq!(crc32fast::hash(&got), crc32fast::hash(&payload), "fd output CRC");
+        assert_eq!(
+            got, payload,
+            "fd output bytes differ under the overlap writer"
+        );
+        assert_eq!(
+            crc32fast::hash(&got),
+            crc32fast::hash(&payload),
+            "fd output CRC"
+        );
     }
 
     /// High-entropy synthetic proxy (not the real silesia.tar.gz gate).
