@@ -97,25 +97,34 @@ it up; this file is on `docs/readme` and rides PR A2.
 
 ---
 
-## Status ledger (2026-10-30, live)
+## Status ledger (2026-10-30, ev. — end of day state)
 
-- All Phase A branches PUSHED + PRs open: #433 wave1/improvements, #434 lever/perf-wave,
-  #435 docs/readme (this file; review-clean CI-green), #436 interop/no-gz-fextra-write,
-  #437 hygiene/hook-gates.
-- PR #438 fix/ci-2026-10-toolchain (opened 2026-10-30): unblocks the two main-carried CI
-  gates the 2026-10 runner toolchain bump broke for every branch — clippy scrutinee deny
-  (block_fetcher rs:239 bound-form) + symbol-canary BufWriter demangle re-pin
-  (std::io -> alloc::io path; apple emit_sequences row removed pending own-box re-pin).
-  Both Anatomy legs CI-verified PASS; Build legs pending; other PRs rebase onto it and
-  re-run CI (interop already carries the same fix at 2d20a384; Lint green).
-- Phase C branches landed: wave-b/decode-output-writer, wave-b/stdin-parallel, wave-b/tiny-input-passthrough,
-  wave-b/sampler-removal, wave-b/tail-pad-fixed.
-- W1 stab×3 (chunk-buf pool, 52fa20aa) grading — run 1: NO-SHIP with 3 confirmed REAL cells
-  (armexe L9-T1 −0.29%; minjs L6-T4 −0.69%; minjs L9-T4 +2.4%; each libdeflate-axes at thin margins;
-  3 others acquitted LAYOUT-ARTIFACT). Run 2: NO-SHIP. Run 3 in census (tool.bin corpora); merged
-  verdict pending.
-- W2/W6 chains queued (/tmp/wave-gate.sh). Wave-B branches enter the queue after wave-A verdicts.
-- Fulcrum upstream carries the staleness fixes through 483e413.
-- Trainer-box tooling note: libz-ng-sys (zlib-ng) needs cmake — absent system-wide here;
-  project-local venv at .tooling/venv-cmake carries it (`PATH=.tooling/venv-cmake/bin:$PATH`).
-  release-syms twin takes ~40 min LTO; cached after.
+- **All six campaign PRs MERGED to main** (every check green at merge time):
+  #438 CI-toolchain fixes (clippy bound-form scrutinee + symbol-canary BufWriter
+  demangle re-pin, std::io -> alloc::io; apple emit_sequences row removed pending
+  own-box re-pin), #437 hook-gate hygiene, #436 interop (GZ FEXTRA never written),
+  #434 lever campaign dossier, #433 wave1 batch (CLI contracts, real -z zlib RFC
+  1950 container, exit ledger, docs), #435 README rewrite + production-paths +
+  CI clippy arm for gzippy-inflate (with its first clippy-pass fixes). Main tip
+  63c04dc8. The README copy has been audited against src (flag honesty, -z/.zz,
+  rejected list).
+- **W1 (chunk-buf pool) final verdict: NO-SHIP** across stab×3 — stable-real
+  conviction `libdeflate:minjs.min.js:L9:T4:wall` +2.24% (thin margin, sign 4/5
+  all runs), owned by the lever's own code. Branch stays on origin unmerged
+  (`wave-a/chunk-buf-pool`) with full receipts; two-strikes rule keeps the lever
+  out.
+- **W2 chain (optimizer-pool, f5d4f57f) grading.** Run 1 wallcensus done (594
+  cells), sizecensus stage; lever compile fixes committed first (thread_local
+  .with, Ordering dup, const thread-local init).
+- **W6 (stored-crc fold, f8adee5f) queued after W2; C1-C5 wave-B levers
+  (3d30eb9c / c82f1af7 / d161a3b1 / 7e3e6696 / f84b0ed4) queued behind** — all
+  five rebased on main, clippy-clean, pushed, chains armed via
+  /home/termag/www/gzippy-bench/campaign/run-wave-b.sh.
+- Wave-gate script bug noted and worked around: the queue's log path
+  `/tmp/wave-$BR.log` breaks when $BR carries a slash (both queued chains rc=1'd
+  instantly); the corrected runner lives at campaign/run-w2-w6.sh.
+- Fulcrum binary updated to upstream 483e413; measurement ok.
+- Trainer-box tooling note: libz-ng-sys (zlib-ng) needs cmake — absent
+  system-wide here; project-local venv at .tooling/venv-cmake carries it
+  (`PATH=.tooling/venv-cmake/bin:$PATH`). release-syms twin ~40 min LTO; cached
+  after.
