@@ -53,10 +53,11 @@ gzippy -9 big.tar              # level 9, every core
 gzippy --ultra big.tar         # level 11, true zopfli parse
 gzippy --max precious.tar      # level 12, densest
 gzippy -p 4 big.tar            # four threads
+gzippy -z big.bin              # zlib wrapper (RFC 1950), .zz suffix
 ```
 
-Rejected loudly, not silently wrong (issues #302, #303):
-`-R` rsyncable, `-z` zlib, `-K` zip.
+Rejected loudly, not silently wrong (issue #302):
+`-R` rsyncable, `-K` zip.
 
 ## Decompress
 
