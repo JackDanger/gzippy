@@ -99,11 +99,23 @@ it up; this file is on `docs/readme` and rides PR A2.
 
 ## Status ledger (2026-10-30, live)
 
-- Phase A branches in-repo, unpushed per git-credential outage: interop/no-gz-fextra-write, docs/readme, hygiene/hook-gates.
+- All Phase A branches PUSHED + PRs open: #433 wave1/improvements, #434 lever/perf-wave,
+  #435 docs/readme (this file; review-clean CI-green), #436 interop/no-gz-fextra-write,
+  #437 hygiene/hook-gates.
+- PR #438 fix/ci-2026-10-toolchain (opened 2026-10-30): unblocks the two main-carried CI
+  gates the 2026-10 runner toolchain bump broke for every branch — clippy scrutinee deny
+  (block_fetcher rs:239 bound-form) + symbol-canary BufWriter demangle re-pin
+  (std::io -> alloc::io path; apple emit_sequences row removed pending own-box re-pin).
+  Both Anatomy legs CI-verified PASS; Build legs pending; other PRs rebase onto it and
+  re-run CI (interop already carries the same fix at 2d20a384; Lint green).
 - Phase C branches landed: wave-b/decode-output-writer, wave-b/stdin-parallel, wave-b/tiny-input-passthrough,
   wave-b/sampler-removal, wave-b/tail-pad-fixed.
 - W1 stab×3 (chunk-buf pool, 52fa20aa) grading — run 1: NO-SHIP with 3 confirmed REAL cells
   (armexe L9-T1 −0.29%; minjs L6-T4 −0.69%; minjs L9-T4 +2.4%; each libdeflate-axes at thin margins;
-  3 others acquitted LAYOUT-ARTIFACT). Merged verdict pending runs 2-3.
+  3 others acquitted LAYOUT-ARTIFACT). Run 2: NO-SHIP. Run 3 in census (tool.bin corpora); merged
+  verdict pending.
 - W2/W6 chains queued (/tmp/wave-gate.sh). Wave-B branches enter the queue after wave-A verdicts.
 - Fulcrum upstream carries the staleness fixes through 483e413.
+- Trainer-box tooling note: libz-ng-sys (zlib-ng) needs cmake — absent system-wide here;
+  project-local venv at .tooling/venv-cmake carries it (`PATH=.tooling/venv-cmake/bin:$PATH`).
+  release-syms twin takes ~40 min LTO; cached after.
