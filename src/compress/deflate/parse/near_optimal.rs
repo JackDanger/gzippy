@@ -191,7 +191,7 @@ thread_local! {
     /// `Optimizer::new` fails the pooled-reuse test even when a same-size
     /// fresh alloc lands on the recycled address). Always-on Relaxed: one
     /// add per drop, off the hot paths.
-    static OPTIMIZER_POOL_RECYCLES: AtomicUsize = AtomicUsize::new(0);
+    static OPTIMIZER_POOL_RECYCLES: AtomicUsize = const { AtomicUsize::new(0) };
 }
 
 /// RAII handle from [`Optimizer::acquire`]. `Deref`/`DerefMut` to
@@ -221,7 +221,7 @@ impl Drop for PooledOptimizer {
             OPTIMIZER_POOL.with(|cell| {
                 *cell.borrow_mut() = Some(s);
                 // Engaged recycles only (see the thread_local's doc).
-                OPTIMIZER_POOL_RECYCLES.fetch_add(1, Ordering::Relaxed);
+                OPTIMIZER_POOL_RECYCLES.with(|c| c.fetch_add(1, Ordering::Relaxed));
             });
         }
     }
@@ -705,7 +705,7 @@ pub(super) fn bt_forced() -> bool {
 // no production call site reads it, and it is driven only by
 // tests/l9_t4_chunk_cost_probe.rs (dead-code allowed on that basis).
 #[cfg(feature = "near-opt-bt-probebudget")]
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 #[cfg(feature = "near-opt-bt-probebudget")]
 static BT_PROBE_BUDGET: AtomicU32 = AtomicU32::new(48);
 
