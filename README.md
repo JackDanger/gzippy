@@ -4,7 +4,7 @@ A parallel gzip.
 In Rust.
 
 One binary.
-Four names: `gzippy`, `gunzip`, `gzcat`, `zcat`.
+Six names: `gzippy`, `gzip`, `gunzip`, `ungzippy`, `gzcat`, `zcat`.
 
 Standard gzip streams. RFC 1952.
 
