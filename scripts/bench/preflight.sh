@@ -77,6 +77,10 @@ box_row() {
     lxc199)        echo "trainer  x86_64 REDACTED_IP neurotic-benchlock"  ;;
     neurotic)      echo "neurotic x86_64 10.30 neurotic-benchlock"        ;;
     local|m1|mac)  echo "$(hostname -s 2>/dev/null) arm64 127 none-local" ;;
+    # OWNER-DECLARED 2026-10-22 (chat receipt): the 8-core aarch64 dev box joins
+    # the fleet for campaign numbers, walls included. No CPUC lock; treat walls
+    # as paired-relative only (measure.sh's interleaved-ratio discipline).
+    owner-aarch64) echo "$(hostname -s 2>/dev/null) aarch64 127 none-local" ;;
     *)             echo "UNKNOWN UNKNOWN UNKNOWN UNKNOWN" ;;
   esac
 }
