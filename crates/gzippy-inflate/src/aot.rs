@@ -54,7 +54,9 @@ mod tests {
     /// build.rs must emit AT LEAST the RFC 1951 fixed-Huffman fingerprint.
     #[test]
     fn aot_table_has_fixed_huffman() {
-        assert!(AOT_FINGERPRINT_COUNT >= 1);
+        const {
+            assert!(AOT_FINGERPRINT_COUNT >= 1);
+        }
         let mut litlen = [0u8; 288];
         for entry in litlen.iter_mut().take(144) {
             *entry = 8;
