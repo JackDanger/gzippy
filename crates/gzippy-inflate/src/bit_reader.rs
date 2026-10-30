@@ -205,7 +205,7 @@ pub fn pext_u64(src: u64, mask: u64) -> u64 {
     let mut s = src;
     let mut bit = 0;
     while m != 0 {
-        let low = m & m.wrapping_neg();
+        let low = m.isolate_lowest_one();
         let pos = low.trailing_zeros();
         out |= ((s >> pos) & 1) << bit;
         bit += 1;

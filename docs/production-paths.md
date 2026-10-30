@@ -92,58 +92,51 @@ Input (mmap'd slice, num_threads)
 
 ## 2. Compression routing tree
 
-Entry point: `compress_with_pipeline` (`src/compress/mod.rs:30`).
-Multi-threaded path dispatches through `SimpleOptimizer`
-(`src/compress/simple.rs:40`).
+Entry point: `compress_with_pipeline_sized`
+(`src/compress/mod.rs:123`). The dispatch is READER-FORM-INDEPENDENT —
+file, stdin and library callers all land here via
+`compress_with_pipeline` (`src/compress/mod.rs:106`).
 
 ```
 Input (reader, args, opt_config)
 │
-├─ args.use_zopfli()?   [L11 or --zopfli flags]
-│   YES → ZopfliGzEncoder::compress [src/compress/zopfli.rs]
-│         (pure-Rust zopfli; single-member output)
+├─ explicit zopfli tuning flags (-F/-I/-J)
+│   YES → parse::ultra::ZopfliGzEncoder::compress
+│         [src/compress/deflate/parse/ultra/encoder.rs]
+│         (pure-Rust zopfli port; single-member output; the intra-block
+│          deflate_part still parallelizes iterations across -p)
 │
-├─ T=1 AND level ≤ 9
-│   │
-│   ├─ level ≤ 3 AND ISA-L available AND NOT --huffman/--rle
-│   │   → isal_compress::compress_gzip_stream_direct(reader, writer, level)
-│   │     [src/backends/isal_compress.rs]
-│   │     (x86_64 + AVX2; single-member output)
-│   │
-│   ├─ level 1–5 AND NOT --huffman/--rle
-│   │   ratio probe on first 64 KiB:
-│   │   ├─ compressible (ratio ≥ 0.10) → libdeflate one-shot
-│   │   │     compress::parallel::compress_single_member [src/compress/parallel.rs]
-│   │   │     (standard single-member gzip output)
-│   │   └─ highly compressible (< 0.10) → flate2/zlib-ng streaming
-│   │         [src/compress/mod.rs:128–133; standard single-member gzip]
-│   │
-│   └─ level 6–9 (or --huffman/--rle)
-│       → flate2/zlib-ng streaming encoder  [src/compress/mod.rs:135–160]
-│         (standard single-member gzip output)
+├─ T=1 (opt_config.thread_count == 1)
+│   → encode_gzip_reader_to_writer_sized
+│     [src/compress/deflate/mod.rs]
+│     ONE route for EVERY level 0-12; the per-level engine choice lives in
+│     `level_uses_ldx` [deflate/mod.rs:637]:
+│     ├─ 0, 2-5, 7-9 → the libdeflate port (src/compress/ldx/)
+│     ├─ 1, 6       → gzippy's own legacy arms (measured wins)
+│     └─ 10-12      → parse/near_optimal (near-optimal parse)
+│     (plain `-11`/`--max` do NOT route through the zopfli branch; the
+│      encoder picks the cheapest of stored/static/dynamic per block,
+│      which subsumes the old L0 passthrough and --huffman/--rle fall-throughs)
 │
-└─ T>1 → SimpleOptimizer::compress [src/compress/simple.rs:40]
-    │
-    ├─ level ≥ 10  → ParallelGzEncoder [src/compress/parallel.rs]
-    │                ("GZ" FEXTRA subfield multi-block format)
-    │
-    ├─ level 6–9   → PipelinedGzEncoder [src/compress/pipelined.rs]
-    │                (single-member gzip-compatible output, dictionary sharing)
-    │
-    └─ level 1–5   → ParallelGzEncoder [src/compress/parallel.rs]
-                     ("GZ" FEXTRA subfield multi-block format)
+└─ T>1
+    → PipelinedGzEncoder::compress_buffer_pure
+      [src/compress/pipelined.rs:299] — the SOLE production T>1 path;
+      single-member RFC 1952 output with sync-flush-seamed per-chunk DEFLATE
+      and a combined CRC/ISIZE trailer. NOT the legacy "GZ" multi-block
+      format: no writer in the tree emits the "GZ" FEXTRA subfield at all
+      (removed in v1.0; decode-side reading of it remains for old files).
 ```
 
 ### Format notes
 
-- `ParallelGzEncoder` output carries a `"GZ"` FEXTRA subfield with per-block size
-  info (`src/compress/parallel.rs`). Decompression routes this to
-  `bgzf::decompress_bgzf_parallel` via `has_bgzf_markers`.
-- `PipelinedGzEncoder` and all T=1 paths emit plain single-member gzip — standard
-  format, no FEXTRA modification.
-- CLAUDE.md describes T>1 routing as `L6–9 → Pipelined`, `L0–5 → Parallel`. The
-  code confirms this but shows `SimpleOptimizer` checks `>= 6` not `>= 7`
-  (`simple.rs:75`). Level 6 is included in the Pipelined branch for T>1.
+- Every production path emits plain RFC 1952 gzip. The legacy "GZ" FEXTRA
+  subfield is READ-side only since v1.0 (decoding pre-1.0 files);
+  `has_bgzf_markers` keeps detecting those streams.
+- All T=1 paths are byte-identical level-for-level regardless of input form
+  (mmap, read-to-end, stdin) — pinned by `entry_point_identity.rs:62-71`.
+- CLAUDE.md's `SimpleOptimizer` T>1 description predates Increment 7:
+  `SimpleOptimizer` [src/compress/simple.rs] is a quarantined oracle, not
+  a production path.
 
 ---
 

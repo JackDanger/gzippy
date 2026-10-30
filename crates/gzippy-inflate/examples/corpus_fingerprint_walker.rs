@@ -100,7 +100,7 @@ fn main() -> ExitCode {
         .iter()
         .map(|(&k, &(freq, ln, dn))| (k, freq, ln, dn))
         .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let top_n = sorted.iter().take(64).collect::<Vec<_>>();
 
@@ -293,7 +293,7 @@ impl<'a> Walker<'a> {
             let sym = decode_cl_symbol(&mut self.bits, &cl_lookup)?;
             match sym {
                 0..=15 => {
-                    all_lens[i] = sym as u8;
+                    all_lens[i] = sym;
                     i += 1;
                 }
                 16 => {
