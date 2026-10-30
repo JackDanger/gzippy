@@ -35,6 +35,7 @@ use crate::cli::GzippyArgs;
 use crate::compress::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
+use crate::format::CompressionFormat;
 use crate::utils::preserve_metadata;
 
 /// Splices a full FNAME/MTIME gzip header over the minimal header the T1
@@ -163,109 +164,167 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         return compress_stdin(args);
     }
 
-    let input_path = Path::new(filename);
-    if !input_path.exists() {
-        return Err(GzippyError::FileNotFound(filename.to_string()));
-    }
-    if input_path.is_dir() {
+    // gzip's whole OPEN contract for a compress input -- ELOOP link
+    // refusal ("Too many levels of symbolic links", ERROR class, which
+    // is what real gzip prints for `gzip symlink` -- probed, NOT the
+    // "is a symbolic link" warning the old pre-open check emitted),
+    // missing-file reporting against the GIVEN name (COMPRESS mode
+    // never retries suffixes -- open_input_file's ladder is
+    // decompress-only, gzip.c:1100-1101), and the opened handle -- is
+    // one helper (gzip.c:1072-1163; see utils docs).
+    let (input_file, resolved_path) = match crate::utils::open_gzip_input(
+        Path::new(filename),
+        false, // COMPRESS mode: no suffix retry
+        args.stdout,
+        args.force,
+        &args.suffix,
+    ) {
+        Ok((f, p)) => (f, p),
+        Err(failure) => return Ok(crate::utils::report_open_failure(failure, args.quiet)),
+    };
+    let input_path: &Path = resolved_path.as_path();
+
+    // Precondition ordering below mirrors treat_file's (gzip.c:717-798):
+    // open (permission/ELOOP) -> directory -> special file -> mode bits /
+    // hardlink -> name-suffix notice -> refuse-overwrite. Established BY
+    // EXECUTION against real gzip 1.14 (never inferred from reading gzip's
+    // source): permission (openability) beats EVERY other precondition and
+    // is never overridden by `-f`; hardlink-refusal beats the already-suffix
+    // notice and the refuse-overwrite notice, and IS overridden by `-f`.
+    // Concretely, `gzip already.gz` where `already.gz` is mode 000 reports
+    // "Permission denied" (exit 1), and where `already.gz` has a second
+    // hardlink reports "has 1 other link -- file ignored" (exit 2) — in BOTH
+    // cases gzip never reaches its "already has .gz suffix" no-op notice,
+    // even though the filename triggers that check too. gzippy previously
+    // ran the already-suffix check (and the hardlink check) before ever
+    // attempting to open the file, so a mode-000 or hardlinked file already
+    // ending in the target suffix short-circuited to the wrong (successful,
+    // no-op) exit code instead of reporting the real precondition failure —
+    // a compound-fixture divergence the drop-in census caught
+    // (`fulcrum dropin`, fixture `already-named.gz` x {mode000, hardlink}).
+    // The helper above opens (and thereby permission-checks) the file; the
+    // handle is reused below instead of being opened a second time.
+    // stat of the OPENED file: a mode-000 DIRECTORY fails open first
+    // ("Permission denied") before the directory notice is reachable,
+    // exactly as in gzip (treat_file reads the OPEN's status).
+    let istat = input_file.metadata().map_err(|e| GzippyError::os(&e))?;
+
+    if istat.is_dir() {
         return if args.recursive {
             compress_directory(filename, args)
         } else {
-            // Contract established by execution (gzip 1.14 / pigz 2.8, macOS
-            // + Linux): `gzip somedir` (no -r) prints exactly this shape and
-            // exits 2 (WARNING, not ERROR) — never touches the directory,
-            // never halts a multi-file invocation's remaining good files.
-            // pigz disagrees (exit 1, "skipping: X is a directory"); gzip is
-            // the primary drop-in target so we match gzip.
+            // Same contract as decompress_file (see comment there):
+            // `gzip somedir` (no -r) prints exactly this shape and
+            // exits 2 (WARNING, not ERROR) — never touches the
+            // directory, never halts a multi-file invocation's remaining
+            // good files. pigz disagrees (exit 1, "skipping: X is a
+            // directory"); gzip is the primary drop-in target so we
+            // match gzip.
             if !args.quiet {
                 eprintln!("gzippy: {} is a directory -- ignored", filename);
             }
             Ok(2)
         };
     }
-    if input_path.is_symlink() && !args.force {
-        if !args.quiet {
-            eprintln!(
-                "gzippy: {}: is a symbolic link -- skipping (use -f to force)",
-                filename
-            );
-        }
-        return Ok(2);
-    }
 
-    // Precondition ordering below is established BY EXECUTION against real
-    // gzip 1.14 (never inferred from reading gzip's source): permission
-    // (openability) beats EVERY other precondition and is never overridden
-    // by `-f`; hardlink-refusal beats the already-suffix notice and the
-    // refuse-overwrite notice, and IS overridden by `-f`. Concretely,
-    // `gzip already.gz` where `already.gz` is mode 000 reports "Permission
-    // denied" (exit 1), and where `already.gz` has a second hardlink reports
-    // "has 1 other link -- file ignored" (exit 2) — in BOTH cases gzip never
-    // reaches its "already has .gz suffix" no-op notice, even though the
-    // filename triggers that check too. gzippy previously ran the
-    // already-suffix check (and the hardlink check) before ever attempting
-    // to open the file, so a mode-000 or hardlinked file already ending in
-    // the target suffix short-circuited to the wrong (successful, no-op)
-    // exit code instead of reporting the real precondition failure — a
-    // compound-fixture divergence the drop-in census caught
-    // (`fulcrum dropin`, fixture `already-named.gz` x {mode000, hardlink}).
-    //
-    // Opening the file here (rather than at its old, later position) is
-    // what actually performs the permission check; the handle is reused
-    // below instead of being opened a second time.
-    let input_file = File::open(input_path)?;
-
+    // gzip.c:737-768 — the whole `if (! to_stdout)` WARN ladder, same skip
+    // as the decompress arm: WARNING class, exit 2 each, ONLY when NOT
+    // going to stdout (`gzip -c /dev/null` compresses zero bytes, probed).
+    // A device/FIFO/socket is not a regular file; set-user-ID and
+    // set-group-ID are refused regardless of -f (unconditional security
+    // refusals — gzip has no force escape for them), while the sticky bit
+    // and a hardlink count of 2+ yield to -f.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::FileTypeExt;
-        let ft = std::fs::symlink_metadata(input_path)?.file_type();
-        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let ft = istat.file_type();
+        // metadata()'s mode() is u32 in std on every unix; Darwin's mode_t is
+        // u16 (Linux's is u32) — normalize to mode_t so `mode & S_ISUID`
+        // (mode_t-typed constants in libc) compiles on both.
+        let mode = istat.mode() as libc::mode_t;
+        if !args.stdout
+            && (ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket())
+        {
             if !args.quiet {
-                eprintln!("gzippy: {}: is not a regular file -- skipping", filename);
+                eprintln!(
+                    "gzippy: {} is not a directory or a regular file - ignored",
+                    filename
+                );
             }
             return Ok(2);
         }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(metadata) = std::fs::metadata(input_path) {
-            if metadata.nlink() > 1 && !args.force {
+        if !args.stdout {
+            if mode & libc::S_ISUID != 0 {
+                if !args.quiet {
+                    eprintln!("gzippy: {} is set-user-ID on execution - ignored", filename);
+                }
+                return Ok(2);
+            }
+            if mode & libc::S_ISGID != 0 {
                 if !args.quiet {
                     eprintln!(
-                        "gzippy: {}: has {} other links -- skipping (use -f to force)",
-                        filename,
-                        metadata.nlink() - 1
+                        "gzippy: {} is set-group-ID on execution - ignored",
+                        filename
                     );
                 }
                 return Ok(2);
             }
+            if !args.force {
+                if mode & libc::S_ISVTX != 0 {
+                    if !args.quiet {
+                        eprintln!("gzippy: {} has the sticky bit set - file ignored", filename);
+                    }
+                    return Ok(2);
+                }
+                // gzip.c:772-777: plural only from the third link on —
+                // nlink == 2 (one other link) formats singular "link".
+                // Message text follows the released gzip generation
+                // (1.12+/1.14: "-- file ignored"; the vendored 1.6 copy
+                // still carries the pre-2022 "-- unchanged" wording).
+                if istat.nlink() > 1 {
+                    if !args.quiet {
+                        let other = istat.nlink() - 1;
+                        eprintln!(
+                            "gzippy: {} has {} other {} -- file ignored",
+                            filename,
+                            other,
+                            if other == 1 { "link" } else { "links" },
+                        );
+                    }
+                    return Ok(2);
+                }
+            }
         }
     }
 
-    // Refuse to compress files that already carry the target suffix in-place
-    // (e.g. foo.gz -> foo.gz.gz). Contract established by execution (gzip
-    // 1.14, pigz 2.8 on macOS + Linux):
-    //   - `-c`: there is no output-FILENAME collision to protect (output
-    //     goes to stdout) so gzip ALWAYS compresses through regardless of
-    //     this file's name, with or without -f. (pigz disagrees here — it
-    //     skips and emits empty stdout — but gzip is the primary drop-in
-    //     target, so we match gzip: skip this check entirely when
-    //     `args.stdout`.)
-    //   - in-place, without -f: gzip leaves the file COMPLETELY UNCHANGED
-    //     and exits 0 -- a no-op NOTICE, not an error (both gzip and pigz
-    //     agree: real `gzip already.gz` prints this message and exits 0).
-    //   - in-place, with -f: `args.force` already short-circuits this
-    //     branch (the condition below), so -f compresses anyway
-    //     (foo.gz -> foo.gz.gz), matching gzip.
-    if !args.stdout && !args.force && filename.ends_with(args.suffix.as_str()) {
-        if !args.quiet {
-            eprintln!(
-                "gzippy: {}: already has {} suffix -- unchanged",
-                filename, args.suffix
-            );
+    // Refuse to compress a name that already carries A RECOGNIZED gzip
+    // suffix — gzip's get_suffix TABLE, not just args.suffix, decides:
+    // `gzip FOO.GZ` and `gzip old.z` print "already has .GZ/.z suffix --
+    // unchanged" (matched tail in ORIGINAL case; get_suffix preserves
+    // it) and exit 0 leaving the file unchanged (probed gzip 1.12;
+    // make_ofname compress arm gzip.c:1204-1215 is a plain fprintf,
+    // deliberately NOT a WARN: "Don't use WARN, as it affects exit
+    // status"). Consequences of that contract:
+    //   - `-c`: there is no output-FILENAME collision to protect (ofname
+    //     := "stdout"), so gzip ALWAYS compresses through regardless of
+    //     the name, with or without -f.
+    //   - in-place, without -f: the file is left COMPLETELY UNCHANGED,
+    //     exit 0 — a no-op NOTICE that does not bump the ledger.
+    //   - in-place, with -f: force bypasses the notice and compresses
+    //     anyway (foo.gz -> foo.gz.gz), matching make_ofname's
+    //     fall-through.
+    //   - the message gate is gzip.c:1206-1209: "Avoid annoying messages
+    //     with -r" — printed only with -v, or without -r and -q.
+    if !args.stdout && !args.force {
+        if let Some(suf) = crate::utils::known_gzip_suffix(filename, &args.suffix) {
+            if args.verbose || (!args.recursive && !args.quiet) {
+                eprintln!(
+                    "gzippy: {} already has {} suffix -- unchanged",
+                    filename, suf
+                );
+            }
+            return Ok(0);
         }
-        return Ok(0);
     }
 
     let output_path = if args.stdout {
@@ -311,7 +370,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
     }
 
-    let file_size = input_file.metadata()?.len();
+    let file_size = istat.len();
 
     let content_type = if args.processes <= 1 || args.compression_level <= 3 {
         ContentType::Binary
@@ -356,8 +415,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // `--rsyncable` keeps its content-defined split (also pure now). The former
     // mmap SimpleOptimizer (flate2/libdeflate C-FFI) path is gone from routing
     // and survives only behind the dev `ffi-oracle` feature as an oracle.
+    // (-z/--zlib also uses this mmap T>1 route: the encoder carries the
+    // container, issue #303.)
     let explicit_zopfli =
         args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
+    let is_zlib = args.format == CompressionFormat::Zlib;
     let use_pure_parallel = use_mmap && !args.rsyncable && !explicit_zopfli;
 
     // T1 FILE inputs above the same threshold: mmap and parse whole-buffer
@@ -368,10 +430,14 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // so the mmap route's point is simply in-place parse with no input copy:
     // the stdin/pipe route reads to end into a Vec and parses the same way.
     // Output is byte-identical to the Read-based T1 route at every level.
+    // Gzip-only: this route splices FNAME over a fixed gzip header; `-z`
+    // (issue #303) falls through to `compress_with_pipeline_sized`, whose
+    // zlib branch frames the container.
     let use_t1_mmap = opt_config.thread_count == 1
         && file_size > 128 * 1024
         && !args.rsyncable
-        && !explicit_zopfli;
+        && !explicit_zopfli
+        && !is_zlib;
 
     if let Some(ref output_path) = output_path {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
@@ -424,6 +490,15 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
         encoder.set_header_info(header_info.clone());
         encoder.set_minimal_gzip_header(args.stdout);
+        // -vv chunk-grid report (issue #259), same contract as the
+        // `compress_with_pipeline_sized` T>1 fallback.
+        encoder.set_report_chunk_grid(args.verbosity >= 2);
+        // Issue #303: the encoder carries the container, so this parallel
+        // fast path holds for `-z` too (no FNAME/FCOMMENT field exists in
+        // zlib; `header_info` and the minimal-header switch are inert then).
+        if is_zlib {
+            encoder.set_container(crate::compress::zlib_container::ContainerKind::Zlib);
+        }
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
             encoder
@@ -440,6 +515,12 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             eprintln!(
                 "gzippy: using pure-Rust DEFLATE encoder (T1 mmap L{})",
                 args.compression_level
+            );
+            // -vv chunk-grid report (issue #259): byte-identical to the
+            // `PureT1` route, and whole-buffer by construction all the same.
+            eprintln!(
+                "gzippy: chunk grid: route={} threads=1 chunks=1 (whole-buffer)",
+                crate::compress::route::PURE_T1_MMAP
             );
         }
         // SAFETY: the input file is opened read-only and mapped for the
@@ -492,11 +573,13 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         )
     } else {
         let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
-        if opt_config.thread_count == 1 && !explicit_zopfli {
+        if opt_config.thread_count == 1 && !explicit_zopfli && !is_zlib {
             // The T1 branch inside `compress_with_pipeline_sized` writes the
             // fixed minimal header; splice the full FNAME/MTIME header over
             // it (issue #309). The zopfli and T>1 branches build their own
-            // full header from `header_info` and must NOT be wrapped.
+            // full header from `header_info` and must NOT be wrapped. `-z`
+            // replaces that header with CMF/FLG upstream of the writer, so
+            // the splicer must never wrap it either.
             crate::compress::compress_with_pipeline_sized(
                 input_file,
                 HeaderSpliceWriter::new(
@@ -636,6 +719,14 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
             encoder.set_header_info(header_info.clone());
             encoder.set_minimal_gzip_header(true);
+            // -vv chunk-grid report (issue #259), same contract as the
+            // `compress_with_pipeline_sized` T>1 fallback.
+            encoder.set_report_chunk_grid(args.verbosity >= 2);
+            // Issue #303: the container travels on the encoder, so the mmap'd
+            // stdin fast path holds for `-z` too (FNAME flags are inert).
+            if args.format == CompressionFormat::Zlib {
+                encoder.set_container(crate::compress::zlib_container::ContainerKind::Zlib);
+            }
             encoder.compress_buffer_pure(input_data, &mut counted)?;
             counted.flush()?;
             if verbose {
@@ -702,16 +793,25 @@ fn print_stdin_stats(in_bytes: u64, out_bytes: u64, args: &GzippyArgs) {
 fn compress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     use walkdir::WalkDir;
     let mut exit_code = 0;
+    // treat_dir (gzip.c:823-860) hands EVERY readdir entry to treat_file —
+    // only real subdirectories are recursed into. Symlinks flow through to
+    // compress_file, where the O_NOFOLLOW open refusals apply (ELOOP →
+    // ERROR class, exit 1 — even for dangling links). gzippy previously
+    // pre-filtered with Path::is_file(), which FOLLOWS links, so links were
+    // silently (and racy — compression may have already consumed the
+    // target) skipped instead of refused like gzip's -r.
     for entry in WalkDir::new(dirname) {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
+        if !entry.file_type().is_dir() {
             let path_str = path.to_string_lossy();
             match compress_file(&path_str, args) {
                 Ok(code) => {
-                    if code != 0 {
-                        exit_code = code;
-                    }
+                    // gzip's WARN-escalation ledger (gzip.h:263-264), same
+                    // rule as the top-level file loop: ERROR (1) wins
+                    // regardless of arrival order, WARNING (2) only sticks
+                    // when nothing worse is recorded.
+                    crate::utils::bump_exit_code(&mut exit_code, code);
                 }
                 Err(e) => {
                     eprintln!("gzippy: {}: {}", path_str, e);

@@ -44,12 +44,12 @@
 //!   igzip -3  -> gzip L3 — but -3 is igzip's BEST (`--best`). A user asking
 //!                igzip for maximum compression gets our third-weakest level.
 //!   igzip -z  -> igzip: "compress (default)", a no-op modifier. gzippy: the
-//!                pigz meaning (zlib container) — unimplemented, REJECTED
-//!                with an error that explains the collision.
+//!                pigz meaning (zlib container) — REAL zlib output, .zz
+//!                suffix (issue #303). The suffix redirect is the only
+//!                observable divergence left on this row.
 //!
-//! The -0 warning, the -z rejection, and the --help documentation of this
-//! scale collision are the flag-honesty PR's mitigation; the -2/-3 rows
-//! remain silent divergences (both valid gzip), pinned below.
+//! The -0 warning, the --help documentation of this scale collision, and the
+//! -2/-3 rows remain silent divergences (both valid gzip), pinned below.
 //!
 //! ## Triage table (updated by the flag-honesty PR, which mitigated every
 //! ## silent-wrong row into a clean rejection or a fix — the missing FEATURES
@@ -58,7 +58,7 @@
 //! | rival flag                | our behaviour                                   | status |
 //! |---------------------------|--------------------------------------------------|----------|
 //! | pigz -R/--rsyncable       | REJECTED in compress mode, exit 2, names issue #302 (was: accepted, output NOT rsyncable) | clean-reject |
-//! | pigz -z/--zlib            | REJECTED in compress mode, exit 2, names issue #303 (was: gzip bytes under .zz) | clean-reject |
+//! | pigz -z/--zlib            | SUPPORTED (#303): real RFC 1950 zlib — CMF low nibble 8, (CMF<<8|FLG)%31==0, big-endian Adler-32 — at every level 0-12 and thread count (T>1 stays on the parallel pipeline); file mode writes FILE.zz and deletes the input; own -d/-t roundtrip; -z + -C refused loudly (no FCOMMENT field) | implemented |
 //! | pigz -K/--zip             | REJECTED in compress mode, exit 2, names issue #303 (was: gzip bytes under .zip) | clean-reject |
 //! | pigz -b/--blocksize N     | FIXED: bare N is KiB, pigz's documented unit (was: bytes) | ok |
 //! | pigz -H/--huffman         | REJECTED in compress mode, exit 2 (was: silent no-op advertised in --help) | clean-reject |
@@ -68,14 +68,14 @@
 //! | pigz -A/--alias xxx       | REJECTED in compress mode, exit 2, names issue #303 (was: silently ignored) | clean-reject |
 //! | pigz -F/--first           | collides: our -F takes a VALUE (zopfli iterations); consumes the next argv | misparse-but-errs MED |
 //! | pigz -I/--iterations n    | collides: our -I is a flag (no-block-split); n becomes a FILE operand | misparse-but-errs MED |
-//! | pigz -O/--oneblock        | clean reject ("Unknown option: -O")             | clean-reject |
+//! | pigz -O/--oneblock        | clean reject ("invalid option -- 'O'" + Try line)| clean-reject |
 //! | pigz -M/-m, -N/-n, -p, -S, -Y, -v, -q, -r, -t, -l, -L, -V, -d, -f, -k, -c, --fast, --best | supported | ok |
-//! | igzip -o FILE             | clean reject ("Unknown option: -o")             | clean-reject |
-//! | igzip -T/--threads n      | clean reject ("Unknown option: -T"; ours is -p) | clean-reject |
-//! | igzip --rm                | clean reject ("Unknown option: --rm")           | clean-reject |
+//! | igzip -o FILE             | clean reject ("invalid option -- 'o'" + Try line)| clean-reject |
+//! | igzip -T/--threads n      | clean reject ("invalid option -- 'T' + Try line; ours is -p") | clean-reject |
+//! | igzip --rm                | clean reject ("unrecognized option '--rm'" + Try line) | clean-reject |
 //! | igzip -0                  | STORE (gzip/pigz contract) + LOUD stderr warning naming issue #305 (was: silent) | divergence, loud |
 //! | igzip -2 / -3             | weak-fast gzip levels; igzip's default/best; documented in --help | divergence MED |
-//! | igzip -z                  | REJECTED in compress mode; the error names the pigz/igzip -z collision (#303/#305) | clean-reject |
+//! | igzip -z                  | -z has the PIGZ meaning (zlib container, issue #303): compresses to .zz and roundtrips; the suffix redirect (.zz, not .gz) is the documented divergence | divergence, loud-doc |
 //! | igzip keep-by-default     | we DELETE the input after compress (gzip rule); igzip keeps | divergence MED |
 //! | libdeflate-gzip -1..-12   | supported, valid gzip at every level             | ok |
 //! | libdeflate-gzip -c -d -f -h -k -q -S -t -V | supported                      | ok |
@@ -151,6 +151,22 @@ fn compress_stdout(dir: &Path, flags: &[&str], file: &str) -> Vec<u8> {
 fn assert_roundtrips(dir: &Path, gz: &[u8], expect: &[u8], what: &str) {
     let name = format!("rt{}.gz", what.replace([' ', '/', '-'], "_"));
     write_file(dir, &name, gz);
+    let out = run(dir, &["-d", "-c", &name]);
+    assert!(
+        out.status.success(),
+        "{what}: our own -d failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, expect, "{what}: roundtrip bytes differ");
+}
+
+/// Same as [`assert_roundtrips`] but names the payload file `.zz`. The .zz
+/// suffix is pigz's own, and decoding is by CONTENT anyway since #303: any
+/// name holding a valid zlib header routes to the zlib decoder (pinned for a
+/// .gz name inside `pigz_zlib_file_mode_writes_zz_and_deletes_input`).
+fn assert_roundtrips_zz(dir: &Path, zz: &[u8], expect: &[u8], what: &str) {
+    let name = format!("rt{}.zz", what.replace([' ', '/', '-'], "_"));
+    write_file(dir, &name, zz);
     let out = run(dir, &["-d", "-c", &name]);
     assert!(
         out.status.success(),
@@ -391,58 +407,196 @@ fn pigz_independent_flag_rejected_loudly() {
     assert_honesty_reject(&["-9", "-p", "4", "-i", "-k"], &["-i", "--independent"]);
 }
 
-#[test]
-fn pigz_zlib_flag_rejected_loudly() {
-    // MITIGATED (issue #303): pigz(1) -z / --zlib: "Compress to zlib (.zz)
-    // instead of gzip format". gzippy used to accept -z, switch the SUFFIX
-    // to .zz — and then emit GZIP bytes, which its own `-d` then rejected.
-    // Now: exit 2, stderr names the flag and the issue, and file mode never
-    // writes the mislabeled FILE.zz.
-    assert_honesty_reject(&["-z", "-c"], &["-z", "--zlib", "#303"]);
-
-    let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(16 * 1024));
-    let file_mode = run(d.path(), &["-z", "-k", "in.txt"]);
-    assert_eq!(
-        file_mode.status.code(),
-        Some(2),
-        "file-mode -z must refuse loudly"
-    );
+/// Assert an RFC 1950 zlib header: CM=8 (low nibble of CMF) and the
+/// (CMF<<8 | FLG) sum divisible by 31 (FCHECK).
+fn assert_rfc1950_header(out: &[u8], what: &str) {
     assert!(
-        !d.path().join("in.txt.zz").exists() && !d.path().join("in.txt.gz").exists(),
-        "-z must write nothing before refusing"
+        out.len() >= 6,
+        "{what}: zlib output must be at least header + one deflate byte + \
+         Adler-32, got {} bytes",
+        out.len()
     );
-    assert!(
-        d.path().join("in.txt").exists(),
-        "-z must leave the input untouched"
-    );
-}
-
-#[test]
-#[ignore] // CONTRACT test for issue #303: un-ignore when -z emits a real zlib stream.
-fn pigz_zlib_contract_emits_zlib_stream() {
-    // pigz(1) -z: the output must be RFC 1950 zlib — CMF low nibble 8
-    // (deflate), and (CMF<<8|FLG) divisible by 31. And our own decoder must
-    // roundtrip the .zz file we just wrote.
-    let d = tempdir();
-    let data = synth(16 * 1024);
-    write_file(d.path(), "in.txt", &data);
-    let out = compress_stdout(d.path(), &["-z"], "in.txt");
     assert_eq!(
         out[0] & 0x0f,
         8,
-        "zlib CMF: compression method must be deflate"
+        "{what}: zlib CMF: compression method must be deflate"
     );
     let check = ((out[0] as u16) << 8) | out[1] as u16;
     assert_eq!(
         check % 31,
         0,
-        "zlib header FCHECK must make CMF|FLG divisible by 31"
+        "{what}: zlib header FCHECK must make CMF|FLG divisible by 31"
     );
+}
+
+/// Big-endian Adler-32 (RFC 1950), checked against the trailer `out` ends with.
+fn assert_zlib_adler_trailer(out: &[u8], data: &[u8], what: &str) {
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for &b in data {
+        s1 = (s1 + b as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    assert_eq!(
+        &out[out.len() - 4..],
+        &((s2 << 16) | s1).to_be_bytes(),
+        "{what}: trailer must be the big-endian Adler-32 of the input"
+    );
+}
+
+#[test]
+fn pigz_zlib_contract_emits_zlib_stream() {
+    // pigz(1) -z: the output must be RFC 1950 zlib — CMF low nibble 8
+    // (deflate), and (CMF<<8|FLG) divisible by 31. And our own decoder must
+    // roundtrip the .zz file we just wrote. Runs at the DEFAULT thread count
+    // (no -p: this box runs at nproc workers). (Was #[ignore]d as the issue
+    // #303 acceptance bar until -z emitted a real zlib stream; un-ignored
+    // with the implementation.)
+    let d = tempdir();
+    let data = synth(16 * 1024);
+    write_file(d.path(), "in.txt", &data);
+    let out = compress_stdout(d.path(), &["-z"], "in.txt");
+    assert_rfc1950_header(&out, "default-T -z stdout");
+    assert_zlib_adler_trailer(&out, &data, "default-T -z stdout");
     write_file(d.path(), "rt.zz", &out);
     let rt = run(d.path(), &["-d", "-c", "rt.zz"]);
     assert!(rt.status.success(), "own -d of own -z output must succeed");
     assert_eq!(rt.stdout, data, "zlib roundtrip bytes");
+}
+
+#[test]
+fn pigz_zlib_roundtrips_all_levels_at_t1_and_t4() {
+    // Every level 1-12 must emit a valid zlib container (T1), and T>1 must be
+    // parallel-but-valid: -p4 roundtrips through our own decoder too
+    // (different chunk grid than T1; multi-chunk Adam/Adler-32 combine path).
+    let d = tempdir();
+    let data = synth(16 * 1024);
+    write_file(d.path(), "in.txt", &data);
+    for level in 1..=12u8 {
+        let level_flag = &*format!("-{level}");
+        // T1 (exact whole-stream encode; also covers the level-1/L6 legacy
+        // arms and the libdeflate-port levels).
+        let flag_t1 = ["-z", "-p", "1", level_flag];
+        let out = compress_stdout(d.path(), &flag_t1, "in.txt");
+        assert_rfc1950_header(&out, &format!("-z {level_flag} -p1"));
+        assert_zlib_adler_trailer(&out, &data, &format!("-z {level_flag} -p1"));
+        assert_roundtrips_zz(d.path(), &out, &data, &format!("-z {level_flag} -p1"));
+        // -p4 (issue #303: the parallel pipeline carries the container).
+        if matches!(level, 1 | 6 | 9 | 12) {
+            let flag_t4 = ["-z", "-p", "4", level_flag];
+            let out = compress_stdout(d.path(), &flag_t4, "in.txt");
+            assert_zlib_adler_trailer(&out, &data, &format!("-z {level_flag} -p4"));
+            assert_roundtrips_zz(d.path(), &out, &data, &format!("-z {level_flag} -p4"));
+        }
+    }
+}
+
+#[test]
+fn pigz_zlib_file_mode_writes_zz_and_deletes_input() {
+    // pigz -z file semantics: FILE.zz written, FILE removed after success
+    // (gzip's delete-by-default rule); -k keeps the input; -t verifies; and
+    // `gzippy -d FILE.zz` restores the original name and deletes the .zz.
+    let d = tempdir();
+    let data = synth(4096);
+    write_file(d.path(), "in.txt", &data);
+    let out = run(d.path(), &["-z", "-k", "in.txt"]);
+    assert!(
+        out.status.success(),
+        "file-mode -z failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(d.path().join("in.txt").exists(), "-k must keep the input");
+    let zz = fs::read(d.path().join("in.txt.zz")).expect("FILE.zz written");
+    assert_rfc1950_header(&zz, "file-mode .zz");
+    assert_zlib_adler_trailer(&zz, &data, "file-mode .zz");
+
+    // Without -k the input is removed (gzip contract) and -d restores it.
+    write_file(d.path(), "gone.txt", &data);
+    let out = run(d.path(), &["-z", "gone.txt"]);
+    assert!(
+        out.status.success(),
+        "-z file-only failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !d.path().join("gone.txt").exists(),
+        "gzip contract: -z input removed after successful compression"
+    );
+    assert!(d.path().join("gone.txt.zz").exists());
+    let rt = run(d.path(), &["-d", "-c", "gone.txt.zz"]);
+    assert!(rt.status.success());
+    assert_eq!(rt.stdout, data, "-d .zz roundtrip bytes");
+    // -t verifies our own .zz (pigz -t handles -z files too).
+    write_file(d.path(), "rt.zz", &zz);
+    let t = run(d.path(), &["-t", "rt.zz"]);
+    assert!(t.status.success(), "-t on own .zz must pass");
+
+    // CONTENT detection (#303): the same .zz bytes under a `.gz` (or any
+    // other) name still decode to the original — sniffing decides, not the
+    // extension, so `-z` output redirected to an arbitrary name roundtrips
+    // instead of hitting the gzip arm's "not in gzip format".
+    write_file(d.path(), "foreign_name.gz", &zz);
+    let det = run(d.path(), &["-d", "-c", "foreign_name.gz"]);
+    assert!(
+        det.status.success(),
+        "-d must route a renamed zlib stream by content: {}",
+        String::from_utf8_lossy(&det.stderr)
+    );
+    assert_eq!(det.stdout, data, "content-detected .gz roundtrip bytes");
+
+    // -1..-9/-12 at the DEFAULT thread count in FILE mode (this box: nproc
+    // workers) — includes the >128 KiB mmap parallel fast path.
+    let big = synth(256 * 1024);
+    write_file(d.path(), "big.txt", &big);
+    let out = run(d.path(), &["-z", "-p", "4", "-k", "big.txt"]);
+    assert!(
+        out.status.success(),
+        "large file-mode -z failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let zz = fs::read(d.path().join("big.txt.zz")).expect("big .zz");
+    assert_rfc1950_header(&zz, "mmap -z");
+    assert_zlib_adler_trailer(&zz, &big, "mmap -z");
+    assert_roundtrips_zz(d.path(), &zz, &big, "mmap -z file mode");
+}
+
+#[test]
+fn pigz_zlib_empty_stdin_roundtrips() {
+    // Edge beyond the rivals: `-z` of EMPTY stdin must emit a valid RFC 1950
+    // empty stream — the 2-byte header, at least one DEFLATE byte (the empty
+    // final block), and the 4-byte Adler-32 (of nothing = 0x00000001).
+    let d = tempdir();
+    let out = run(d.path(), &["-z", "-c"]); // no file operand: stdin (empty)
+    assert!(
+        out.status.success(),
+        "-z -c on empty stdin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_rfc1950_header(&out.stdout, "empty stdin -z");
+    assert!(
+        out.stdout.len() >= 7,
+        "empty zlib stream = 2 header + ≥1 deflate + 4 adler, got {}",
+        out.stdout.len()
+    );
+    assert_eq!(
+        &out.stdout[out.stdout.len() - 4..],
+        &1u32.to_be_bytes(),
+        "empty Adler-32 must be 1"
+    );
+    // The empty stream decodes to nothing — through our own decoder.
+    write_file(d.path(), "empty.zz", &out.stdout);
+    let rt = run(d.path(), &["-d", "-c", "empty.zz"]);
+    assert!(rt.status.success());
+    assert!(rt.stdout.is_empty(), "empty roundtrip must yield empty");
+}
+
+#[test]
+fn pigz_zlib_comment_conflict_rejected_loudly() {
+    // zlib (RFC 1950) has NO FCOMMENT field: `-z -C comment` would silently
+    // drop what the user typed, which breaks the honesty rule. Only the
+    // combination is refused (both -c and file mode), loudly, exit 2,
+    // before any work; gzip-mode -C keeps its own contract.
+    assert_honesty_reject(&["-z", "-C", "hello", "-c"], &["-z", "comment"]);
+    assert_honesty_reject(&["-z", "-C", "hello", "-k"], &["-z", "comment"]);
 }
 
 #[test]
@@ -568,7 +722,7 @@ fn pigz_iterations_flag_collision_errs_loudly() {
 fn pigz_oneblock_flag_clean_reject() {
     // pigz(1) -O / --oneblock: "Do not split into smaller blocks for -11".
     // Not supported here; must reject loudly, not misparse.
-    assert_clean_reject(&["-11", "-O", "-c"], "-O");
+    assert_clean_reject(&["-11", "-O", "-c"], "invalid option -- 'O'");
 }
 
 #[test]
@@ -601,14 +755,14 @@ fn igzip_output_file_flag_clean_reject() {
     // igzip_cli.c: `-o <file>  output file`. Not supported here (we follow
     // gzip's in-place/-c model). Must be a clean reject so an igzip script
     // fails loudly instead of compressing to the wrong place.
-    assert_clean_reject(&["-o", "out.gz", "-c"], "-o");
+    assert_clean_reject(&["-o", "out.gz", "-c"], "invalid option -- 'o'");
 }
 
 #[test]
 fn igzip_threads_flag_clean_reject() {
     // igzip_cli.c: `-T, --threads <n>`. Ours is -p (pigz's spelling). An
     // igzip script's `-T 8` must fail loudly, not silently single-thread.
-    assert_clean_reject(&["-T", "4", "-c"], "-T");
+    assert_clean_reject(&["-T", "4", "-c"], "invalid option -- 'T'");
 }
 
 #[test]
@@ -723,37 +877,36 @@ fn igzip_levels_two_and_three_map_to_weak_gzip_levels() {
 }
 
 #[test]
-fn igzip_compress_flag_z_rejected_with_collision_explanation() {
-    // MITIGATED (issues #303/#305): igzip_cli.c: `-z, --compress  compress
-    // file (default)` — a no-op modifier. gzippy gives -z the PIGZ meaning
-    // (zlib container), which is unimplemented and now rejected. An igzip
-    // script's `-z FILE` therefore FAILS with an error that explains the
-    // collision (pigz's -z wins; igzip's -z is a plain-compress no-op)
-    // instead of silently writing FILE.zz where *.gz globs find nothing.
+fn igzip_z_flag_now_gets_the_pigz_zlib_contract() {
+    // UPDATED (issues #303/#305): `-z` USED to be rejected loudly, because
+    // gzippy's pre-implementation accept produced GZIP bytes under .zz names
+    // (silent-wrong). It now delivers the PIGZ -z contract instead of
+    // failing an igzip-shaped script: real RFC 1950 zlib with the .zz
+    // suffix. An igzip script's `-z FILE` (= "compress (default)" there)
+    // now compresses and roundtrips; the remaining divergence is the output
+    // NAME (FILE.zz where `*.gz` globs find nothing) — documented in the
+    // triage table and --help.
     let d = tempdir();
-    write_file(d.path(), "in.txt", &synth(4096));
+    let data = synth(16 * 1024);
+    write_file(d.path(), "in.txt", &data);
     let out = run(d.path(), &["-z", "-k", "in.txt"]);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "-z must refuse loudly in compress mode"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("igzip") && stderr.contains("pigz"),
-        "the -z error must explain the pigz/igzip collision; got: {stderr}"
+        out.status.success(),
+        "-z must compress (the pigz contract) in file mode: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        !d.path().join("in.txt.zz").exists() && !d.path().join("in.txt.gz").exists(),
-        "-z must write nothing before refusing"
-    );
+    let zz = fs::read(d.path().join("in.txt.zz")).expect("FILE.zz written");
+    assert_rfc1950_header(&zz, "igzip-shaped -z");
+    assert_roundtrips_zz(d.path(), &zz, &data, "igzip-shaped -z");
 }
 
 #[test]
 fn rejected_flags_still_inert_on_decompress() {
     // The honesty rejections are COMPRESS-MODE ONLY. pigz accepts and
     // ignores these flags on decompress, so a `-d` pipeline carrying them
-    // must keep working here too.
+    // must keep working here too. -z belongs on this list now in BOTH
+    // directions: it compresses in compress mode (#303), and on -d/-t it is
+    // inert (routing decodes by content/extension, not by the flag).
     let d = tempdir();
     let data = synth(16 * 1024);
     write_file(d.path(), "in.txt", &data);
@@ -762,6 +915,7 @@ fn rejected_flags_still_inert_on_decompress() {
     for flags in [
         &["-d", "-c", "-R"][..],
         &["-d", "-c", "-H", "-U", "-i"][..],
+        &["-d", "-c", "-z"][..],
         &["-t", "-R"][..],
     ] {
         let mut full: Vec<&str> = flags.to_vec();

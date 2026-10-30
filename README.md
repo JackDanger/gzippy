@@ -1,8 +1,8 @@
 # gzippy
 
 A parallel gzip compressor and decompressor in Rust. One binary answers to
-`gzip`, `gunzip`, `gzcat`, and `zcat`, reads and writes standard RFC 1952
-streams, and uses every core you have.
+`gunzip`, `ungzippy`, `gzcat`, and `zcat` symlinks, reads and writes standard
+RFC 1952 streams, and uses every core you have.
 
 ## What it does
 
@@ -138,16 +138,20 @@ checking `argv[0]`. Existing scripts and pipelines run unchanged.
 gzippy -9 big.tar                      # keep-it-simple, every core
 gzippy -dc /var/log/prod-2026-04-22.gz | grep -i error
 find /var/log -name '*.log' -mtime +30 -print0 | xargs -0 gzippy -k -6
-tar c big-dir | gzippy --ultra > big-dir.tgz   # near-zopfli ratio, sane speed
-gzippy -p4 -R backup.sql               # rsync-friendly, four threads
+tar c big-dir | gzippy --ultra > big-dir.tgz   # true zopfli (level 11): best ratio, slowest
+gzippy -p4 -9 backup.sql               # four threads, strong ratio
 pg_dump mydb | gzippy -6 | aws s3 cp - s3://bucket/dump.gz
 gzippy --max precious.tar              # densest level (12)
 GZIPPY_DEBUG=1 gzippy -d mystery.gz    # show which decode route ran
 ```
 
-For output, zlib (`-z`, `.zz`) and single-entry ZIP (`-K`) containers are
-also supported. Manual: `man gzippy`, wire format: `man gzippy-format`,
-tuning: `man gzippy-tuning`.
+Flag honesty: `-z` (zlib container) emits a real RFC 1950 zlib stream at
+every level and thread count (`FILE.zz`, roundtrips through `gzippy -d`
+and any `zlib` decoder). `-R` (rsyncable), `-K` (single-entry ZIP),
+`-H`, `-U`, `-i` and `-A` are parsed but rejected loudly with exit 2
+rather than silently misbehaving — not yet implemented (issues #302 /
+#303). Manual:
+`man gzippy`, wire format: `man gzippy-format`, tuning: `man gzippy-tuning`.
 
 ## Analyze
 

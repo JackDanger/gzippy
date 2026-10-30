@@ -86,7 +86,7 @@ const WINDOW_MASK: u16 = (WINDOW_SIZE - 1) as u16;
 /// (libdeflate's representation): a chain-walk read is then `self + const_offset
 /// + i*2` (one x86 addressing mode, disp32 immediate) instead of a `RawVec`
 /// pointer deref, and no register is tied up holding the table base. The struct
-/// is >64 KiB, so it is always heap-boxed (`new` returns `Box<Self>`) and never
+/// is >64 KiB, so it is always heap-boxed (`new` returns ``Box<Self>``) and never
 /// passed/constructed by value.
 pub struct HcMatchfinder {
     /// Singleton nodes for length-3 matches (`hash3_tab`).
@@ -120,7 +120,7 @@ thread_local! {
 /// RAII handle returned by [`HcMatchfinder::acquire`]. `Deref`/`DerefMut` to
 /// `HcMatchfinder` so every existing `&mut mf` call site (which relies on the
 /// same deref-coercion `Box<HcMatchfinder>` already provided) needs no
-/// change. On drop, the box is returned to this thread's [`HC_POOL`] instead
+/// change. On drop, the box is returned to this thread's `HC_POOL` instead
 /// of being freed, so the NEXT `acquire()` on this same thread reuses the
 /// allocation rather than requesting a new one from the allocator.
 pub struct PooledHc(Option<Box<HcMatchfinder>>);

@@ -460,7 +460,7 @@ pub fn decode_simd_multi_sym(
 // =============================================================================
 
 /// Packed u32 table entry for gather-based decode
-/// Format: bits[7:0] = code_length, bits[15:8] = symbol, bits[31] = literal_flag
+/// Format: `bits[7:0]` = code_length, `bits[15:8]` = symbol, `bits[31]` = literal_flag
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]
 pub struct GatherEntry(pub u32);

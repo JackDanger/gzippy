@@ -24,6 +24,10 @@ pub mod pipelined;
 /// compressor — extracted from `parallel` for the same reason (its only
 /// production consumers are io.rs's two call sites).
 pub mod rsyncable;
+/// RFC 1950 zlib container helpers (`-z/--zlib`, issue #303): the 2-byte
+/// CMF/FLG header, the big-endian Adler-32 trailer, and the Gzip|Zlib
+/// container selector shared by the T1 and T>1 routes.
+pub mod zlib_container;
 // Increment 7: `SimpleOptimizer` is the C-FFI (flate2 / libdeflate / ISA-L)
 // parallel-compress dispatcher. It is OFF the production routing graph and kept
 // only as a differential oracle behind `ffi-oracle`.
@@ -112,7 +116,6 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
 ) -> GzippyResult<u64> {
     compress_with_pipeline_sized(reader, writer, args, opt_config, header_info, None)
 }
-
 /// Same as [`compress_with_pipeline`] but takes an optional exact-length
 /// `size_hint` (the caller's already-known file/mmap length) so the initial
 /// `Vec::with_capacity` for the whole-input read buffer is sized once up
@@ -128,6 +131,9 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     header_info: &GzipHeaderInfo,
     size_hint: Option<usize>,
 ) -> GzippyResult<u64> {
+    // One mutable rebinding up front: the zlib branches below write through
+    // `writer` directly (the gzip T1 branch rebinds further down, unchanged).
+    let mut writer = writer;
     // Explicit zopfli tuning flags (-F iterations / -I no-split / -J split-max)
     // force the true zopfli encoder (the pure-Rust `parse/ultra` port — NO
     // C-FFI). Plain `-11` does NOT: it falls through to the pure near-optimal
@@ -151,10 +157,58 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
             args.compression_level as u32,
             args.processes.max(1),
         );
+        // `-z` + explicit zopfli tuning: the same crown engine — the crown
+        // module carries a first-class zlib container arm (the port of C
+        // zopfli's `ZopfliFormat::Zlib`) — so the request is honoured, not
+        // rejected. Tuning (-F/-I/-J) and `-p` (intra-block budget) flow
+        // through identically; there is no FNAME/FCOMMENT field to carry.
+        if args.format == crate::format::CompressionFormat::Zlib {
+            let mut input = Vec::with_capacity(size_hint.unwrap_or(0));
+            reader.read_to_end(&mut input)?;
+            let out = crate::compress::deflate::parse::ultra::compress_zlib(&input, &tuning);
+            writer.write_all(&out)?;
+            writer.flush()?;
+            return Ok(input.len() as u64);
+        }
         let mut encoder =
             crate::compress::deflate::parse::ultra::encoder::ZopfliGzEncoder::new(tuning);
         encoder.set_header_info(header_info.clone());
         return encoder.compress(reader, writer).map_err(|e| e.into());
+    }
+
+    // Issue #303: `-z/--zlib` produces a REAL zlib container at every
+    // level 0-12 and every thread count. The DEFLATE payload choice is
+    // container-independent: T1 gets the exact whole-stream encode, T>1 the
+    // parallel pipeline — both via `PipelinedGzEncoder` carrying the
+    // container, so the framing (CMF/FLG header, Adler-32 trailer, no
+    // FNAME/FCOMMENT) is the only difference from the gzip routes. The
+    // route assertion names the executing encoder; the container is not part
+    // of that identity.
+    if args.format == crate::format::CompressionFormat::Zlib {
+        if opt_config.thread_count == 1 {
+            route::emit(route::PURE_T1, args.compression_level as u32, 1);
+        } else if args.verbosity >= 2 {
+            eprintln!(
+                "gzippy: using pure-Rust parallel DEFLATE encoder ({} threads)",
+                opt_config.thread_count,
+            );
+        }
+        let mut input = Vec::with_capacity(size_hint.unwrap_or(0));
+        reader.read_to_end(&mut input)?;
+        let bytes = input.len() as u64;
+        let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+            args.compression_level as u32,
+            opt_config.thread_count,
+        );
+        encoder.set_container(zlib_container::ContainerKind::Zlib);
+        encoder.set_block_size_override(if args.block_size_explicit {
+            Some(args.block_size)
+        } else {
+            None
+        });
+        encoder.compress_buffer_pure(&input, &mut writer)?;
+        writer.flush()?;
+        return Ok(bytes);
     }
 
     // Increment 7: the pure-Rust DEFLATE encoder is the SOLE production
@@ -170,6 +224,13 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
             eprintln!(
                 "gzippy: using pure-Rust DEFLATE encoder (T1 L{})",
                 args.compression_level
+            );
+            // -vv chunk-grid report (issue #259): the T1 route is
+            // whole-buffer by construction (`ldx` has no resumable parser),
+            // so its grid summary is always the same single chunk.
+            eprintln!(
+                "gzippy: chunk grid: route={} threads=1 chunks=1 (whole-buffer)",
+                route::PURE_T1
             );
         }
         route::emit(route::PURE_T1, args.compression_level as u32, 1);
@@ -230,6 +291,10 @@ pub(crate) fn compress_with_pipeline_sized<R: Read, W: Write + Send>(
     });
     encoder.set_header_info(header_info.clone());
     encoder.set_minimal_gzip_header(args.stdout);
+    // -vv chunk-grid report (issue #259): the pipeline prints the grid it
+    // runs (route/threads/block size/chunk count) right where the numbers
+    // are computed; see `pipelined::set_report_chunk_grid`.
+    encoder.set_report_chunk_grid(args.verbosity >= 2);
     encoder.compress_buffer_pure(&input, writer)?;
     Ok(bytes)
 }

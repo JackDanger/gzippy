@@ -95,7 +95,12 @@ pure-rust-encoder = []
 # (ISA-L compression is separately gated on `isal-compression`; DECODE FFI is a
 # distinct, always-available differential oracle and is out of scope here.)
 ffi-oracle = []
-isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
+# ISA-L compress ORACLE — production-dead: the module is compiled under
+# test/`ffi-oracle`/this feature (`src/backends/mod.rs`) but only tests and
+# `ffi-oracle` ever call it, so the shipped binary links zero ISA-L
+# compressor. This feature's real production effect is `arena-allocator`:
+# the rpmalloc chunk arenas the ParallelSM decoder's chunk buffers run on.
+isal-compression = ["isal-rs", "arena-allocator"]
 trace = []  # Enable decode tracing instrumentation
 # Coz causal profiling: wires fulcrum::probe scopes/progress into the
 # parallel-SM decode so `coz run` can measure per-region wall-elasticity
@@ -357,9 +362,12 @@ asm-kernel = []
 # cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on
 # every arch. It is a pure alias of `pure-rust-inflate`, so a native build is
 # byte-identical to today's shipped decode. NOTE: the FFI-free mandate is
-# DECODE-ONLY — x86_64 release builds may still ADD `isal-compression` on the
-# command line for the ISA-L *compression* backend (T1 L0–L3); that is layered by
-# the build/CI scripts per-target, NOT pulled here, so arm64 native stays C-free.
+# DECODE-ONLY — the compress routing graph is pure-Rust in every flavor, so a
+# per-target `isal-compression` (x86_64 only, added by the build/CI scripts)
+# compiles just the ISA-L *compress oracle* (production-dead: only tests /
+# `ffi-oracle` ever call it — src/backends/mod.rs) plus the rpmalloc chunk
+# arenas the ParallelSM decoder uses; NOT pulled here, so arm64 native stays
+# C-free.
 gzippy-native = ["pure-rust-inflate"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 # Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so

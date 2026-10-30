@@ -1,7 +1,7 @@
 .\" gzippy(1) — the fastest gzip. Hand-written troff.
 .\" Lint:   mandoc -Tlint man/gzippy.1
 .\" Render: man -l man/gzippy.1
-.TH GZIPPY 1 2026-09-30 "gzippy 0.2.0" "User Commands"
+.TH GZIPPY 1 2026-09-30 "gzippy 1.0.0" "User Commands"
 .
 .SH NAME
 gzippy \- the fastest gzip
@@ -80,9 +80,8 @@ is given).
 Decompress to standard output.
 .TP
 .B "gzippy -t"
-Test integrity by decompressing to a sink. Prints
-.RI \(oq FILE :\ OK\(cq
-on success.
+Test integrity by decompressing to a sink. Silent on success (exit 0),
+error reason on failure (exit 1).
 .TP
 .B "gzippy -l"
 List compressed, uncompressed, and ratio for each
@@ -158,30 +157,32 @@ Alias for
 .BR -9 .
 .TP
 .BR --ultra
-Level 11 \(em gzippy's own near-optimal parse at roughly pigz speed.
+Level 11 \(em true zopfli (the zopfli port), single-member: the smallest
+and by far the slowest output. \fB-p\fR tunes intra-block parallelism
+only.
 .TP
 .BR --max
-Level 12 \(em the densest of the near-optimal levels, closest to zopfli ratio.
-Slower than
+Level 12 \(em the densest of the near-optimal parse levels (near-zopfli
+ratio, still parallel). Smaller than \fB-9\fR, not as small as
 .BR --ultra .
 .TP
-.BR -H ", " --huffman
-Huffman-only compression (no LZ77 matching). Fastest possible; worst ratio
-that is not \-0. Useful when input is already well compressed.
-.TP
-.BR -U ", " --rle
-Run-length-only matching. A middle ground between
-.B -H
-and
-.BR -1 .
-.TP
 .BR -z ", " --zlib
-Write zlib stream (RFC 1950) instead of gzip. Default suffix changes to
-.BR .zz .
+Compress to a zlib stream (RFC 1950) instead of gzip (pigz's \fB-z\fP
+meaning, container issue #303): output is a single zlib stream —
+2-byte CMF/FLG header, deflate payload, big-endian Adler-32 — at every
+level and thread count; file mode writes
+.IR FILE.zz .
+zlib carries no FNAME/FCOMMENT header fields, so \fB-N\fR/\fB-n\fR are
+inert and combining \fB-z\fR with \fB-C\fR is rejected loudly (exit 2).
+Decompression detects zlib by content (magic-header check, not by
+suffix), so renamed \fB.zz\fR files still decode.
 .TP
-.BR -K ", " --zip
-Write a single-entry ZIP archive. Default suffix changes to
-.BR .zip .
+.BR -R ", " --rsyncable ", " -K ", " --zip ", " -H ", " --huffman ", " -U ", " --rle ", " -i ", " --independent ", " -A ", " --alias
+Not yet implemented (rejected loudly rather than silently misbehaving):
+we parse these flags and exit 2 with a pointer to the tracking issue
+(#302 for \fB-R\fR, #303 for the \fB-K\fP/\fB-A\fP zip container pair,
+#305 for the igzip scale the \fB-z\fP spelling would collide with —
+\fB-z\fP now takes pigz's meaning: the RFC 1950 zlib container above).
 .
 .SS Parallelism and blocks
 .TP
@@ -201,15 +202,6 @@ suffixes (e.g.\&
 .BR 256k ,
 .BR 2m ).
 Default 128K. Minimum 1K.
-.TP
-.BR -i ", " --independent
-Force fully independent blocks even when the compressor could share state
-across them. Slightly larger output; enables parallel decompression and
-random access on pure stdin streams.
-.TP
-.BR -R ", " --rsyncable
-Insert periodic sync points so small source changes produce small rsync deltas.
-Costs about 1% ratio.
 .TP
 .BR -Y ", " --synchronous
 .BR fsync (2)
@@ -240,11 +232,6 @@ instead of
 Attach
 .I TEXT
 as the gzip FCOMMENT field.
-.TP
-.BR -A ", " --alias " " \fIALIAS\fR
-Record
-.I ALIAS
-for decompression. For round-trip tooling.
 .
 .SS Diagnostics
 .TP
@@ -340,15 +327,12 @@ simplest way to confirm which path ran your input:
 GZIPPY_DEBUG=1 gzippy -dc mystery.gz > /dev/null
 .EE
 .TP
-.B GZIPPY_TRACE
-If set, emits a detailed per-phase performance breakdown of the BGZF
-decompression engine. Noisy; turn it on only when you are chasing a
-microsecond.
-.TP
-.B GZIPPY_SPEC_DEBUG
-Diagnostics for the speculative-parallel experimental path. See
-.IR CLAUDE.md
-in the source tree.
+.B FULCRUM_TRACE
+When built with the
+.B trace
+feature and set to a file path, span-timing trace JSON (Chrome-trace-style
+Begin/End pairs) is written there at the end of the parallel compression
+pipeline. Noisy; turn it on only when chasing a microsecond.
 .TP
 .B DEBUG_POS
 Byte offset in the compressed stream to trace during inflate, when built
@@ -362,17 +346,24 @@ feature.
 Success.
 .TP
 .B 1
-Any error: invalid argument, I/O failure, bad CRC, truncated input,
-integrity-test failure, or a file that already exists when
+Any error: invalid argument, I/O failure, bad CRC, truncated input, or
+integrity-test failure.
+.TP
+.B 2
+Warning-class skip or refusal: a file that already exists when
 .B -f
-was not given.
+was not given (in-place), a skipped symlink/hard-link/directory, or a
+not-yet-implemented flag (e.g.\&
+.BR -R ).
 .PP
 A single
 .B gzippy
-invocation processing multiple files continues past a per-file error and
+invocation processing multiple files continues past a per-file failure and
 returns
 .B 1
-if any file failed.
+if any file errored (or
+.B 2
+if only warning-class skips happened).
 .
 .SH PERFORMANCE
 Compressing 211 MB of logs on an M4 MacBook Pro with 14 cores:
@@ -389,12 +380,14 @@ Apple gzip (NEON)	~315 MB/s	0.67 s
 .PP
 Decompression: 300\(en2000 MB/s depending on file type and thread count.
 .PP
-As of February 2026 the in-tree cloud fleet benchmark stands at 47 wins
-and 13 losses against pigz and gzip across levels, sizes, and platforms.
-The remaining losses are in single-member Tmax decompress (a pipelining
-gap), L1 T1 compress vs
-.BR igzip ,
-and one small arm64 L1 Tmax case. See
+As of February 2026 the in-tree cloud fleet benchmark stood at 47 wins
+and 13 losses against pigz and gzip across levels, sizes, and platforms
+(the single-member Tmax decompress losses named there predate the pure-
+Rust ParallelSM pipeline, which is now the sole single-member decode
+path at every thread count). Current remaining compression losses are
+L1 T1 compress vs
+.BR igzip
+and one small arm64 L1 case. See
 .BR gzippy-tuning (7).
 .
 .SH EXAMPLES
@@ -418,10 +411,10 @@ find /var/log -name '*.log' -mtime +30 -print0 \\
     | xargs -0 gzippy -k -9
 .EE
 .PP
-Make a rsync-friendly backup with four threads:
+Compress a big database dump with four threads and level 9:
 .PP
 .EX
-gzippy -p4 -R backup.sql
+gzippy -p4 -9 backup.sql
 .EE
 .PP
 Ask what path gzippy took for a mystery file:
@@ -471,16 +464,14 @@ cat mystery.bin | gzippy --analyze -
 Verbose output for a compression looks like this:
 .PP
 .EX
-file.txt: 12.4% -- replaced with file.txt.gz (14 threads, 2.8 GB/s)
+file.txt:   12.4% -- replaced with file.txt.gz
 .EE
 .PP
-Fields: percent reduction from input size, replacement path, thread count
-used, observed throughput.
-.PP
+Fields: percent reduction from input size, replacement path
+(\fB-v\fP). With \fB-vv\fP the detail format shows input and output sizes,
+percent saved, and the thread count.
 .B -t
-prints
-.I FILE: OK
-on success and the error reason on failure. Exit status is
+prints nothing on success and the error reason on failure. Exit status is
 .B 0
 or
 .B 1

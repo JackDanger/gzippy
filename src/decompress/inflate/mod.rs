@@ -9,7 +9,9 @@
 //! - `consume_first_table` — packed Huffman lookup table layout.
 //! - `libdeflate_entry` / `libdeflate_decode` — fixed-table builders and entry packing
 //!   matching libdeflate's `decompress_template.h` layout.
-//! - `jit_decode` — table-fingerprint cache key for specialized decoders.
+//! - `jit_decode` — the `TableFingerprint` cache key used by `specialized_decode`
+//!   and `consume_first_decode`, plus `FingerprintStats`/`analyze_deflate_stream`
+//!   analysis helpers used only by the module's own unit tests.
 //! - `specialized_decode` — code-length-specialized decoder (built per dynamic block).
 //! - `bmi2` — x86_64 BMI2 bit-extraction intrinsics (with portable fallback).
 

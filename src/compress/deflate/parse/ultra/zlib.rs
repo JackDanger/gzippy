@@ -1,32 +1,13 @@
 //! Zlib container: 2-byte CMF/FLG header + deflate payload + 4-byte
 //! big-endian Adler-32. Port of Google Zopfli zlib_container.c.
 //!
-//! gzippy itself does not use the zlib format, but the C zopfli's public
-//! API exposes it; porting it here keeps `ZopfliFormat` complete.
+//! gzippy's production `-z` routes use `crate::compress::zlib_container`
+//! for the header/checksum primitives; this module contributes the zopfli
+//! DEFLATE engine behind C zopfli's public zlib-container API shape.
 
 use super::deflate::deflate;
 use super::ZopfliOptions;
-
-/// Vanilla Adler-32. Mirrors the C inner loop exactly, including the
-/// 5550-element sum-overflow chunking (the largest count of bytes that
-/// can be added without overflowing 32-bit `s2 = s2 + s1`).
-fn adler32(data: &[u8]) -> u32 {
-    const SUMS_OVERFLOW: usize = 5550;
-    let mut s1: u32 = 1;
-    let mut s2: u32 = 0;
-    let mut rest = data;
-    while !rest.is_empty() {
-        let amount = rest.len().min(SUMS_OVERFLOW);
-        for &b in &rest[..amount] {
-            s1 += b as u32;
-            s2 += s1;
-        }
-        s1 %= 65521;
-        s2 %= 65521;
-        rest = &rest[amount..];
-    }
-    (s2 << 16) | s1
-}
+use crate::compress::zlib_container::adler32;
 
 /// Zlib-wraps `in_` and appends the result to `out`. Header is the 2-byte
 /// CMF/FLG with CM=8, CINFO=7, FLEVEL=3, FDICT=0, FCHECK adjusted so
@@ -69,17 +50,6 @@ pub fn zlib_compress(options: &ZopfliOptions, in_: &[u8], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn adler32_matches_known_values() {
-        // Reference values from RFC 1950 / common implementations.
-        assert_eq!(adler32(b""), 0x0000_0001);
-        assert_eq!(adler32(b"a"), 0x0062_0062);
-        assert_eq!(adler32(b"abc"), 0x024d_0127);
-        // Hand-computed: s1 = 1+sum(bytes) = 920 = 0x398;
-        // s2 = sum of running s1 values = 4582 = 0x11E6.
-        assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
-    }
 
     #[test]
     fn header_modulo_31_is_zero() {

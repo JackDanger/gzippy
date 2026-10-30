@@ -193,21 +193,6 @@ fn fast_exit_success(exit_code: i32) -> ! {
     process::exit(exit_code);
 }
 
-/// gzip's real exit-code precedence, established by execution (gzip 1.14):
-/// ERROR (1) ALWAYS wins regardless of arrival order; WARNING (2) — e.g. "is
-/// a directory -- ignored" — only takes the code if nothing worse has been
-/// recorded yet. A multi-file invocation with `good1 baddir missing2 good2`
-/// still processes both good files AND settles on exit 1 (error), never 2,
-/// regardless of whether the directory-warning or the missing-file-error
-/// argument came first — verified both orders give exit 1 on real gzip.
-fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
-    if new_code == 1 {
-        *exit_code = 1;
-    } else if new_code != 0 && *exit_code == 0 {
-        *exit_code = new_code;
-    }
-}
-
 fn run() -> Result<i32, GzippyError> {
     let args = GzippyArgs::parse()?;
 
@@ -284,8 +269,11 @@ fn run() -> Result<i32, GzippyError> {
     if !decompress && !args.test && !args.force && (stdout_mode || args.files.is_empty()) {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
+            // gzip's treat_stdin message verbatim (gzip.c:610-620; probed via
+            // a pty): two lines, then do_exit(ERROR) = exit 1.
             eprintln!(
-                "gzippy: compressed data not written to a terminal. Use -f to force compression."
+                "gzippy: compressed data not written to a terminal. Use -f to force compression.\n\
+                 For help, type: gzippy -h"
             );
             return Ok(1);
         }
@@ -295,7 +283,8 @@ fn run() -> Result<i32, GzippyError> {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
             eprintln!(
-                "gzippy: compressed data not read from a terminal. Use -f to force decompression."
+                "gzippy: compressed data not read from a terminal. Use -f to force decompression.\n\
+                 For help, type: gzippy -h"
             );
             return Ok(1);
         }
@@ -314,7 +303,7 @@ fn run() -> Result<i32, GzippyError> {
     // Rival flags we PARSE but whose documented semantics we do not deliver
     // are rejected LOUDLY before any work starts, instead of exiting 0 with
     // output that silently lacks the property the flag exists to provide
-    // (non-rsyncable "rsyncable" archives, gzip bytes under .zz/.zip names,
+    // (non-rsyncable "rsyncable" archives, gzip bytes under .zip names,
     // strategy flags that change nothing). Compress mode only: on
     // decompress/test/list these flags are inert for the rivals too, so a
     // `-d` pipeline that happens to carry them keeps working. Exit 2
@@ -328,11 +317,18 @@ fn run() -> Result<i32, GzippyError> {
         }
         match args.format {
             format::CompressionFormat::Zlib => {
-                eprintln!(
-                    "gzippy: -z/--zlib: zlib container output is not yet implemented (see issue #303). \
-                     Note: gzippy follows pigz's -z (zlib container), not igzip's -z (plain compress)."
-                );
-                return Ok(2);
+                // Implemented (issue #303): -z emits a real RFC 1950 zlib
+                // container. The only flag that cannot be honoured is a
+                // comment: zlib has no FCOMMENT field, so accepting `-C`
+                // would silently drop what the user typed.
+                if args.comment.is_some() {
+                    eprintln!(
+                        "gzippy: -z/--zlib cannot store a comment (zlib containers have no \
+                         comment field); refusing to silently drop it — write gzippy gzip \
+                         output with -C, or drop -C"
+                    );
+                    return Ok(2);
+                }
             }
             format::CompressionFormat::Zip => {
                 eprintln!("gzippy: -K/--zip: zip container output is not yet implemented (see issue #303)");
@@ -382,15 +378,24 @@ fn run() -> Result<i32, GzippyError> {
             eprintln!("gzippy: --list does not support stdin");
             return Ok(1);
         }
-        if args.verbose {
-            println!(
-                "method  crc     date  time    compressed uncompressed  ratio uncompressed_name"
-            );
-        } else {
-            println!("  compressed uncompressed  ratio uncompressed_name");
-        }
+        // gzip.c 553-556: `-q` sets `quiet = 1; verbose = 0` — mirror that
+        // ratio/verbose interplay locally for -l headers and totals (member
+        // rows print regardless). gzippy's parser keeps the two flags
+        // independent; last-flag-wins ordering is not mirrored.
+        let verbose = args.verbose && !args.quiet;
+        // gzip.c do_list (1504-1605): the header is first_time's `if (!quiet)`
+        // row; member rows print regardless of -q — and the header prints only
+        // when an actual row is about to print (do_list's first_time is set
+        // inside the per-file call, so `gzip -l /nope` prints NOTHING on
+        // stdout). gzippy's established -v header shape is kept as-is; the
+        // non-verbose header is copied verbatim from the vendored format
+        // string "%*.*s %*.*s  ratio uncompressed_name" at
+        // positive_off_t_width. `header_done` mirrors `first_time`. The -v
+        // header carries the fixed 9-column shape used since the gzip -v era.
+        let mut header_done = false;
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
+        let mut last_header_bytes = 0u64;
         for file in &args.files {
             if Path::new(file).is_dir() {
                 // Same contract as compress/decompress/-t (see comment on
@@ -399,30 +404,55 @@ fn run() -> Result<i32, GzippyError> {
                 if !args.quiet {
                     eprintln!("gzippy: {} is a directory -- ignored", file);
                 }
-                bump_exit_code(&mut exit_code, 2);
+                crate::utils::bump_exit_code(&mut exit_code, 2);
                 continue;
             }
-            match list_file(file, &args) {
-                Ok((comp, uncomp)) => {
+            match list_file(file, &args, verbose, &mut header_done) {
+                Ok(Some((comp, uncomp, header_bytes))) => {
                     total_comp += comp;
                     total_uncomp += uncomp;
+                    last_header_bytes = header_bytes;
+                }
+                Ok(None) => {
+                    // The failure was already rendered inside list_file (in
+                    // gzip's progerror shape); credit the ERROR class.
+                    crate::utils::bump_exit_code(&mut exit_code, 1);
                 }
                 Err(e) => {
-                    eprintln!("gzippy: {}: {}", file, e);
-                    bump_exit_code(&mut exit_code, 1);
+                    // Per-file rendering: gzip's get_method format-class
+                    // messages print with a LEADING blank line
+                    // (gzip.c:1473-1475); everything else is plain
+                    // "program: file: message" (gzip.c:389-394).
+                    let lead = if e.has_leading_blank_line() { "\n" } else { "" };
+                    eprintln!("{}gzippy: {}: {}", lead, file, e);
+                    crate::utils::bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
-        if args.files.len() > 1 {
-            let ratio = if total_uncomp > 0 {
-                (1.0 - total_comp as f64 / total_uncomp as f64) * 100.0
-            } else {
-                0.0
-            };
-            println!(
-                "{:>12} {:>12} {:4.1}% (totals)",
-                total_comp, total_uncomp, ratio
-            );
+        // gzip.c 574: `if (list && !quiet && file_count > 1) do_list(-1, -1);`
+        // do_list(-1) starts `if (total_in <= 0 || total_out <= 0) return;`
+        if args.files.len() > 1 && !args.quiet && !(total_comp == 0 || total_uncomp == 0) {
+            // do_list(-1) re-reads the CURRENT global header_bytes, i.e. the
+            // last listed row's: "header_bytes is not meaningful but used to
+            // ensure the same ratio if there is a single file" (gzip.c 1545).
+            let num = total_uncomp as i128 - (total_comp as i128 - last_header_bytes as i128);
+            let ratio = 100.0 * num as f64 / total_uncomp as f64;
+            // Verbose totals carry a 28-space strip ("method  crc     date  time  "
+            // length, gzip.c 1537) and drop the sizes only under -q
+            // (`if (verbose || !quiet)`); non-verbose totals always print them.
+            let mut row = String::new();
+            if verbose {
+                row.push_str("                            ");
+            }
+            if verbose || !args.quiet {
+                row.push_str(&format!(
+                    "{:>width$} {:>width$} ",
+                    total_comp,
+                    total_uncomp,
+                    width = positive_off_t_width()
+                ));
+            }
+            println!("{}{:5.1}% (totals)", row, ratio);
         }
         return Ok(exit_code);
     }
@@ -451,11 +481,17 @@ fn run() -> Result<i32, GzippyError> {
 
             match result {
                 Ok(code) => {
-                    bump_exit_code(&mut exit_code, code);
+                    crate::utils::bump_exit_code(&mut exit_code, code);
                 }
                 Err(e) => {
-                    eprintln!("gzippy: {}: {}", file, e);
-                    bump_exit_code(&mut exit_code, 1);
+                    // Per-file rendering: gzip's get_method-class messages
+                    // ("not in gzip format", "unexpected end of file") print
+                    // with a LEADING blank line (gzip.c:1473-1475,
+                    // util.c:394-402); everything else is plain
+                    // "program: file: message" (gzip.c:389-394).
+                    let lead = if e.has_leading_blank_line() { "\n" } else { "" };
+                    eprintln!("{}gzippy: {}: {}", lead, file, e);
+                    crate::utils::bump_exit_code(&mut exit_code, 1);
                 }
             }
         }
@@ -467,28 +503,116 @@ fn run() -> Result<i32, GzippyError> {
 /// Test integrity of a compressed file by decompressing to a sink
 fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     use memmap2::Mmap;
-    use std::fs::File;
 
-    let input_path = Path::new(filename);
-    if !input_path.exists() {
-        return Err(GzippyError::FileNotFound(filename.to_string()));
-    }
-    if input_path.is_dir() {
-        // Same contract as compress_file/decompress_file: `gzip -t somedir`
-        // exits 2 (WARNING) with this exact message, established by
-        // execution (gzip 1.14). Never opens/mmaps the directory.
+    // gzip's -t open semantics: internally `case 't': test = decompress =
+    // to_stdout = 1` (gzip.c:464-465), so -t DOES follow symlinks
+    // (open_and_stat's O_NOFOLLOW applies only when NOT to_stdout,
+    // gzip.c:1022-1025 — probed: `gzip -t link-to-real.gz` tests the target)
+    // and a missing input rides the SAME decompress suffix ladder as -d
+    // (open_input_file, gzip.c:1100-1146).
+    let (input_file, resolved_path) = match crate::utils::open_gzip_input(
+        Path::new(filename),
+        true, // -t is internally DECOMPRESS: the suffix ladder applies
+        true, // -t sets to_stdout: follow links
+        args.force,
+        &args.suffix,
+    ) {
+        Ok((f, p)) => (f, p),
+        Err(failure) => return Ok(crate::utils::report_open_failure(failure, args.quiet)),
+    };
+    let name = resolved_path.to_string_lossy().into_owned();
+
+    // Directory arm with the OPEN's stat (gzip.c:731-732): WARNING class,
+    // exit 2, this exact message — established by execution (gzip 1.12/1.14:
+    // `gzip -t somedir` → "is a directory -- ignored", exit 2).
+    let istat = input_file.metadata().map_err(|e| GzippyError::os(&e))?;
+    if istat.is_dir() {
         if !args.quiet {
-            eprintln!("gzippy: {} is a directory -- ignored", filename);
+            eprintln!("gzippy: {} is a directory -- ignored", name);
         }
         return Ok(2);
     }
 
-    let input_file = File::open(input_path)?;
-    let mmap = unsafe { Mmap::map(&input_file)? };
+    let mmap = unsafe { Mmap::map(&input_file).map_err(|e| GzippyError::os(&e))? };
 
-    // Decompress into a Vec (discarded after) to verify integrity
+    // Container-boundary classification (BEFORE any decode) mirrors gzip's
+    // get_method exactly: EOF before a complete magic ("unexpected end of
+    // file" — probed 0- and 1-byte inputs; util.c:394-402) and 2+ bytes with
+    // no gzip/zlib shape ("not in gzip format"; get_method gzip.c:1473-1475).
+    // WITHOUT this gate the parallel decode path reports OK for garbage (exit
+    // 0, nothing printed), inverting `gzip -t`'s integrity verdict.
+    let is_gzip = mmap.len() >= 2 && mmap[0] == 0x1f && mmap[1] == 0x8b;
+    let cont = mmap.len() >= 2 && mmap[0] == 0x78;
+    if !is_gzip && !cont {
+        // gzip get_method (gzip.c:1461-1462): force + to_stdout copies the
+        // input through unchanged instead of failing — `-tf <junk>` exits 0
+        // silently (probed; -t sets to_stdout internally, so this holds for
+        // every -t with -f on non-container bytes).
+        if args.force {
+            return Ok(0);
+        }
+        // ERROR class prints unconditionally (get_method has no -q gate).
+        if mmap.len() < 2 {
+            eprintln!("\ngzippy: {}: unexpected end of file", name);
+        } else {
+            eprintln!("\ngzippy: {}: not in gzip format", name);
+        }
+        return Ok(1);
+    }
+    // get_method's header walk applies to -t exactly like -d (the
+    // decompress_file block carries the citations): EOF inside the header is
+    // read_error's blank-lined "unexpected end of file"; a CM byte other
+    // than DEFLATED is "unknown method N -- not supported". A `-t` verdict
+    // must not come back OK from the parallel decoder for either. ERROR
+    // class: unconditional.
+    if is_gzip {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(&mmap) {
+            FirstMemberBoundary::UnexpectedEof => {
+                eprintln!("\ngzippy: {}: unexpected end of file", name);
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                eprintln!("gzippy: {}: unknown method {} -- not supported", name, cm);
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
+    }
+    // get_method's header walk applies to -t exactly like -d (the
+    // decompress_file block carries the citations): EOF inside the header is
+    // read_error's blank-lined "unexpected end of file"; a CM byte other
+    // than DEFLATED is "unknown method N -- not supported". A `-t` verdict
+    // must not come back OK from the parallel decoder for either.
+    if is_gzip {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(&mmap) {
+            FirstMemberBoundary::UnexpectedEof => {
+                if !args.quiet {
+                    eprintln!("\ngzippy: {}: unexpected end of file", name);
+                }
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                if !args.quiet {
+                    eprintln!("gzippy: {}: unknown method {} -- not supported", name, cm);
+                }
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
+    }
+
+    // Decompress into a Vec (discarded after) to verify integrity. Route by
+    // CONTENT: pigz -t verifies its own -z (.zz) files too, so a zlib stream
+    // goes to the zlib decoder; everything else keeps the gzip path (and its
+    // decode-internal error for foreign/truncated bytes).
     let mut sink = Vec::new();
-    let result = decompress::decompress_gzip_to_writer(&mmap, &mut sink);
+    let result = if crate::compress::zlib_container::is_zlib_stream(&mmap) {
+        crate::decompress::decompress_zlib_turbo(&mmap, &mut sink)
+    } else {
+        decompress::decompress_gzip_to_writer(&mmap, &mut sink)
+    };
 
     match result {
         Ok(_) => {
@@ -499,12 +623,12 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
             // still report unconditionally. (pigz is silent even with -tv; we
             // follow gzip, the primary drop-in target.)
             if args.verbose {
-                eprintln!("{}:\t OK", filename);
+                eprintln!("{}:\t OK", name);
             }
             Ok(0)
         }
         Err(e) => {
-            eprintln!("{}: {}", filename, e);
+            eprintln!("gzippy: {}: {}", name, e);
             Ok(1)
         }
     }
@@ -521,8 +645,72 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
         reader.read_to_end(&mut input_data)?;
     }
 
+    // Same container-boundary classification as the file path (gzip's
+    // get_method taxonomy, probed): EOF before a complete magic is
+    // "unexpected end of file"; 2+ bytes with no gzip/zlib shape is "not in
+    // gzip format"; -f pass-through (gzip.c:1461-1462, "pass input
+    // unchanged" — `gzip -tf <junk>` exits 0 silently). gzip names the peer
+    // "stdin" itself (treat_stdin: strcpy(ifname, "stdin"), gzip.c:623).
+    let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
+    let cont = input_data.len() >= 2 && input_data[0] == 0x78;
+    if !is_gzip && !cont {
+        if args.force {
+            return Ok(0);
+        }
+        // ERROR class prints unconditionally (get_method has no -q gate).
+        if input_data.len() < 2 {
+            eprintln!("\ngzippy: stdin: unexpected end of file");
+        } else {
+            eprintln!("\ngzippy: stdin: not in gzip format");
+        }
+        return Ok(1);
+    }
+    // get_method's header walk on stdin too (decompress_file's block holds
+    // the citations): read_error EOF in the header, "unknown method" for a
+    // foreign CM byte — same texts, peer named "stdin". ERROR class:
+    // unconditional.
+    if is_gzip {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(&input_data) {
+            FirstMemberBoundary::UnexpectedEof => {
+                eprintln!("\ngzippy: stdin: unexpected end of file");
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                eprintln!("gzippy: stdin: unknown method {} -- not supported", cm);
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
+    }
+    // get_method's header walk on stdin too (decompress_file's block holds
+    // the citations): read_error EOF in the header, "unknown method" for a
+    // foreign CM byte — same texts, peer named "stdin".
+    if is_gzip {
+        use crate::decompress::format::FirstMemberBoundary;
+        match crate::decompress::format::classify_first_member(&input_data) {
+            FirstMemberBoundary::UnexpectedEof => {
+                if !args.quiet {
+                    eprintln!("\ngzippy: stdin: unexpected end of file");
+                }
+                return Ok(1);
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                if !args.quiet {
+                    eprintln!("gzippy: stdin: unknown method {} -- not supported", cm);
+                }
+                return Ok(1);
+            }
+            FirstMemberBoundary::Header => {}
+        }
+    }
+
     let mut sink = Vec::new();
-    let result = decompress::decompress_gzip_to_writer(&input_data, &mut sink);
+    let result = if crate::compress::zlib_container::is_zlib_stream(&input_data) {
+        crate::decompress::decompress_zlib_turbo(&input_data, &mut sink)
+    } else {
+        decompress::decompress_gzip_to_writer(&input_data, &mut sink)
+    };
 
     match result {
         Ok(_) => {
@@ -533,107 +721,361 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
             Ok(0)
         }
         Err(e) => {
-            eprintln!("stdin: {}", e);
+            eprintln!("gzippy: stdin: {}", e);
             Ok(1)
         }
     }
 }
 
-/// List compressed file information (gzip -l format)
-fn list_file(filename: &str, args: &GzippyArgs) -> Result<(u64, u64), GzippyError> {
-    use std::fs;
+/// List compressed file information (gzip -l format).
+///
+/// Contract evidence — vendored gzip source (vendor/gzip):
+/// - `gzip.c do_list` (1504-1605): ONE row per file; `bytes_in` = input file
+///   size (stat), `bytes_out` = ISIZE read from the last 8 bytes
+///   (`bytes_in = lseek(ifd, (off_t)(-8), SEEK_END)` + `read(buf, 8)` in the
+///   RECORD_IO branch; the body never inflates).
+/// - `gzip.c get_method` (1431-1432): the reader's per-member overhead is
+///   `header_bytes = inptr + 2*4` — every byte the header parse consumed
+///   (fixed 10-byte header + FEXTRA + FNAME + FCOMMENT + FHCRC) plus the
+///   8 trailer bytes.
+/// - `util.c display_ratio` (416-422): prints `"%5.1f%%"` of
+///   `den == 0 ? 0 : 100.0 * num / den` where the caller passes
+///   `num = bytes_out - (bytes_in - header_bytes)`, `den = bytes_out`.
+///   NO clamping — expansion prints negative values as-is.
+/// - Name column = `ofname` generated by `make_ofname` (gzip.c 1173-1248)
+///   from the on-disk input name via `get_suffix` (gzip.c 982-1022): the
+///   gzip suffix stripped case-insensitively, ".tgz"/".taz" mapped to
+///   ".tar", names without a gzip suffix printed verbatim. The header FNAME
+///   is consulted ONLY for an explicit -N: with the -l default
+///   `no_name = decompress` (gzip.c 530) get_method's ORIG_NAME branch
+///   discards the stored name (gzip.c 1384).
+/// - Reads are two-point by construction: the ~192 KB header prefix from
+///   the front and 8 bytes at EOF-8.
+///
+/// gzip's -l open semantics: internally `case 'l': list = decompress =
+/// to_stdout = 1` (gzip.c:462), so links are followed (no O_NOFOLLOW) and
+/// a missing input rides the SAME decompress suffix ladder as -d,
+/// including the resolved naming (`gzip -l nofile` reports
+/// "nofile.gz: No such file or directory" — probed).
+///
+/// Known divergence (documented, not papered over): gzip 1.12 runs the
+/// decompression loop in -l mode and re-parses EVERY member header, so
+/// `part_nb > 1` zeroes header_bytes for concatenated multi-member FILES;
+/// this cheap reader parses only the first header and always charges that
+/// member's overhead. Single-member files — the target of every pinned
+/// row — are identical.
+///
+/// Returns `Ok(Some((compressed, uncompressed, header_bytes)))` on a listed
+/// row; `Ok(None)` when the failure was already REPORTED here (in gzip's
+/// fopen-error shape) and the caller should just credit `1`; `Err` is
+/// reserved for errors the caller renders (`NotInGzipFormat`,
+/// `UnexpectedEof`, head-truncation IO).
+fn list_file(
+    filename: &str,
+    args: &GzippyArgs,
+    verbose: bool,
+    header_done: &mut bool,
+) -> Result<Option<(u64, u64, u64)>, GzippyError> {
+    use std::io::{Read, Seek, SeekFrom};
 
-    let metadata =
-        fs::metadata(filename).map_err(|_| GzippyError::FileNotFound(filename.to_string()))?;
-    let compressed_size = metadata.len();
+    // gzip's -l open semantics: internally `case 'l': list = decompress =
+    // to_stdout = 1` (gzip.c:462), so links are followed (no O_NOFOLLOW) and
+    // a missing input rides the SAME decompress suffix ladder as -d,
+    // including the resolved naming (`gzip -l nofile` reports
+    // "nofile.gz: No such file or directory" — probed).
+    let (mut handle, _resolved_path) = match crate::utils::open_gzip_input(
+        Path::new(filename),
+        true, // -l is internally DECOMPRESS: the suffix ladder applies
+        true, // -l sets to_stdout: follow links
+        args.force,
+        &args.suffix,
+    ) {
+        Ok((f, p)) => (f, p),
+        Err(failure) => {
+            // Already rendered in gzip's progerror shape; callers credit the
+            // ERROR class (1) without printing again.
+            let _ = crate::utils::report_open_failure(failure, args.quiet);
+            return Ok(None);
+        }
+    };
+    // do_list's bytes_in is the size of the file that was actually opened
+    // (gzip stats ifname after the suffix ladder resolves it).
+    let compressed_size = handle.metadata().map_err(|e| GzippyError::os(&e))?.len();
 
-    // Read the gzip file
-    let data = fs::read(filename).map_err(GzippyError::Io)?;
+    // Point read 1 — the header prefix. Far upper bound of a gzip header:
+    // 10 fixed + 2+XLEN + FNAME + FCOMMENT (each string <= 65535 + NUL)
+    // + FHCRC. The deflate body below it is NEVER read — the two-point
+    // structure is the point of -l (gzip.c 1556-1561).
+    const LIST_HEADER_MAX: usize = 10 + 2 + 65_535 + 65_536 + 65_536 + 2;
+    let prefix_len = (compressed_size as usize).min(LIST_HEADER_MAX);
+    let mut prefix = vec![0u8; prefix_len];
+    let mut got = 0usize;
+    while got < prefix_len {
+        match handle.read(&mut prefix[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(GzippyError::Io(e)),
+        }
+    }
+    prefix.truncate(got);
 
-    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
-        return Err(GzippyError::invalid_argument(format!(
-            "{}: not in gzip format",
-            filename
-        )));
+    // get_method's two first-member failure classes (both probed: gzip -l of
+    // an empty/2-byte .gz prints "unexpected end of file" via read_error —
+    // util.c:394-402 — while garbage bytes reach "not in gzip format" —
+    // gzip.c:1473-1475). Both are ERROR class with the leading blank line;
+    // the per-file loop prepends "program: file:".
+    if prefix.len() < 2 {
+        return Err(GzippyError::UnexpectedEof);
+    }
+    let is_gzip = prefix[0] == 0x1f && prefix[1] == 0x8b;
+    if !is_gzip {
+        return Err(GzippyError::NotInGzipFormat);
+    }
+    if compressed_size < 18 {
+        // Good magic with an incomplete member: gzip's header scan runs out
+        // of input and read_error fires (probed: `gzip -l` of a 2/9/20-byte
+        // header fragment → "unexpected end of file", exit 1).
+        return Err(GzippyError::UnexpectedEof);
     }
 
-    // ISIZE is last 4 bytes of the gzip file
-    let isize_bytes = &data[data.len() - 4..];
-    let uncompressed_size = u32::from_le_bytes([
-        isize_bytes[0],
-        isize_bytes[1],
-        isize_bytes[2],
-        isize_bytes[3],
-    ]) as u64;
+    let header = parse_list_header(&prefix);
+    // display_ratio (util.c 416-422) with do_list's caller arguments:
+    // num = bytes_out - (bytes_in - header_bytes), den = bytes_out.
+    let header_bytes = header.header_bytes.unwrap_or((10 + 8) as u64);
 
-    // CRC32 is 4 bytes before ISIZE
-    let crc_bytes = &data[data.len() - 8..data.len() - 4];
-    let crc32 = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+    // Point read 2 — the trailer: CRC32 + ISIZE at EOF-8.
+    handle.seek(SeekFrom::End(-8)).map_err(GzippyError::Io)?;
+    let mut trailer = [0u8; 8];
+    handle.read_exact(&mut trailer).map_err(GzippyError::Io)?;
+    let crc32 = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let uncompressed_size =
+        u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as u64;
 
-    let ratio = if uncompressed_size > 0 {
-        ((1.0 - compressed_size as f64 / uncompressed_size as f64) * 100.0).clamp(-99.9, 99.9)
-    } else {
+    let num = uncompressed_size as i128 - (compressed_size as i128 - header_bytes as i128);
+    let ratio = if uncompressed_size == 0 {
         0.0
-    };
-
-    // Output name: prefer FNAME from header, else strip suffix from the given path.
-    // Show the full path as given (matching gzip -l behavior).
-    let fname = extract_list_fname(&data);
-    let display_name_owned;
-    let display_name: &str = if let Some(ref name) = fname {
-        name.as_str()
     } else {
-        let output_name = crate::utils::strip_compression_extension(Path::new(filename));
-        display_name_owned = output_name.to_str().unwrap_or(filename).to_string();
-        &display_name_owned
+        100.0 * num as f64 / uncompressed_size as f64
     };
 
-    if args.verbose {
-        let mtime = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let date_str = if mtime > 0 {
-            format_unix_timestamp(mtime)
+    // uncompressed_name: gzip's ofname — on-disk name minus the gzip suffix;
+    // header FNAME only for an explicit -N. See make_ofname/get_method.
+    let fname = header.fname;
+    let display: String = if args.name_explicit && fname.as_deref().is_some_and(|f| !f.is_empty()) {
+        // get_method's ORIG_NAME branch (gzip.c 1388-1401): copy the
+        // stored name over the on-disk directory prefix intact, then
+        // strip the header name's own directory component (basename).
+        let dir = Path::new(filename)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let base = fname
+            .as_deref()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        if dir.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}/{}", dir, base)
+        }
+    } else {
+        list_output_name(filename, &args.suffix)
+    };
+
+    // done_header (do_list's first_time): the header prints only when the
+    // first actual ROW is about to print — a failed listing leaves stdout
+    // empty (`gzip -l /nope/nope.gz 2>/dev/null | wc -c` == 0, probed).
+    if !*header_done {
+        if verbose {
+            println!(
+                "method  crc     date  time    compressed uncompressed  ratio uncompressed_name"
+            );
+        } else if !args.quiet {
+            println!("{}", list_header_line());
+        }
+        *header_done = true;
+    }
+
+    // Same -q-clears-verbose mirror as the -l orchestration above (gzip.c
+    // 553-556): a quieted run lists plain rows.
+    if args.verbose && !args.quiet {
+        let date_str = if header.mtime > 0 {
+            format_unix_timestamp(header.mtime)
         } else {
             "            ".to_string() // 12 spaces matching "MMM DD HH:MM"
         };
         println!(
             "defla {:08x} {} {:>12} {:>12} {:4.1}% {}",
-            crc32, date_str, compressed_size, uncompressed_size, ratio, display_name
+            crc32, date_str, compressed_size, uncompressed_size, ratio, display
         );
     } else {
         println!(
-            "{:>12} {:>12} {:4.1}% {}",
-            compressed_size, uncompressed_size, ratio, display_name
+            "{:>width$} {:>width$} {:5.1}% {}",
+            compressed_size,
+            uncompressed_size,
+            ratio,
+            display,
+            width = positive_off_t_width()
         );
     }
 
-    Ok((compressed_size, uncompressed_size))
+    Ok(Some((compressed_size, uncompressed_size, header_bytes)))
 }
 
-/// Extract FNAME from gzip header for list display
-fn extract_list_fname(data: &[u8]) -> Option<String> {
-    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
-        return None;
-    }
-    let flags = data[3];
-    if flags & 0x08 == 0 {
-        return None;
-    }
-    let mut pos = 10;
-    if flags & 0x04 != 0 {
-        if pos + 2 > data.len() {
-            return None;
+/// The first-header facts -l needs: how many bytes the header parse consumed
+/// (None when the header does not parse — flags fields run off the read
+/// window, unterminated strings, CM != DEFLATED), plus FNAME and MTIME.
+/// Field order mirrors gzip's get_method: FEXTRA -> FNAME -> FCOMMENT ->
+/// FHCRC.
+struct ListHeader {
+    header_bytes: Option<u64>,
+    fname: Option<String>,
+    mtime: u32,
+}
+
+impl ListHeader {
+    fn unparsable(mtime: u32) -> Self {
+        ListHeader {
+            header_bytes: None,
+            fname: None,
+            mtime,
         }
-        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    }
+}
+
+fn parse_list_header(prefix: &[u8]) -> ListHeader {
+    // RFC 1952 flag bits (vendor names: gzip.h FEXTRA etc).
+    const FEXTRA: u8 = 0x04;
+    const FNAME_FLAG: u8 = 0x08;
+    const FCOMMENT: u8 = 0x10;
+    const FHCRC: u8 = 0x02;
+
+    if prefix.len() < 10 || prefix[0] != 0x1f || prefix[1] != 0x8b {
+        return ListHeader::unparsable(0);
+    }
+    let mtime = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+    // CM != 8 is gzip's "unknown method -- not supported" (gzip.c 1319-1326);
+    // for an existing -l row we fall back to the bare fixed-header overhead.
+    if prefix[2] != 0x08 {
+        return ListHeader::unparsable(mtime);
+    }
+    let flags = prefix[3];
+    let mut pos = 10usize;
+
+    if flags & FEXTRA != 0 {
+        if pos + 2 > prefix.len() {
+            return ListHeader::unparsable(mtime);
+        }
+        let xlen = u16::from_le_bytes([prefix[pos], prefix[pos + 1]]) as usize;
         pos += 2 + xlen;
+        if pos > prefix.len() {
+            return ListHeader::unparsable(mtime);
+        }
     }
-    let start = pos;
-    while pos < data.len() && data[pos] != 0 {
-        pos += 1;
+    let mut fname = None;
+    if flags & FNAME_FLAG != 0 {
+        let nul = match prefix[pos..].iter().position(|&b| b == 0) {
+            Some(n) => pos + n,
+            None => return ListHeader::unparsable(mtime),
+        };
+        fname = String::from_utf8(prefix[pos..nul].to_vec()).ok();
+        pos = nul + 1;
     }
-    if pos >= data.len() {
-        return None;
+    if flags & FCOMMENT != 0 {
+        let nul = match prefix[pos..].iter().position(|&b| b == 0) {
+            Some(n) => pos + n,
+            None => return ListHeader::unparsable(mtime),
+        };
+        pos = nul + 1;
     }
-    String::from_utf8(data[start..pos].to_vec()).ok()
+    if flags & FHCRC != 0 {
+        pos += 2;
+    }
+    if pos > prefix.len() {
+        return ListHeader::unparsable(mtime);
+    }
+    ListHeader {
+        header_bytes: Some((pos + 8) as u64),
+        fname,
+        mtime,
+    }
+}
+
+/// gzip's get_suffix (gzip.c 982-1022) + make_ofname's decompress branch
+/// (gzip.c 1181-1201): the last min(len, MAX_SUFFIX+2) bytes of the name are
+/// compared lowercased against the known gzip suffixes; a matching suffix
+/// must sit at the name's very end with a non-separator character before it.
+/// ".tgz"/".taz" map to ".tar" (make_ofname 1195-1198), every other match is
+/// stripped; a name without a gzip suffix is listed under its own name
+/// (make_ofname 1183-1186: `-l` tries all files).
+fn list_output_name(input: &str, z_suffix: &str) -> String {
+    // vendor known_suffixes (Unix tailoring): z_suffix first (gzip.c 995),
+    // then the fixed set (gzip.c 988); the bare "z" candidate is
+    // MSDOS/VMS-only tailoring (MAX_EXT_CHARS) and absent on Unix.
+    const KNOWN: [&str; 7] = [".gz", ".z", ".taz", ".tgz", "-gz", "-z", "_z"];
+    let name_len = input.len();
+    // MAX_SUFFIX == 30 on Unix (tailor.h); strlwr window = MAX_SUFFIX + 2.
+    let window_len = name_len.min(32);
+    let lower: Vec<u8> = input.as_bytes()[name_len - window_len..]
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    let mut hit: Option<&str> = None;
+    for cand in std::iter::once(z_suffix).chain(KNOWN.iter().copied()) {
+        let s = cand.len();
+        if s == 0 || window_len <= s {
+            continue;
+        }
+        let tail = &lower[window_len - s..];
+        // get_suffix lowercases the window before every compare (1011).
+        let pre = lower[window_len - s - 1];
+        if tail == cand.as_bytes() && pre != b'/' {
+            hit = Some(cand);
+            break;
+        }
+    }
+    let Some(cand) = hit else {
+        // No gzip suffix: make_ofname returns OK with ofname unchanged.
+        return input.to_string();
+    };
+    let Some(stem) = input.get(..name_len - cand.len()) else {
+        // Guard: an ASCII suffix can never end inside a multi-byte char.
+        return input.to_string();
+    };
+    // Decompress branch: strlwr(suff) first, so the mapping is case-free;
+    // .tgz/.taz become .tar, everything else is dropped (1195-1201).
+    if cand.eq_ignore_ascii_case(".tgz") || cand.eq_ignore_ascii_case(".taz") {
+        format!("{}.tar", stem)
+    } else {
+        stem.to_string()
+    }
+}
+
+/// do_list's header at positive_off_t_width (gzip.c 1530):
+/// "%*.*s %*.*s  ratio uncompressed_name" over "compressed"/"uncompressed".
+fn list_header_line() -> String {
+    format!(
+        "{:>width$} {:>width$}  ratio uncompressed_name",
+        "compressed",
+        "uncompressed",
+        width = positive_off_t_width()
+    )
+}
+
+/// gzip.c do_list (1517-1522): decimal digits of OFF_T_MAX
+/// (`for (o = OFF_T_MAX; 9 < o; o /= 10) positive_off_t_width++;`); off_t is
+/// i64 on our platforms, so i64::MAX = 2^63-1 = 19 digits.
+fn positive_off_t_width() -> usize {
+    let mut width = 1usize;
+    let mut o = i64::MAX;
+    while o > 9 {
+        o /= 10;
+        width += 1;
+    }
+    width
 }
 
 /// Format a Unix timestamp into a basic date/time string
@@ -731,12 +1173,12 @@ fn print_help() {
     println!("igzip compatibility: gzippy follows the gzip/pigz flag contract where they");
     println!("collide with igzip's. igzip's 0..3 level scale is NOT emulated: -0 stores");
     println!("(igzip's -0 is its fastest compressor) and -2/-3 are weak-fast gzip levels");
-    println!("(igzip's default/best). -z takes pigz's meaning (zlib container, currently");
-    println!("rejected — issue #303), not igzip's 'compress' no-op. See issue #305.");
+    println!("(igzip's default/best). -z takes pigz's meaning (zlib container, RFC 1950),");
+    println!("not igzip's 'compress' no-op. See issue #305.");
     println!();
     println!("Not yet implemented (rejected loudly rather than silently misbehaving):");
-    println!("  -R/--rsyncable (#302), -z/--zlib and -K/--zip containers (#303),");
-    println!("  -H/--huffman, -U/--rle, -i/--independent, -A/--alias");
+    println!("  -R/--rsyncable (#302), -K/--zip and -A/--alias (#303),");
+    println!("  -H/--huffman, -U/--rle, -i/--independent");
     println!();
     println!("Examples:");
     println!("  gzippy file.txt          Compress file.txt -> file.txt.gz");

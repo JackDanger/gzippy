@@ -13,6 +13,11 @@ GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
 
+# Recipes use bashisms (`set -o pipefail`): without this pin GNU make runs
+# them with /bin/sh, which is dash on Debian/Ubuntu and rejects them —
+# `make quick` failed on every dash box with "set: Illegal option -o pipefail".
+SHELL := /bin/bash
+
 # Build targets
 GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy

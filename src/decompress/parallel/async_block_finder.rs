@@ -11,7 +11,8 @@
 //! stops as soon as one offset decodes) and streams monotonically
 //! increasing offsets through [`StreamedResults`].
 //!
-//! Production uses [`Self::with_scoped_boundary_search`] so the finder
+//! Production uses [`RawBlockFinderCoordinator::with_scoped_boundary_search`]
+//! so the finder
 //! borrows `&[u8]` with zero copy (vendor passes a raw pointer; we use
 //! `thread::scope` instead of `Arc::from` which would clone the slice).
 

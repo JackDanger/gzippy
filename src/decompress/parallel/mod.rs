@@ -37,7 +37,7 @@
 //! [`sm_driver::read_parallel_sm_multi`] walks each member and inflates it with
 //! the full within-member parallel engine (per-member CRC32 + ISIZE verified). It
 //! is the deterministic route for MIXED "GZ" ++ plain concatenations
-//! ([`crate::decompress::bgzf::gz_coverage_is_pure`]), which the BGZF fast path
+//! (`crate::decompress::bgzf::gz_coverage_is_pure`), which the BGZF fast path
 //! would truncate. Plain dominant/few-member distributions stay on the
 //! member-per-worker split (`MultiMemberPar`): routing them to this member-walk
 //! was MEASURED to REGRESS on M1 (per-member pipeline spinup + thread

@@ -489,7 +489,7 @@ fn finish_decode_chunk_impl(
 }
 
 /// Window-absent chunk decode (speculative prefetch / boundary search).
-/// Same unified [`decode_chunk_with_rapidgzip_impl`] as [`decode_chunk`], with
+/// Same unified `decode_chunk_with_rapidgzip_impl` as [`decode_chunk`], with
 /// an empty initial window so the marker phase runs until 32 KiB clean.
 #[cfg(parallel_sm)]
 pub fn decode_chunk_window_absent(
@@ -791,7 +791,7 @@ fn try_continue_next_member(
 
 /// STAGE-2b: window-absent (speculative) decode entry that WALKS member
 /// boundaries — the `MULTI_MEMBER=true` instantiation of
-/// [`decode_chunk_unified_marker`]. This is the entry the whole-file MM parallel
+/// `decode_chunk_unified_marker`. This is the entry the whole-file MM parallel
 /// pipeline dispatches speculative chunks through (stage 2 driver, item 2); the
 /// existing [`decode_chunk_window_absent`] stays byte-identical (`::<false>`).
 #[cfg(parallel_sm)]

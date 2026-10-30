@@ -313,7 +313,7 @@ pub enum DeflateEvent {
 /// Walk a RAW DEFLATE stream (RFC 1951, no gzip framing) and report every
 /// token in order via `observe`. Returns the total uncompressed byte count.
 /// This is the same bit-exact walk as [`fingerprint_gzip`], sharing
-/// [`decode_block_body_obs`] so no second decode loop exists to rot.
+/// `decode_block_body_obs` so no second decode loop exists to rot.
 pub fn walk_deflate_tokens(
     deflate: &[u8],
     observe: &mut impl FnMut(DeflateEvent),
@@ -419,8 +419,8 @@ pub struct BlockLens {
 
 /// Walk a RAW DEFLATE stream (RFC 1951, no gzip framing) and return every
 /// block's [`BlockLens`]. Bit-exact: the same walk as
-/// [`walk_deflate_tokens`], sharing [`decode_block_body`] /
-/// [`parse_dynamic_header`] so no second decode loop exists to rot.
+/// [`walk_deflate_tokens`], sharing `decode_block_body` /
+/// `parse_dynamic_header` so no second decode loop exists to rot.
 pub fn walk_deflate_block_lens(deflate: &[u8]) -> std::io::Result<Vec<BlockLens>> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     let mut bits = BitWalker {

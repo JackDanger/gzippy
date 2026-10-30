@@ -1,8 +1,7 @@
 # Contributing to gzippy
 
-Welcome. This guide gets you productive in the codebase. The authoritative
-spec for routing, lessons, and PR workflow lives in [`CLAUDE.md`](CLAUDE.md);
-this file is the on-ramp.
+Welcome. This guide gets you productive in the codebase. The project charter (project rules, work discipline) lives in
+[`CLAUDE.md`](CLAUDE.md); this file is the on-ramp.
 
 ## What gzippy is
 
@@ -30,27 +29,57 @@ gzippy file.txt
 │   main.rs   │   parse args, route to compress / decompress
 └──────┬──────┘
        │
-       ├─────────────────────────┐
-       ▼                         ▼
-┌──────────────────┐     ┌──────────────────┐
-│ compress::mod    │     │ decompress::mod  │
-│ (routing)        │     │ (classify+route) │
-└────────┬─────────┘     └────────┬─────────┘
-         │                        │
-         ├──── T>1 L6-L9 ──┐      ├──── parallel SM ──┐
-         │                 │      │  (ISA-L+T>1+>10MB)│
-         ▼                 ▼      ▼                   ▼
-┌────────────────┐ ┌──────────────┐ ┌─────────────────────┐
-│ compress::      │ │ compress::   │ │ decompress::        │
-│ pipelined       │ │ parallel     │ │ parallel::          │
-│ (single-member  │ │ (GZ subfield │ │ single_member       │
-│  zlib-ng)       │ │  multi-block │ │ (rapidgzip-style    │
-└────────────────┘ └──────────────┘ │  + ISA-L inflatePrime)│
-                                    └─────────────────────┘
+       ├───────────────────────────┐
+       ▼                           ▼
+┌──────────────────┐     ┌──────────────────────┐
+│ compress::mod    │     │ decompress::mod      │
+│ (routing)        │     │ (classify → Decode-  │
+│ level+threads →  │     │  Path: format +      │
+│ encoder          │     │  thread count)       │
+└────────┬─────────┘     └──────────┬───────────┘
+         │                         │
+         ├─ T1, L0–L12 ──┐         ├─ "GZ" FEXTRA subfield → bgzf/
+         │               │         │     parallel member decode
+         │               │         ├─ multi-member → MultiMemberPar /
+         │               │         │     MultiMemberGrid / MultiMemberSeq
+         │               │         └─ single-member → parallel::
+         │               │             single_member (ParallelSM — the
+         ▼               ▼             SOLE single-member path, every
+┌───────────────────┐ ┌───────────────────┐ size × thread count × arch;
+│ deflate (pure T1: │ │ pipelined (pure   │ StoredParallel when stored-
+│ whole-buffer      │ │ T>1: PipelinedGz- │ blocks dominate)
+│ encode: the ldx   │ │ Encoder::compress_│
+│ libdeflate port   │ │ buffer_pure —     │
+│ L0–9 except       │ │ standard single-  │
+│ near-optimal      │ │ gzip at every     │
+│ parse L10–12)     │ │ level)            │
+└───────────────────┘ └───────────────────┘
 ```
 
-Full routing table (every path the CLI can take, with thread-count and
-size gates) is in [`CLAUDE.md` § Production Routing](CLAUDE.md#production-routing-apr-2026).
+Both compress arms above run the pure-Rust DEFLATE engine in EVERY build
+flavor (Increment 7): T1 routes through
+`deflate::encode_gzip_reader_to_writer_sized` (with a byte-identical mmap
+fast path for FILE inputs over 128 KiB), T>1 through
+`PipelinedGzEncoder::compress_buffer_pure`. One encode per input — no trial
+encodes. Which engine serves a level is `level_uses_ldx`
+(`src/compress/deflate/mod.rs`); `tests/one_encode_only.rs` counts encoder
+entries so a second-encode regression fails instead of asserting.
+
+**One C footnote.** The CI x86_64 flavor builds with
+`--features gzippy-native,isal-compression` (`.github/workflows/ci.yml`).
+`isal-compression` brings in the vendored ISA-L C compressor as a
+DIFFERENTIAL-ORACLE LIBRARY ONLY: `src/backends/isal_compress.rs` compiles
+under that feature (also under `test` / `ffi-oracle`) but is
+`#![allow(dead_code)]` with no production call site — the routing graph
+never invokes it, in any flavor. The same feature enables rpmalloc chunk
+arenas for the ParallelSM decoder (`arena-allocator`). ci.yml's comment
+about ISA-L *compression* "(T1 L0–L3)" describes the pre-Increment-7
+routing and is historical; the routing functions — not the build flavor —
+decide where your bytes run.
+
+The full decode table lives in the `DecodePath` enum and `classify_gzip`
+(`src/decompress/mod.rs`), and the compress routes are documented at
+`src/compress/mod.rs`'s top (`route` module).
 
 ## File guide
 
@@ -59,19 +88,21 @@ size gates) is in [`CLAUDE.md` § Production Routing](CLAUDE.md#production-routi
 | `src/main.rs` | CLI entry point, signal handling, file iteration |
 | `src/cli.rs` | gzip-compatible argument parsing |
 | `src/compress/mod.rs` | Compression routing (level + thread count → encoder) |
-| `src/compress/parallel.rs` | T>1 L0–L5: independent blocks, "GZ" FEXTRA subfield |
-| `src/compress/pipelined.rs` | T>1 L6–L9: dictionary-shared single-member output |
 | `src/compress/io.rs` | Compression I/O: stdin/file in, stdout/file out |
-| `src/decompress/mod.rs` | Decompression entry, format detection, routing |
-| `src/decompress/bgzf.rs` | gzippy-parallel + multi-member parallel core engine |
-| `src/decompress/parallel/single_member.rs` | Parallel single-member (v0.3.0) |
+| `src/compress/deflate/` | The whole-buffer DEFLATE engine: level params, parsers, matchfinders; `level_uses_ldx` and the one-encode census live here |
+| `src/compress/ldx/` | The libdeflate port — production encoder for L0–9 except L1/L6, and the per-decision differential oracle |
+| `src/compress/pipelined.rs` | T>1: the pure parallel single-member pipeline (`compress_buffer_pure`), every level |
+| `src/compress/parallel.rs` | Shared format helpers (`GzipHeaderInfo`, the "GZ" subfield ID, rsyncable chunking) + C-FFI differential-oracle encoders (test / `ffi-oracle` only) |
+| `src/decompress/mod.rs` | Decompression entry, format detection, routing (the `DecodePath` table) |
+| `src/decompress/bgzf/` | "GZ"-subfield and BGZF parallel member decode + member-boundary scanning |
+| `src/decompress/parallel/single_member.rs` | The ParallelSM driver — sole single-member decode path, pure Rust |
 | `src/decompress/inflate/` | Pure-Rust inflate primitives + Huffman tables |
-| `src/backends/isal_compress.rs` | ISA-L compression (x86_64, T1 L0–L3) |
-| `src/backends/isal_decompress.rs` | ISA-L decompression (x86_64) |
-| `src/backends/libdeflate.rs` | libdeflate FFI |
-| `src/backends/inflate_bit.rs` | Universal inflate-from-bit (ISA-L on x86_64, libz-ng elsewhere) |
-| `src/infra/scheduler.rs` | Compression block scheduler (pigz N+1 model) |
-| `src/infra/thread_pool.rs` | Worker thread pool |
+| `src/backends/isal_compress.rs` | ISA-L compression — differential oracle only (test / `ffi-oracle` / `isal-compression` builds; off the routing graph) |
+| `src/backends/isal_decompress.rs` | ISA-L decode FFI differential oracle (+ the resumable from-bit oracle export in `lib.rs`) |
+| `src/backends/libdeflate.rs` | libdeflate decode FFI differential oracle (tests only) |
+| `src/backends/inflate_bit.rs` | Resumable inflate-from-bit decode FFI oracle (tests only) |
+| `src/infra/scheduler.rs` | Compression block scheduler (pigz N+1 model) — drives the T>1 pipelined path |
+| `src/infra/thread_pool.rs` | Persistent worker pool for parallel decompression |
 | `src/tests/` | Cross-cutting integration tests (routing, fixtures, oracles) |
 
 ## Iteration loop
@@ -88,8 +119,14 @@ make
 cargo test --release
 
 # 5. Authoritative numbers — only after step 3 passes.
-source .env && make ship
+make ship
 ```
+
+`make ship` is homelab-bench-limited: after the local checks it PUSHES the
+current branch and runs the benchmark on the remote homelab box (SSH
+`neurotic ...`, ~20–25 min for step 6 — see the `ship` target in the
+Makefile). Without access to that box, run `make ship-local` — steps 1–5
+(fmt, tests, clippy, corpus oracle, smoke) and skip the bench.
 
 `make route-check` generates 1 MiB and 10 MiB test files and shows routing
 + timing vs pigz across T1/T4 × 1 MiB/10 MiB. Run it before any
@@ -98,7 +135,11 @@ decompression-routing change.
 ## PR workflow
 
 `main` is protected — every change goes through a PR. The pre-push hook
-(installed by `cargo build`) enforces this locally.
+(installed by `cargo build` via `build.rs`) enforces this locally: it
+refuses direct pushes to `main` and runs
+`scripts/verify_submodule_remotes.sh`. CI reports a single required status
+check named `build` — the aggregate job in `.github/workflows/ci.yml` that
+fans the Build & Test / Integration / Anatomy / Lint jobs into one name.
 
 ```bash
 git checkout -b fix/my-change       # or feat/, refactor/, chore/, perf/
@@ -113,10 +154,13 @@ the Release workflow, which opens a formula-update PR.
 
 ## Pre-commit checks
 
-The pre-commit hook runs:
+The pre-commit hook (also installed by `build.rs`) runs only for the file
+kinds staged:
 
-1. `cargo fmt --check`
-2. `cargo clippy --release --all-targets -- -D warnings`
+1. staged `.rs` files → `cargo fmt --check`, then
+   `cargo clippy --all-targets -- -D warnings` (default features)
+2. staged `VERSION` / `Cargo.toml` → VERSION-vs-Cargo.toml consistency
+3. staged `.github/**.yml` → YAML syntax check
 
 If lint fails:
 
@@ -131,15 +175,17 @@ cargo clippy --fix --allow-staged --release --all-targets
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy --release --all-targets -- -D warnings` clean
 - [ ] `make` (or `make quick`) passes
-- [ ] `make ship` (homelab bench) shows no regression
+- [ ] if you have homelab access: `make ship` shows no regression
+      (otherwise `make ship-local` covers the local part)
 
 ## House rules
 
-Before changing decompression routing, read [`CLAUDE.md`'s Hard-Won
-Lessons](CLAUDE.md#hard-won-lessons). It records what's been tried and why
-some "obvious" optimizations make things slower (mmap on single-thread,
-two-pass scan-then-decode, speculative parallel on arm64, etc.). Don't
-relitigate without reading it first.
+Before changing decompression routing, read [`CLAUDE.md`](CLAUDE.md) — in
+particular its *Non-negotiables* and *Hard stops* sections. They record
+what the project counts as closed and why some "obvious"
+optimizations lose (mmap on single-thread, two-pass scan-then-decode,
+speculative parallel on arm64, etc.). Don't relitigate without reading
+them first.
 
 ## Questions?
 

@@ -102,7 +102,7 @@ pub fn encode_deflate_bytes_to_vec(data: &[u8], level: u32) -> Vec<u8> {
 /// logical input end so the matchfinder's speculative word loads always stay in
 /// bounds. Re-exported for the in-place T1 path, which pads its read buffer once
 /// (`resize(len + PAD, 0)`) rather than copying the input into a second padded
-/// buffer. Must equal [`parse::BUF_PAD`].
+/// buffer. Must equal `parse::BUF_PAD`.
 pub const INPLACE_TAIL_PAD: usize = parse::BUF_PAD;
 
 /// Compress `data` into a raw DEFLATE stream, appending to `out`.
@@ -223,9 +223,9 @@ pub fn encode_deflate_segment_to_sink(
 ///   (BTYPE=00) block. Stored LEN/NLEN byte-alignment is relative to the
 ///   fragment's own start, so such a fragment must be placed byte-aligned:
 ///   the splicer re-creates the old-style seam at that one boundary instead
-///   of shifting the fragment. Detection is [`STORED_BLOCK_EMITTED`], a
+///   of shifting the fragment. Detection is `STORED_BLOCK_EMITTED`, a
 ///   thread-local set by the two cold stored-block emitters
-///   ([`write_stored_subblock`], which the parser's stored-escape and
+///   (`write_stored_subblock`, which the parser's stored-escape and
 ///   `emit_stored_block` both route through, and ultra's
 ///   `add_non_compressed_block`) — NOT a field on [`BitWriter`]: the first
 ///   version put it there and eroded T1 wall broadly (see the layout note in

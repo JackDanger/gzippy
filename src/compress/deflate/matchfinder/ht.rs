@@ -138,9 +138,9 @@
 //! measures T-numcores on a multi-core box. Both arms above are `-p1`; the T16 output
 //! on the same slice is 881,816, not 881,712, which is how the trap announces itself.
 //!
-//! ⚠ INSTRUMENT: `fulcrum why`'s layer [2] callgrind figures are inflated ~12x by the
+//! ⚠ INSTRUMENT: `fulcrum why`'s layer \[2\] callgrind figures are inflated ~12x by the
 //! recorded parser instrumentation bug (corroborating tell: `Dr 0` on every row).
-//! Layer [1] (position counts) is independent of that path and is safe to use.
+//! Layer \[1\] (position counts) is independent of that path and is safe to use.
 //!
 //! **And the obvious escape hatch is not available: the wall regression is
 //! write-traffic-shaped, not bounds-check-shaped.**
@@ -148,7 +148,7 @@
 //! # Soundness of the elided bounds checks
 //!
 //! The hot loop drops Rust's bounds checks to match libdeflate's C codegen, exactly as
-//! [`super::hc`] does and for the same reasons. Every elided check is discharged by
+//! `super::hc` does and for the same reasons. Every elided check is discharged by
 //! construction, not by inspection:
 //!
 //! * **Bucket / length-3 indices.** `hash = lz_hash(seq, HT_HASH_ORDER)` with
@@ -159,7 +159,7 @@
 //!   pin this in test builds.
 //! * **Buffer reads.** The parser pads its working buffer by `BUF_PAD` (16) bytes past
 //!   `in_end` and the caller guarantees `max_len >= HT_REQUIRED_NBYTES`; see the
-//!   per-call SAFETY comment in [`HtMatchfinder::longest_match`].
+//!   per-call SAFETY comment on `HtMatchfinder::longest_match`.
 
 use super::common::{
     load_u24, load_u32, lz_extend, lz_hash, matchfinder_rebase, prefetch_write,
@@ -182,7 +182,7 @@ pub const HT_REQUIRED_NBYTES: u32 = 5;
 /// Hash order for the LENGTH-3 singleton table. Same order libdeflate's
 /// `hc_matchfinder` uses for its own `hash3_tab` (`HC_HASH3_ORDER` 15).
 pub const HT_HASH3_ORDER: u32 = 15;
-/// Entries in [`HtMatchfinder::hash3_tab`]. 32,768 x 2 B = 64 KiB.
+/// Entries in `HtMatchfinder::hash3_tab` (the private hash3 table field). 32,768 x 2 B = 64 KiB.
 pub const HT_HASH3_SIZE: usize = 1 << HT_HASH3_ORDER;
 /// Longest length-3 match distance worth coding. A length-3 match at a large
 /// offset costs more bits than three literals, so libdeflate's greedy parser
@@ -217,7 +217,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// RAII handle from [`HtMatchfinder::acquire`]; returns its box to [`HT_POOL`]
+/// RAII handle from [`HtMatchfinder::acquire`]; returns its box to `HT_POOL`
 /// on drop instead of freeing it.
 pub struct PooledHt(Option<Box<HtMatchfinder>>);
 
