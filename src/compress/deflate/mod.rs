@@ -756,10 +756,12 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
     // reservation), and peak RSS at 2.5-2.7x the input.
     //
     // When the mapping already carries >= INPLACE_TAIL_PAD readable bytes
-    // past `logical_len` — which `map_with_tail_pad` arranges by mapping
-    // into the final partial page, where the kernel zero-fills past EOF —
-    // those bytes ARE the pad the padded encoder requires, and the copy is
-    // pure waste. `debug_assert` the zero-fill rather than trust it.
+    // past `logical_len` — which `map_with_tail_pad` arranges for EVERY
+    // regular unix file (into the final partial page, or since the 2026-10
+    // overlay lever, an anonymous zero tail under a MAP_FIXED file head for
+    // the exact-page-multiple and thin-slack shapes) — those bytes ARE the
+    // pad the padded encoder requires, and the copy is pure waste.
+    // `debug_assert` the zero-fill rather than trust it.
     if data.len() >= logical_len + INPLACE_TAIL_PAD {
         debug_assert!(
             data[logical_len..logical_len + INPLACE_TAIL_PAD]
@@ -772,8 +774,14 @@ pub fn encode_gzip_unpadded_slice_to_writer<W: std::io::Write>(
         return Ok(logical_len as u64);
     }
 
-    // SLOW PATH: no slack available (e.g. the input ends exactly on a page
-    // boundary, so mapping further would fault). Copy once.
+    // SLOW PATH: no slack available. Survives only where the mmap side cannot
+    // arrange a pad at all — non-unix targets without a page size, kernels
+    // that refused every mapping attempt, and callers that pass their own
+    // exact-length slice. Copy once. (This used to be the route taken by the
+    // exact-page-multiple and thin-slack file shapes, ~0.4% of arbitrary
+    // files — measured 2026-10-29 at CLI L1 `-c` on a 262,144 B file: this
+    // path's alloc event charged input+16 = 262,160 B on TOP of the work both
+    // routes share; the overlay deleted it.)
     let cap = logical_len + INPLACE_TAIL_PAD;
     crate::anatomy_count!(alloc_events);
     crate::anatomy_count!(alloc_bytes, cap);

@@ -97,48 +97,233 @@ impl<W: Write> Write for HeaderSpliceWriter<W> {
     }
 }
 
-/// Map `input_file`, asking for [`TAIL_PAD`] bytes of readable slack past EOF so
-/// the encoder can parse IN PLACE instead of copying the whole input.
+/// Map `input_file`, handing the encoder TAIL_PAD readable zero bytes past `len`
+/// so the encoder can parse IN PLACE instead of copying the whole input.
 ///
-/// Returns `(mapping, logical_len)`. The mapping is `logical_len + TAIL_PAD`
-/// bytes when the slack was obtainable and exactly `logical_len` otherwise.
+/// Returns `(mapping, logical_len)`. On unix every mapping here carries at
+/// least `len + [`INPLACE_TAIL_PAD`]` readable bytes; a mapping of exactly `len`
+/// (no pad) survives only where neither route below could mmap at all.
 ///
 /// WHY. The padded encoder requires TAIL_PAD trailing bytes so the matchfinder's
 /// speculative 4/8-byte loads stay in bounds. Without slack, the only way to
-/// supply them is to copy the entire input — a 51 MB memcpy on monorepo.tar to
-/// append 16 bytes. Measured 2026-08-21: explicit allocations ran at exactly
-/// 1.50x the input on every corpus file regardless of compressibility, and peak
-/// RSS at 2.5-2.7x, against pigz's flat ~2 MB.
+/// supply them used to be to copy the entire input — a 51 MB memcpy on
+/// monorepo.tar to append 16 bytes. Measured 2026-08-21: explicit allocations
+/// ran at exactly 1.50x the input on every corpus file regardless of
+/// compressibility, and peak RSS at 2.5-2.7x, against pigz's flat ~2 MB — the
+/// 1.0x share was this copy, and it fired for every input whose length is an
+/// exact multiple of the page size (~1/4096 of arbitrary files) or whose final
+/// partial page left < TAIL_PAD slack.
 ///
-/// HOW IT IS SAFE. A file's last page is partial whenever `len % page != 0`, and
-/// the kernel zero-fills the remainder of that page; reading it is defined, and
-/// mapping into it does not fault. Mapping into a page BEYOND the last one is
-/// what raises SIGBUS, so we only ask for slack that fits inside the final
-/// partial page, and fall back to the plain map (and the copy) otherwise —
-/// including the exact-multiple-of-page case, where there is no partial page at
-/// all.
-fn map_with_tail_pad(file: &File, len: usize) -> std::io::Result<(memmap2::Mmap, usize)> {
+/// THE THREE ROUTES, best first:
+///
+/// 1. `len % page != 0 && slack >= TAIL_PAD` — the file's final partial page
+///    already owns `slack` readable bytes past EOF (the kernel zero-fills the
+///    tail of a partial page): map `len + TAIL_PAD` and those bytes ARE the
+///    pad. ~99.6% of arbitrary files.
+/// 2. THE overlay (this is where the whole-input copy used to live): `len %
+///    page == 0` (no partial page to borrow from) or `slack < TAIL_PAD` (the
+///    pad would cross into a page the file does not own), plus any route-1
+///    attempt the kernel refused. Anonymous PROT_READ pages cover the whole
+///    reserved range first, then MAP_FIXED installs a private file mapping of
+///    exactly `len` over the head: file bytes stay file-backed, the pad stays
+///    fresh anonymous zero.
+/// 3. plain exact-length map — only when mmap failed everywhere above (e.g.
+///    non-unix targets with no usable page size, or a kernel that refused
+///    every attempt); `encode_gzip_unpadded_slice_to_writer` then pays the one
+///    whole-input copy. Never reached for regular unix files with instant mmap.
+///
+/// HOW IT IS SAFE. Route 1: a file's last page is partial whenever
+/// `len % page != 0`, and the kernel zero-fills the remainder of that page;
+/// reading it is defined, and mapping into it does not fault — only a page
+/// BEYOND the file's last one raises SIGBUS, so route 1 only asks for slack
+/// inside that partial page. Route 2's file mapping is exactly `len` bytes
+/// (never a page the file does not own); for the partial-page shapes the
+/// kernel still rounds the length up to the file's own page boundary, where
+/// reads past EOF stay zero-filled — the same guarantee route 1 is built on.
+/// Everything past the file's last page is anonymous fresh pages, which read
+/// as zero before any write.
+fn map_with_tail_pad(file: &File, len: usize) -> std::io::Result<(InputMap, usize)> {
     const TAIL_PAD: usize = crate::compress::deflate::INPLACE_TAIL_PAD;
     let page = page_size();
-    let slack_in_last_page = if page == 0 { 0 } else { page - (len % page) };
+    if page == 0 || len == 0 {
+        // Mainframe case (non-unix: no page size knowledge) or the empty file
+        // (nothing to pad past): the plain map and the encode-site copy.
+        let m = unsafe { memmap2::Mmap::map(file)? };
+        return Ok((m.into(), len));
+    }
+    let slack_in_last_page = page - (len % page);
     // `len % page == 0` gives slack_in_last_page == page, but there is no
-    // partial page then — the next byte is in a page the file does not own.
-    let can_extend = page != 0 && !len.is_multiple_of(page) && slack_in_last_page >= TAIL_PAD;
+    // partial page then — the next byte is in a page the file does not own;
+    // route 2 (the overlay) covers it instead.
+    let can_extend = !len.is_multiple_of(page) && slack_in_last_page >= TAIL_PAD;
     if can_extend {
         // SAFETY: same contract as the plain `Mmap::map` below — the file is
         // opened read-only and not mutated concurrently by gzippy. The extra
         // TAIL_PAD bytes lie inside the file's final partial page, which the
         // kernel zero-fills, so they are readable and read as zero.
-        let m = unsafe { memmap2::MmapOptions::new().len(len + TAIL_PAD).map(file) };
-        if let Ok(m) = m {
-            return Ok((m, len));
+        let extended = unsafe { memmap2::MmapOptions::new().len(len + TAIL_PAD).map(file) };
+        if let Ok(m) = extended {
+            return Ok((m.into(), len));
         }
-        // Fall through to the plain map if the kernel refused the longer
-        // mapping for any reason; correctness never depends on the fast path.
+        // The kernel refused the longer mapping: fall through to the overlay,
+        // which pads the tail anonymously and works wherever the plain map can.
     }
-    // SAFETY: as above.
+    let reserved_len = (len + TAIL_PAD).div_ceil(page) * page;
+    if let Some(m) = map_with_tail_pad_overlay(file, len, reserved_len) {
+        return Ok((m, len));
+    }
+    // Both pad routes failed to mmap (kernel refused every attempt). The
+    // encoder at the call site pays the one whole-input copy; the diagnostic
+    // mirrors `route::emit`'s GZIPPY_DEBUG gate so a fallback run is visible.
+    if crate::utils::debug_enabled() {
+        eprintln!("[gzippy] tail-pad overlay failed; falling back to the whole-input copy path");
+    }
+    // SAFETY: `file` is opened read-only and is not mutated concurrently by
+    // gzippy; the mapping is never written.
     let m = unsafe { memmap2::Mmap::map(file)? };
-    Ok((m, len))
+    Ok((m.into(), len))
+}
+
+/// The read-only `[u8]` window the T1 mmap route parses over. Either a plain
+/// `memmap2::Mmap`, or the two-mapping overlay of `map_with_tail_pad`'s route 2
+/// (anonymous pad tail under a MAP_FIXED file head), which memmap2 cannot
+/// express by itself.
+///
+/// The overlay's raw pointer exists only because the joined range spans two
+/// kernel VMAs; memory owns it for exactly this struct's lifetime (one munmap
+/// in Drop, after which the `[u8]` handed out by Deref is dead — callers (the
+/// encoder) never outlive the value on any in-crate path.
+pub(crate) struct InputMap {
+    /// The MAPPED byte count. Either exactly the file length (route 3, no pad
+    /// obtainable), `len + TAIL_PAD` (route 1), or the page-rounded route-2
+    /// reservation (>= `len + TAIL_PAD`).
+    len: usize,
+    kind: InputMapKind,
+}
+
+enum InputMapKind {
+    Simple(memmap2::Mmap),
+    #[cfg(unix)]
+    Overlay {
+        /// Start of the joined (file head + anonymous tail) reservation.
+        base: *const u8,
+    },
+}
+
+impl From<memmap2::Mmap> for InputMap {
+    fn from(m: memmap2::Mmap) -> Self {
+        Self {
+            len: m.len(),
+            kind: InputMapKind::Simple(m),
+        }
+    }
+}
+
+impl std::ops::Deref for InputMap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.kind {
+            InputMapKind::Simple(m) => m,
+            #[cfg(unix)]
+            InputMapKind::Overlay { base } => unsafe {
+                // SAFETY: `[base, base + len)` is fully installed, read-only,
+                // and lives until this value's Drop; every borrow handed out
+                // through Deref is shorter than that lifetime on any in-crate
+                // path (the encoder borrows it for one synchronous call).
+                std::slice::from_raw_parts(*base, self.len)
+            },
+        }
+    }
+}
+
+impl InputMap {
+    /// Configure the kernel's readahead for the whole window. Errors are
+    /// dropped, matching the `let _ = mmap.advise(..)` at every call site.
+    pub(crate) fn advise_sequential(&self) {
+        match &self.kind {
+            InputMapKind::Simple(m) => {
+                let _ = m.advise(memmap2::Advice::Sequential);
+            }
+            #[cfg(unix)]
+            InputMapKind::Overlay { base } => {
+                // SAFETY: `[base, base + len)` is a live, readable mapping;
+                // madvise only annotates it.
+                let _ = unsafe {
+                    libc::madvise(
+                        base.cast_mut().cast::<libc::c_void>(),
+                        self.len,
+                        libc::MADV_SEQUENTIAL,
+                    )
+                };
+            }
+        }
+    }
+}
+
+impl Drop for InputMap {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let InputMapKind::Overlay { base } = &self.kind {
+            // SAFETY: exactly one munmap, at owner death, over the whole
+            // reservation this type created (it removes BOTH the file mapping
+            // and the anonymous tail; the `Simple` arm is freed by its own
+            // `Mmap` drop below).
+            unsafe { libc::munmap(base.cast_mut().cast::<libc::c_void>(), self.len) };
+        }
+    }
+}
+
+/// Route 2 of `map_with_tail_pad`: one address range whose head is a private
+/// file mapping of exactly `len` bytes and whose tail reads as fresh zero
+/// pages. Returns None (keeping `map_with_tail_pad`'s plain-map fallback) if
+/// any kernel call fails — correctness never depends on this route.
+#[cfg(unix)]
+fn map_with_tail_pad_overlay(file: &File, len: usize, reserved_len: usize) -> Option<InputMap> {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: kernel-chosen address; on failure the result is exactly
+    // MAP_FAILED (checked below), never an errno-as-pointer.
+    let base = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            reserved_len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return None;
+    }
+    let base: *const u8 = base.cast();
+
+    // SAFETY: `base` is this thread's freshly mapped reservation — the ONLY
+    // pages MAP_FIXED consumes are pages this function created two lines
+    // above; no other thread can hold a reference to them. The file mapping
+    // (fd of the read-only input) then covers `[base, base + len)`, rounded
+    // up by the kernel to the file's own page boundary, where reads past EOF
+    // stay zero-filled.
+    let head = unsafe {
+        libc::mmap(
+            base.cast_mut().cast::<libc::c_void>(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if head.is_null() || head != base.cast_mut().cast::<libc::c_void>() {
+        // MAP_FIXED failed atomically: the anonymous reservation is intact.
+        // SAFETY: the range is unmapped exactly once, right here.
+        unsafe { libc::munmap(base.cast_mut().cast::<libc::c_void>(), reserved_len) };
+        return None;
+    }
+    Some(InputMap {
+        len: reserved_len,
+        kind: InputMapKind::Overlay { base },
+    })
 }
 
 #[cfg(unix)]
@@ -447,7 +632,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // gzippy, matching every other mmap read path in this module.
         let (mmap, logical_len) = map_with_tail_pad(&input_file, file_size as usize)?;
         #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
+        mmap.advise_sequential();
         // Gate-4 route assertion at the call site of the encoder about to run
         // (both writer arms below invoke the same function unconditionally).
         crate::compress::route::emit(
@@ -827,32 +1012,51 @@ fn human_size(bytes: u64) -> (f64, &'static str) {
 #[cfg(test)]
 mod map_with_tail_pad_tests {
     use super::*;
+    use crate::compress::deflate::encode_gzip_unpadded_slice_to_writer;
     use std::io::Write;
 
-    /// The fast path in `encode_gzip_unpadded_slice_to_writer` is only correct
-    /// if the bytes past EOF in the final partial page are readable AND ZERO.
-    /// That is a kernel guarantee, not a gzippy one, so pin it: a release build
-    /// compiles the `debug_assert` away, and a non-zero pad would silently
-    /// corrupt the tail of every compressed file.
+    /// Every route a regular unix file can take must hand the encoder its
+    /// TAIL_PAD pad window past EOF, and the pad must read as ZERO — the fast
+    /// path in `encode_gzip_unpadded_slice_to_writer` is only correct if the
+    /// bytes past EOF are readable AND zero. Zero-fill is a kernel promise
+    /// (the tail of a partial final page, and fresh anonymous pages), not a
+    /// gzippy one, so pin it: a release build compiles the `debug_assert`
+    /// away, and a non-zero pad would silently corrupt the tail of every
+    /// compressed file.
+    ///
+    /// The exact-multiple sizes (`page`, `3 * page`) and the thin-slack band
+    /// (`page - 15 .. page - 1`) are the sizes that keep the whole-input-copy
+    /// fallback alive (route 3): if `map_with_tail_pad`'s overlay ever stops
+    /// covering them (mmap refusal, regression), the plain map lands here with
+    /// `m.len() == len` and both assertions below go RED with it.
     #[test]
     fn extended_map_slack_is_readable_and_zero() {
         let page = page_size();
         assert!(page > 0, "test needs a real page size");
+        let tail_pad = crate::compress::deflate::INPLACE_TAIL_PAD;
         let dir = tempfile::tempdir().expect("tempdir");
-        // Sizes chosen around the page boundary, where the branch decides.
-        for &len in &[
+        // Sizes chosen around the page boundary, where the route decides:
+        // route 1 (slack >= tail_pad), the whole thin-slack band (slack
+        // 1..15: slack -1 is `page`, slack.. every reduction), and the
+        // exact-multiple case where there is no partial page at all.
+        let mut sizes = vec![
             1usize,
             17,
             page - 17,
             page - 16,
-            page - 15,
-            page - 1,
             page,
             page + 1,
             3 * page - 16,
             3 * page,
             3 * page + 7,
-        ] {
+            3 * page + 8,
+        ];
+        // Every thin-slack shape in [page - tail_pad + 1, page): the pad
+        // window would cross into a page the file does not own.
+        sizes.extend((1..tail_pad).map(|s| page - s));
+        sizes.sort_unstable();
+        sizes.dedup();
+        for &len in &sizes {
             let path = dir.path().join(format!("f{len}"));
             let mut f = std::fs::File::create(&path).expect("create");
             // Non-zero content, so a pad read as zero cannot be content bleed.
@@ -868,28 +1072,91 @@ mod map_with_tail_pad_tests {
                 &vec![0xABu8; len][..],
                 "content changed, len={len}"
             );
-
-            let extended = m.len() > len;
+            // Every in-place route: the mapping carries the TAIL_PAD window
+            // and it reads as zero. The only shape allowed to miss this is
+            // the route-3 plain map — which, when reached, means BOTH pad
+            // arrangements above failed and the encode site pays the copy.
             assert!(
-                m.len() == len || m.len() == len + crate::compress::deflate::INPLACE_TAIL_PAD,
-                "mapping is either exact or exactly padded, got {} for len={len}",
+                m.len() >= len + tail_pad,
+                "mapping must carry the {}-byte pad window past EOF, got {} \
+                 readable bytes for len={len} (route-2 overlay failed and \
+                 route 3 ran — the whole-input copy is live again)",
+                tail_pad,
                 m.len()
             );
-            if extended {
-                assert!(
-                    m[len..].iter().all(|&b| b == 0),
-                    "slack past EOF must read as zero, len={len}"
-                );
-            }
-            // A file ending exactly on a page boundary has no partial page to
-            // borrow from, so it MUST fall back rather than map a page it does
-            // not own.
-            if len.is_multiple_of(page) {
-                assert!(
-                    !extended,
-                    "must not extend past a full final page, len={len}"
-                );
-            }
+            assert!(
+                m[len..].iter().all(|&b| b == 0),
+                "pad past EOF must read as zero, len={len} (mapping {} bytes)",
+                m.len()
+            );
+            // The mapping never extends beyond a page past the pad; anything
+            // larger is a kernel-ABI surprise to catch here rather than
+            // discover as an ASan reports on the encoder's read window.
+            assert!(
+                m.len() <= (len + tail_pad).div_ceil(page) * page,
+                "mapping {} bytes is past the pad's page for len={len}",
+                m.len()
+            );
+        }
+    }
+
+    /// Whatever pad route a file takes, the ENCODED BYTES must be identical:
+    /// the in-place parse over a mapping whose pad is anonymous zero (route 2,
+    /// incl. the exact-page-multiple and thin-slack shapes) must equal the
+    /// historical whole-input copy the exact-multiple files used to pay for —
+    /// same parser state, pad filling zero either way. Guards the T1
+    /// tie-cage contract (output identity) against a pad that is readable but
+    /// not zero, or a logical length that drifted.
+    #[test]
+    fn overlay_route_output_equals_the_copy_path_output_bytes() {
+        let page = page_size();
+        assert!(page > 0, "test needs a real page size");
+        let tail_pad = crate::compress::deflate::INPLACE_TAIL_PAD;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The overlay shapes: exact multiples (page, 3 * page) and the whole
+        // thin-slack band. 3 * page spans several parser blocks so the tail
+        // byte state is exercised across block boundaries, not just once.
+        for &len in &[1usize, page, 3 * page, 3 * page - tail_pad, 3 * page - 1] {
+            let path = dir.path().join(format!("id{len}"));
+            let content = {
+                // Deterministic, structured-enough data (literals + matches),
+                // non-zero, and NOT page-indifferent: any pad bleed would
+                // change the bytes.
+                let mut v = vec![0u8; len];
+                for (i, b) in v.iter_mut().enumerate() {
+                    let s = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                    *b = if (i / 4096) % 2 == 0 {
+                        (s & 0xFF) as u8
+                    } else {
+                        b'a' + (s % 26) as u8
+                    };
+                }
+                v
+            };
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(&content).expect("write");
+            f.sync_all().expect("sync");
+            drop(f);
+            let f = std::fs::File::open(&path).expect("open");
+
+            // (a) the in-place route: parse straight over the padded mapping.
+            let (m, logical) = map_with_tail_pad(&f, len).expect("map");
+            let mut src_a = Vec::new();
+            encode_gzip_unpadded_slice_to_writer(&m, logical, &mut src_a, 6)
+                .expect("encode over the mapping");
+
+            // (b) the historical copy path: whole input + zero pad, logical
+            // length unchanged. References the SAME encoder one level under.
+            let mut copied = content.clone();
+            copied.resize(len + tail_pad, 0);
+            let mut src_b = Vec::new();
+            encode_gzip_unpadded_slice_to_writer(&copied, len, &mut src_b, 6)
+                .expect("encode over the copy");
+
+            assert_eq!(
+                src_a, src_b,
+                "in-place (mapping) bytes differ from the copy path, len={len}"
+            );
         }
     }
 }

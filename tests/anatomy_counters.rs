@@ -511,3 +511,138 @@ fn l1_allocations_within_2x_of_l6() {
          the block comment above)"
     );
 }
+
+// ============================================================================
+// TAIL-PAD OVERLAY (io.rs::map_with_tail_pad) — the exact-page-multiple /
+// thin-slack falsifier for the whole-input copy.
+//
+// A file whose length is an exact multiple of the page size has NO partial
+// final page to borrow slack bytes from, and a thin-slack file (slack < 16
+// bytes) cannot be extended across the page edge without claiming a page
+// beyond EOF (SIGBUS). Before the overlay lever these were the
+// ~16/4096 = 0.4%-of-arbitrary-files shapes that paid a 1.0x-input memcpy at
+// `encode_gzip_unpadded_slice_to_writer`'s slow path (deflate/mod.rs):
+//
+//   measured 2026-10-29, CLI L1 `-c` FILE route, arm64 host, 4096 B pages,
+//   262,144 B fixture (exact page multiple; a multiple of every supported
+//   unix page size, so also thin-slack on 16 KiB-page macOS at -15):
+//
+//     FRAME (baseline):  alloc_events 5 = 1 (this path's input+16 = 262,160 B
+//                        copy) + 4 (the per-block/output allocation work every
+//                        route carries); alloc_bytes 786,766 = 524,606 + 262,160.
+//     OVERLAY lever:     alloc_events 4, alloc_bytes 524,606 — EXACTLY the
+//                        route-1 (simple-slack, 262,160 B fixture) control's
+//                        profile: input+16 deleted from the FILE route.
+//
+// If the whole-input copy ever comes back for a regular unix file — an
+// mmap-regression that drops the pad window back to its old narrow shape —
+// alloc_bytes here jumps by exactly len+16 and the assertions below go RED.
+// ============================================================================
+
+/// Run `gzippy -{level} -c -p 1` over a FILE, returning
+/// `(compressed_stdout, counters_map_from_stderr)`. Same shape as
+/// `compress_with_counters` above, but with the input taken from disk so the
+/// T1 mmap route runs (subprocess isolation against the shared `COUNTERS`
+/// static, like the rest of this file).
+fn compress_file_with_counters(
+    path: &std::path::Path,
+    level: u32,
+) -> (Vec<u8>, BTreeMap<String, u64>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_gzippy"))
+        .arg(format!("-{level}"))
+        .arg("-c")
+        .arg("-p")
+        .arg("1")
+        .arg(path)
+        .output()
+        .expect("failed to spawn gzippy");
+    assert!(
+        output.status.success(),
+        "gzippy exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("ANATOMY_COUNTERS="))
+        .unwrap_or_else(|| {
+            panic!("no ANATOMY_COUNTERS= line on stderr:\n{stderr}");
+        });
+    (output.stdout, parse_flat_json(line))
+}
+
+/// Page-boundary-relative fixtures: `262144 = 64 * 4096` is an exact multiple
+/// of every supported unix page size (4096 and 16384 both divide it), so
+/// `- 15` stays thin-slack and `+ 16` stays route-1 simple-slack for ANY page
+/// size — the fixture must not leak the build host's page size into its
+/// meaning.
+fn page_boundary_corpus(len: usize) -> Vec<u8> {
+    let mut data = mixed_corpus(len);
+    data.truncate(len);
+    assert_eq!(data.len(), len);
+    data
+}
+
+#[test]
+fn t1_file_route_allocates_no_whole_input_copy_on_exact_page_multiple() {
+    const EXACT: usize = 262144; // 64 * 4096 — rem == 0 on every unix page size
+    let data = page_boundary_corpus(EXACT);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exact_page_multiple.bin");
+    std::fs::write(&path, &data).unwrap();
+
+    let (compressed, c) = compress_file_with_counters(&path, 1);
+    let mut decoded = Vec::new();
+    {
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .expect("gzippy stdout must be a valid gzip stream");
+    }
+    assert_eq!(decoded, data, "roundtrip sanity check failed");
+
+    // THE falsifier. The instrumented-allocation budget of the file route on
+    // this fixture measured 524,624 B with the overlay lever (outputVec cap
+    // len/2+32 plus the L1 parser's pooled head tables ~131,072 B each; the
+    // WHOLE-INPUT share is zero). When the slow path's input+16 copy is live
+    // again, alloc_bytes jumps by len+16 — measured 786,766 B — and the
+    // condition below goes RED. Threshold 2.5x sits half-way between the
+    // measured no-copy shape (2.00x) and the measured copy shape (3.00x), with
+    // a ~131 KB margin in each direction, so it tolerates internal buffer
+    // churn but can never absorb the copy.
+    let alloc_bytes = c.get("alloc_bytes").copied().unwrap_or(0);
+    assert!(
+        alloc_bytes > 0,
+        "alloc_bytes must be live (counters feature runs real compressions)"
+    );
+    assert!(
+        alloc_bytes < (EXACT as u64) * 5 / 2,
+        "the exact-page-multiple file route allocated {alloc_bytes} B for a {EXACT} B \
+         input — the 1.0x-input copy at encode_gzip_unpadded_slice_to_writer's \
+         slow path is live again (baseline for reference: 524,606 B pre-lever, \
+         786,766 B when the copy path was taken)"
+    );
+
+    // And the thin-slack sibling (rem = page - 15, slack < TAIL_PAD): the SAME
+    // no-copy contract.
+    const THIN: usize = 262144 + 16 * 4096 - 15; // thin-slack on every supported unix page size
+    let thin_data = page_boundary_corpus(THIN);
+    let thin_path = dir.path().join("thin_slack.bin");
+    std::fs::write(&thin_path, &thin_data).unwrap();
+    let (thin_compressed, thin_c) = compress_file_with_counters(&thin_path, 1);
+    let mut thin_decoded = Vec::new();
+    {
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&thin_compressed[..])
+            .read_to_end(&mut thin_decoded)
+            .expect("gzippy stdout must be a valid gzip stream");
+    }
+    assert_eq!(thin_decoded, thin_data, "thin-slack roundtrip failed");
+    let thin_alloc = thin_c.get("alloc_bytes").copied().unwrap_or(0);
+    assert!(
+        thin_alloc < (THIN as u64) * 5 / 2,
+        "the thin-slack file route allocated {thin_alloc} B for a {THIN} B input — the \
+         whole-input copy is live again"
+    );
+}
