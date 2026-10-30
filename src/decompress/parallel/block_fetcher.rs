@@ -236,7 +236,8 @@ where
         // sleep (same 1ms cadence as the old poll).
         W: FnMut(),
     {
-        if let Some(v) = { self.get_if_available(block_offset) } {
+        let res = self.get_if_available(block_offset);
+        if let Some(v) = res {
             return Some(Ok(v));
         }
         let rx = { self.take_prefetch(block_offset)? };
