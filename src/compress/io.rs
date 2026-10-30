@@ -608,9 +608,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     let header_info = GzipHeaderInfo::default();
     let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
-    let explicit_zopfli = args.zopfli_iterations.is_some()
-        || args.zopfli_no_split
-        || args.zopfli_split_max.is_some();
+    let explicit_zopfli =
+        args.zopfli_iterations.is_some() || args.zopfli_no_split || args.zopfli_split_max.is_some();
 
     let in_bytes = if let Some((ref mmap, logical_len)) = stdin_mmap {
         // Regular-file stdin (< file): multi-threaded parallel compression.
@@ -736,7 +735,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                     args.compression_level as u32,
                     opt_config.thread_count,
                 );
-                encoder.set_block_size_override(args.block_size_explicit.then_some(args.block_size));
+                encoder
+                    .set_block_size_override(args.block_size_explicit.then_some(args.block_size));
                 encoder.set_header_info(header_info.clone());
                 encoder.set_minimal_gzip_header(true);
                 encoder.compress_buffer_pure(&input, &mut counted)?;
@@ -767,12 +767,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             // T1 pipe (or explicit zopfli, any -p): the route below is
             // byte-identical to what stdin has always shipped — keep it
             // streaming (the encoder owns the read-to-end and the pad).
-            let opt_config = OptimizationConfig::new(
-                1,
-                0,
-                args.compression_level,
-                ContentType::Binary,
-            );
+            let opt_config =
+                OptimizationConfig::new(1, 0, args.compression_level, ContentType::Binary);
             crate::compress::compress_with_pipeline(
                 stdin(),
                 &mut counted,
