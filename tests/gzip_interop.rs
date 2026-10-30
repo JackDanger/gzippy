@@ -12,7 +12,7 @@
 //! The decode side still READS the marker (decompress::format), which is
 //! backward compatibility, not regressable writer behavior.
 
-const LEGACY_SUBFIELD_ID: [u8; 2] = [b'G', b'Z'];
+const LEGACY_SUBFIELD_ID: [u8; 2] = *b"GZ";
 
 /// A payload with real redundancy so every level produces a real member.
 fn payload(len: usize) -> Vec<u8> {

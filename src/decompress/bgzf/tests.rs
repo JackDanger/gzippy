@@ -4444,10 +4444,9 @@ mod optimization_tests {
             );
             // LEGACY "GZ" fixture — the marker subfield is synthesized by
             // hand; no writer emits it any more.
-            compressed
-                .extend_from_slice(&crate::compress::parallel::synthesize_legacy_gz_member(
-                    &block_output,
-                ));
+            compressed.extend_from_slice(&crate::compress::parallel::synthesize_legacy_gz_member(
+                &block_output,
+            ));
         }
 
         // Verify compressed data is valid gzip (decompress with gzip_decompress_ex)
@@ -4549,10 +4548,9 @@ mod optimization_tests {
             );
             // LEGACY "GZ" fixture — the marker subfield is synthesized by
             // hand; no writer emits it any more.
-            compressed
-                .extend_from_slice(&crate::compress::parallel::synthesize_legacy_gz_member(
-                    &block_output,
-                ));
+            compressed.extend_from_slice(&crate::compress::parallel::synthesize_legacy_gz_member(
+                &block_output,
+            ));
         }
 
         assert!(crate::decompress::format::has_bgzf_markers(&compressed));

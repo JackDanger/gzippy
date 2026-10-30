@@ -72,8 +72,16 @@ pub(crate) fn synthesize_legacy_gz_member(plain_member: &[u8]) -> Vec<u8> {
         "fixture input must be a whole gzip member"
     );
     assert_eq!(plain_member[3] & 0x04, 0, "input must not carry FEXTRA");
-    assert_eq!(plain_member[3] & 0x20, 0, "input must not carry reserved flag bits");
-    assert_eq!(plain_member[3] & 0x02, 0, "input must not carry the DEF flag");
+    assert_eq!(
+        plain_member[3] & 0x20,
+        0,
+        "input must not carry reserved flag bits"
+    );
+    assert_eq!(
+        plain_member[3] & 0x02,
+        0,
+        "input must not carry the DEF flag"
+    );
 
     // The FEXTRA field goes right after the 10-byte base header and BEFORE
     // FNAME/FCOMMENT (the RFC 1952 header field order the member already
@@ -91,7 +99,6 @@ pub(crate) fn synthesize_legacy_gz_member(plain_member: &[u8]) -> Vec<u8> {
     debug_assert_eq!(out.len() as u32, member_size);
     out
 }
-
 
 // GzipHeaderInfo moved to `super::gzip_header` (audit item #3) — re-exported below
 pub use super::gzip_header::GzipHeaderInfo;

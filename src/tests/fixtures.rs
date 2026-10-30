@@ -90,7 +90,9 @@ mod inner {
         // fixture synthesizes it onto the plain member (see
         // `synthesize_legacy_gz_member`).
         let header = GzipHeaderInfo::default();
-        crate::compress::parallel::synthesize_legacy_gz_member(&compress_bgzf_gz_plain(plain, &header))
+        crate::compress::parallel::synthesize_legacy_gz_member(&compress_bgzf_gz_plain(
+            plain, &header,
+        ))
     }
 
     fn compress_bgzf_gz_plain(plain: &[u8], header: &GzipHeaderInfo) -> Vec<u8> {
