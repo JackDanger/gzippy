@@ -94,3 +94,16 @@ One lever, one branch, one stab×3 verdict before merge; tie-guard before
 any T1-byte change; cross-layout confirm before any wall conviction; never
 rewrite a failed rule. The plan file lives in tree so the next agent picks
 it up; this file is on `docs/readme` and rides PR A2.
+
+---
+
+## Status ledger (2026-10-30, live)
+
+- Phase A branches in-repo, unpushed per git-credential outage: interop/no-gz-fextra-write, docs/readme, hygiene/hook-gates.
+- Phase C branches landed: wave-b/decode-output-writer, wave-b/stdin-parallel, wave-b/tiny-input-passthrough,
+  wave-b/sampler-removal, wave-b/tail-pad-fixed.
+- W1 stab×3 (chunk-buf pool, 52fa20aa) grading — run 1: NO-SHIP with 3 confirmed REAL cells
+  (armexe L9-T1 −0.29%; minjs L6-T4 −0.69%; minjs L9-T4 +2.4%; each libdeflate-axes at thin margins;
+  3 others acquitted LAYOUT-ARTIFACT). Merged verdict pending runs 2-3.
+- W2/W6 chains queued (/tmp/wave-gate.sh). Wave-B branches enter the queue after wave-A verdicts.
+- Fulcrum upstream carries the staleness fixes through 483e413.
