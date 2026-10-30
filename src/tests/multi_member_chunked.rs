@@ -19,12 +19,15 @@ mod tests {
         enc.finish().unwrap()
     }
 
-    /// gzippy's own "GZ"-FEXTRA parallel format (a pure-GZ member).
+    /// A PURE-GZ legacy member: the plain single member with the "GZ"
+    /// FEXTRA subfield synthesized on top — no writer in the tree emits the
+    /// legacy format any more, so the fixture builds it by hand (see
+    /// `synthesize_legacy_gz_member`).
     fn gz_subfield_member(payload: &[u8], _threads: usize) -> Vec<u8> {
         use crate::compress::parallel::{compress_single_member, GzipHeaderInfo};
-        let mut out = Vec::new();
-        compress_single_member(&mut out, payload, 1, &GzipHeaderInfo::default()).unwrap();
-        out
+        let mut member = Vec::new();
+        compress_single_member(&mut member, payload, 1, &GzipHeaderInfo::default()).unwrap();
+        crate::compress::parallel::synthesize_legacy_gz_member(&member)
     }
 
     fn concat(members: &[Vec<u8>]) -> Vec<u8> {

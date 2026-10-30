@@ -99,11 +99,13 @@ mod tests {
     }
 
     fn compress_bgzf(data: &[u8]) -> Vec<u8> {
+        // LEGACY "GZ" fixture — no writer emits the subfield any more; the
+        // decode-side route test synthesizes it by hand.
         use crate::compress::parallel::{compress_single_member, GzipHeaderInfo};
         let mut output = Vec::new();
         let header = GzipHeaderInfo::default();
         compress_single_member(&mut output, data, 1, &header).unwrap();
-        output
+        crate::compress::parallel::synthesize_legacy_gz_member(&output)
     }
 
     fn decompress_reference(gz_data: &[u8]) -> Vec<u8> {

@@ -19,7 +19,8 @@
 //! - Thread-local buffer reuse to minimize allocations
 //! - 128KB fixed blocks (matches pigz default)
 //! - libdeflate for L1-L6 (30-50% faster than zlib-ng)
-//! - BGZF-style block size markers in FEXTRA for fast parallel decompression
+//! - (the legacy "GZ" FEXTRA block-size marker: retired from compression in
+//!   v1.0 — the decode side still reads it for backward compatibility)
 
 // Increment 7: the C-FFI encoders here are compiled only for tests / the
 // `ffi-oracle` feature. In a NON-test `ffi-oracle` build they have no in-crate
@@ -50,9 +51,54 @@ use std::io::{self, Write};
 #[cfg(any(test, feature = "ffi-oracle"))]
 use std::path::Path;
 
-/// BGZF-style subfield ID for block size markers
-/// Using "GZ" to identify gzippy-compressed blocks with embedded block sizes
+/// Legacy "GZ" FEXTRA subfield ID — the v0.x parallel multi-block marker.
+/// READ SIDE ONLY since v1.0: the format detector (decompress::format) still
+/// recognizes it so pre-1.0 files decode, but no writer in the tree emits it.
 pub const GZ_SUBFIELD_ID: [u8; 2] = *b"GZ";
+
+/// Build a LEGACY pre-1.0 "GZ"-subfield member from a plain single member
+/// whose header carries no extra fields (the minimal-header shape every
+/// current writer emits). Test fixture only — it exists so the decode-side
+/// detector and marker scan keep their regression coverage against REAL
+/// legacy bytes now that no writer produces them.
+///
+/// Patch: FLG |= 0x04, insert XLEN(8) + [GZ][4][member_size] after the
+/// 10-byte base header, and restart the member total including both new
+/// fields — exactly the layout man/gzippy-format.5 documents.
+#[cfg(any(test, feature = "ffi-oracle"))]
+pub(crate) fn synthesize_legacy_gz_member(plain_member: &[u8]) -> Vec<u8> {
+    assert!(
+        plain_member.len() >= 18,
+        "fixture input must be a whole gzip member"
+    );
+    assert_eq!(plain_member[3] & 0x04, 0, "input must not carry FEXTRA");
+    assert_eq!(
+        plain_member[3] & 0x20,
+        0,
+        "input must not carry reserved flag bits"
+    );
+    assert_eq!(
+        plain_member[3] & 0x02,
+        0,
+        "input must not carry the DEF flag"
+    );
+
+    // The FEXTRA field goes right after the 10-byte base header and BEFORE
+    // FNAME/FCOMMENT (the RFC 1952 header field order the member already
+    // follows — FEXTRA is simply pushed ahead of any of them).
+    let member_size = plain_member.len() as u32 + 10;
+    let mut out = Vec::with_capacity(plain_member.len() + 10);
+    out.extend_from_slice(&plain_member[0..3]); // ID1 ID2 CM
+    out.push(plain_member[3] | 0x04); // FLG with FEXTRA
+    out.extend_from_slice(&plain_member[4..10]); // MTIME, XFL, OS
+    out.extend_from_slice(&[8, 0]); // XLEN = 8
+    out.extend_from_slice(&GZ_SUBFIELD_ID); // SI1 SI2
+    out.extend_from_slice(&[4, 0]); // SLEN = 4
+    out.extend_from_slice(&member_size.to_le_bytes()); // BLOCK_SIZE
+    out.extend_from_slice(&plain_member[10..]); // FNAME?/FCOMMENT?/deflate/trailer
+    debug_assert_eq!(out.len() as u32, member_size);
+    out
+}
 
 // GzipHeaderInfo moved to `super::gzip_header` (audit item #3) — re-exported below
 pub use super::gzip_header::GzipHeaderInfo;
@@ -91,9 +137,9 @@ pub fn get_block_size_for_level(level: u32) -> usize {
     match level {
         // L1-L2: Use 128KB blocks as baseline
         // This gives enough parallelism for small files
-        // Note: 128KB > BGZF u16 limit, so BGZF markers will be disabled
+        // 128KB blocks (kept from the legacy planner; no in-band markers)
         1 | 2 => 128 * 1024,
-        // L3-L6: Use 64KB blocks - fits BGZF, enables parallel decompression
+        // L3-L6: Use 64KB blocks for finer parallelization
         3..=6 => DEFAULT_BLOCK_SIZE,
         // L7-L9: Handled by pipelined compressor (shouldn't reach here)
         7..=9 => 128 * 1024,
@@ -338,9 +384,9 @@ impl ParallelGzEncoder {
         let header_info = self.header_info.clone();
 
         // Note: We previously fell back to single-stream for highly compressible data
-        // (ratio < 10%), but parallel BGZF blocks are always faster because:
+        // (ratio < 10%), but parallel member blocks are always faster because:
         // - The bottleneck is CPU time per block, not I/O overhead
-        // - BGZF header overhead is negligible (<0.01% of output)
+        // - Member header overhead is negligible (<0.01% of output)
         // - N threads processing N/num_threads of the data = N× throughput
         // The single-stream fallback was incorrect. Always use parallel blocks.
 
@@ -369,8 +415,9 @@ impl ParallelGzEncoder {
 /// For L0-L3: Uses ISA-L (AVX2/NEON assembly) if available, otherwise libdeflate.
 /// For L4-L12: Uses libdeflate.
 ///
-/// The output includes a standard gzip header with FNAME/MTIME and a BGZF-compatible
-/// block size marker in FEXTRA. This is valid gzip readable by any decompressor.
+/// The output includes a standard gzip header with FNAME/MTIME only — plain
+/// RFC 1952, no FEXTRA subfield (the "GZ" marker was retired from writers in
+/// v1.0; the decode side still reads it for backward compatibility).
 #[cfg(any(test, feature = "ffi-oracle"))]
 pub fn compress_single_member<W: Write>(
     writer: &mut W,
@@ -399,17 +446,13 @@ pub fn compress_single_member<W: Write>(
     Ok(bytes)
 }
 
-/// Compress a block with BGZF-style gzip header containing block size
+/// Compress a block as ONE standard gzip member (plain RFC 1952 header).
 ///
-/// The header includes:
-/// - Standard gzip magic (0x1f 0x8b)
-/// - FEXTRA flag set (0x04), optionally FNAME (0x08) and FCOMMENT (0x10)
-/// - "GZ" subfield with compressed block size (allows parallel decompression)
-/// - MTIME from file metadata (when available)
-/// - Original filename (when available)
-///
-/// This is compatible with all gzip decompressors (they ignore unknown subfields)
-/// but enables gzippy to find block boundaries without inflating.
+/// The header includes the standard gzip magic, FNAME/FCOMMENT (when
+/// available) and nothing else — NO FEXTRA subfield. The legacy "GZ" block
+/// size marker was retired from every writer in v1.0; block boundaries today
+/// are found by the decode side's structural scan (rapidgzip-style), which
+/// needs no in-band markers.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
 #[cfg(any(test, feature = "ffi-oracle"))]
@@ -423,11 +466,10 @@ pub fn compress_block_bgzf_libdeflate(
 
     output.clear();
 
-    // Reserve space for header (we'll write block size later)
-    let header_start = output.len();
-
-    // Build flags: FEXTRA always set, optionally FNAME and FCOMMENT
-    let mut flags: u8 = 0x04; // FEXTRA
+    // Build flags: optionally FNAME and FCOMMENT. NO FEXTRA — the legacy "GZ"
+    // subfield was retired from every writer (see `GZ_SUBFIELD_ID`: it lives
+    // on in the DECODE side only, to detect files produced before v1.0).
+    let mut flags: u8 = 0x00;
     if header_info.filename.is_some() {
         flags |= 0x08; // FNAME
     }
@@ -447,18 +489,7 @@ pub fn compress_block_bgzf_libdeflate(
         0xff, // OS (unknown)
     ]);
 
-    // FEXTRA: XLEN + subfield data
-    // XLEN: 8 bytes (2 byte ID + 2 byte len + 4 byte block size)
-    output.extend_from_slice(&[8, 0]);
-
-    // Subfield: "GZ" + 2 bytes len + 4 bytes block size (placeholder)
-    // Using 4 bytes allows block sizes up to 4GB
-    output.extend_from_slice(&GZ_SUBFIELD_ID);
-    output.extend_from_slice(&[4, 0]); // Subfield data length (4 bytes)
-    let block_size_offset = output.len();
-    output.extend_from_slice(&[0, 0, 0, 0]); // Placeholder for block size
-
-    // FNAME (after FEXTRA, per RFC 1952 order)
+    // FNAME (per RFC 1952 order)
     if let Some(ref name) = header_info.filename {
         output.extend_from_slice(name.as_bytes());
         output.push(0); // null terminator
@@ -508,18 +539,11 @@ pub fn compress_block_bgzf_libdeflate(
     // Write gzip trailer: CRC32 + ISIZE (uncompressed size mod 2^32)
     output.extend_from_slice(&crc32.to_le_bytes());
     output.extend_from_slice(&(block.len() as u32).to_le_bytes());
-
-    // Now write the total block size (including header and trailer)
-    let total_block_size = output.len() - header_start;
-
-    // Block size stored as u32 (no overflow possible for reasonable blocks)
-    output[block_size_offset..block_size_offset + 4]
-        .copy_from_slice(&(total_block_size as u32).to_le_bytes());
 }
 
-/// Compress a block using ISA-L for levels 0-3, with BGZF-style header.
-/// Uses the same header format as compress_block_bgzf_libdeflate so blocks
-/// from either compressor can be mixed.
+/// Compress a block using ISA-L for levels 0-3, plain member header
+/// (same format as compress_block_bgzf_libdeflate so blocks from either
+/// compressor can be mixed).
 /// Compresses directly into the output buffer to avoid per-block allocation.
 #[cfg(any(test, feature = "ffi-oracle"))]
 fn compress_block_bgzf_isal(
@@ -529,9 +553,10 @@ fn compress_block_bgzf_isal(
     header_info: &GzipHeaderInfo,
 ) {
     output.clear();
-    let header_start = output.len();
 
-    let mut flags: u8 = 0x04; // FEXTRA
+    // Plain member header — NO FEXTRA (the legacy "GZ" subfield is retired
+    // from every writer; see `GZ_SUBFIELD_ID` for the read-side note).
+    let mut flags: u8 = 0x00;
     if header_info.filename.is_some() {
         flags |= 0x08;
     }
@@ -542,13 +567,6 @@ fn compress_block_bgzf_isal(
     output.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
     output.extend_from_slice(&header_info.mtime.to_le_bytes());
     output.extend_from_slice(&[0x00, 0xff]);
-
-    // FEXTRA: 8 bytes (2 ID + 2 len + 4 block size)
-    output.extend_from_slice(&[8, 0]);
-    output.extend_from_slice(&GZ_SUBFIELD_ID);
-    output.extend_from_slice(&[4, 0]);
-    let block_size_offset = output.len();
-    output.extend_from_slice(&[0, 0, 0, 0]); // placeholder
 
     if let Some(ref name) = header_info.filename {
         output.extend_from_slice(name.as_bytes());
@@ -597,10 +615,6 @@ fn compress_block_bgzf_isal(
     let crc32 = crc32fast::hash(block);
     output.extend_from_slice(&crc32.to_le_bytes());
     output.extend_from_slice(&(block.len() as u32).to_le_bytes());
-
-    let total_block_size = output.len() - header_start;
-    output[block_size_offset..block_size_offset + 4]
-        .copy_from_slice(&(total_block_size as u32).to_le_bytes());
 }
 
 // These tests exercise the C-FFI ParallelGzEncoder / BGZF block compressors,
