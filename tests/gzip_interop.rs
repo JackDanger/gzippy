@@ -66,7 +66,10 @@ fn assert_no_fextra_member_header(stream: &[u8], what: &str) {
             j += 1; // NUL
         }
         // DEF (flg bit 5) would need 2 more bytes; never emitted anywhere.
-        assert!(flg & 0x20 == 0 && flg & 0x02 == 0, "{what}: unexpected flags {flg:#04x}");
+        assert!(
+            flg & 0x20 == 0 && flg & 0x02 == 0,
+            "{what}: unexpected flags {flg:#04x}"
+        );
         let _ = first;
         first = false;
         // For a single-member stream the member body follows; with more
@@ -101,7 +104,10 @@ fn no_level_or_thread_count_sets_fextra() {
             // mmap-free path) and the T>1 pure pipeline at every level.
             let out = gzippy::compress_with_threads(&data, level, threads)
                 .unwrap_or_else(|e| panic!("L{level} T{threads}: {e}"));
-            assert_no_fextra_member_header(&out, &format!("compress_with_threads L{level} T{threads}"));
+            assert_no_fextra_member_header(
+                &out,
+                &format!("compress_with_threads L{level} T{threads}"),
+            );
             // Independent-decoder roundtrip: another gzip MUST read it.
             let mut d = flate2::read::MultiGzDecoder::new(&out[..]);
             let mut restored = Vec::new();
@@ -116,8 +122,7 @@ fn no_level_or_thread_count_sets_fextra() {
 fn no_fextra_on_the_streaming_wrapper() {
     let data = payload(400_000);
     let mut out = Vec::new();
-    gzippy::compress_to_writer(&data[..], &mut out, 7)
-        .expect("compress_to_writer");
+    gzippy::compress_to_writer(&data[..], &mut out, 7).expect("compress_to_writer");
     assert_no_fextra_member_header(&out, "compress_to_writer L7");
 
     let mut restored = Vec::new();
