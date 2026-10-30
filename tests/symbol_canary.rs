@@ -105,13 +105,6 @@ const SUBSTRINGS: &[&str] = &[
     // pick-min (lib.rs's PARSER TRUTH owns the contract now,
     // tests/streaming_api_is_honest.rs pins it). The canary itself caught it:
     // both substrings went 0-match at the pin step.
-    // greedy::run_resumable / lazy::run_resumable were REMOVED from this
-    // watch list 2026-09-04: the one-encoder stack (PR #367, d9418505 lineage)
-    // deleted the streaming-tail machinery they lived in — resumable parses
-    // existed only for the streaming route whose routing went away with
-    // pick-min (lib.rs's PARSER TRUTH owns the contract now,
-    // tests/streaming_api_is_honest.rs pins it). The canary itself caught it:
-    // both substrings went 0-match at the pin step.
     // REACH + INTERLEAVED + GZIP_HASH monomorphized `fastloop_l1` (PR #331
     // three-way fastloop); those arms were deleted by the same stack, so the
     // watch now covers exactly what exists: the two `fastloop_l1_lean`
@@ -125,8 +118,15 @@ const SUBSTRINGS: &[&str] = &[
     "emit_sequences",
     "build_dynamic_header",
     "make_huffman_code_into",
-    "compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>",
-    "compress_buffer_pure::<std::io::buffered::bufwriter::BufWriter<std::fs::File>>",
+    // 2026-10-30: the 2026-10 CI toolchain bump changed how nm demangles the
+    // BufWriter generic argument — std moved the buffered-IO submodule from the
+    // `std::` to the `alloc::` crate path in demangled names (verified on
+    // aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu CI and
+    // aarch64-apple-darwin CI simultaneously 0-matched the old substrings).
+    // Functions unchanged — substrings re-pointed, pins re-graded by the
+    // owning boxes at next run.
+    "compress_buffer_pure::<alloc::io::buffered::bufwriter::BufWriter<std::io::stdio::Stdout>>",
+    "compress_buffer_pure::<alloc::io::buffered::bufwriter::BufWriter<std::fs::File>>",
 ];
 
 const REGEN_CMD: &str = "cargo build --profile release-syms && \
