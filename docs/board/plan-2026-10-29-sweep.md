@@ -128,3 +128,27 @@ it up; this file is on `docs/readme` and rides PR A2.
   system-wide here; project-local venv at .tooling/venv-cmake carries it
   (`PATH=.tooling/venv-cmake/bin:$PATH`). release-syms twin ~40 min LTO; cached
   after.
+- **W2 (optimizer-pool, f5d4f57f) final verdict: NO-SHIP-STABLE** across
+  stab×3 — all three runs NoShip; confirmed thin-margin REJECTs repeat in
+  every run, concentrated in the `libdeflate:*:L8/L9:T1:wall` band (aozora
+  L8/L9, data.json L8/L9, dickens L8/L9, symbols.dwarf L8/L9, tool.bin L8/L9;
+  Δ up to +1.0% over the flat budget, sign-confirmed by the margin-floor
+  arithmetic). Stable-real and owned by the lever's own code, not layout.
+  Two-strikes rule keeps the lever out; branch stays on origin unmerged as
+  receipts (`wave-a/optimizer-pool`).
+- **W6 (stored-crc fold, f8adee5f) final verdict: LAYOUT-ATTRIBUTED** —
+  runs 1–2 clause-4 FAIL (no failing cell closed; fail-gap 51.90→52.24 did
+  not drop ≥1%), run 3 grew no stable per-cell conviction; per the merge
+  rule a conviction realized in only some runs is layout-unstable and the
+  verdict never self-upgrades. Lever out; branch stays on origin unmerged
+  as receipts (`wave-a/stored-crc-fold`).
+- **Wave-A closed: W1 NO-SHIP, W2 NO-SHIP-STABLE, W6 LAYOUT-ATTRIBUTED —
+  zero levers merged from wave-A.** Receipts:
+  `campaign/try-{w1-pool,w2-pool,w6-fold}-stab3/try-stabilized.json`.
+- **Wave-B grading in progress** (runner alive): c1 decode-output-writer
+  (3d30eb9c) chain through run 3; c2–c5 (c82f1af7 / d161a3b1 / 7e3e6696 /
+  f84b0ed4) queued serially behind it. Dispositions land here as each
+  verdict stabilizes.
+- Measurement ops: serialized stab×3 chains ran clean end-to-end after the
+  log-path fix; fulcrum 483e413 (dirty=false), cores 0-7 throughout, gates
+  respected.
