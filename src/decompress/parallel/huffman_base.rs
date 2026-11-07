@@ -274,12 +274,25 @@ impl HuffmanCodingBase {
         // `m_maxCodeLength = getMax( codeLengths );` (HuffmanCodingBase.hpp:61)
         let mut max_len: u8 = 0;
         // `m_minCodeLength = getMinPositive( codeLengths );` (HuffmanCodingBase.hpp:63)
-        let mut min_len: u8 = u8::MAX;
+        //
+        // Vendor `getMinPositive` (common.hpp:408) seeds from the container
+        // front and keeps the smallest positive value, scanning as
+        // `result > 0 ? min(result, value) : value`; with nothing positive it
+        // returns 0. And 0/0 is not just a sentinel-clean state: "A maximum
+        // code length of 0 is valid! It happens when encoding this with
+        // pigz ... 0CL.pigz" (initializeMinMaxCodeLengths, :59-60). Mirror
+        // that — leaving `u8::MAX` here made `1u32 <<
+        // self.min_code_length` in check_code_length_frequencies shift by 255
+        // and panic on all-zero alphabets. The vendor applies
+        // `frequencies[0] > 1 << 0` there, so size-1 all-zero alphabets keep
+        // passing as the empty tree while larger ones are rejected as
+        // InvalidCodeLengths, exactly like the C++.
+        let mut min_len: u8 = 0;
         for &cl in code_lengths {
             if cl > max_len {
                 max_len = cl;
             }
-            if cl > 0 && cl < min_len {
+            if cl > 0 && (min_len == 0 || cl < min_len) {
                 min_len = cl;
             }
         }
@@ -419,5 +432,56 @@ mod tests {
         // 1 symbol of code length 1.
         let lens = [1u8];
         assert!(check_huffman_code_lengths(&lens, 15));
+    }
+
+    /// All-zero alphabets mirror the vendor semantics documented for the
+    /// `0CL.pigz` probes: min resolves to 0 via `getMinPositive`, never a
+    /// sentinel, and the frequency check then applies the plain vendor rules
+    /// — sizes > 1 are rejected outright, and the size-1 alphabet passes as
+    /// the empty tree.
+    /// Regression: `u8::MAX` used to leak through as `min_code_length` and
+    /// `1u32 << 255` panicked at huffman_base.rs:309 (observed as stray
+    /// panics from worker threads of passing integration tests).
+    #[test]
+    fn all_zero_alphabets_reject_without_panicking() {
+        let zeros = [0u8; 512];
+        for size in [2usize, 19, 30, 288, 512] {
+            let mut base = HuffmanCodingBase::new();
+            let err = base.initialize_min_max_code_lengths(&zeros[..size], 512);
+            assert_eq!(err, Error::None, "size {size}: vendor returns None here");
+            let mut freqs: CodeLengthFrequencies = [0; CODE_LENGTH_STORAGE];
+            for &cl in &zeros[..size] {
+                freqs[cl as usize] += 1;
+            }
+            assert_eq!(base.min_code_length, 0, "size {size}: getMinPositive is 0");
+            let err = base.check_code_length_frequencies(&freqs, size, false);
+            assert_eq!(err, Error::InvalidCodeLengths, "size {size}");
+        }
+    }
+
+    /// The documented `0CL.pigz` shape: one zero-length symbol = the empty
+    /// tree the vendor accepts (min 0, max 0, `is_valid`).
+    #[test]
+    fn all_zero_single_symbol_is_the_empty_tree() {
+        let mut base = HuffmanCodingBase::new();
+        assert_eq!(
+            base.initialize_min_max_code_lengths(&[0u8], 512),
+            Error::None
+        );
+        assert_eq!((base.min_code_length, base.max_code_length), (0, 0));
+        assert!(base.is_valid(), "vendor min<=max, so valid");
+
+        let mut freqs: CodeLengthFrequencies = [0; CODE_LENGTH_STORAGE];
+        freqs[0] = 1;
+        assert_eq!(
+            base.check_code_length_frequencies(&freqs, 1, false),
+            Error::None
+        );
+        // CHECK_OPTIMALITY with no symbols at all: nonZeroCount != 1 and
+        // not > 1, so neither branch trips (vendor :104-109).
+        assert_eq!(
+            base.check_code_length_frequencies(&freqs, 1, true),
+            Error::None
+        );
     }
 }
