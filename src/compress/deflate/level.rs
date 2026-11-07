@@ -494,19 +494,24 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     }
     if level == 8 {
         // L8 keeps the raw L11-knob path (the L9 retune's "scope guard: no
-        // silent creep") — but the retune lever is now PRICED. Measured
-        // 2026-11-06 on this Mac, ladder-tune binary, `GZIPPY_LADDER`
-        // override, `-p4`, medians of 5, T4, vs the shipped passes=4:
+        // silent creep") — but the retune lever is now PRICED, on BOTH thread
+        // axes, and the answer is thread-scoped. Measured 2026-11-06/07 on
+        // this Mac, ladder-tune binary, `GZIPPY_LADDER` override,
+        // medians of 5 (T4) / 9 (T1), vs the shipped passes=4:
         //
-        //     corpus        passes=2                     passes=1
-        //     silesia-mix   x0.790 wall  +2,538 B (+0.068%)   x0.655  +17,742 B (+0.476%)
-        //     bin-heavy     x0.776 wall  +3,956 B (+0.085%)   x0.643  +23,552 B (+0.506%)
+        //     T>1  (-p4: silesia-mix x0.783 wall / +0.068%,
+        //                bin-heavy   x0.776 wall / +0.085%)   passes=1: x0.643-0.655, +0.48-0.51%
+        //     T1   (-p1: silesia-mix x1.058, text-1MB x1.043 — WORSE,
+        //                medians of 9, both corpora agree)
         //
-        // passes=2 is better on both axes than the landed L9 receipt
-        // ("passes2 −16% wall for +0.6%"). NOT SHIPPED: the same scope guard
-        // that authorized L9's retune as its own lever applies here — an L8
-        // retune must run its own board (the near-opt-ladder tool shape of
-        // the L9 landing) before this comment is allowed to shrink.
+        // So passes=2 wins the T>1 axis (better on both axes than the landed
+        // L9 receipt: "passes2 −16% wall for +0.6%") and LOSES the T1 axis by
+        // 4-6%. A thread-count-scoped retune (`threads beyond 1 → passes=2`)
+        // is a NEW routing dimension, not a level knob — its adjudication
+        // belongs to the board, and `make lever ARGS="--threads 1,4"` grades
+        // exactly this shape. NOT SHIPPED: the same scope guard that
+        // authorized L9's retune as its own lever applies here; the shipped
+        // line below stays byte-for-byte main's.
         return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
