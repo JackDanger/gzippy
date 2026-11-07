@@ -208,12 +208,21 @@ impl LdxCompressor {
             cfg_override.unwrap_or((max_search_depth, nice_match_length, good_match));
 
         let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
-            // ⚠ PROBE (2026-09-28, the residual board's access.log L5 card):
-            // the fingerprint diff named 50,210 len-3 tokens in gzip's access.log
-            // stream where ours carries zero — the far-len-3 gate is the priced
-            // candidate at L5 too. MEASUREMENT-ONLY row until the sweep plus the
-            // wall check adjudicate it.
+            // Adjudicated lever (6165d87f): the ported L3 len-3 machinery
+            // retires the L3 routing exception — shipped and priced, not a
+            // probe. See the level map above.
             3 => (true, 224),
+            // L5 residual-board probe row (b2eca3bc, 2026-09-28): byte-neutral
+            // on that probe's residual members ("honest zero") but NOT byte
+            // neutral across the wider corpus — 15/32 of corpus/silesia_blocks
+            // change bytes both directions (+94 max, −158 min) when armed vs
+            // not. A shipped un-adjudicated decision divergence violates the
+            // charter's L2-L9 byte-identity bar, so the row ships OFF; it is
+            // armed only under `ladder-tune`, where every other
+            // measurement-only knob lives. Re-adjudication must sweep the
+            // whole size board (the 15 diverging members above included),
+            // not just the residual members.
+            #[cfg(feature = "ladder-tune")]
             5 => (true, 224),
             _ => (false, 0),
         };
