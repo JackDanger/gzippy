@@ -531,6 +531,17 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // plain Lazy2-300 arm with the rest of the ladder, byte-class parity with
     // C libdeflate -8, at 0.35x of that rival's wall.
     let mut p = params_inner(level);
+    // L8 BEST-GUESS SELECTION (worktree probe, 2026-11-07, second try):
+    // `try_exact_huffman` was measured INERT on the lazy2 route (the knob's
+    // engine.wasm receipt predates this engine class; zero byte effect at
+    // L8-T>1) — replaced by the zlib `good_length` quartering knob, the same
+    // lever that closed the L6/L7 exceptions: when the incumbent match is
+    // already >= good_match (64), the chain walk drops to depth/4. Diverges
+    // from C libdeflate's parse on purpose, like the L6/L7 receipts; the bet
+    // is wall-neutral-or-better at the same or smaller size.
+    if level == 8 {
+        p.good_match = 64;
+    }
     // DEPTH, NOT STRATEGY. A parser-strategy step (Greedy->Lazy,
     // Lazy->Lazy2) alone was NO-SHIP on the wall clause: it flipped
     // igzip:weights.safetensors:L2:T4 from 0.9998 to 1.0002. Mechanism, measured: on

@@ -182,6 +182,13 @@ pub fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) ->
     debug_assert!(num_threads >= 1);
     // L1 uses fewer chunks (better amortization of the fast matchfinder);
     // L2+ uses the standard chunk count.
+    //
+    // [SELECTION FALSIFIED 2026-11-07, worktree probe]: the L8-specific
+    // cpt=1 + 4 MiB ceiling candidate won ~8% wall at -p2/-p4 but
+    // QUEUE-STARVED -p8 (+71% — cpt=1 caps the chunk count near the
+    // reference-thread count, so threads beyond 4 sit idle). Reverted to
+    // the stock grid; the selection that survives the run is
+    // `good_match=64` in the level table only.
     let cpt = if level <= 1 { 1 } else { chunks_per_thread() };
     let max_block = if level >= 6 {
         MAX_T_AWARE_BLOCK_SIZE_L6_UP
