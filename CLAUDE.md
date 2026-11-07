@@ -24,6 +24,37 @@ four commands you will actually use:
 `make lever` grades levels 2,6,9 and threads 1 BY DEFAULT. Both defaults have shipped
 a wrong verdict; pass the level and thread range the change actually acts on.
 
+## The local loop (laptop agent) — what CAN be done here and how
+
+The four commands above are authority-box commands: on any other machine they
+run all the way to measuring NOTHING (`ir_budget` logs "MEASURED NOTHING" and
+passes; `make board-size` needs fulcrum on the frozen box). The laptop loop that
+legitimately precedes a lever PR is smaller and wired as a script:
+
+    scripts/perf/ab.sh                     # HEAD-vs-tree release A/B: byte identity
+                                           #   over the corpus + interleaved wall, medians
+    scripts/perf/ab.sh -l 3,8 -p 1,4        # pick the cells the change actually touches
+    scripts/perf/ab.sh --byte-only          # pure byte-identity gate
+    scripts/perf/ab.sh --keep               # retain the two binaries for follow-up probes
+
+It handles the two traps every first-time A/B hits: fresh `git worktree`s do not
+materialize submodules (the script symlinks `vendor/isal-rs/isal-sys` and
+`vendor/isa-l` into the baseline worktree, without which `isal-sys` will not
+build), and the user-global `~/.cargo/config.toml` pins ONE shared `target-dir`
+(two builds must each get their own `--target-dir` or the second overwrites the
+first binary — colliding arms produce byte-identical "A/B" comparisons that lie).
+
+Rules that stay UNCONDITIONAL on a laptop (they are charter bars, not box
+privileges): the byte bar for wall-only claims, the lever ceremony for anything
+that changes output bytes (probe rows ride `ladder-tune`, never the shipped map),
+the no-env rule, and the scope sentences in `level.rs`/routing comments. What the
+laptop loop buys is the RIGHT TO PROPOSE: measured receipts (byte deltas,
+interleaved wall medians) go in the PR and the in-file comments, and the frozen
+box still adjudicates promotion. Wall numbers from an unfrozen box are
+hypothesis-tier — treat a tie as NO-SHIP (the 2026-11-06 pipelined-walk
+falsifier in `ldx/hc_matchfinder.rs` is the template), and present a win as a
+lever whose board step is still owed.
+
 ## Build order — the plan IS one encoder now (reset 2026-09-03)
 
 **STATUS — the Aug-20 build order below is SUPERSEDED by what shipped 2026-08-21→23,

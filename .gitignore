@@ -98,3 +98,6 @@ shortmatch-*.bin
 # committed by accident in #255 and shipped in every clone since.
 target-trace/
 target-*/
+
+# Session-local scratch (A/B binaries, probe corpora, chrome traces).
+.review-tmp/
