@@ -479,14 +479,21 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     //
     // 2. SIZE. The old routing receipt ("whole_t1 bytes LOSE to gzip -8 on
     //    match-rich classes", gun-vs-libdeflate whole_t1 at 2,444,590 vs
-    //    gzip -8 2,425,693) predates the ldx port: today's T1-L8 output is
-    //    the same size as C libdeflate -8 to the byte (3,822,479 == 3,822,479;
-    //    same size class, different internal code ordering), so the chunked
-    //    lazy2 output (3,820,237) sits BELOW every rival at -8:
-    //    libdeflate 3,822,479 / pigz 3,911,509 / gzip 3,913,317 on the same
-    //    corpus. The bar is "at least as small as the rivals", not "as small
-    //    as our own previous output"; the +2.4% regression against the
-    //    near-opt route is spent wall headroom, bought back at 7.4x.
+    //    gzip -8 2,425,693) predates the ldx port: today's T1-L8 deflate
+    //    PAYLOAD is byte-identical to C libdeflate -8 (3,822,479 == 3,822,479
+    //    verified payload-exact after the 10-byte header; the only container
+    //    delta is XFL 0x00 vs the C's 0x02), so the chunked lazy2 output
+    //    (3,820,237) sits at-or-below the rivals at -8 on the aggregate
+    //    corpus: libdeflate 3,822,479 / pigz 3,911,509 / gzip 3,913,317.
+    //    ⚠ PER-MEMBER DISPROOF (2026-11-07): at member granularity the
+    //    chunked boundaries cost 3/30 silesia members +4/+6/+7 B vs C
+    //    libdeflate -8 (023: +4, 024: +6, 028: +7 = 0.003-0.005%, near-tie
+    //    class); EVERY member still lands below pigz -8 and gzip -8, and
+    //    the aggregate stays below libdeflate. The three near-ties are
+    //    exactly the cells this lever trades for 7.1x wall.
+    //    The bar is "at least as small as the rivals", not "as small as our
+    //    own previous output"; the +2.4% regression against the near-opt
+    //    route is spent wall headroom, bought back at 7.4x.
     //
     // L9's near-opt route stays exactly as landed (its passes=2 retune is
     // C-beating on its corpus mix); L8 alone leaves the near-opt ladder.
