@@ -493,6 +493,20 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         return p;
     }
     if level == 8 {
+        // L8 keeps the raw L11-knob path (the L9 retune's "scope guard: no
+        // silent creep") — but the retune lever is now PRICED. Measured
+        // 2026-11-06 on this Mac, ladder-tune binary, `GZIPPY_LADDER`
+        // override, `-p4`, medians of 5, T4, vs the shipped passes=4:
+        //
+        //     corpus        passes=2                     passes=1
+        //     silesia-mix   x0.790 wall  +2,538 B (+0.068%)   x0.655  +17,742 B (+0.476%)
+        //     bin-heavy     x0.776 wall  +3,956 B (+0.085%)   x0.643  +23,552 B (+0.506%)
+        //
+        // passes=2 is better on both axes than the landed L9 receipt
+        // ("passes2 −16% wall for +0.6%"). NOT SHIPPED: the same scope guard
+        // that authorized L9's retune as its own lever applies here — an L8
+        // retune must run its own board (the near-opt-ladder tool shape of
+        // the L9 landing) before this comment is allowed to shrink.
         return default_params_parallel_route(11);
     }
     let mut p = params_inner(level);
