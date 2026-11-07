@@ -404,19 +404,30 @@ pub(crate) fn hc_matchfinder_longest_match(
         // link-load shape ported here (hc.rs:414-504). The NEXT link is loaded
         // BEFORE the current candidate is compared, so the link load overlaps the
         // probe latency instead of serialising behind each miss; on a hit the
-        // already-loaded link feeds the >=5 search without a second walk step. Each
-        // preload also hints the next candidate's data line one node ahead (the
-        // `prefetchw` at `matchfinder_common.rs:109`): a hint only, issued only for
-        // a LIVE node (the same cutoff test the next step would apply), so no
-        // address outside the walker's reachable window is ever formed.
+        // already-loaded link feeds the >=5 search without a second walk step.
+        // Each preload also hints the next candidate's data line one node ahead:
+        // a hint only, issued only for a LIVE node (the same cutoff test the next
+        // step would apply), so no address outside the walker's reachable window
+        // is ever formed.
         //
         // Visit order, cutoff/depth checks and every compare are IDENTICAL to the
         // classic walk above — same nodes, same order, same returns — so the
-        // reported match and the stream are unchanged by construction. Counter
-        // totals stay event-for-event too (each preload site bumps `chain_reads`
-        // exactly where the classic walk's advance loads): the one exception is a
-        // `nice_len` exit, where the pipeline has already paid one extra chain
-        // load the classic walk defers — the same accounting the legacy walk has.
+        // reported match and the stream are unchanged by construction: verified
+        // locally, 0 byte deltas over corpus/silesia_blocks + test_data at
+        // L2/L3/L4/L8/L9. Counter totals stay event-for-event too (each preload
+        // site bumps `chain_reads` exactly where the classic walk's advance
+        // loads): the one exception is a `nice_len` exit, where the pipeline has
+        // already paid one extra chain load the classic walk defers — the same
+        // accounting the legacy walk has.
+        //
+        // ⚠ FALSIFIER (2026-11-06, this Mac): interleave-repped wall A/B vs the
+        // classic walk shipped here — 12 cells (silesia-mix / bin-heavy /
+        // text × L2/L4/L9), medians of 7: B/A 0.996-1.027 with the SIGN
+        // flipping per corpus (worst +2.6% text L4, reversed on the same
+        // content at a different input size). Wall-neutral locally; the
+        // promotion that hc.rs already enjoys was NOT reproduced here and
+        // stays pending an authority-box measurement. Stays behind
+        // `ladder-tune`; the classic shape above remains shipped.
         #[cfg(feature = "ladder-tune")]
         {
             bump!(local.chain_reads);
@@ -600,6 +611,10 @@ pub(crate) fn hc_matchfinder_longest_match(
     // and each miss reuses it — the compare of the current candidate overlaps the
     // link load and the next candidate's data prefetch. The classic walk's visit
     // order, checks and returns are reproduced exactly, so bytes cannot change.
+    //
+    // Same 2026-11-06 falsifier as the >=4 walk above: wall-neutral on this
+    // Mac (12-cell interleave A/B), stays behind `ladder-tune` pending an
+    // authority-box measurement.
     #[cfg(feature = "ladder-tune")]
     {
         bump!(local.chain_reads);
