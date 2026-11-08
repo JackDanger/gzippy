@@ -621,12 +621,21 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //       and priced the gate's costs wrong. With the correct bsr the port
     //       reproduces the incumbent exactly.)
     //
-    //   L6  STAYS AN EXCEPTION: the port's L6 wall is +1.8% on the
-    //       gated leg (byte-equal output; erodes the heavily-won cell past
-    //       the flat budget). The port's good_match bookkeeping pays
-    //       for itself at L6-T1 in instructions (+3.6-5.2% Ir/B) and NOT in
-    //       wall; L6 stays on the legacy arm until the port's L6 economy
-    //       reprices.
+    //   L6  CLOSED 2026-11-08 (BYTE-FREEDOM repricing, wave-3 forensics): the
+    //       historical "+1.8% port wall premium on the gated leg" does not
+    //       reproduce on today's code — a controlled same-config A/B (both
+    //       arms at (128, 65, 8), interleaved, 5/5 rounds, hypothesis-tier
+    //       per the charter) measured the PORT 4.0% FASTER than the legacy
+    //       arm, and the two arms emit byte-identical deflate bodies at that
+    //       config (the uniform +18 B looked like divergence and was the
+    //       gzip frame). The good_match quartering pays in WALL as well as
+    //       Ir: removing it (mechanism probe, bytes deliberately changed)
+    //       costs the port +11.8%. Sizes stay legal: port-L6 = shipped-L6
+    //       bytes, aggregate −29,095 B under the libdeflate -6 bar, tightest
+    //       members `019.bin` = 1 B under ldc (tie band) and `025.bin`
+    //       0.105% — re-check those two band-edge cells on the canonical
+    //       corpus at merge. Route L6 to the port; the legacy-lazy arm
+    //       remains only for L1.
     //
     //   L1  stays an exception: our L1 is igzip-derived and BEATS pigz -1 on
     //       text where the port does not (43,980 vs 42,384 = 1.038x pigz).
@@ -634,7 +643,7 @@ pub(crate) fn level_uses_ldx(level: u32) -> bool {
     //
     // Enforced by `tests/one_encode_only.rs`, which COUNTS encoder entries: a predicate
     // has lied about exactly this three times.
-    !matches!(level, 1 | 6) && level <= 9
+    !matches!(level, 1) && level <= 9
 }
 
 pub fn encode_gzip_slack_padded_to_vec(buf: &[u8], logical_len: usize, level: u32) -> Vec<u8> {
