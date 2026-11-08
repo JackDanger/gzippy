@@ -9,6 +9,29 @@ LEVEL THE USER TYPED, and less wall time — on their machine, at their thread c
 DECOMPRESSION IS DONE AND WON (four months, PR #116, merged 2026-07-18). Do not
 revisit it, re-measure it, or optimise it. This file is about the encoder.
 
+**BYTE-FREEDOM (owner, 2026-11-07):** "We don't care that gzippy compresses into
+anything byte-identical to anything else, we only care that it's a valid gzip."
+The correctness bar is VALID GZIP — roundtrip sha256 through our decoder plus one
+independent decoder, at every level, thread count and input class — plus the
+per-label size/wall bar against the four rivals above. Byte-identity to the
+vendor, to our own T1, or to a previous gzippy build is NOT a goal, NOT a gate,
+and NOT a reason to reject or accept a change. This supersedes every byte-parity
+rationale in this file and in the plan docs:
+
+* The ldx case-for-port ("decision-for-decision identical bytes") and the
+  exception-retirement machinery (#363/#364/#446 template) are now instrument
+  history, not bars. Routing a level to any engine is a pure size/wall question,
+  adjudicated by the size/wall cells alone.
+* Budget letters tied to parity ("+0.6% authorized spend", "tie on size") keep
+  their numbers but their RATIONALE is the size bar, not identity.
+* Content-adaptive or thread-adaptive parse selection, chunk-grid re-halving,
+  `good_match`-class knobs anywhere in the ladder, and any engine mix are in
+  scope as ordinary levers: what must hold is a valid stream, sizes at-or-below
+  the rivals' at the typed level, and the wall board.
+* The falsifier discipline does NOT change: interleave, medians, verify-stamped
+  probe binaries, "tie = NO-SHIP locally". Whatever a lever is claimed to win,
+  the claim is now simply "valid + smaller-or-equal + faster", never "identical".
+
 **Where everything is.** This file is the charter; it is not the state and it is not
 the toolbox. `docs/plan-2026-09-one-encoder.md` is the live state, the phase plan and
 the board-numbers contract — read it FIRST. `docs/encoder-campaign-plan.md` is kept
