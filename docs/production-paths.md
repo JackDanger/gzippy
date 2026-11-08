@@ -125,6 +125,13 @@ Input (reader, args, opt_config)
       and a combined CRC/ISIZE trailer. NOT the legacy "GZ" multi-block
       format: no writer in the tree emits the "GZ" FEXTRA subfield at all
       (removed in v1.0; decode-side reading of it remains for old files).
+      NOTE (2026-11-08 probe): T>1 at L2-L5/L7 may be SMALLER than T1 BY DESIGN —
+      the chunk parse runs `level::params_parallel` (max_search_depth ×4 +
+      `try_exact_huffman`, `level.rs:431-627`) while T1 runs the libdeflate port at
+      preset depth; dictionary sharing across chunks is NOT the cause (measured,
+      16,085,866-B corpus: L2 T1 4,328,425 → T4 4,235,747 with ONE chunk
+      (params-only −92,678) vs 4,235,399 with the default 9-chunk grid (dict+seams
+      −348 net); L3 4,118,450 → 4,072,249 / 4,073,729 the same shape).
 ```
 
 ### Format notes
