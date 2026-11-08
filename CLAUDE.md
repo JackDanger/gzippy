@@ -8,6 +8,11 @@ LEVEL THE USER TYPED, and less wall time — on their machine, at their thread c
 
 DECOMPRESSION IS DONE AND WON (four months, PR #116, merged 2026-07-18). Do not
 revisit it, re-measure it, or optimise it. This file is about the encoder.
+Carve-out (2026-11-07): a demonstrated decoder DEFECT — a panic, UB or
+vendor-divergent behavior on any input the vendor handles, including
+corrupt-input parity paths — may be fixed as its own PR with the failing test
+as receipt (PR #443 is the template). Nothing of that license extends to
+re-measurement, restructuring, or performance work on the decoder.
 
 **BYTE-FREEDOM (owner, 2026-11-07):** "We don't care that gzippy compresses into
 anything byte-identical to anything else, we only care that it's a valid gzip."
@@ -24,10 +29,23 @@ rationale in this file and in the plan docs:
   adjudicated by the size/wall cells alone.
 * Budget letters tied to parity ("+0.6% authorized spend", "tie on size") keep
   their numbers but their RATIONALE is the size bar, not identity.
-* Content-adaptive or thread-adaptive parse selection, chunk-grid re-halving,
-  `good_match`-class knobs anywhere in the ladder, and any engine mix are in
-  scope as ordinary levers: what must hold is a valid stream, sizes at-or-below
-  the rivals' at the typed level, and the wall board.
+* **Thread-adaptive** parse selection (routing by the `-p` the user typed),
+  chunk-grid re-balancing, `good_match`-class knobs anywhere in the ladder, and
+  any engine mix are in scope as ordinary levers: what must hold is a valid
+  stream, sizes at-or-below the rivals at the typed level, and the wall board.
+  **Content-adaptive selection stays under non-negotiable #3** (below): it may
+  arrive only as parameter tuning after user sign-off — nothing here re-legalizes
+  the deleted corpus/cell detectors. Cross-`-p` byte equality
+  (`tests/thread_byte_parity.rs`, "THE CONTRACT v3.1") is a determinism nicety,
+  not a bar: a winning chunk-grid lever may renegotiate it, deliberately, in
+  that lever's PR.
+* **TIE BAND (owner, 2026-11-07): a per-cell size delta within 0.1% of the
+  rival's is a TIE, not a flip.** Size is adjudicated deterministically (byte
+  counts). Wall deltas on an unfrozen box are hypothesis-tier — the wave-1 A/A
+  audit measured same-binary interleaved medians swinging ±3-24% under
+  co-runner contention, so a sub-5% wall delta is a local tie and the frozen
+  box adjudicates the real number. `docs/promotion-rule.md` clause 3's "not
+  one flip" reads: flips are judged against the tie band, not raw bytes.
 * The falsifier discipline does NOT change: interleave, medians, verify-stamped
   probe binaries, "tie = NO-SHIP locally". Whatever a lever is claimed to win,
   the claim is now simply "valid + smaller-or-equal + faster", never "identical".
