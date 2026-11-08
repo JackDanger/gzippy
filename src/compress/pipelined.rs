@@ -116,8 +116,10 @@ const MAX_T_AWARE_BLOCK_SIZE_L1_5: usize = 8 * 1024 * 1024;
 /// the 2MB cap to the levels where it was measured; L1-L5 keep the 8MB bound.
 const MAX_T_AWARE_BLOCK_SIZE_L6_UP: usize = 2 * 1024 * 1024;
 
-// Reference thread count anchoring the thread-free chunk grid — the T=4
-// layout is preserved bit-for-bit under the parity unification (PR-2).
+// Grid floor: the reference thread count. `-p N` grids DO NOT depend on the
+// live request for N <= GRID_REF_THREADS (the T=4 layout is preserved bit-for-bit,
+// so the board's dominant T>1 cells and the T4 fingerprint rows stay put); for
+// N > GRID_REF_THREADS the grid scales up with N (the grid-by-threads lever).
 pub const GRID_REF_THREADS: usize = 4;
 
 #[inline]
@@ -125,36 +127,44 @@ pub const GRID_REF_THREADS: usize = 4;
 // can derive the chunk count of a T>1 run from the same pure function the
 // encoder uses — bit-splice (#257) deleted the per-chunk sync-flush stored
 // blocks the suite previously counted chunks by.
-/// Threads-free chunk grid: every `-p N`, N >= 2, layout is identical to T=4's.
+/// T-scaled chunk grid: `-p N` with N <= 4 keeps the T4 layout bit-for-bit;
+/// N > 4 splits the input into up to ~`2 × N` chunks so wall can actually use
+/// the extra cores.
 ///
-/// THREAD-FREE GRID (2026-09-25, design v3.1, `docs/board/parity-unification-design.md`).
+/// THREAD-SCALED GRID (2026-11-08, the grid-by-threads lever). Renegotiates the
+/// thread-free anchor of 2026-09-25 (design v3.1,
+/// `docs/board/parity-unification-design.md`) for N > 4, on the charter
+/// amendment v2 cross-`-p` bullet: cross-`-p` byte equality of a levered
+/// change is renegotiable, per-N determinism is not (live contract:
+/// `tests/thread_byte_parity.rs`).
 ///
-/// The chunk grid is anchored at a FIXED reference thread count
-/// (`GRID_REF_THREADS = 4`, the board's dominant T>1 class) instead of the live
-/// request, so **every `-p N`, N >= 2, on any box derives the identical chunk
-/// layout — and therefore the identical output bytes — for the same input**.
-/// This is the byte-parity unification's PR-2: the engine, per-level params
-/// (`params_parallel(level)`, a pure function of level), header budget and
-/// flush seams were already thread-independent; the grid was the last
-/// thread-dependent byte input. Measured (sprint doc P4/P4b): with the anchor,
-/// T2 == T4 == T8 == T16 byte-identical at every pipelined level on the real
-/// corpora; WITHOUT it, divergence was confined to windows where
-/// `input/target_chunks` fell between the two floors below (T16-only on the
-/// big-file binary sweep).
+/// * `N <= GRID_REF_THREADS = 4`: `target_chunks = GRID_REF_THREADS × cpt` —
+///   THE T4 GRID EXACTLY, byte-for-byte what shipped before. The board's
+///   dominant T>1 class — every T4 cell, and every other `-p` in 2..=4 —
+///   keeps its bytes BY CONSTRUCTION (same `target_chunks` into the
+///   untouched bounds/alignment expression).
+/// * `N > 4`: `target_chunks = N × cpt` — the grid scales WITH THE LIVE
+///   REQUEST. Why the renegotiation is worth its seams: pigz default strips
+///   one worker per core and beat the thread-free grid's best `-p` by 12-38%
+///   wall at L1-L4 (12% at L5), because the anchor capped every run at
+///   `4 × cpt ≈ 8` chunks — extra `-p` bought idle pipes. Chunk count is the
+///   only thing a `-p N` request has ever changed; giving it back to the user
+///   is the one knob wall scaling has.
 ///
-/// The anchor is the T4 grid BY CONSTRUCTION: `num_threads = 4` produces the
-/// same `target_chunks` the thread-aware arm did, fed into an otherwise
-/// untouched `max(MIN).clamp(..).min(..)` + SOFT_MAX alignment expression —
-/// the board's T>1 (T4) cells cannot move. N ≠ 4 grids shift toward it:
-/// T > 4 ⇒ fewer, larger chunks (fewer seams); T < 4 ⇒ more, smaller (more
-/// seams); both ride the wall/size census per the runbook. Wall receipts:
-/// T2/T4 identical by construction; T8/T16 measured wall-neutral-or-better
-/// on the 32 MB probe.
+/// CONSTANTS kept: `cpt`/level rules, `MIN`/`MAX` chunk-size bounds, the
+/// `MAX_PARALLEL_BLOCK_SIZE` floor, the `SOFT_MAX_BLOCK_LENGTH` alignment.
 ///
-/// Anchoring at `available_parallelism()` instead was CONSIDERED and REJECTED:
-/// it prices wall at the machine optimum but makes `-p N` bytes differ between
-/// boxes (the pins become per-host, weaker than the receipts need) and adds
-/// per-chunk fixed costs on the T2 big-file end (the 0.3 s/chunk ledger class).
+/// PURITY (unchanged): same `(input_len, num_threads, level)` ⇒ same grid. No
+/// host reads: the CLI's `-p` is capped to `available_parallelism()` upstream
+/// (in [`PipelinedGzEncoder::new`]), so a request above the core count
+/// collapses to the core count deterministically. `tests/perf_shape.rs` and
+/// `tests/chunk_grid_report.rs` derive chunk counts from this function.
+///
+/// Anchoring at `available_parallelism()` INSIDE the grid (ignoring `-p`) was
+/// CONSIDERED and REJECTED in 2026-09-25 and stays rejected: it ignores the
+/// user's explicit worker count. What changed in 2026-11-08 is only that a
+/// user's explicit N > 4 is obeyed; N bytes are now per-N deterministic, not
+/// per-host-constant.
 pub fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
     // Chunk COUNT is what costs size: every chunk restarts the block
     // grid and pays its own dynamic-header mass plus a seam, so a 26 MB file cut into
@@ -188,14 +198,19 @@ pub fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) ->
     } else {
         MAX_T_AWARE_BLOCK_SIZE_L1_5
     };
-    // The parity anchor: the reference-thread grid — the T=4 layout exactly
-    // (`GRID_REF_THREADS` is the board's dominant T>1 class) — independent of
-    // the live request. For L1, `cpt == 1`, matching the former `4 × 1`.
-    let target_chunks = GRID_REF_THREADS.saturating_mul(cpt);
+    // The grid floor is the reference-thread layout (the T4 grid exactly —
+    // `GRID_REF_THREADS` is the board's dominant T>1 class, preserved
+    // bit-for-bit for N <= 4); ABOVE the reference the request scales the grid
+    // instead of being capped by it — the parity renegotiation of 2026-11-08.
+    // For L1, `cpt == 1`, so `-p N` targets N chunks, matching the former
+    // `4 × 1` anchor shape.
+    let target_chunks = GRID_REF_THREADS.max(num_threads).saturating_mul(cpt);
     let by_parallelism = input_len / target_chunks.max(1);
-    // Never go BELOW the old fixed grid's chunk size for a given input: this change is
-    // meant to remove seams, never to add them. A file that the old grid split into
-    // fewer chunks than `target_chunks` keeps the old size.
+    // The 2026-09-25 direction ("remove seams, never add them") still governs
+    // N <= 4 chunk sizing; the 2026-11-08 renegotiation deliberately ADDS
+    // chunks in the N > 4 arm — wall beats pigz is the axis now, and the size
+    // census (`-p16` per-member vs rivals, 0.1% tie band) prices the extra
+    // seams explicitly per level.
     let raw = by_parallelism
         .max(MAX_PARALLEL_BLOCK_SIZE)
         .clamp(MIN_PARALLEL_BLOCK_SIZE, max_block)
@@ -658,10 +673,13 @@ impl PipelinedGzEncoder {
     /// flate2/zlib-ng. Non-final chunks are closed with a sync-flush marker by
     /// that function so the concatenation is one valid DEFLATE stream.
     ///
-    /// NOTE (2026-09-25, PR-2 landed): the grid is thread-free —
-    /// `target_chunks = GRID_REF_THREADS × cpt` (the T=4 layout for every
-    /// N ≥ 2; see [`pipelined_block_size`]), so `-p N` streams are
-    /// byte-identical at any N ≥ 2 (gates: `tests/thread_byte_parity.rs`).
+    /// NOTE (2026-11-08, grid-by-threads): the grid is the T4 layout for every
+    /// N ≤ 4 and scales with the live thread count for N > 4
+    /// (`target_chunks = N × cpt`; see [`pipelined_block_size`]), so `-p N`
+    /// streams are per-N deterministic but MAY differ across N for N > 4
+    /// (renegotiated contract, charter amendment v2; gates:
+    /// `tests/thread_byte_parity.rs`). The N ≤ 4 cross-N byte identity that
+    /// PR-2 landed is preserved.
     /// T1 remains a distinct whole-buffer stream class (a digest tie with the
     /// chunked route is structurally unreachable; the tie is sizes-only —
     /// `FINAL-ADJUDICATION.md:48`). The parallel path parses with

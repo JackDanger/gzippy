@@ -9,7 +9,9 @@
 //!
 //! The T>1 numbers are not hard-coded: they are derived from
 //! `pipelined_block_size`, the same pure function the encoder's grid uses
-//! (the thread-free grid is host-independent, so the values below hold on
+//! (the grid is a pure function of input_len × requested `-p` × level; the
+//! runs below use `-p4`, inside the N <= `GRID_REF_THREADS` band the
+//! grid-by-threads lever preserves at the T4 anchor, so the values hold on
 //! any box), so the pin fails if the report ever drifts from the numbers
 //! that actually decided the encode — and only then. Default (non `-vv`)
 //! runs are not exercised here; `tests/thread_byte_parity.rs` pins their
