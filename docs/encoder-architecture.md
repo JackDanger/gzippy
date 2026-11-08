@@ -24,10 +24,13 @@ provenance only. The per-label bar and peak-memory axis are unchanged.
 At the level the user typed, output at least as small AND less wall time than gzip, pigz,
 libdeflate-gzip and igzip. Per-label, not curve. That means:
 
-* **Output bytes are a contract, not an implementation detail.** At L2/4/5/6/7 our output
-  is byte-identical to libdeflate's. Any restructuring that changes those bytes must be
-  measured against every rival at that label before it lands — twice now a change that
-  "only cost 0.02%" flipped tied cells to failing.
+* **Valid output is the contract; the bytes are an instrument.** Our output does not have
+  to be byte-identical to libdeflate's (BYTE-FREEDOM, 2026-11-07): valid gzip + the
+  per-label size/wall cells decide, and byte-moving changes are still measured against
+  every rival at that label before they land — twice now a change that "only cost 0.02%"
+  flipped tied cells to failing. Under the charter TIE BAND a sub-0.1% size delta is a
+  TIE, not a flip; the port's byte-identity is the construction receipt that shows what
+  the tables still mean, not a bar.
 * **Peak memory is a user-visible axis** even though no benchmark in the matrix measures
   it. A tool that OOMs where gzip worked is not a drop-in replacement.
 

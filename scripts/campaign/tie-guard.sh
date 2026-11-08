@@ -2,14 +2,16 @@
 # tie-guard.sh — THE CHEAPEST FALSIFIER FOR ANY CHANGE THAT ALTERS T1 OUTPUT.
 #
 # WHY THIS EXISTS. We are BYTE-IDENTICAL to libdeflate on most T1 cells (154 of 198 on the
-# frozen census). A tie PASSES the board (not bigger) but has ZERO tolerance: one byte in
-# either direction on a tied file flips a passing cell to failing, and promotion clause 3
-# forbids that absolutely.
+# frozen census). A tie PASSES the board (not bigger) but a base-tied cell pushed beyond
+# the charter TIE BAND (+0.1%, owner 2026-11-07) flips to failing — sub-band growth is a
+# TIE, not a flip; beyond-band growth is still forbidden outright.
 #
 # Two levers died on exactly this in one session, each after a full ~20 minute `fulcrum try`:
 #   * hash3 chaining      6 closed / 12 tied cells flipped
 #   * zlib good_match    31 closed / 17 tied cells flipped (data.csv L2 T1 1.0000 -> 1.0431)
-# Both were NET T1 IMPROVEMENTS. Net-positive is not the bar — non-worse on EVERY tie is.
+# Both were NET T1 IMPROVEMENTS. Net-positive is not the bar — no tied cell may end
+# beyond the 0.1% TIE BAND. (Those levers died under the then-current zero-tolerance
+# reading; sub-band growth is a TIE since charter v2, 2026-11-07.)
 #
 # A hand-picked 9-file sample of tied cells found ZERO flips for good_match and missed the two
 # worst files entirely. Sampling does not work here; enumerate the ties.
@@ -56,10 +58,10 @@ for f in "$CORPUS"/*; do
     r=$("$LD" -"$L" -c "$f" </dev/null 2>/dev/null | wc -c | tr -d ' ')
     b=$("$BASE_BIN"  -"$L" -p1 -c "$f" </dev/null 2>/dev/null | wc -c | tr -d ' ')
     checked=$((checked+1))
-    [ "$b" = "$r" ] || continue          # only TIED cells have zero tolerance
+    [ "$b" = "$r" ] || continue          # only TIED cells can flip (the band cage)
     ties=$((ties+1))
     a=$("$AFTER_BIN" -"$L" -p1 -c "$f" </dev/null 2>/dev/null | wc -c | tr -d ' ')
-    if [ "$a" -gt "$r" ]; then
+    if [ "$(($a * 1000))" -gt "$(($r * 1001))" ]; then   # beyond the 0.1% tie band
       flips=$((flips+1))
       printf "  FLIP  %-22s L%-2s  tied at %s -> %s  (+%s)\n" "$(basename "$f")" "$L" "$r" "$a" "$((a-r))"
     fi
@@ -68,4 +70,4 @@ done
 git worktree remove --force "$WT" >/dev/null 2>&1; git worktree remove --force "$BWT" >/dev/null 2>&1; git worktree prune
 echo "  cells probed=$checked  TIED=$ties  FLIPPED=$flips"
 [ "$flips" -eq 0 ] && { echo "  PASS — no tie flipped. NEXT: fulcrum try (this is a pre-check, not a verdict)."; exit 0; }
-echo "  FAIL — clause 3 would refuse this. Fix before spending a graded run."; exit 1
+echo "  FAIL — a base-tied cell grew beyond the 0.1% tie band; clause 3 refuses that. Fix before spending a graded run."; exit 1

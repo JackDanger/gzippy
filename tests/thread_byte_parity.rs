@@ -27,6 +27,7 @@
 //!
 //! Payload grids derive from `pipelined_block_size` itself — the gates must
 //! never hardcode chunk sizes the encoder is free to retune.
+//! Charter v2 (2026-11-07, PR #447): this cross--p contract is pre-authorized for in-lever renegotiation — it stays law until a lever deliberately renegotiates it.
 
 use gzippy::compress::pipelined::pipelined_block_size;
 use std::collections::hash_map::DefaultHasher;

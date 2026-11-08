@@ -12,6 +12,7 @@
 //! L6/L7 were retired on 2026-09-27 (PR #363): the port carries the
 //! zlib good_match pair byte-identically, so their bodies ARE the port's
 //! and the structural assert below now guards them.
+//! Charter v2 (2026-11-07, PR #447): this pin is pre-authorized for in-lever renegotiation — it stays law until a lever deliberately renegotiates it.
 
 use gzippy::compress::{
     deflate::encode_gzip_bytes_to_vec, ldx::compress_for_diff, pipelined::PipelinedGzEncoder,
