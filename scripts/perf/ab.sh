@@ -26,36 +26,47 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 1
 ROOT=$(pwd)
-SCRATCH="$ROOT/.review-tmp/ab"
+# Unique scratch per invocation: concurrent sessions share this repo, and a
+# fixed `.review-tmp/ab` path recreates the 2026-11-07 wrong-file-under-the-
+# same-name race between two batteries (one rebuilds in16m.bin while the
+# other is timing against it).
+SCRATCH="$ROOT/.review-tmp/ab-$$"
 
 LEVELS="2,4,9"
 THREADS="1"
 REPS=5
 BYTE_ONLY=0
 KEEP=0
+FEATURES=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -l) LEVELS="$2"; shift 2 ;;
         -p) THREADS="$2"; shift 2 ;;
         -r) REPS="$2"; shift 2 ;;
+        -f) FEATURES="$2"; shift 2 ;;
         --byte-only) BYTE_ONLY=1; shift ;;
         --keep) KEEP=1; shift ;;
-        *) echo "usage: ab.sh [-l levels] [-p threads] [-r reps] [--byte-only] [--keep]"; exit 1 ;;
+        *) echo "usage: ab.sh [-l levels] [-p threads] [-r reps] [-f cargo-features] [--byte-only] [--keep]"; exit 1 ;;
     esac
 done
+[ "$REPS" -lt 1 ] && REPS=1
+feat_args=""
+[ -n "$FEATURES" ] && feat_args="--features $FEATURES"
 
 # 0. One shared input big enough for stable timing (silesia blocks x2 + text x2).
 # CORPUS VERIFY-STAMP (the 2026-11-07 lesson: an ad-hoc probe script rebuilt this
 # corpus at 9.5 MB — one `cat` missing the x2 — and two probe batteries then
 # measured a different file under the same name, poisoning three claims before
 # detection). The stamp is the recipe's byte count; any drift rebuilds.
+# macOS `wc -c <` prints leading whitespace — strip it or the comparison can
+# never pass (the wave-1 review found this kiling the tool on its own platform).
 mkdir -p "$SCRATCH"
-if [ ! -s "$SCRATCH/in16m.bin" ] || [ "$(wc -c < "$SCRATCH/in16m.bin")" != "16085866" ]; then
+stampsz() { wc -c < "$1" | tr -d ' '; }
+if [ ! -s "$SCRATCH/in16m.bin" ] || [ "$(stampsz "$SCRATCH/in16m.bin")" != "16085866" ]; then
     cat corpus/silesia_blocks/*.bin corpus/silesia_blocks/*.bin \
         test_data/text-1MB.txt test_data/text-1MB.txt > "$SCRATCH/in16m.bin" 2>/dev/null
-    stamped=$(wc -c < "$SCRATCH/in16m.bin")
-    if [ "$stamped" != "16085866" ]; then
-        echo "ab.sh: corpus verify-stamp FAILED (built $stamped bytes, expected 16085866)" >&2
+    if [ "$(stampsz "$SCRATCH/in16m.bin")" != "16085866" ]; then
+        echo "ab.sh: corpus verify-stamp FAILED (built $(stampsz "$SCRATCH/in16m.bin") bytes, expected 16085866)" >&2
         exit 2
     fi
 fi
@@ -74,13 +85,18 @@ ln -sfn "$ROOT/vendor/isa-l" "$SCRATCH/ldx-baseline/vendor/isa-l"
 
 # 3. Two separate target dirs — NEVER one shared (global target-dir trap).
 echo "[ab] building baseline (HEAD)..." >&2
-(cd "$SCRATCH/ldx-baseline" && cargo build --release --target-dir "$SCRATCH/target-A" 2>&1 | tail -1) >&2
+(cd "$SCRATCH/ldx-baseline" && cargo build --release $feat_args --target-dir "$SCRATCH/target-A" 2>&1 | tail -1) >&2
 cp "$SCRATCH/target-A/release/gzippy" "$SCRATCH/gzA"
 echo "[ab] building candidate (working tree)..." >&2
-cargo build --release --target-dir "$SCRATCH/target-B" 2>&1 | tail -1 >&2
+cargo build --release $feat_args --target-dir "$SCRATCH/target-B" 2>&1 | tail -1 >&2
 cp "$SCRATCH/target-B/release/gzippy" "$SCRATCH/gzB"
 A="$SCRATCH/gzA"
 B="$SCRATCH/gzB"
+# Provenance stamps: every wall receipt needs corpus + binary identity in its
+# log or the cross-session numbers are forensically useless (wave-1 review).
+{
+    echo "--- canonical: corpus=$(shasum -a 256 "$IN" | awk '{print $1}') A=$(shasum -a 256 "$A" | awk '{print $1}') B=$(shasum -a 256 "$B" | awk '{print $1}') levels=$LEVELS threads=$THREADS features='$FEATURES' ---"
+} >> "$SCRATCH/wall.log"
 
 # 4. Byte identity over the corpus, every level x thread pair requested.
 echo "[ab] byte identity:" >&2
@@ -107,26 +123,36 @@ else
     echo "[ab] byte identity: $byte_mismatch/$byte_files outputs DIFFER (not a wall-only change)"
 fi
 
-# 5. Interleaved wall timing on the shared corpus, medians.
+# 5. Interleaved wall timing on the shared corpus, medians. The wall phase
+# honors -p (the wave-1 review caught it measuring -p1 while advertising the
+# requested thread cells), alternates arm order per rep (an unalternated fixed
+# order lets thermal/cache ordering favor one arm every pair), and ties a
+# local wall-delta slack note to every receipt.
 if [ "$BYTE_ONLY" -eq 0 ]; then
-python3 - "$A" "$B" "$IN" "$LEVELS" "$REPS" >>"$SCRATCH/wall.log" <<'PY'
+python3 - "$A" "$B" "$IN" "$LEVELS" "$REPS" "$THREADS" >>"$SCRATCH/wall.log" <<'PY'
 import subprocess, sys, time
 A, B, inp, levels, reps = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(','), int(sys.argv[5])
+threads = [int(x) for x in sys.argv[6].split(',')]
 def run(bin, lvl, th):
     t0 = time.perf_counter()
     subprocess.run([bin, '-n', f'-{lvl}', f'-p{th}', '-c', inp], stdout=subprocess.DEVNULL, check=True)
     return time.perf_counter() - t0
 print("--- A/B wall (median of interleaved reps, in16m corpus) ---")
 for lvl in levels:
-    run(A, lvl, 1); run(B, lvl, 1)  # warm both
-    ta, tb = [], []
-    for _ in range(reps):
-        ta.append(run(A, lvl, 1)); tb.append(run(B, lvl, 1))
-    a = sorted(ta)[len(ta) // 2]
-    b = sorted(tb)[len(tb) // 2]
-    print(f"  L{lvl}: HEAD {a*1000:8.1f} ms | candidate {b*1000:8.1f} ms | B/A = {b/a:.4f}")
+    for th in threads:
+        run(A, lvl, th); run(B, lvl, th)  # warm both
+        ta, tb = [], []
+        for i in range(reps):
+            if i % 2 == 0:
+                ta.append(run(A, lvl, th)); tb.append(run(B, lvl, th))
+            else:
+                tb.append(run(B, lvl, th)); ta.append(run(A, lvl, th))
+        a = sorted(ta)[len(ta) // 2]
+        b = sorted(tb)[len(tb) // 2]
+        print(f"  L{lvl} -p{th}: HEAD {a*1000:8.1f} ms | candidate {b*1000:8.1f} ms | B/A = {b/a:.4f}"
+              f" [~5% of a wall delta is NOT admissible locally — hypothesis-tier; the frozen box adjudicates]")
 PY
-tail -3 "$SCRATCH/wall.log"
+tail -12 "$SCRATCH/wall.log"
 fi
 
 # 6. Cleanup unless asked to keep.
