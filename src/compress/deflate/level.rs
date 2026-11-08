@@ -580,11 +580,14 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         p.strategy = Strategy::Lazy;
         p.max_search_depth = p.max_search_depth.saturating_mul(4);
     } else {
-        // The `level == 8` arm below is now unreachable (L8 returns early via
-        // the near-optimal routing above); it is kept verbatim with its
-        // receipt because the engine.wasm non-monotonicity it records is a
-        // depth-scaling fact about Lazy2, not about L8 the level, and it must
-        // be re-consulted if the near-optimal routing is ever reverted.
+        // The `level == 8` arm below was UNREACHABLE while L8 routed early to
+        // the near-optimal ladder (pre-2026-11-07). PR #446 retired that
+        // routing — L8 now falls through to `params_inner(8)`, so this arm is
+        // REACHABLE and load-bearing: it keeps L8's Lazy2 depth at 300
+        // instead of x4-scaling to 1200. The engine.wasm non-monotonicity
+        // receipt it rests on is a depth-scaling fact about Lazy2, not about
+        // L8 the level, and it must be re-consulted before any depth scaling
+        // here.
         p.max_search_depth = if level == 8 {
             p.max_search_depth
         } else {
