@@ -1,14 +1,19 @@
 //! Correctness net for the pure-Rust PARALLEL DEFLATE encoder (Increment 6:
 //! `PipelinedGzEncoder::compress_buffer_pure` — the sole production T>1 path).
 //!
-//! The T>1 entry point is the CANONICAL CHUNK GRID (thread-free,
-//! `GRID_REF_THREADS = 4`): its bytes are identical at every `-p N`, N >= 2
-//! (`tests/thread_byte_parity.rs` pins the digests at every level), while T1
-//! remains a distinct whole-buffer stream class (the FINAL-ADJUDICATION's
-//! own receipt: matches straddle what would be seams). This module pins:
+//! The T>1 entry point rides the chunk grid: `-p N` with N <= 4 keeps the T4
+//! layout (`GRID_REF_THREADS = 4`) bit-for-bit — those `-p N` outputs stay
+//! byte-identical across N — while N > 4 scales the grid with the live
+//! thread count and MAY differ from `-p4` bytes (grid-by-threads lever,
+//! renegotiated 2026-11-08; per-N determinism is pinned in
+//! `tests/thread_byte_parity.rs`). T1 remains a distinct whole-buffer stream
+//! class (the FINAL-ADJUDICATION's own receipt: matches straddle what would
+//! be seams). This module pins:
 //!
 //!   1. DETERMINISM — per-p-T validity is asserted; byte-identity ACROSS
-//!      thread counts is asserted by the parity gates, not duplicated here.
+//!      thread counts N <= 4 is asserted by the parity gates, not duplicated
+//!      here (cross-N identity above 4 is renegotiated away, charter
+//!      amendment v2).
 //!   2. 3-ORACLE roundtrip — flate2, libdeflate, and system `gzip -d` all
 //!      reproduce the input byte-exact at L1/L6/L9/L12.
 //!   3. proptest — tiny (<1 chunk), incompressible (each chunk stored-escapes),

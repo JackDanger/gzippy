@@ -1,5 +1,15 @@
 # T(N) byte-parity unification — design decision v3 (2026-09-25)
 
+> **AMENDMENT 2026-11-08 (grid-by-threads lever, charter amendment v2
+> cross-`-p` bullet):** the thread-free grid below is now the FLOOR, not the
+> whole contract. `-p N` with N <= `GRID_REF_THREADS` = 4 keeps the T4 layout
+> bit-for-bit (this doc's PR-2 shape is unchanged there, and so are its T4
+> cells/pins); `N > 4` scales `target_chunks = N × cpt` so wall can use the
+> extra cores, and cross-`-p` byte equality above N = 4 is RENEGOTIATED to
+> per-N determinism (same N twice ⇒ same bytes; different N MAY differ). The
+> live gates are `tests/thread_byte_parity.rs`; this file's PR-2 wording
+> describes what v3 shipped, not what the lever changed.
+
 Ship shape: **cross-T (N>1) bit-parity + T1 as a distinct, census-tied stream**,
 landed as three separable PRs. v3 supersedes v1/v2 after adversarial review
 (agent-22, findings block-by-block) plus a direct silesia.tar measurement that
