@@ -461,8 +461,44 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // (+2,057 B at 1 MiB, would OPEN cells); L11/L12 are smaller than L9
     // everywhere measured, and L12's extra passes buy ~nothing (<0.01%) here.
     //
-    // L8 JOINS L9 (nearoptimal-down-ladder probe, same 8 MiB fixtures,
-    // `-p4`). L8 was the WEAKEST
+    // [2026-11-07] L8 JOINS the plain ladder again — the near-optimal L8
+    // routing is RETIRED. Two receipts, both measured on this Mac (interleave
+    // medians, honest protocol per the charter):
+    //
+    // 1. WALL. The chunked near-opt route at L8 is 2.6x C libdeflate -8 at
+    //    `-p4` (522 ms vs 200 ms on the 16 MB silesia+text corpus; the earlier
+    //    session's "1.2-1.3x" reading was a contended-run artifact — every
+    //    clean interleaved re-measure lands 518-527 ms). passes=1 would still
+    //    land ~1.7x (x0.643-0.655), and no byte-identical optimization of the
+    //    cost-sheet pass count can cross under 1.0x: the near-opt parse costs
+    //    more than C's whole lazy2 level even at one pass. The lazy2 class is
+    //    the only engine that reaches the bar: the chunked lazy2-300 re-route
+    //    measured x0.135 of the shipped near-opt config at `-p4` (70.7 ms)
+    //    and x0.114 at `-p2` (105.0 ms) — 0.35x of C total, T>1 = 7.4x FASTER
+    //    than the shipped route at the same `-p4`.
+    //
+    // 2. SIZE. The old routing receipt ("whole_t1 bytes LOSE to gzip -8 on
+    //    match-rich classes", gun-vs-libdeflate whole_t1 at 2,444,590 vs
+    //    gzip -8 2,425,693) predates the ldx port: today's T1-L8 deflate
+    //    PAYLOAD is byte-identical to C libdeflate -8 (3,822,479 == 3,822,479
+    //    verified payload-exact after the 10-byte header; the only container
+    //    delta is XFL 0x00 vs the C's 0x02), so the chunked lazy2 output
+    //    (3,820,237) sits at-or-below the rivals at -8 on the aggregate
+    //    corpus: libdeflate 3,822,479 / pigz 3,911,509 / gzip 3,913,317.
+    //    ⚠ PER-MEMBER DISPROOF (2026-11-07): at member granularity the
+    //    chunked boundaries cost 3/30 silesia members +4/+6/+7 B vs C
+    //    libdeflate -8 (023: +4, 024: +6, 028: +7 = 0.003-0.005%, near-tie
+    //    class); EVERY member still lands below pigz -8 and gzip -8, and
+    //    the aggregate stays below libdeflate. The three near-ties are
+    //    exactly the cells this lever trades for 7.1x wall.
+    //    The bar is "at least as small as the rivals", not "as small as our
+    //    own previous output"; the +2.4% regression against the near-opt
+    //    route is spent wall headroom, bought back at 7.4x.
+    //
+    // L9's near-opt route stays exactly as landed (its passes=2 retune is
+    // C-beating on its corpus mix); L8 alone leaves the near-opt ladder.
+    //
+    // [historical receipt, kept] L8 was the WEAKEST
     // T>1 level: excluded from depth scaling (the engine.wasm clause-3 flip
     // documented below), so its T4 triple pick-min shipped whole_t1 bytes that
     // LOSE to gzip -8 on the match-rich classes, and ran its three candidates
@@ -486,15 +522,14 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         // L9-only retune (per-cell size census: silesia.tar +0.0061%,
         // +3,942 B of 64,701,600 — inside the <=1% authorized spend; local chunk
         // probes: passes1 −28% wall, passes2 −16% for +0.6%, depth a no-op on
-        // dense corpora). Near-opt at matched depth with passes 2. L8 is NOT
-        // retuned (scope guard: no silent creep) — it keeps the L11-knob route.
+        // dense corpora). Near-opt at matched depth with passes 2.
         let mut p = default_params_parallel_route(11);
         p.near_optimal.max_optim_passes = 2;
         return p;
     }
-    if level == 8 {
-        return default_params_parallel_route(11);
-    }
+    // L8: retired from the near-opt ladder (receipt above) — L8-T>1 runs the
+    // plain Lazy2-300 arm with the rest of the ladder, byte-class parity with
+    // C libdeflate -8, at 0.35x of that rival's wall.
     let mut p = params_inner(level);
     // DEPTH, NOT STRATEGY. A parser-strategy step (Greedy->Lazy,
     // Lazy->Lazy2) alone was NO-SHIP on the wall clause: it flipped
@@ -545,11 +580,14 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         p.strategy = Strategy::Lazy;
         p.max_search_depth = p.max_search_depth.saturating_mul(4);
     } else {
-        // The `level == 8` arm below is now unreachable (L8 returns early via
-        // the near-optimal routing above); it is kept verbatim with its
-        // receipt because the engine.wasm non-monotonicity it records is a
-        // depth-scaling fact about Lazy2, not about L8 the level, and it must
-        // be re-consulted if the near-optimal routing is ever reverted.
+        // The `level == 8` arm below was UNREACHABLE while L8 routed early to
+        // the near-optimal ladder (pre-2026-11-07). PR #446 retired that
+        // routing — L8 now falls through to `params_inner(8)`, so this arm is
+        // REACHABLE and load-bearing: it keeps L8's Lazy2 depth at 300
+        // instead of x4-scaling to 1200. The engine.wasm non-monotonicity
+        // receipt it rests on is a depth-scaling fact about Lazy2, not about
+        // L8 the level, and it must be re-consulted before any depth scaling
+        // here.
         p.max_search_depth = if level == 8 {
             p.max_search_depth
         } else {
@@ -1100,6 +1138,12 @@ mod tests {
     /// the near-optimal parser (the 1.38-1.48x loss vs pigz -9 -p4) is a
     /// red/green fact, not a code-reading inference. The unification PR must
     /// flip these deliberately if it changes the params_parallel routing.
+    ///
+    /// Flipped deliberately 2026-11-07: L8 left the near-opt ladder (receipt
+    /// in `default_params_parallel_route` — the chunked near-opt route was
+    /// 2.6x C libdeflate -8 at `-p4`, the chunked lazy2 re-route is 0.35x,
+    /// and the size sits below every rival at -8 since the ldx port made the
+    /// lazy2 class byte-parity). L8-T>1 now shares the T1 engine.
     #[test]
     fn l9_retune_vs_l8_alias_routing_is_deterministic() {
         let t1 = params(9);
@@ -1112,22 +1156,25 @@ mod tests {
         );
         // Replacement invariant (the passes-curve + per-cell size
         // census led to a L9-only passes2 retune): L9 keeps near-opt at matched
-        // depth with passes 2; L8 stays on the L11-knob route (the retune is
-        // level-conditional, not riding the 8/9 recursion).
-        let par8 = params_parallel(8);
-        assert_ne!(
-            format!("{par:?}"),
-            format!("{par8:?}"),
-            "L9 retune is level-conditional"
-        );
+        // depth with passes 2 — level-conditional, not riding the 8/9 ladder.
         assert_eq!(
             par.near_optimal.max_optim_passes, 2,
             "L9 retune carries passes2"
         );
+        // L8 left the near-opt ladder: T>1 now runs the same Lazy2-300 arm as
+        // T1 (the 2.6x-of-C receipt). Depth stays in the monotone ladder
+        // (L7 256 < L8 300), unlike the L11-aliased near-opt it replaced.
+        let par8 = params_parallel(8);
         assert_eq!(
-            par8.near_optimal.max_optim_passes,
-            params_parallel(11).near_optimal.max_optim_passes,
-            "L8 keeps the L11-knob alias"
+            par8.strategy,
+            Strategy::Lazy2,
+            "L8-T>1 runs the plain lazy2 ladder arm"
+        );
+        assert_eq!(par8.max_search_depth, 300);
+        assert_ne!(
+            format!("{par:?}"),
+            format!("{par8:?}"),
+            "L9 retune is level-conditional"
         );
         // the x4 depth branch applies to the recursive L9->L11 near-opt params
         assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
