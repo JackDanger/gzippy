@@ -36,16 +36,27 @@ contradicts this doc (§8 lists the deltas landed in the same PR).
 
 ## 1. The strategy in one sentence
 
-**Tie libdeflate byte-for-byte at T1 with a faster implementation, make T>1
-emit the *same bytes* by carrying exact encoder state across chunks, and spend
-the codegen headroom on the only remaining size lever (L1) and the wall.**
+**Beat every rival per-label on size and wall with a valid gzip stream, make T>1
+cost no more wall than T1 by carrying exact encoder state across chunks, and
+spend the codegen headroom on the only remaining size lever (L1) and the wall.**
 
-Per-label bar and every non-negotiable in `CLAUDE.md` still apply. Ties pass
-`<=`-style comparisons, so byte-parity never loses a cell it could have won;
-adopting-parse differences are adopted ONE level at a time through the
-exception-retirement path (#363/#364 template).
+(BYTE-FREEDOM, 2026-11-07: the original sentence — "tie libdeflate byte-for-byte
+at T1, make T>1 emit the same bytes" — was the port's construction receipt, not a
+bar. Exact state carry survives as the wall mechanism; its byte output is an
+instrument, not a contract, and the exception-retirement path (#363/#364/#446
+template) is instrument history, not a bar.)
+
+Per-label bar and every non-negotiable in `CLAUDE.md` still apply. A per-cell size
+delta within 0.1% of the rival's is a TIE, not a flip (charter TIE BAND,
+2026-11-07); engine-routing differences are a pure size/wall question adjudicated
+by the size/wall cells alone.
 
 ## 2. The three live exceptions after the stack lands
+
+*(BYTE-FREEDOM, 2026-11-07: none of these is an "exception" to any law anymore —
+engine choice is a plain size/wall question at the typed level. The table and its
+exit conditions are routing provenance, kept verbatim; re-derive each against the
+board before acting on it.)*
 
 | level | exception | why | exit condition |
 |---|---|---|---|

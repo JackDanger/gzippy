@@ -34,6 +34,12 @@ binary hashes before any measurement. (`fulcrum ablate`)
 **3. No pass -> fail flips.** Not one. Any previously-passing per-label cell that fails
 after the change blocks the ship, regardless of what else improved.
 
+*Size flips adjudicate against the charter TIE BAND (2026-11-07): a per-cell size delta
+within 0.1% of the rival's is a TIE, not a flip — only beyond-band growth is a flip
+("flips are judged against the tie band, not raw bytes", CLAUDE.md, owner steer
+2026-11-07). Wall flips are untouched: wall stays on clause 5's cross-layout machinery,
+clause 7's frozen box, and clause 8's fixed method — never on this band.*
+
 **4. Progress.** At least one failing cell closes, **or** the total fail-gap
 (`sum of max(0, ratio - 1)` over failing cells) decreases by at least 1%.
 
@@ -56,7 +62,10 @@ involved.
 — a per-cell size erosion **<= 1%** on a passing cell is an authorized spend, priced at
 clause-6 harm exactly like an authorized wall margin-spend (excluded from residual
 harm, itemized on the clause-6 line — never silent); **> 1% convicts**. Size flips
-(pass -> fail) still convict directly: 1% of a tie is not a pass. The one-encode law
+(pass -> fail) still convict directly: 1% of a tie is not a pass. *(Tie band,
+2026-11-07: "pass -> fail" for size cells means beyond the 0.1% band; an
+exactly-tied cell eroded inside the band is a TIE — a priced erosion under this
+clause, not a flip. Beyond the band convicts regardless of spend.)* The one-encode law
 (2026-08-23) stands absolute — the authorized spend exists precisely because delete
 pick-min removes the per-file two-encode min that used to mask margin spends; the
 size budget is its replacement pricing, not a new lever to spend twice. Wall rules in
