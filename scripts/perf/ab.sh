@@ -45,10 +45,19 @@ while [ $# -gt 0 ]; do
 done
 
 # 0. One shared input big enough for stable timing (silesia blocks x2 + text x2).
+# CORPUS VERIFY-STAMP (the 2026-11-07 lesson: an ad-hoc probe script rebuilt this
+# corpus at 9.5 MB — one `cat` missing the x2 — and two probe batteries then
+# measured a different file under the same name, poisoning three claims before
+# detection). The stamp is the recipe's byte count; any drift rebuilds.
 mkdir -p "$SCRATCH"
-if [ ! -s "$SCRATCH/in16m.bin" ]; then
+if [ ! -s "$SCRATCH/in16m.bin" ] || [ "$(wc -c < "$SCRATCH/in16m.bin")" != "16085866" ]; then
     cat corpus/silesia_blocks/*.bin corpus/silesia_blocks/*.bin \
         test_data/text-1MB.txt test_data/text-1MB.txt > "$SCRATCH/in16m.bin" 2>/dev/null
+    stamped=$(wc -c < "$SCRATCH/in16m.bin")
+    if [ "$stamped" != "16085866" ]; then
+        echo "ab.sh: corpus verify-stamp FAILED (built $stamped bytes, expected 16085866)" >&2
+        exit 2
+    fi
 fi
 IN="$SCRATCH/in16m.bin"
 
