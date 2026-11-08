@@ -519,12 +519,80 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
     // of only 2-5x. L8/L9 pay because their pick-min paths were ALREADY paying
     // near-optimal-class wall for worse bytes. Scope stops at L8.
     if level == 9 {
-        // L9-only retune (per-cell size census: silesia.tar +0.0061%,
-        // +3,942 B of 64,701,600 — inside the <=1% authorized spend; local chunk
-        // probes: passes1 −28% wall, passes2 −16% for +0.6%, depth a no-op on
-        // dense corpora). Near-opt at matched depth with passes 2.
+        // L9-only retune. History: the original pass kept passes 2 under the
+        // parity-era budget letters ("passes1 −28% wall, passes2 −16% for
+        // +0.6%"). BYTE-FREEDOM (charter, 2026-11-07, PR #447) re-carves the
+        // bar to "valid gzip + at-or-below the rivals at the typed level".
+        //
+        // RECEIPT v2 (2026-11-08, adversarial wave): passes 2 -> 1 measured
+        // in16m x0.75-0.84 wall at +15,204 B (+0.407%) aggregate and 34/34
+        // on the per-member rival bar — BUT it OVERSHOOTS the other half of
+        // the bar: the jumped ledger cell tabular:L9:T4 (ours <= C
+        // libdeflate -n -9 = 236,201) measures 244,455 (+3.49%), so passes 1
+        // is NO-SHIP. v2's own receipts are reproduced below and held in
+        // this wave on the same box: passes1 in16m = 3,749,220 = anchor
+        // +15,204 B exactly; tabular:L9:T4 = 244,455; T1 byte-identical
+        // 35/35 (corpus + 34 members). The passes knob stays a T>1-only
+        // lever (inert on the lazy2 T1 route within A/A noise).
+        //
+        // ⚠ ADJUDICATION v3 (2026-11-08, wave-5, branch l9-retune-v3; probe
+        // channel: `--features ladder-tune` + GZIPPY_LADDER
+        // `nearoptimal:100:<nice>:2`, cross-checked A/A-identical to the
+        // shipped route at nice=150 — in16m sha and tabular sha agree
+        // byte-for-byte). With passes RESTORED to 2 and depth unchanged at
+        // 100, `nice_match_length` moves the near-opt wall live
+        // (`ChunkFillState.nice_len`), so the ladder traded wall against
+        // size inside the bar:
+        //
+        //   cfg (depth,nice,passes)  tabular:L9:T4   in16m aggregate   34-member bar
+        //     100,150,2 (ship v1)    232,057 (=pin)  3,734,016 (anchor) 34/34
+        //     100, 64,2              232,057         3,752,751 (+0.502%) MISS 024.bin
+        //                            (all four tabular cells byte-identical by
+        //                             sha — the 1 MiB fixture has no long
+        //                             matches, so the ledger cell cannot flip
+        //                             on this knob either way)
+        //     100, 96,2              232,057         3,740,910 (+0.185%)  34/34  <- SHIPPED
+        //     100,112,2              232,057         3,736,221 (+0.059%)  34/34
+        //     100,150,1 (v2 arm)     244,455 BREAK   3,749,220 (+0.407%)  34/34
+        //
+        //   wall, in16m, interleaved medians (laptop, hypothesis-tier; box
+        //   observed 1-min load 9-31 across the runs, each run medians of
+        //   7-9 reps with alternating arm order). Three independent ladder
+        //   runs (two env-probed, one on the shipped binary):
+        //     -p4 ratios ship/main: x0.731, x0.843, x0.889 (medians
+        //          387-764 ms vs main 435-906); in the tightest low-load
+        //          window (load ~10) the shipped binary pairs at
+        //          x0.87-0.94 per rep — every run and every paired rep is
+        //          <= main; magnitude 6-27%, load-dependent. Never slower.
+        //     -p2 ratios: x0.835, x0.919 (shipped), x0.960 (loaded window),
+        //          medians 683-1302 ms vs main 731-1559 ms.
+        //     ldc -9 -p4 stays x0.51 from the shipped binary (median 223 ms
+        //          in the quiet window): the -p4 cell vs C libdeflate is
+        //          NOT closed by this retune, only narrowed.
+        //     -p1: byte-identical to the shipped T1 route (35/35 files).
+        //
+        //   validity: 112 decoder checks, zero failures — every claimed
+        //   stream (corpus at -p1/-p2/-p4 + all 34 members at -p4) roundtrips
+        //   through THREE independent decoders (python gzip
+        //   byte-compare, vendored gzip -t, vendored pigz -t) and the zlib
+        //   container (-z) roundtrips via python zlib. Fingerprint pins are
+        //   UNREGENERATED and by design stay untouched: on the four frozen
+        //   fixtures every near-opt match is shorter than nice 96, so this
+        //   branch's L9:T4 fingerprints are byte-identical to the pins
+        //   (fingerprint_suite green, tabular:L9:T4 measured 232,057 with
+        //   the pinned stream sha — the ledger cell does not flip).
+        //
+        // DECISION: nice 96 is the frontier config that holds BOTH hard bars
+        // (tabular ledger cell and 34/34 per-member rival bar) at the best
+        // measured wall; nice 64 loses 34/34 (+0.69% on 024.bin) and nice
+        // 112 saves only 4,689 B more of aggregate for a -p4 wall inside
+        // the tie band. This supersedes the v2 passes-1 arm (NO-SHIP:
+        // ledger overshoot). NOT closed even after this: -p4 remains above
+        // C libdeflate on wall; closing that cell needs near-opt engine
+        // work (per-pass cost-sheet reuse), its own lever.
         let mut p = default_params_parallel_route(11);
         p.near_optimal.max_optim_passes = 2;
+        p.nice_match_length = 96;
         return p;
     }
     // L8: retired from the near-opt ladder (receipt above) — L8-T>1 runs the
@@ -1154,16 +1222,15 @@ mod tests {
             Strategy::Lazy2,
             "T>1 L9 must not silently share the T1 engine"
         );
-        // Replacement invariant (the passes-curve + per-cell size
-        // census led to a L9-only passes2 retune): L9 keeps near-opt at matched
-        // depth with passes 2 — level-conditional, not riding the 8/9 ladder.
-        assert_eq!(
-            par.near_optimal.max_optim_passes, 2,
-            "L9 retune carries passes2"
-        );
-        // L8 left the near-opt ladder: T>1 now runs the same Lazy2-300 arm as
-        // T1 (the 2.6x-of-C receipt). Depth stays in the monotone ladder
-        // (L7 256 < L8 300), unlike the L11-aliased near-opt it replaced.
+        // Replacement invariant (wave-5 adjudication, branch l9-retune-v3):
+        // L9 keeps near-opt at the L11 knobs with nice_match_length 96 and
+        // passes 2 — the frontier config that holds the tabular:L9:T4 ledger
+        // bar (236,201; passes 1 measured 244,455) and the 34-member rival
+        // bar at the best measured wall, level-conditional (not riding the
+        // 8/9 recursion). L8 left the near-opt ladder: T>1 now runs the same
+        // Lazy2-300 arm as T1 (the 2.6x-of-C receipt). Depth stays in the
+        // monotone T1 ladder (L7 256 < L8 300), unlike the L11-aliased
+        // near-opt it replaced.
         let par8 = params_parallel(8);
         assert_eq!(
             par8.strategy,
@@ -1175,6 +1242,14 @@ mod tests {
             format!("{par:?}"),
             format!("{par8:?}"),
             "L9 retune is level-conditional"
+        );
+        assert_eq!(
+            par.nice_match_length, 96,
+            "L9 retune carries nice 96 (wave-5 adjudication receipt)"
+        );
+        assert_eq!(
+            par.near_optimal.max_optim_passes, 2,
+            "v2's passes 1 broke tabular:L9:T4 (244455 > 236201); retune keeps 2"
         );
         // the x4 depth branch applies to the recursive L9->L11 near-opt params
         assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
