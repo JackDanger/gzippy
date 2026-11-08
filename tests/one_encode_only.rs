@@ -113,6 +113,9 @@ fn every_level_encodes_each_input_exactly_once() {
 /// and is byte-identical to the legacy arm (11/11 branch receipts; 189/189
 /// cells over the canonical 21-member corpus at levels 1-9) — the flipped-tree
 /// wall verdict cleared the routing (no regression, 4 cells won-with-margin).
+/// L6 flip ADJUDICATED 2026-11-08 (lever/l6-port-route): byte-identical bodies
+/// at the (128, 65, 8) config, so the L6 routing exception above is closed and
+/// this guard now carries L1 alone.
 ///
 /// L3 RETIRED (this PR's landing): the port learned the len-3 machinery
 /// (`ldx/far_len3.rs` + the sparse-blocks split-hold modulator; 11/11 files
@@ -126,7 +129,7 @@ fn every_level_encodes_each_input_exactly_once() {
 /// above is the same machinery that made the legacy L3 win. L1 stays an
 /// exception until someone beats pigz -1 on that text cell from the port.
 /// Until then L1 stays on the measured-best legacy config.
-const PORT_EXCEPTIONS: &[u32] = &[1, 6];
+const PORT_EXCEPTIONS: &[u32] = &[1];
 
 #[test]
 fn the_port_is_the_production_encoder_for_levels_0_through_9() {
