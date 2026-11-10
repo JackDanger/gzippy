@@ -125,13 +125,30 @@ Input (reader, args, opt_config)
       and a combined CRC/ISIZE trailer. NOT the legacy "GZ" multi-block
       format: no writer in the tree emits the "GZ" FEXTRA subfield at all
       (removed in v1.0; decode-side reading of it remains for old files).
-      NOTE (2026-11-08 probe): T>1 at L2-L5/L7 may be SMALLER than T1 BY DESIGN —
+      NOTE (2026-11-08 probe; walls re-driven 2026-11-10 on clean 90f75548):
+      T>1 at L2-L5/L7 may be SMALLER than T1 BY DESIGN —
       the chunk parse runs `level::params_parallel` (max_search_depth ×4 +
-      `try_exact_huffman`, `level.rs:431-627`) while T1 runs the libdeflate port at
+      `try_exact_huffman`, `level.rs:411-733` — re-anchored 2026-11-10; the
+      431-627 span cited by the 2026-11-08 probe shifted when the L8 reroute
+      landed, `default_params_parallel_route` now ends at 733) while T1 runs
+      the libdeflate port at
       preset depth; dictionary sharing across chunks is NOT the cause (measured,
-      16,085,866-B corpus: L2 T1 4,328,425 → T4 4,235,747 with ONE chunk
-      (params-only −92,678) vs 4,235,399 with the default 9-chunk grid (dict+seams
-      −348 net); L3 4,118,450 → 4,072,249 / 4,073,729 the same shape).
+      16,085,866-B corpus [sha 1010fa2f787d0a92]: L2 T1 4,328,425 → T4 4,235,747
+      with ONE chunk (params-only −92,678) vs 4,235,399 with the default 9-chunk
+      grid (dict+seams −348 net); L3 4,118,450 → 4,072,249 / 4,073,729 the same
+      shape; all five integers re-verified exact from a clean build in the
+      2026-11-10 re-drive — L1-L5 T1 4,424,116 / 4,328,425 / 4,118,450 /
+      4,090,913 / 3,997,838 all unchanged).
+      WALL TRADE (2026-11-10 re-drive, interleaved medians of 5, alternating arm
+      order, /dev/null stdout; walls are hypothesis-tier, local A/A ties ≤~5%):
+      the depth-×4 parse ALONE is a wall premium, not a win — at a single
+      chunk (`-b 16384k -p4`) L2 84.93 ms vs T1 60.15 ms (+41%) and L3 100.55 ms
+      vs 70.13 ms (+43%). The default grids win because the ×4-cost parse is
+      spread over 4 threads: p4 vs p1 medians L2 30.38 vs 60.15 (−49.5%), L3
+      37.19 vs 70.13 (−47.0%), L4 41.28 vs 65.43 (−36.9%), L5 46.17 vs 75.52
+      (−38.8%), with the grid also smaller (sizes below). So at p1 wall
+      is cheaper (lower depth), at p4 both size and wall favor the grids
+      (sizes −2.15% at L2, −1.09% at L3).
 ```
 
 ### Format notes
