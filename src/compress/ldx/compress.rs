@@ -215,6 +215,13 @@ impl LdxCompressor {
             // wall check adjudicate it.
             3 => (true, 224),
             5 => (true, 224),
+            // SIZE-RECLAIM LEVER (byte-freedom): Lazy2-300 ties libdeflate -8
+            // on aggregate and sits +4..+7 B on members 023/024/028 — arm the
+            // far-len-3 cost gate (near-3s at the ~-1 B/len-3 ask) so the
+            // depth-300 chains can convert those near-ties. Accept-only: it
+            // prices the arc against its 3 literals at emit time and changes
+            // no probe/chain-walk volume.
+            8 => (true, 224),
             _ => (false, 0),
         };
 
