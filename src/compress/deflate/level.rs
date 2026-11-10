@@ -1050,9 +1050,17 @@ fn params_inner(level: u32) -> LevelParams {
             max_search_depth: 300,
             nice_match_length: max_match,
             good_match: 0,
-            far_len3_gate: false,
+            // SIZE-RECLAIM LEVER (byte-freedom, pairs with the `8 => (true,
+            // 224)` row in `ldx/compress.rs`): C libdeflate -8 and T1 are
+            // near-tie class and the chunked Lazy2-300 sits +4/+6/+7 B on
+            // members 023/024/028 — arm the far-len-3 cost gate (prices the
+            // len-3 arc against the 3 literals it replaces at emit time) plus
+            // the 224x sparse split-hold modulator so the depth-300 arm can
+            // convert the near-ties. Same accept-only mechanism the port
+            // learned for L3; changes no probe/chain-walk volume.
+            far_len3_gate: true,
             greedy_len3_shadow: false,
-            lazy_sparse_len3_guard_mul: LAZY_SPARSE_LEN3_GUARD_MUL_OFF,
+            lazy_sparse_len3_guard_mul: 224,
             forced_min_match_len: 0,
             greedy_accept_far_len3: false,
             hash3_chain_depth: 0,
