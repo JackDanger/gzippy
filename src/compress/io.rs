@@ -8,7 +8,7 @@
 //! preservation, stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufWriter, Cursor, Write};
+use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 struct CountingWriter<W: Write> {
@@ -652,7 +652,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     // Try to mmap stdin when it's a regular file (< file redirection).
     // For pipes, mmap_data stays None and we fall through to the
-    // whole-buffer `compress_with_pipeline` route.
+    // whole-buffer route below (which honours `-p N`).
     #[cfg(unix)]
     let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
         use std::os::unix::io::FromRawFd;
@@ -749,15 +749,38 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     } else {
         // Pipe stdin: whole-buffer (read-to-end into one Vec, then the T1
         // parse — `ldx` is whole-buffer by construction; the 2026-08-30
-        // streaming deletion made buffering the honest contract). Single
-        // worker, so it is the cheapest T1 route for unknown-length input.
-        let opt_config = OptimizationConfig::new(1, 0, args.compression_level, ContentType::Binary);
-        crate::compress::compress_with_pipeline(
-            stdin(),
+        // streaming deletion made buffering the honest contract). The buffer
+        // is fed to `compress_with_pipeline_sized` through a REAL
+        // OptimizationConfig — `args.processes` and the true input length, not
+        // the former hardcoded `(1, 0, ..)` that ignored `-p` and routed every
+        // FIFO-pipe encode single-threaded (the LIVE ROUTING BUG pinned by
+        // tests/pipe_parallel.rs::true_pipe_matches_file_arg_at_p4). The sized
+        // dispatcher owns the zopfli / zlib / T1 / parallel routing, so pipe
+        // bytes now match file-arg mode at the same level and `-p` — parallel
+        // T>1 through `PipelinedGzEncoder::compress_buffer_pure`, T1 through
+        // the same one-shot encoder, both minimal-header on stdout.
+        let mut input = Vec::new();
+        stdin().read_to_end(&mut input)?;
+        let content_type = if input.len() >= 8192 {
+            crate::compress::optimization::analyze_content_type(&input[..8192])
+        } else if !input.is_empty() {
+            crate::compress::optimization::analyze_content_type(&input)
+        } else {
+            ContentType::Binary
+        };
+        let opt_config = OptimizationConfig::new(
+            args.processes,
+            input.len() as u64,
+            args.compression_level,
+            content_type,
+        );
+        crate::compress::compress_with_pipeline_sized(
+            Cursor::new(&input[..]),
             &mut counted,
             args,
             &opt_config,
             &header_info,
+            Some(input.len()),
         )?
     };
 

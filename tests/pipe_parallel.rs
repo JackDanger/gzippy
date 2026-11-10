@@ -1,4 +1,4 @@
-//! Pipe-parallelism regression guard — and a LIVE BUG pin.
+//! Pipe-parallelism regression guard.
 //!
 //! The contract under test: `gzippy -p N` reading stdin must produce
 //! BYTE-IDENTICAL output to `gzippy -p N -c file` on the same bytes. This was
@@ -6,7 +6,7 @@
 //! single-threaded output and single-threaded wall while file arguments got
 //! the parallel path), and it was fixed — but, as this suite discovered on
 //! 2026-08-09, ONLY FOR SEEKABLE STDIN. There are two distinct stdin cases
-//! and they route differently today:
+//! and they routed differently from then until 2026-11-10:
 //!
 //!   1. REDIRECT stdin (`gzippy -p4 < file`): fd 0 is a regular file.
 //!      `compress_stdin` (src/compress/io.rs) mmaps it and takes the same
@@ -15,17 +15,18 @@
 //!      guards it against regression.
 //!
 //!   2. TRUE PIPE stdin (`cat file | gzippy -p4`): fd 0 is a FIFO. The mmap
-//!      probe fails and `compress_stdin` falls into its explicit
-//!      "Pipe stdin: ... Single-threaded" branch: `-p` is IGNORED, output is
-//!      T1 bytes (measured: pipe == `-p 1` output on 7 of 12 cells; the L6
-//!      cells differ from BOTH because the pipe branch also hardcodes
-//!      file_size=0 + ContentType::Binary into OptimizationConfig, landing a
-//!      third config), and wall is T1 wall (64 MiB Cargo.lock-repeat, M1:
+//!      probe failed and `compress_stdin` fell into its explicit
+//!      "Pipe stdin: ..." branch, which hardcoded
+//!      `OptimizationConfig::new(1, 0, ..)` and called the single-thread
+//!      pipeline: `-p` was IGNORED, output was T1 bytes, and wall was T1
+//!      wall (measured 2026-08-09: 64 MiB Cargo.lock-repeat, M1:
 //!      truepipe@p4 0.269 s == truepipe@p1 0.269 s vs file@p4 0.087 s at L1;
-//!      0.323 vs 0.148 s at L6). pigz parallelizes this case fine. LIVE
-//!      ROUTING BUG — pinned by the #[ignore] test
-//!      `true_pipe_matches_file_arg_at_p4` below: un-ignore it when the
-//!      streaming-chunker path serves FIFOs, and it becomes the guard.
+//!      0.323 vs 0.148 s at L6). FIXED 2026-11-10: the pipe branch reads
+//!      stdin to end and feeds the whole-buffer bytes through
+//!      `compress_with_pipeline_sized` with a real OptimizationConfig
+//!      (`args.processes` + true input length), so it routes exactly like a
+//!      file argument at the same level and `-p`. The former #[ignore] pin
+//!      `true_pipe_matches_file_arg_at_p4` below is now the guard.
 //!
 //! Why byte-identity with the FILE path proves the stdin path is PARALLEL:
 //! the file-arg path at -p 4 is known-parallel and its output differs from
@@ -164,8 +165,7 @@ fn assert_stdin_matches_file(
                         " (Confirmed: the stdin bytes MATCH the -p 1 output — routed T1.)"
                     } else {
                         " (The stdin bytes match NEITHER -p 4 nor -p 1 file output — a \
-                         third config; the pipe branch hardcodes file_size=0 + \
-                         ContentType::Binary.)"
+                         third config; check what OptimizationConfig the stdin route built.)"
                     }
                 ));
             }
@@ -191,28 +191,23 @@ fn redirect_stdin_matches_file_arg_at_p4() {
     });
 }
 
-/// THE LIVE BUG, pinned (fails today — see the module doc for the full
-/// anatomy): `cat file | gzippy -p4` routes the explicit single-threaded
-/// pipe branch of `compress_stdin`, ignoring -p entirely. Every fixture x
-/// level {1,6,9} fails the identity, and wall equals -p1 wall. When the
-/// FIFO case is routed to a parallel (streaming-chunker) path, remove the
-/// #[ignore] and this becomes the permanent guard.
+/// THE BUG, FIXED 2026-11-10 and now the permanent guard: `cat file | gzippy
+/// -p4` used to route the explicit single-threaded pipe branch of
+/// `compress_stdin`, ignoring -p entirely (every fixture x level {1,6,9}
+/// failed the identity, and wall equalled -p1 wall). The pipe branch now
+/// routes whole-buffer bytes through `compress_with_pipeline_sized` with the
+/// real `-p` config, so this must stay green the same way the redirect twin
+/// above does.
 #[test]
-#[ignore = "LIVE ROUTING BUG: FIFO-pipe stdin ignores -p and routes single-threaded \
-            (src/compress/io.rs compress_stdin, the 'Pipe stdin' branch). \
-            Run: cargo test --test pipe_parallel -- --ignored"]
 fn true_pipe_matches_file_arg_at_p4() {
     assert_stdin_matches_file("FIFO-pipe", &|_path, data, level| {
         compress_pipe(data, level, THREADS)
     });
 }
 
-/// Even while the FIFO routing bug stands, pipe output must stay VALID and
-/// deterministic T1-shaped gzip: it roundtrips through flate2 (asserted for
-/// every cell here) and two runs emit identical bytes. If pipe output ever
-/// changes class (e.g. the FIFO fix lands and it becomes parallel output),
-/// the identity test above starts passing and this stays green — this test
-/// pins correctness, not routing.
+/// Pipe output must stay valid and deterministic: it roundtrips through
+/// flate2 (asserted for every cell here) and two runs emit identical bytes.
+/// Pins correctness, not routing — the identity twin above guards routing.
 #[test]
 fn true_pipe_output_roundtrips_and_is_deterministic() {
     let mut cells = 0usize;
