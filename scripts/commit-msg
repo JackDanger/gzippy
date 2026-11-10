@@ -32,16 +32,33 @@ done < <(git diff --cached --name-only -z)
 # HEAD:dst as 0 — so a rename that dropped PARK records silently passed with
 # fewer records than HEAD's copy of the SOURCE ever carried. When the staged
 # dst is not in HEAD, Rule 1 reads the count from HEAD:src instead.
-declare -A SRC_OF=()
+# bash 3.2 (macOS /bin/bash) has no `declare -A`: the dst->src map is two
+# parallel indexed arrays scanned linearly. Staged sets are tiny — the scan is
+# noise next to the git process it lets us avoid per Rule-1 file.
+SRC_DST=()
+SRC_SRC=()
 while IFS= read -r -d '' st; do
     IFS= read -r -d '' a
     case $st in
         R*|C*)
             IFS= read -r -d '' b
-            SRC_OF[$b]=$a
+            SRC_DST+=("$b")
+            SRC_SRC+=("$a")
             ;;
     esac
 done < <(git diff --cached --name-status -z)
+
+src_of() {
+    local i=0
+    while [ "$i" -lt "${#SRC_DST[@]}" ]; do
+        if [ "${SRC_DST[$i]}" = "$1" ]; then
+            printf '%s' "${SRC_SRC[$i]}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
 
 # ── Rule 1: a PARK record is BINDING ──────────────────────────────────
 # A PARK is a MEASURED win that did not ship ("PARK monotone work; never DELETE
@@ -71,8 +88,11 @@ if [ "${#STAGED[@]}" -gt 0 ]; then
         before=0
         if git cat-file -e "HEAD:$f" 2>/dev/null; then
             before=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep -c PARKED) || true
-        elif [ -n "${SRC_OF[$f]:-}" ]; then
-            before=$(git cat-file -p "HEAD:${SRC_OF[$f]}" 2>/dev/null | grep -c PARKED) || true
+        else
+            src=$(src_of "$f")
+            if [ -n "$src" ]; then
+                before=$(git cat-file -p "HEAD:$src" 2>/dev/null | grep -c PARKED) || true
+            fi
         fi
         after=$(git show ":$f" 2>/dev/null | grep -c PARKED) || true
         if [ "${after:-0}" -lt "${before:-0}" ]; then
