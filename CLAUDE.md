@@ -77,6 +77,7 @@ legitimately precedes a lever PR is smaller and wired as a script:
     scripts/perf/ab.sh -l 3,8 -p 1,4        # pick the cells the change actually touches
     scripts/perf/ab.sh --byte-only          # pure byte-identity gate
     scripts/perf/ab.sh --keep               # retain the two binaries for follow-up probes
+    scripts/dev/worktree-link.sh [WT]      # any fresh worktree lacks submodules — links vendor/isal-rs/isal-sys + vendor/isa-l (ab.sh does this only for its own baseline; run once per new worktree)
 
 It handles the two traps every first-time A/B hits: fresh `git worktree`s do not
 materialize submodules (the script symlinks `vendor/isal-rs/isal-sys` and
