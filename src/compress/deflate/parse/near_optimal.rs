@@ -70,6 +70,13 @@ const MAX_BLOCK_LENGTH: usize = {
 /// `optimum_nodes` length (`:583-584`).
 const OPTIMUM_NODES_LEN: usize = MAX_BLOCK_LENGTH + 1;
 
+/// The dense offset → offset-slot map helpers for the NEON items adder
+/// (`item = item_base + lane`) — see `len_step8_neon`.
+#[cfg(target_arch = "aarch64")]
+static LANE_IDX_0123: [u32; 4] = [0, 1, 2, 3];
+#[cfg(target_arch = "aarch64")]
+static LANE_IDX_4567: [u32; 4] = [4, 5, 6, 7];
+
 /// The min-cost-path result for one pass: the chosen path's symbol frequencies
 /// and the Huffman codes built from them.
 struct PathCodes {
@@ -103,6 +110,24 @@ struct Optimizer {
     /// once more in `optimize_and_flush`'s final emit, so a fresh `Vec` per
     /// call was the same waste class as the pre-fix `sink`.
     header_scratch: HeaderScratch,
+    /// Lever A (near-opt DP fast path): the `.item` snapshot of the
+    /// static-Huffman DP (branch (b)), taken right where (b) restores
+    /// `costs_saved`, and restored by the "(d) static block is cheapest"
+    /// recovery branch instead of RE-RUNNING `find_min_cost_path` under
+    /// identical costs (the re-run reads only `costs` + `match_cache` + the
+    /// pinned sentinel costs — all unchanged since (b) — so it was a pure
+    /// re-derivation; the copy-back is byte-exact, sha-verified on the
+    /// corpus / 34-member / tabular cells). Pre-sized `[0; OPTIMUM_NODES_LEN]`;
+    /// only `[..block_length]` is ever touched.
+    path_items_static: Vec<u32>,
+    /// Lever A: the `.item` snapshot of the best dynamic pass, taken at the
+    /// exact statement where `costs_saved` is cloned in the refinement loop,
+    /// restored by the "(d) the final pass regressed" recovery branch — same
+    /// byte-exactness argument as `path_items_static` (under the restored
+    /// `costs_saved`, the re-run was deterministic and only re-produced these
+    /// items + the same codes, whose `set_from_codes` already holds in
+    /// `self.costs`).
+    path_items_best: Vec<u32>,
     code_scratch: CodeScratch,
 }
 
@@ -117,11 +142,112 @@ impl Optimizer {
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
             sink: Sink::new(),
             header_scratch: HeaderScratch::new(),
+            path_items_static: vec![0u32; OPTIMUM_NODES_LEN],
+            path_items_best: vec![0u32; OPTIMUM_NODES_LEN],
             code_scratch: CodeScratch {
                 budget,
                 ..Default::default()
             },
         }
+    }
+
+    /// Lever B: one 8-lane step of the near-opt DP's len-step min-scan
+    /// (`find_min_cost_path`'s inner loop, `vendor/libdeflate`'s
+    /// `deflate_find_min_cost_path`). Processes the lengths `len ..= len+7` of a
+    /// SINGLE match under its `offset`, returning the block's (cost, item) pair
+    /// — the caller folds it into the scalar running best with a strict `<`.
+    ///
+    /// ## Exactness of the tie-break (the fold-over contract)
+    ///
+    /// The scalar loop keeps the first candidate reaching a cost: `cost_to_end <
+    /// best_cost` is strict, and lens arrive ascending (first across matches,
+    /// then ascending within a match), so equal costs always keep the SMALLER len.
+    /// Blocks here never cross a match (each `m` is scanned alone), so all eight
+    /// candidates share one `offset`. Packaging cost and item as
+    /// `((u64)cost << 32) | item` with `item == (offset << OPTIMUM_OFFSET_SHIFT)
+    /// | len_abs` makes a plain u64 min encode EXACTLY (min cost, then smallest
+    /// len among ties) — `item` values within the block are strictly increasing
+    /// with lane index because `(offset << SHIFT) + len + k == itembase + k`
+    /// stays under the 9-bit length field (`len + 7 <= 258 < 512`).
+    ///
+    /// ## Safety (as compared to the scalar path's invariant doc)
+    ///
+    /// All eight `costs.length[len+k]` reads and eight
+    /// `optimum_nodes[node+len+k].cost_to_end` reads stay within the same bounds
+    /// the scalar iteration asserted (`len+7 <= m.length <= MAX_MATCH_LEN`
+    /// bounds the length table; the caller's `hi = min(block_length-1 +
+    /// MAX_MATCH_LEN, ...)` pin covers `node + len + 7`). The `vld2q_u32`
+    /// deinterleave reads BOTH fields of each node (the `item` column too) — a
+    /// read of state the caller owns; `offset_cost` is already in registers.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn len_step8_neon(
+        costs_length_ptr: *const u32,
+        nodes_ptr: *const OptimumNode,
+        len: usize,
+        node: usize,
+        offset: u32,
+        offset_cost: u32,
+    ) -> (u32, u32) {
+        use core::arch::aarch64::{
+            uint32x4_t, vaddq_u32, vbslq_u32, vcgtq_u64, vdupq_n_u32, vgetq_lane_u64, vld1q_u32,
+            vld2q_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32, vzip1q_u32, vzip2q_u32,
+        };
+
+        let off_bc = vdupq_n_u32(offset_cost);
+        // Length costs for the 8 lens: `costs.length` is contiguous.
+        let lc0 = unsafe { vld1q_u32(costs_length_ptr.add(len)) };
+        let lc1 = unsafe { vld1q_u32(costs_length_ptr.add(len + 4)) };
+        // Node costs (`cost_to_end` first in `OptimumNode`): the item column is
+        // interleaved at stride 4 bytes, so one deinterleave load per half
+        // yields both (the item half is discarded).
+        let nc0 = unsafe { vld2q_u32(nodes_ptr.add(node + len) as *const u32).0 };
+        let nc1 = unsafe { vld2q_u32(nodes_ptr.add(node + len + 4) as *const u32).0 };
+        let c0 = vaddq_u32(vaddq_u32(off_bc, lc0), nc0);
+        let c1 = vaddq_u32(vaddq_u32(off_bc, lc1), nc1);
+
+        // Candidate items: item_k = item_base + k (exact under OPTIMUM_LEN_MASK).
+        let item_base = (offset << OPTIMUM_OFFSET_SHIFT) | len as u32;
+        let it0: uint32x4_t = vaddq_u32(vdupq_n_u32(item_base), unsafe {
+            vld1q_u32(LANE_IDX_0123.as_ptr())
+        });
+        let it1: uint32x4_t = vaddq_u32(vdupq_n_u32(item_base), unsafe {
+            vld1q_u32(LANE_IDX_4567.as_ptr())
+        });
+
+        // Pack (cost, item) into u64 lanes (item in the LOW half so `<` reads
+        // cost-first) and fold lane pairs: zip(it, c) → {lane0, lane1} pairs.
+        let p01 = vreinterpretq_u64_u32(vzip1q_u32(it0, c0));
+        let p23 = vreinterpretq_u64_u32(vzip2q_u32(it0, c0));
+        let p45 = vreinterpretq_u64_u32(vzip1q_u32(it1, c1));
+        let p67 = vreinterpretq_u64_u32(vzip2q_u32(it1, c1));
+
+        // Bitwise select (u64 lanes via u32 view — vbslq has no u64 form, and
+        // the mask is all-ones-per-64-lane, so it is the same select).
+        let min_0415 = {
+            let mask = vcgtq_u64(p01, p45); // true iff p45 strictly smaller
+            vreinterpretq_u64_u32(vbslq_u32(
+                vreinterpretq_u32_u64(mask),
+                vreinterpretq_u32_u64(p45),
+                vreinterpretq_u32_u64(p01),
+            ))
+        };
+        let min_2637 = {
+            let mask = vcgtq_u64(p23, p67);
+            vreinterpretq_u64_u32(vbslq_u32(
+                vreinterpretq_u32_u64(mask),
+                vreinterpretq_u32_u64(p67),
+                vreinterpretq_u32_u64(p23),
+            ))
+        };
+        // Horizontal fold: plain min of the packed u64 values is the exact
+        // lexicographic winner (ties pick the smaller item == smaller len).
+        let a = vgetq_lane_u64(min_0415, 0);
+        let b = vgetq_lane_u64(min_0415, 1);
+        let c = vgetq_lane_u64(min_2637, 0);
+        let d = vgetq_lane_u64(min_2637, 1);
+        let v = a.min(b).min(c).min(d);
+        ((v >> 32) as u32, v as u32)
     }
 
     /// `deflate_find_min_cost_path` (`:3327-3399`): backward DP filling
@@ -201,24 +327,59 @@ impl Optimizer {
                     let offset_slot = unsafe { self.offset_slot_full.slot_unchecked(offset) };
                     debug_assert!(offset_slot < self.costs.offset_slot.len());
                     let offset_cost = unsafe { *self.costs.offset_slot.get_unchecked(offset_slot) };
-                    loop {
-                        // SAFETY: `len <= m.length <= MAX_MATCH_LEN` and
-                        // `node + len <= hi < optimum_nodes.len()` (invariant
-                        // above).
-                        debug_assert!(len < self.costs.length.len());
-                        debug_assert!(node + len < self.optimum_nodes.len());
-                        let cost_to_end = offset_cost
-                            .wrapping_add(unsafe { *self.costs.length.get_unchecked(len) })
-                            .wrapping_add(unsafe {
-                                self.optimum_nodes.get_unchecked(node + len).cost_to_end
-                            });
-                        if cost_to_end < best_cost {
-                            best_cost = cost_to_end;
-                            best_item = (len as u32) | (offset << OPTIMUM_OFFSET_SHIFT);
+                    // Lever B (NEON len-step min-scan): the match's new lens
+                    // arrive in strictly-increasing order (the cache layout
+                    // contract — matches sorted by strictly-increasing
+                    // length), so an 8-lane SIMD pass over them can fold the
+                    // scalar's strict-`<` smallest-len-win discipline exactly:
+                    // within one match every candidate shares `offset`, so
+                    // packed (cost, item) keys order ties by item == len and
+                    // a plain min reproduces "first candidate wins"; blocks
+                    // never straddle matches, and the shipped scalar
+                    // threshold takes over across matches. aarch64 only; the
+                    // scalar loop below is compiled unchanged elsewhere.
+                    #[cfg(target_arch = "aarch64")]
+                    while len + 8 <= m.length as usize + 1 {
+                        // SAFETY: `len + 7 <= m.length <= MAX_MATCH_LEN` so
+                        // `costs.length.len()` bounds the 8-load, and
+                        // `node + len + 7 <= hi` holds by the caller's pin
+                        // (same invariant the scalar iteration relies on).
+                        let (blk_cost, blk_item) = unsafe {
+                            Self::len_step8_neon(
+                                self.costs.length.as_ptr(),
+                                self.optimum_nodes.as_ptr(),
+                                len,
+                                node,
+                                offset,
+                                offset_cost,
+                            )
+                        };
+                        if blk_cost < best_cost {
+                            best_cost = blk_cost;
+                            best_item = blk_item;
                         }
-                        len += 1;
-                        if len > m.length as usize {
-                            break;
+                        len += 8;
+                    }
+                    if len <= m.length as usize {
+                        loop {
+                            // SAFETY: `len <= m.length <= MAX_MATCH_LEN` and
+                            // `node + len <= hi < optimum_nodes.len()` (invariant
+                            // above).
+                            debug_assert!(len < self.costs.length.len());
+                            debug_assert!(node + len < self.optimum_nodes.len());
+                            let cost_to_end = offset_cost
+                                .wrapping_add(unsafe { *self.costs.length.get_unchecked(len) })
+                                .wrapping_add(unsafe {
+                                    self.optimum_nodes.get_unchecked(node + len).cost_to_end
+                                });
+                            if cost_to_end < best_cost {
+                                best_cost = cost_to_end;
+                                best_item = (len as u32) | (offset << OPTIMUM_OFFSET_SHIFT);
+                            }
+                            len += 1;
+                            if len > m.length as usize {
+                                break;
+                            }
                         }
                     }
                     mi += 1;
@@ -370,6 +531,16 @@ impl Optimizer {
             self.find_min_cost_path(block_length, cache_end);
             static_cost = (self.optimum_nodes[0].cost_to_end / BIT_COST).wrapping_add(7);
             self.costs = self.costs_saved.clone();
+            // Lever A: freeze the static path's items NOW — the (d) static
+            // recovery branch used to re-derive them with a second
+            // `find_min_cost_path` under the SAME (restored) costs, i.e. a
+            // byte-identical duplicate of this DP pass (folded into
+            // [`save_path_items`]'s note).
+            save_path_items(
+                &self.optimum_nodes,
+                block_length,
+                &mut self.path_items_static,
+            );
         }
 
         // (c) iterative dynamic optimization.
@@ -397,6 +568,10 @@ impl Optimizer {
             }
             best_true_cost = true_cost;
             self.costs_saved = self.costs.clone();
+            // Lever A: the best pass's items, frozen at exactly the point
+            // `costs_saved` is cloned (the recovery branch restores them
+            // together with `costs_saved`; see [`save_path_items`]).
+            save_path_items(&self.optimum_nodes, block_length, &mut self.path_items_best);
             self.costs
                 .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
             num_passes_remaining -= 1;
@@ -406,6 +581,28 @@ impl Optimizer {
         }
 
         // (d) selection.
+        //
+        // ## Lever A (near-opt DP fast path)
+        //
+        // The two recovery branches below used to RE-RUN
+        // [`Self::find_min_cost_path`] under costs IDENTICAL to the pass whose
+        // path they recover (the static branch: `set_from_codes(statics)` —
+        // exactly branch (b)'s costs; the best-path branch: `costs =
+        // costs_saved`, exactly the seed costs of the best pass). The DP is a
+        // pure function of (`costs`, `match_cache[0..cache_end]`, the pinned
+        // sentinel `cost_to_end`s past `block_length`, and the backward
+        // walk's own outputs) — none of those change between the pass and the
+        // recovery, so each re-run re-derived the byte-identical `item`s (and
+        // codes) it had already computed. The lever pushes an `.item`
+        // snapshot taken where `costs_saved` is cloned and replaces each
+        // re-run with [`restore_path_items`] + [`Self::tally_and_build_codes`]
+        // (the DP's own tail, same codes, no second full-path scan of the
+        // match cache). Byte-exactness is sha-proven (corpus -9 -p2/-p4,
+        // tabular:L9:T1/T4, text, 34-member -p4 set) in the commit receipt.
+        // `optimum_nodes[*].cost_to_end` below `block_length` is stale after
+        // a restore but is not read downstream (the token walk reads `.item`
+        // only, and the next block's DP rewrites every node before reading
+        // it); past `block_length` the (a)-pinned sentinels stay untouched.
         let mut used_only_literals = false;
         if only_lits_cost.min(static_cost) < best_true_cost {
             if only_lits_cost < static_cost {
@@ -417,12 +614,24 @@ impl Optimizer {
                 // Static block is cheapest: regenerate its path.
                 self.costs
                     .set_from_codes(&statics.litcode.lens, &statics.offcode.lens);
-                self.find_min_cost_path(block_length, cache_end);
+                // Lever A: restore the static path instead of re-running
+                // `find_min_cost_path` under these identical costs (the
+                // snapshot IS that re-run's output; see the (d) note above).
+                restore_path_items(
+                    &mut self.optimum_nodes,
+                    &self.path_items_static,
+                    block_length,
+                );
             }
         } else if true_cost >= best_true_cost.wrapping_add(np.min_bits_to_use_nonfinal_path) {
             // The final pass regressed; recover the best non-final path.
             self.costs = self.costs_saved.clone();
-            let codes = self.find_min_cost_path(block_length, cache_end);
+            // Lever A: restore the best pass's items; the re-run's only other
+            // effect — rebuilding `codes` — is reproduced exactly by the tally
+            // of the restored path, because under `costs_saved` the DP was
+            // deterministic and its codes came from these same items.
+            restore_path_items(&mut self.optimum_nodes, &self.path_items_best, block_length);
+            let codes = self.tally_and_build_codes(block_length);
             self.costs
                 .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
         }
@@ -507,6 +716,31 @@ fn build_all_literals_codes(block: &[u8]) -> PathCodes {
     }
     litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
     build_codes(litlen_freqs, [0u32; DEFLATE_NUM_OFFSET_SYMS])
+}
+
+/// Lever A: freeze `nodes[0..block_length].item` into a flat snapshot buffer.
+/// Downstream (`optimize_and_flush`'s token walk, `tally_and_build_codes`)
+/// reads `.item` only, and only below `block_length`, so this is the complete
+/// observable state of a DP pass — see the `(d) selection` note.
+#[inline]
+fn save_path_items(nodes: &[OptimumNode], block_length: usize, dst: &mut [u32]) {
+    debug_assert!(nodes.len() >= block_length && dst.len() >= block_length);
+    for k in 0..block_length {
+        dst[k] = nodes[k].item;
+    }
+}
+
+/// Lever A: the restore direction of [`save_path_items`].
+#[inline]
+fn restore_path_items(nodes: &mut [OptimumNode], src: &[u32], block_length: usize) {
+    debug_assert!(nodes.len() >= block_length && src.len() >= block_length);
+    // `src[0..block_length]` is exactly the `item` column a re-run of
+    // `find_min_cost_path` would write under the same costs (the DP writes
+    // every node `0..block_length`), so this closes the recovery branch without
+    // the second full DP pass.
+    for k in 0..block_length {
+        nodes[k].item = src[k];
+    }
 }
 
 // ── `near-opt-parallel-flush` test/observability surface ────────────────────
