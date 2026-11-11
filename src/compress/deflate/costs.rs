@@ -133,7 +133,13 @@ impl Default for OffsetSlotFull {
 impl DeflateCosts {
     /// `deflate_set_costs_from_codes`: derive the cost model from built codeword
     /// lengths (`litlen_lens[288]`, `offset_lens[32]`).
+    ///
+    /// `set_from_codes_calls` counts every production call site
+    /// (near_optimal.rs's branch (b) static seed, one per refinement-pass
+    /// end, and the (d) selection's) — see the fixed-point-skip instrument
+    /// block in `anatomy_counters.rs`.
     pub fn set_from_codes(&mut self, litlen_lens: &[u8], offset_lens: &[u8]) {
+        crate::anatomy_count!(set_from_codes_calls);
         // Literals.
         for i in 0..NUM_LITERALS {
             let bits = if litlen_lens[i] != 0 {
@@ -196,6 +202,33 @@ impl DeflateCosts {
             let def = default_offset_slot_cost(slot);
             adjust_cost(&mut self.offset_slot[slot], def, change_amount);
         }
+    }
+
+    /// True when both sheets are bitwise-equal over the ranges `find_min_cost_path`
+    /// actually READS — `literal[0..256]`, `length[MIN_MATCH_LEN..=MAX_MATCH_LEN]`,
+    /// `offset_slot[0..NUM_OFFSET_SLOTS-1]`. The remaining entries
+    /// (`length[0..3]`, `offset_slot[30..32]`) are written by neither
+    /// `set_from_codes` nor `set_default` (`Adjust` reads-but-does-not-write
+    /// them unchanged from the `default()` zeros) and the DP never indexes
+    /// them, so they are not DP input and excluding them keeps this exactly
+    /// the "same DP inputs" test.
+    ///
+    /// THE FIXED-POINT LEMMA (`lever nearopt-fixedpoint-skip`): after a
+    /// refinement pass, the loop's `set_from_codes` derives the NEXT pass's
+    /// sheet; if it equals the sheet the pass consumed (this compare, with
+    /// `costs_saved` being the pre-overwrite clone), the next pass's DP is a
+    /// pure-function recomputation on unchanged inputs (`find_min_cost_path`
+    /// reads `costs`, `match_cache[0..cache_end]`, and the sentinel costs
+    /// past `block_length` — all identical) producing identical items/codes
+    /// and tripping the `min_improvement_to_continue` gate identically
+    /// (shipped `min_improvement_to_continue >= 1` makes `best + mi > best`
+    /// true). Same byte-exactness shape as PR #457's item-snapshot restore.
+    #[cfg(any(feature = "anatomy-counters", feature = "nearopt-fixedpoint-skip"))]
+    pub fn dp_input_sheet_eq(&self, other: &Self) -> bool {
+        self.literal == other.literal
+            && self.length[MIN_MATCH_LEN..=MAX_MATCH_LEN]
+                == other.length[MIN_MATCH_LEN..=MAX_MATCH_LEN]
+            && self.offset_slot[..NUM_OFFSET_SLOTS] == other.offset_slot[..NUM_OFFSET_SLOTS]
     }
 }
 

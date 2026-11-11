@@ -62,6 +62,8 @@ text	1	bt_probe_attempts	0
 text	1	bt_probe_outcome_accepted	0
 text	1	bt_probe_outcome_miss	0
 text	1	bt_probe_outcome_too_short	0
+text	1	cost_sheet_equal_at_last_pass	0
+text	1	cost_sheet_equal_flags	0
 text	1	dynamic_header_bits_total	7629
 text	1	emit_body_bits	2873034
 text	1	fast_hash_computations	1407005
@@ -98,6 +100,9 @@ text	1	matches_emitted	178076
 text	1	matches_emitted_fast	178076
 text	1	near_opt_flush_blocks	0
 text	1	near_opt_only_literals_blocks	0
+text	1	nearopt_finite_skip_would_save	0
+text	1	nearopt_pass_entries	0
+text	1	set_from_codes_calls	0
 text	2	alloc_bytes	524320
 text	2	alloc_events	1
 text	2	bitstream_flush_word_calls	190171
@@ -145,6 +150,8 @@ text	2	bt_probe_attempts	0
 text	2	bt_probe_outcome_accepted	0
 text	2	bt_probe_outcome_miss	0
 text	2	bt_probe_outcome_too_short	0
+text	2	cost_sheet_equal_at_last_pass	0
+text	2	cost_sheet_equal_flags	0
 text	2	dynamic_header_bits_total	2248
 text	2	emit_body_bits	2788462
 text	2	fast_hash_computations	0
@@ -181,6 +188,9 @@ text	2	matches_emitted	155225
 text	2	matches_emitted_fast	0
 text	2	near_opt_flush_blocks	0
 text	2	near_opt_only_literals_blocks	0
+text	2	nearopt_finite_skip_would_save	0
+text	2	nearopt_pass_entries	0
+text	2	set_from_codes_calls	0
 text	4	alloc_bytes	524320
 text	4	alloc_events	1
 text	4	bitstream_flush_word_calls	167574
@@ -228,6 +238,8 @@ text	4	bt_probe_attempts	0
 text	4	bt_probe_outcome_accepted	0
 text	4	bt_probe_outcome_miss	0
 text	4	bt_probe_outcome_too_short	0
+text	4	cost_sheet_equal_at_last_pass	0
+text	4	cost_sheet_equal_flags	0
 text	4	dynamic_header_bits_total	2331
 text	4	emit_body_bits	2667785
 text	4	fast_hash_computations	0
@@ -264,6 +276,9 @@ text	4	matches_emitted	148636
 text	4	matches_emitted_fast	0
 text	4	near_opt_flush_blocks	0
 text	4	near_opt_only_literals_blocks	0
+text	4	nearopt_finite_skip_would_save	0
+text	4	nearopt_pass_entries	0
+text	4	set_from_codes_calls	0
 text	5	alloc_bytes	524320
 text	5	alloc_events	1
 text	5	bitstream_flush_word_calls	174341
@@ -311,6 +326,8 @@ text	5	bt_probe_attempts	0
 text	5	bt_probe_outcome_accepted	0
 text	5	bt_probe_outcome_miss	0
 text	5	bt_probe_outcome_too_short	0
+text	5	cost_sheet_equal_at_last_pass	0
+text	5	cost_sheet_equal_flags	0
 text	5	dynamic_header_bits_total	2322
 text	5	emit_body_bits	2665805
 text	5	fast_hash_computations	0
@@ -347,6 +364,9 @@ text	5	matches_emitted	139651
 text	5	matches_emitted_fast	0
 text	5	near_opt_flush_blocks	0
 text	5	near_opt_only_literals_blocks	0
+text	5	nearopt_finite_skip_would_save	0
+text	5	nearopt_pass_entries	0
+text	5	set_from_codes_calls	0
 text	6	alloc_bytes	524320
 text	6	alloc_events	1
 text	6	bitstream_flush_word_calls	146865
@@ -394,6 +414,8 @@ text	6	bt_probe_attempts	0
 text	6	bt_probe_outcome_accepted	0
 text	6	bt_probe_outcome_miss	0
 text	6	bt_probe_outcome_too_short	0
+text	6	cost_sheet_equal_at_last_pass	0
+text	6	cost_sheet_equal_flags	0
 text	6	dynamic_header_bits_total	2245
 text	6	emit_body_bits	2431611
 text	6	fast_hash_computations	0
@@ -430,6 +452,9 @@ text	6	matches_emitted	121838
 text	6	matches_emitted_fast	0
 text	6	near_opt_flush_blocks	0
 text	6	near_opt_only_literals_blocks	0
+text	6	nearopt_finite_skip_would_save	0
+text	6	nearopt_pass_entries	0
+text	6	set_from_codes_calls	0
 text	9	alloc_bytes	524320
 text	9	alloc_events	1
 text	9	bitstream_flush_word_calls	149040
@@ -477,6 +502,8 @@ text	9	bt_probe_attempts	0
 text	9	bt_probe_outcome_accepted	0
 text	9	bt_probe_outcome_miss	0
 text	9	bt_probe_outcome_too_short	0
+text	9	cost_sheet_equal_at_last_pass	0
+text	9	cost_sheet_equal_flags	0
 text	9	dynamic_header_bits_total	1910
 text	9	emit_body_bits	2451968
 text	9	fast_hash_computations	0
@@ -513,6 +540,9 @@ text	9	matches_emitted	112068
 text	9	matches_emitted_fast	0
 text	9	near_opt_flush_blocks	0
 text	9	near_opt_only_literals_blocks	0
+text	9	nearopt_finite_skip_would_save	0
+text	9	nearopt_pass_entries	0
+text	9	set_from_codes_calls	0
 tabular	1	alloc_bytes	524621
 tabular	1	alloc_events	2
 tabular	1	bitstream_flush_word_calls	159250
@@ -560,6 +590,8 @@ tabular	1	bt_probe_attempts	0
 tabular	1	bt_probe_outcome_accepted	0
 tabular	1	bt_probe_outcome_miss	0
 tabular	1	bt_probe_outcome_too_short	0
+tabular	1	cost_sheet_equal_at_last_pass	0
+tabular	1	cost_sheet_equal_flags	0
 tabular	1	dynamic_header_bits_total	4003
 tabular	1	emit_body_bits	2276426
 tabular	1	fast_hash_computations	1265774
@@ -596,6 +628,9 @@ tabular	1	matches_emitted	111121
 tabular	1	matches_emitted_fast	111121
 tabular	1	near_opt_flush_blocks	0
 tabular	1	near_opt_only_literals_blocks	0
+tabular	1	nearopt_finite_skip_would_save	0
+tabular	1	nearopt_pass_entries	0
+tabular	1	set_from_codes_calls	0
 tabular	2	alloc_bytes	524320
 tabular	2	alloc_events	1
 tabular	2	bitstream_flush_word_calls	156971
@@ -643,6 +678,8 @@ tabular	2	bt_probe_attempts	0
 tabular	2	bt_probe_outcome_accepted	0
 tabular	2	bt_probe_outcome_miss	0
 tabular	2	bt_probe_outcome_too_short	0
+tabular	2	cost_sheet_equal_at_last_pass	0
+tabular	2	cost_sheet_equal_flags	0
 tabular	2	dynamic_header_bits_total	1079
 tabular	2	emit_body_bits	2249372
 tabular	2	fast_hash_computations	0
@@ -679,6 +716,9 @@ tabular	2	matches_emitted	99216
 tabular	2	matches_emitted_fast	0
 tabular	2	near_opt_flush_blocks	0
 tabular	2	near_opt_only_literals_blocks	0
+tabular	2	nearopt_finite_skip_would_save	0
+tabular	2	nearopt_pass_entries	0
+tabular	2	set_from_codes_calls	0
 tabular	4	alloc_bytes	524320
 tabular	4	alloc_events	1
 tabular	4	bitstream_flush_word_calls	149317
@@ -726,6 +766,8 @@ tabular	4	bt_probe_attempts	0
 tabular	4	bt_probe_outcome_accepted	0
 tabular	4	bt_probe_outcome_miss	0
 tabular	4	bt_probe_outcome_too_short	0
+tabular	4	cost_sheet_equal_at_last_pass	0
+tabular	4	cost_sheet_equal_flags	0
 tabular	4	dynamic_header_bits_total	1255
 tabular	4	emit_body_bits	2170620
 tabular	4	fast_hash_computations	0
@@ -762,6 +804,9 @@ tabular	4	matches_emitted	93753
 tabular	4	matches_emitted_fast	0
 tabular	4	near_opt_flush_blocks	0
 tabular	4	near_opt_only_literals_blocks	0
+tabular	4	nearopt_finite_skip_would_save	0
+tabular	4	nearopt_pass_entries	0
+tabular	4	set_from_codes_calls	0
 tabular	5	alloc_bytes	524320
 tabular	5	alloc_events	1
 tabular	5	bitstream_flush_word_calls	142747
@@ -809,6 +854,8 @@ tabular	5	bt_probe_attempts	0
 tabular	5	bt_probe_outcome_accepted	0
 tabular	5	bt_probe_outcome_miss	0
 tabular	5	bt_probe_outcome_too_short	0
+tabular	5	cost_sheet_equal_at_last_pass	0
+tabular	5	cost_sheet_equal_flags	0
 tabular	5	dynamic_header_bits_total	1557
 tabular	5	emit_body_bits	2016473
 tabular	5	fast_hash_computations	0
@@ -845,6 +892,9 @@ tabular	5	matches_emitted	79449
 tabular	5	matches_emitted_fast	0
 tabular	5	near_opt_flush_blocks	0
 tabular	5	near_opt_only_literals_blocks	0
+tabular	5	nearopt_finite_skip_would_save	0
+tabular	5	nearopt_pass_entries	0
+tabular	5	set_from_codes_calls	0
 tabular	6	alloc_bytes	524320
 tabular	6	alloc_events	1
 tabular	6	bitstream_flush_word_calls	139027
@@ -892,6 +942,8 @@ tabular	6	bt_probe_attempts	0
 tabular	6	bt_probe_outcome_accepted	0
 tabular	6	bt_probe_outcome_miss	0
 tabular	6	bt_probe_outcome_too_short	0
+tabular	6	cost_sheet_equal_at_last_pass	0
+tabular	6	cost_sheet_equal_flags	0
 tabular	6	dynamic_header_bits_total	1348
 tabular	6	emit_body_bits	1970591
 tabular	6	fast_hash_computations	0
@@ -928,6 +980,9 @@ tabular	6	matches_emitted	77174
 tabular	6	matches_emitted_fast	0
 tabular	6	near_opt_flush_blocks	0
 tabular	6	near_opt_only_literals_blocks	0
+tabular	6	nearopt_finite_skip_would_save	0
+tabular	6	nearopt_pass_entries	0
+tabular	6	set_from_codes_calls	0
 tabular	9	alloc_bytes	524320
 tabular	9	alloc_events	1
 tabular	9	bitstream_flush_word_calls	134669
@@ -975,6 +1030,8 @@ tabular	9	bt_probe_attempts	0
 tabular	9	bt_probe_outcome_accepted	0
 tabular	9	bt_probe_outcome_miss	0
 tabular	9	bt_probe_outcome_too_short	0
+tabular	9	cost_sheet_equal_at_last_pass	0
+tabular	9	cost_sheet_equal_flags	0
 tabular	9	dynamic_header_bits_total	1111
 tabular	9	emit_body_bits	1888339
 tabular	9	fast_hash_computations	0
@@ -1011,6 +1068,9 @@ tabular	9	matches_emitted	71318
 tabular	9	matches_emitted_fast	0
 tabular	9	near_opt_flush_blocks	0
 tabular	9	near_opt_only_literals_blocks	0
+tabular	9	nearopt_finite_skip_would_save	0
+tabular	9	nearopt_pass_entries	0
+tabular	9	set_from_codes_calls	0
 binary	1	alloc_bytes	524626
 binary	1	alloc_events	2
 binary	1	bitstream_flush_word_calls	196156
@@ -1058,6 +1118,8 @@ binary	1	bt_probe_attempts	0
 binary	1	bt_probe_outcome_accepted	0
 binary	1	bt_probe_outcome_miss	0
 binary	1	bt_probe_outcome_too_short	0
+binary	1	cost_sheet_equal_at_last_pass	0
+binary	1	cost_sheet_equal_flags	0
 binary	1	dynamic_header_bits_total	8615
 binary	1	emit_body_bits	5291802
 binary	1	fast_hash_computations	1105711
@@ -1094,6 +1156,9 @@ binary	1	matches_emitted	41605
 binary	1	matches_emitted_fast	41605
 binary	1	near_opt_flush_blocks	0
 binary	1	near_opt_only_literals_blocks	0
+binary	1	nearopt_finite_skip_would_save	0
+binary	1	nearopt_pass_entries	0
+binary	1	set_from_codes_calls	0
 binary	2	alloc_bytes	524320
 binary	2	alloc_events	1
 binary	2	bitstream_flush_word_calls	195685
@@ -1141,6 +1206,8 @@ binary	2	bt_probe_attempts	0
 binary	2	bt_probe_outcome_accepted	0
 binary	2	bt_probe_outcome_miss	0
 binary	2	bt_probe_outcome_too_short	0
+binary	2	cost_sheet_equal_at_last_pass	0
+binary	2	cost_sheet_equal_flags	0
 binary	2	dynamic_header_bits_total	2082
 binary	2	emit_body_bits	5326658
 binary	2	fast_hash_computations	0
@@ -1177,6 +1244,9 @@ binary	2	matches_emitted	42986
 binary	2	matches_emitted_fast	0
 binary	2	near_opt_flush_blocks	0
 binary	2	near_opt_only_literals_blocks	0
+binary	2	nearopt_finite_skip_would_save	0
+binary	2	nearopt_pass_entries	0
+binary	2	set_from_codes_calls	0
 binary	4	alloc_bytes	524320
 binary	4	alloc_events	1
 binary	4	bitstream_flush_word_calls	193172
@@ -1224,6 +1294,8 @@ binary	4	bt_probe_attempts	0
 binary	4	bt_probe_outcome_accepted	0
 binary	4	bt_probe_outcome_miss	0
 binary	4	bt_probe_outcome_too_short	0
+binary	4	cost_sheet_equal_at_last_pass	0
+binary	4	cost_sheet_equal_flags	0
 binary	4	dynamic_header_bits_total	2114
 binary	4	emit_body_bits	5306387
 binary	4	fast_hash_computations	0
@@ -1260,6 +1332,9 @@ binary	4	matches_emitted	40780
 binary	4	matches_emitted_fast	0
 binary	4	near_opt_flush_blocks	0
 binary	4	near_opt_only_literals_blocks	0
+binary	4	nearopt_finite_skip_would_save	0
+binary	4	nearopt_pass_entries	0
+binary	4	set_from_codes_calls	0
 binary	5	alloc_bytes	524320
 binary	5	alloc_events	1
 binary	5	bitstream_flush_word_calls	192029
@@ -1307,6 +1382,8 @@ binary	5	bt_probe_attempts	0
 binary	5	bt_probe_outcome_accepted	0
 binary	5	bt_probe_outcome_miss	0
 binary	5	bt_probe_outcome_too_short	0
+binary	5	cost_sheet_equal_at_last_pass	0
+binary	5	cost_sheet_equal_flags	0
 binary	5	dynamic_header_bits_total	2138
 binary	5	emit_body_bits	5258442
 binary	5	fast_hash_computations	0
@@ -1343,6 +1420,9 @@ binary	5	matches_emitted	37179
 binary	5	matches_emitted_fast	0
 binary	5	near_opt_flush_blocks	0
 binary	5	near_opt_only_literals_blocks	0
+binary	5	nearopt_finite_skip_would_save	0
+binary	5	nearopt_pass_entries	0
+binary	5	set_from_codes_calls	0
 binary	6	alloc_bytes	524320
 binary	6	alloc_events	1
 binary	6	bitstream_flush_word_calls	184004
@@ -1390,6 +1470,8 @@ binary	6	bt_probe_attempts	0
 binary	6	bt_probe_outcome_accepted	0
 binary	6	bt_probe_outcome_miss	0
 binary	6	bt_probe_outcome_too_short	0
+binary	6	cost_sheet_equal_at_last_pass	0
+binary	6	cost_sheet_equal_flags	0
 binary	6	dynamic_header_bits_total	2105
 binary	6	emit_body_bits	5192233
 binary	6	fast_hash_computations	0
@@ -1426,6 +1508,9 @@ binary	6	matches_emitted	31678
 binary	6	matches_emitted_fast	0
 binary	6	near_opt_flush_blocks	0
 binary	6	near_opt_only_literals_blocks	0
+binary	6	nearopt_finite_skip_would_save	0
+binary	6	nearopt_pass_entries	0
+binary	6	set_from_codes_calls	0
 binary	9	alloc_bytes	524320
 binary	9	alloc_events	1
 binary	9	bitstream_flush_word_calls	177569
@@ -1473,6 +1558,8 @@ binary	9	bt_probe_attempts	0
 binary	9	bt_probe_outcome_accepted	0
 binary	9	bt_probe_outcome_miss	0
 binary	9	bt_probe_outcome_too_short	0
+binary	9	cost_sheet_equal_at_last_pass	0
+binary	9	cost_sheet_equal_flags	0
 binary	9	dynamic_header_bits_total	2079
 binary	9	emit_body_bits	5094407
 binary	9	fast_hash_computations	0
@@ -1509,6 +1596,9 @@ binary	9	matches_emitted	25270
 binary	9	matches_emitted_fast	0
 binary	9	near_opt_flush_blocks	0
 binary	9	near_opt_only_literals_blocks	0
+binary	9	nearopt_finite_skip_would_save	0
+binary	9	nearopt_pass_entries	0
+binary	9	set_from_codes_calls	0
 noise	1	alloc_bytes	524895
 noise	1	alloc_events	3
 noise	1	bitstream_flush_word_calls	0
@@ -1556,6 +1646,8 @@ noise	1	bt_probe_attempts	0
 noise	1	bt_probe_outcome_accepted	0
 noise	1	bt_probe_outcome_miss	0
 noise	1	bt_probe_outcome_too_short	0
+noise	1	cost_sheet_equal_at_last_pass	0
+noise	1	cost_sheet_equal_flags	0
 noise	1	dynamic_header_bits_total	0
 noise	1	emit_body_bits	0
 noise	1	fast_hash_computations	1050269
@@ -1592,6 +1684,9 @@ noise	1	matches_emitted	827
 noise	1	matches_emitted_fast	827
 noise	1	near_opt_flush_blocks	0
 noise	1	near_opt_only_literals_blocks	0
+noise	1	nearopt_finite_skip_would_save	0
+noise	1	nearopt_pass_entries	0
+noise	1	set_from_codes_calls	0
 noise	2	alloc_bytes	524320
 noise	2	alloc_events	1
 noise	2	bitstream_flush_word_calls	0
@@ -1639,6 +1734,8 @@ noise	2	bt_probe_attempts	0
 noise	2	bt_probe_outcome_accepted	0
 noise	2	bt_probe_outcome_miss	0
 noise	2	bt_probe_outcome_too_short	0
+noise	2	cost_sheet_equal_at_last_pass	0
+noise	2	cost_sheet_equal_flags	0
 noise	2	dynamic_header_bits_total	0
 noise	2	emit_body_bits	0
 noise	2	fast_hash_computations	0
@@ -1675,6 +1772,9 @@ noise	2	matches_emitted	228
 noise	2	matches_emitted_fast	0
 noise	2	near_opt_flush_blocks	0
 noise	2	near_opt_only_literals_blocks	0
+noise	2	nearopt_finite_skip_would_save	0
+noise	2	nearopt_pass_entries	0
+noise	2	set_from_codes_calls	0
 noise	4	alloc_bytes	524320
 noise	4	alloc_events	1
 noise	4	bitstream_flush_word_calls	0
@@ -1722,6 +1822,8 @@ noise	4	bt_probe_attempts	0
 noise	4	bt_probe_outcome_accepted	0
 noise	4	bt_probe_outcome_miss	0
 noise	4	bt_probe_outcome_too_short	0
+noise	4	cost_sheet_equal_at_last_pass	0
+noise	4	cost_sheet_equal_flags	0
 noise	4	dynamic_header_bits_total	0
 noise	4	emit_body_bits	0
 noise	4	fast_hash_computations	0
@@ -1758,6 +1860,9 @@ noise	4	matches_emitted	228
 noise	4	matches_emitted_fast	0
 noise	4	near_opt_flush_blocks	0
 noise	4	near_opt_only_literals_blocks	0
+noise	4	nearopt_finite_skip_would_save	0
+noise	4	nearopt_pass_entries	0
+noise	4	set_from_codes_calls	0
 noise	5	alloc_bytes	524320
 noise	5	alloc_events	1
 noise	5	bitstream_flush_word_calls	0
@@ -1805,6 +1910,8 @@ noise	5	bt_probe_attempts	0
 noise	5	bt_probe_outcome_accepted	0
 noise	5	bt_probe_outcome_miss	0
 noise	5	bt_probe_outcome_too_short	0
+noise	5	cost_sheet_equal_at_last_pass	0
+noise	5	cost_sheet_equal_flags	0
 noise	5	dynamic_header_bits_total	0
 noise	5	emit_body_bits	0
 noise	5	fast_hash_computations	0
@@ -1841,6 +1948,9 @@ noise	5	matches_emitted	228
 noise	5	matches_emitted_fast	0
 noise	5	near_opt_flush_blocks	0
 noise	5	near_opt_only_literals_blocks	0
+noise	5	nearopt_finite_skip_would_save	0
+noise	5	nearopt_pass_entries	0
+noise	5	set_from_codes_calls	0
 noise	6	alloc_bytes	524320
 noise	6	alloc_events	1
 noise	6	bitstream_flush_word_calls	0
@@ -1888,6 +1998,8 @@ noise	6	bt_probe_attempts	0
 noise	6	bt_probe_outcome_accepted	0
 noise	6	bt_probe_outcome_miss	0
 noise	6	bt_probe_outcome_too_short	0
+noise	6	cost_sheet_equal_at_last_pass	0
+noise	6	cost_sheet_equal_flags	0
 noise	6	dynamic_header_bits_total	0
 noise	6	emit_body_bits	0
 noise	6	fast_hash_computations	0
@@ -1924,6 +2036,9 @@ noise	6	matches_emitted	446
 noise	6	matches_emitted_fast	0
 noise	6	near_opt_flush_blocks	0
 noise	6	near_opt_only_literals_blocks	0
+noise	6	nearopt_finite_skip_would_save	0
+noise	6	nearopt_pass_entries	0
+noise	6	set_from_codes_calls	0
 noise	9	alloc_bytes	524320
 noise	9	alloc_events	1
 noise	9	bitstream_flush_word_calls	0
@@ -1971,6 +2086,8 @@ noise	9	bt_probe_attempts	0
 noise	9	bt_probe_outcome_accepted	0
 noise	9	bt_probe_outcome_miss	0
 noise	9	bt_probe_outcome_too_short	0
+noise	9	cost_sheet_equal_at_last_pass	0
+noise	9	cost_sheet_equal_flags	0
 noise	9	dynamic_header_bits_total	0
 noise	9	emit_body_bits	0
 noise	9	fast_hash_computations	0
@@ -2007,3 +2124,6 @@ noise	9	matches_emitted	446
 noise	9	matches_emitted_fast	0
 noise	9	near_opt_flush_blocks	0
 noise	9	near_opt_only_literals_blocks	0
+noise	9	nearopt_finite_skip_would_save	0
+noise	9	nearopt_pass_entries	0
+noise	9	set_from_codes_calls	0
