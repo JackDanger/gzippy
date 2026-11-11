@@ -1,0 +1,35 @@
+[sweep] 31 member files
+[sweep] A/A control: env-unset tune == vanilla on ALL members (route assertion ok)
+[sweep] dickens                ship=   3972887 medium=   3935501 rt=rt-ok
+[sweep] logs.txt               ship=  12386135 medium=  10239512 rt=rt-ok
+[sweep] logs.txt-card26m       ship=   1473523 medium=   1216322 rt=rt-ok
+[sweep] mozilla                ship=  19145403 medium=  18883030 rt=rt-ok
+[sweep] mr                     ship=   3660029 medium=   3655561 rt=rt-ok
+[sweep] nci                    ship=   3431861 medium=   3204179 rt=rt-ok
+[sweep] ooffice                ship=   3129694 medium=   3098518 rt=rt-ok
+[sweep] osdb                   ship=   3789343 medium=   3684140 rt=rt-ok
+[sweep] reymont                ship=   1990970 medium=   1947174 rt=rt-ok
+[sweep] samba                  ship=   5553450 medium=   5463111 rt=rt-ok
+[sweep] sao                    ship=   5391143 medium=   5367903 rt=rt-ok
+[sweep] software.archive       ship=   5633004 medium=   5578777 rt=rt-ok
+[sweep] webster                ship=  12601951 medium=  12344264 rt=rt-ok
+[sweep] x-ray                  ship=   6058381 medium=   6056817 rt=rt-ok
+[sweep] xml                    ship=    747620 medium=    705492 rt=rt-ok
+[sweep] access.log             ship=   2857413 medium=   2654961 rt=rt-ok
+[sweep] aozora.txt             ship=   4197277 medium=   4118650 rt=rt-ok
+[sweep] armexe.elf             ship=    586728 medium=    579934 rt=rt-ok
+[sweep] data.json              ship=   1736197 medium=   1599316 rt=rt-ok
+[sweep] data.sqlite            ship=  14804403 medium=  13753190 rt=rt-ok
+[sweep] ecoli.fastq            ship=   4568588 medium=   4564521 rt=rt-ok
+[sweep] markup.xml             ship=   2261494 medium=   2205336 rt=rt-ok
+[sweep] minjs.min.js           ship=   1129252 medium=   1104583 rt=rt-ok
+[sweep] monorepo.tar           ship=  10337816 medium=  10065349 rt=rt-ok
+[sweep] movie.mp4              ship=  12891391 medium=  12890594 rt=rt-ok
+[sweep] photo.jpg              ship=   6473476 medium=   6473437 rt=rt-ok
+[sweep] sil40                  ship=  15852476 medium=  15674093 rt=rt-ok
+[sweep] text-1MB               ship=    414843 medium=    411223 rt=rt-ok
+[sweep] tool.bin               ship=  21400590 medium=  20957814 rt=rt-ok
+[sweep] weights.safetensors    ship= 213295620 medium= 213295197 rt=rt-ok
+[sweep] winexe.exe             ship=   1551013 medium=   1524881 rt=rt-ok
+[sweep] wrote /Users/jackdanger/www/gzippy/.review-tmp/wA-medium/scratch/sizes.tsv
+exit=0
