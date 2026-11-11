@@ -1,0 +1,3 @@
+provenance: arm A(MAIN)=/Users/jackdanger/www/gzippy/.review-tmp/wC-walls/gzA sha=fe8bdab354dec553 | arm B(BASE)=/Users/jackdanger/www/gzippy/.review-tmp/wC-walls/gzB sha=f5afff2f2c91ac5c | A-sha==B-sha: False
+git A: gitdir: /Users/jackdanger/www/gzippy/.git/worktrees/wt-main2
+
