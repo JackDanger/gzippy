@@ -96,6 +96,10 @@ pub mod compress;
 mod compress_fastest;
 mod compress_greedy;
 mod compress_lazy;
+// L4-run PROBE (zlib-ng deflate_medium pricing): default-off, compiled away in
+// shipped builds. See the module's header for the vendoring contract.
+#[cfg(feature = "ladder-tune")]
+mod compress_medium;
 mod far_len3;
 mod flush;
 mod hc_matchfinder;
