@@ -86,6 +86,16 @@ pub mod near_opt_flush_probe {
     pub fn set_stale_flag_for_tests(v: bool) {
         super::near_optimal::set_stale_flag_for_tests(v);
     }
+    /// [flipsafe] Number of flip-safe settles whose wait arm ran — the
+    /// witness that the flipsafe feature compiled in and engaged (a
+    /// zero-settle identity test would prove nothing about the wait path).
+    /// Exists only under BOTH flush features; the plain
+    /// `near-opt-parallel-flush` build changes nothing (byte-for-byte).
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn poison_settles() -> u64 {
+        super::near_optimal::poison_settles()
+    }
 }
 
 /// Test/observability handle for the near-optimal d3 FILL probe (lever #2 /

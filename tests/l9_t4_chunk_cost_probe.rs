@@ -437,6 +437,89 @@ mod parallel_flush_probes {
         }
         near_opt_flush_probe::set_stale_flag_for_tests(false);
     }
+
+    /// [flipsafe] THE flip-safe bar, in-process: the fp-settle pool arm must
+    /// reproduce the serial build's stream bit-for-bit on corpora KNOWN to
+    /// flip (the 2026-11-10 flip record's in16m recipe: 6-11 only-literals
+    /// flushes at L9/L11 `-p4`, where the plain `near-opt-parallel-flush`
+    /// feature quarantines one chunk and diverges bytes). Uses the whole-file
+    /// parallel route (`compress_with_threads`) — the census shape — and
+    /// proves, per arm, that the pool engaged (`parallel_flush_writes`), the
+    /// settle arm resolved real blocks (`poison_settles` > 0 on a flip
+    /// corpus), the guard did NOT latch (flipsafe clears the quarantine by
+    /// construction), and the stream decompresses back to the input.
+    ///
+    /// Feature-gated: needs BOTH `near-opt-parallel-flush` and
+    /// `near-opt-parallel-flush-flipsafe` (after `mod`'s flush gate above).
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    #[test]
+    fn flipsafe_pool_stream_is_the_serial_stream() {
+        // The flip record's corpus (16,085,866 B; the 2026-11-10 probe attests
+        // 6 flips L9 / 11 L11 with the feature ON). Locally staged corpus IS
+        // the flip class; absent, fall back to the probe corpus (which stays
+        // zero-flip — the settles witness then only proves the code path).
+        let (flip_data, flip_is_real): (Option<Vec<u8>>, bool) =
+            match std::fs::read("/Users/jackdanger/www/gzippy/.review-tmp/in16m.bin") {
+                Ok(bytes) => (Some(bytes), true),
+                Err(_) => (None, false),
+            };
+
+        // At least one shape that the settle arm must serve at FULL depth:
+        // an fp-negative-margin block (only-literals wins over the first
+        // pass) is what the weights-style zeros/binary noise tail makes —
+        // deterministic, no external file.
+        let mut noise = Vec::new();
+        {
+            let mut s: u32 = 0x0BADC0DE;
+            for _ in 0..64 * 1024 {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                noise.push((s >> 24) as u8);
+            }
+        }
+
+        for (name, data) in [
+            (
+                "in16m (flip record)",
+                flip_data.clone().unwrap_or_else(build_corpus),
+            ),
+            ("fp-negative synthetic", noise),
+        ] {
+            near_opt_flush_probe::set_force_serial_flush(false);
+            let writes_before = near_opt_flush_probe::parallel_flush_writes();
+            let settles_before = near_opt_flush_probe::poison_settles();
+            // The SAFE arm: flipsafe + flush features => the pool resolves
+            // the freshness edge exactly.
+            let stream = gzippy::compress_with_threads(&data, 9, 4).expect("safe encode");
+            let writes_delta = near_opt_flush_probe::parallel_flush_writes() - writes_before;
+            let settles_delta = near_opt_flush_probe::poison_settles() - settles_before;
+            assert!(
+                writes_delta > 0,
+                "{name}: the pool never engaged (feature wiring under test)"
+            );
+            assert!(
+                !near_opt_flush_probe::stale_flag_fired(),
+                "{name}: the stale-flag guard latched under flipsafe — the \
+                 construction (exact verdicts) forbids a byte-quarantine"
+            );
+            if flip_is_real && name != "fp-negative synthetic" {
+                assert!(
+                    settles_delta > 0,
+                    "{name}: the settle arm resolved nothing on the flip corpus"
+                );
+            }
+            // The serial reference: force the pool off (same binary).
+            near_opt_flush_probe::set_force_serial_flush(true);
+            let serial = gzippy::compress_with_threads(&data, 9, 4).expect("serial encode");
+            near_opt_flush_probe::set_force_serial_flush(false);
+            assert_eq!(
+                stream, serial,
+                "{name}: the flip-safe pool arm diverged from the serial stream"
+            );
+            // Non-negotiable #1 on the pool arm's bytes: roundtrip.
+            let decoded = gzippy::decompress(&stream).expect("roundtrip decode");
+            assert_eq!(decoded, data, "{name}: pool-arm stream does not roundtrip");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

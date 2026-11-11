@@ -622,6 +622,15 @@ impl Optimizer {
         prev_observations: &[u32; NUM_OBSERVATION_TYPES],
         prev_num_observations: u32,
         bw: &mut BitWriter,
+        // [flipsafe] the fp-settle observer (feature `near-opt-parallel-flush`;
+        // serial arms pass `None` — zero change). Called ONCE, right after the
+        // FIRST refinement pass's true cost exists, with `(fp, only_lits)` =
+        // (that first pass's true cost, branch (a)'s candidate cost). The
+        // fp-soundness contract lives on `POISON_SETTLES` in the
+        // `parallel_flush` module below.
+        #[cfg(feature = "near-opt-parallel-flush")] mut first_pass_observer: Option<
+            &mut (dyn FnMut(u32, u32) + '_),
+        >,
     ) -> bool {
         let block = &buf[block_begin..block_begin + block_length];
         let np = &params.near_optimal;
@@ -678,6 +687,10 @@ impl Optimizer {
         // Assigned on the first (always-executed) loop iteration; read after.
         let mut true_cost;
         let mut num_passes_remaining = np.max_optim_passes;
+        // [flipsafe] the FIRST pass's publication is one-shot per call (the
+        // `first_pass_observer` runs exactly once, after pass 1).
+        #[cfg(feature = "near-opt-parallel-flush")]
+        let mut first_pass_unpublished = first_pass_observer.is_some();
         loop {
             crate::anatomy_count!(nearopt_pass_entries);
             let freqs = self.find_min_cost_path(block_length, cache_end);
@@ -687,6 +700,13 @@ impl Optimizer {
                 &self.pass_offcode.lens,
                 &mut self.header_scratch,
             );
+            #[cfg(feature = "near-opt-parallel-flush")]
+            if first_pass_unpublished {
+                first_pass_unpublished = false;
+                if let Some(ref mut obs) = first_pass_observer {
+                    obs(true_cost, only_lits_cost);
+                }
+            }
             if true_cost.wrapping_add(np.min_improvement_to_continue) > best_true_cost {
                 break;
             }
@@ -954,6 +974,12 @@ pub(super) fn set_stale_flag_for_tests(v: bool) {
     parallel_flush::set_stale_flag_for_tests(v);
 }
 
+#[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+#[allow(dead_code)]
+pub(super) fn poison_settles() -> u64 {
+    parallel_flush::poison_settles()
+}
+
 // ── `near-opt-d3-probe` test/observability surface (LEVER #2, row 2) ────────
 // Thin forwards of the `matchfinder::near_opt_probe` selector's force-bt
 // state at THIS module's top level so `parse::near_opt_d3_probe` can name it
@@ -1146,6 +1172,47 @@ mod parallel_flush {
     /// the module doc — an identity test must prove its parallel arm ran).
     static WRITES: AtomicU64 = AtomicU64::new(0);
 
+    // ── the flip-safe shape (`near-opt-parallel-flush-flipsafe`) ──
+    //
+    // One freshness carrier is left dangling by the pool: flush block k's
+    // `used_only_literals` verdict feeds block k+1's `min_match_len` in the
+    // serial shape (`run`'s `prev_block_used_only_literals`) and the dispatch
+    // arm assumes `false` for it. This sub-feature closes that edge with a
+    // WAIT gated on a fill-side predicate.
+
+    /// THE FP-SETTLE SIGNAL (`near-opt-parallel-flush-flipsafe`): what makes
+    /// the wait Truncatable instead of unbounded. The freshness chain's edge
+    /// is: flush block k's `used_only_literals` verdict feeds block k+1's
+    /// `min_match_len` (`run` reads it as `prev_block_used_only_literals`);
+    /// the dispatch arm assumes `false`. Sound WAIT TRUNCATION comes from the
+    /// (d) decision's own shape:
+    ///
+    ///   verdict=true ⟹ only_lits_cost < best_true_cost   (the nested `if
+    ///   only_lits_cost < static_cost` inside `min(only,static) < best`),
+    ///   best_true_cost = min over passes ≤ FIRST pass's true_cost.
+    ///
+    /// Necessarily: verdict ⟹ only_lits < F1; contrapositive: only_lits ≥ F1
+    /// ⟹ used_only_literals=false GUARANTEED. A worker therefore publishes
+    /// `(F1, only_lits_cost)` right after the first refinement pass, and the
+    /// fill thread's settle resolves EARLY (no-flip, proven) withOUT waiting
+    /// for the whole flush whenever only_lits ≥ F1 — the common case on
+    /// match-dense blocks (`only_lits / best` ratios of 1.5-8 on the envelope
+    /// census); the rare negative-margin block falls back to waiting for the
+    /// real verdict. There is NO fill-side shape predicate: the fp-soundness
+    /// is per-block and per-corpus by construction (measured sh2 range
+    /// check: fp-settle resolves weights.safetensors' 300 KB/125-entries
+    /// flip blocks by full-wait, mozilla's by full-wait, in16m's narrow
+    /// ones by fp-truncation or fp-resolve).
+    ///
+    /// This replaces the first draft's `(block_len, matched)` envelope: the
+    /// 51-member envelope campaign showed the flip class spans
+    /// matched ∈ [1..125_031] and len ∈ [5_000..300_126] — no shape cutoff
+    /// is complete, and an incomplete predicate manufactured a THIRD wrong
+    /// stream (measured: prefix-of-flips caught ⇒ SAFE diverged from BOTH
+    /// arms on mozilla/sil40).
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    static POISON_SETTLES: AtomicU64 = AtomicU64::new(0);
+
     /// `min(2, cpus - 1)` extra flush workers (the worker-count contract). A
     /// single-CPU host gets 0 and never spawns the pool (pure serial bytes
     /// fall out of the `None` arm).
@@ -1155,8 +1222,22 @@ mod parallel_flush {
 
     /// Whether this `run` should engage the pool (feature on, no stale flag,
     /// no test override, at least one worker).
+    ///
+    /// [flipsafe] `STALE_FLAG` is deliberately NOT consulted: that latch is
+    /// the byte-quarantine of the UNtil-served freshness edge — under
+    /// flipsafe the verdict is taken exactly (the fp-settle ladder), so a
+    /// chunk's flips stop being a divergence event and the pool keeps
+    /// serving later chunks. The plain `near-opt-parallel-flush` build
+    /// (flipsafe off) latches exactly as shipped.
     pub(super) fn engaged() -> bool {
-        !FORCE_SERIAL.load(Relaxed) && !STALE_FLAG.load(Relaxed) && worker_count() > 0
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        {
+            !FORCE_SERIAL.load(Relaxed) && worker_count() > 0
+        }
+        #[cfg(not(feature = "near-opt-parallel-flush-flipsafe"))]
+        {
+            !FORCE_SERIAL.load(Relaxed) && !STALE_FLAG.load(Relaxed) && worker_count() > 0
+        }
     }
 
     // ── test/observability surface (`parse` re-exports this block) ──
@@ -1191,6 +1272,14 @@ mod parallel_flush {
         // real chunks only (the test asserts the LATCH, not the print).
         STALE_FLAG_LOGGED.store(true, Relaxed);
         STALE_FLAG.store(v, Relaxed);
+    }
+
+    /// [flipsafe] Probe accessor: how many settles took the wait arm so far
+    /// (see `POISON_SETTLES`). Re-exported by `parse::near_opt_flush_probe`.
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    #[allow(dead_code)]
+    pub(super) fn poison_settles() -> u64 {
+        POISON_SETTLES.load(Relaxed)
     }
 
     // ── job + result plumbing ──
@@ -1249,6 +1338,27 @@ mod parallel_flush {
         /// worker parks on this key (and consumes it) before optimizing.
         exited: Mutex<BTreeMap<usize, DeflateCosts>>,
         exited_cv: Condvar,
+        /// [flipsafe] THE fp-settle mailbox: `settle[k]` = block k's
+        /// first-pass signal (`(F1, only_lits)` — posted after the first
+        /// refinement pass) and, later, the block's REAL verdict. The fill
+        /// thread's `settle_poison` parks here; see the fp-soundness note on
+        /// [`POISON_SETTLES`].
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        settle: Mutex<BTreeMap<usize, SettleEntry>>,
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        settle_cv: Condvar,
+    }
+
+    /// [flipsafe] One block's row of the settle mailbox: the first-pass
+    /// snapshot (`None` until the worker reaches the first refinement pass)
+    /// and the definitive verdict (`None` until `optimize_and_flush`
+    /// returns). `only_lits ≥ fp` resolves the settle to `false` PROVEN (the
+    /// contrapositive of `verdict ⟹ only_lits < min(F1, …)`) without the
+    /// flush's remaining passes; otherwise the settle waits for `verdict`.
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    struct SettleEntry {
+        fp_and_only: Option<(u32, u32)>,
+        verdict: Option<bool>,
     }
 
     struct Queue {
@@ -1298,6 +1408,10 @@ mod parallel_flush {
                     results_cv: Condvar::new(),
                     exited: Mutex::new(BTreeMap::new()),
                     exited_cv: Condvar::new(),
+                    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+                    settle: Mutex::new(BTreeMap::new()),
+                    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+                    settle_cv: Condvar::new(),
                 }),
                 handles: Vec::new(),
                 spawned: false,
@@ -1380,6 +1494,77 @@ mod parallel_flush {
             self.core.queue_cv.notify_one();
         }
 
+        /// [flipsafe] THE byte-conserving serialization of the one unserved
+        /// freshness edge, with the wait truncated where it is PROVEN safe.
+        /// Called at the top of `run`'s block loop, before block k+1's
+        /// `min_len`: it resolves the `used_only_literals` verdict of the
+        /// last dispatched block (slot `next_index - 1`) — bit-for-bit the
+        /// value the serial arm would assign into
+        /// `prev_block_used_only_literals`.
+        ///
+        /// Resolution ladder (park on [`Core::settle`], see the fp-soundness
+        /// note on `POISON_SETTLES`):
+        /// 1. nothing dispatched yet (first block of the chunk): `false` —
+        ///    the serial arm's only possible value there;
+        /// 2. `(F1, only_lits)` published AND `only_lits ≥ F1`: `false`
+        ///    PROVEN — `verdict=true` requires `only_lits < best ≤ F1`, so
+        ///    the flush that is still running in its own worker WILL return
+        ///    `false`; the fill thread resumes without the remaining passes;
+        /// 3. the REAL `verdict` posted: return it (the rare negative-margin
+        ///    block falls here and pays the full-flush wait).
+        ///
+        /// Why the wait cannot deadlock: the settle parks on the settle
+        /// mailbox only, whose writers (the flush workers) never need the
+        /// fill thread — the flush→flush exit-cost chain lives between
+        /// workers, the queue is not closed before every dispatched slot's
+        /// verdict is posted, and the fill thread releases no lock around
+        /// this call.
+        ///
+        /// Why the ONLY edge that needs it is this one: every other
+        /// `optimize_and_flush` input is fill-produced (the carriers audit,
+        /// the module doc) or the `costs` entry state, which the flush→flush
+        /// mailbox already chains in block order.
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        pub(super) fn settle_poison(&mut self) -> bool {
+            if self.next_index == 0 {
+                return false;
+            }
+            let index = self.next_index - 1;
+            let verdict = {
+                let mut settle = self
+                    .core
+                    .settle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    match settle.get(&index) {
+                        None => {}
+                        Some(entry) => {
+                            if let Some(v) = entry.verdict {
+                                break v;
+                            }
+                            if let Some((fp, only_lits)) = entry.fp_and_only {
+                                if only_lits >= fp {
+                                    // PROVEN false: see the ladder's step 2
+                                    // (the contrapositive argument on
+                                    // `POISON_SETTLES`).
+                                    break false;
+                                }
+                            }
+                        }
+                    }
+                    settle = self
+                        .core
+                        .settle_cv
+                        .wait(settle)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            };
+            POISON_SETTLES.fetch_add(1, Relaxed);
+            crate::anatomy_count!(near_opt_flip_safe_settles);
+            verdict
+        }
+
         /// Close the queue, wait for every dispatched flush, join the
         /// workers, then write the finished fragments into `bw` in block
         /// order. Returns the chunk's only-literals count (the guard's
@@ -1434,14 +1619,22 @@ mod parallel_flush {
                 // The stale-flag guard's runtime half. The zero-flip
                 // finding makes this unreachable on the bench corpora;
                 // when it does fire the process latches to serial.
-                STALE_FLAG.store(true, Relaxed);
-                if !STALE_FLAG_LOGGED.swap(true, Relaxed) {
-                    eprintln!(
-                        "gzippy: near-optimal parallel flush guard tripped \
-                         ({flips} only-literals flushes in one chunk) -- \
-                         falling back to the serial optimize_and_flush for the \
-                         rest of this process"
-                    );
+                // [flipsafe] no latch: the fp-settle ladder took every
+                // verdict exactly, so a flip never diverged this chunk's
+                // bytes and later chunks need no quarantine — `engaged()`
+                // already reads accordingly. (The tally above still reports
+                // through the anatomy counters.)
+                #[cfg(not(feature = "near-opt-parallel-flush-flipsafe"))]
+                {
+                    STALE_FLAG.store(true, Relaxed);
+                    if !STALE_FLAG_LOGGED.swap(true, Relaxed) {
+                        eprintln!(
+                            "gzippy: near-optimal parallel flush guard tripped \
+                             ({flips} only-literals flushes in one chunk) -- \
+                             falling back to the serial optimize_and_flush for the \
+                             rest of this process"
+                        );
+                    }
                 }
             }
             flips
@@ -1492,6 +1685,24 @@ mod parallel_flush {
                     .unwrap()
                     .insert(index, DeflateCosts::default());
                 core.exited_cv.notify_all();
+                // [flipsafe] the settle mailbox must also see a verdict, or a
+                // panic between the fp post and this handler parks the fill
+                // thread forever (in release `panic = "abort"` takes the
+                // process first; this keeps the debug pipeline loud instead
+                // of stuck).
+                #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+                {
+                    let mut settle = core.settle.lock().unwrap();
+                    settle
+                        .entry(index)
+                        .or_insert(SettleEntry {
+                            fp_and_only: None,
+                            verdict: None,
+                        })
+                        .verdict = Some(false);
+                    drop(settle);
+                    core.settle_cv.notify_all();
+                }
                 Fragment {
                     // A panicking flush leaves its slot EMPTY-sized: the
                     // write-back then produces a stream that the
@@ -1537,6 +1748,26 @@ mod parallel_flush {
         // emit_block sub-regions must stay silent while the flush region owns
         // the span (fresh thread => fresh flag; set only around this call).
         let __flush_guard = crate::compress::deflate::anatomy_wall::NearOptFlushGuard::enter();
+        // [flipsafe] the fp-settle publisher: captures the FIRST pass's true
+        // cost together with the (a) candidate's cost and posts them to the
+        // settle mailbox where the fill thread's `settle_poison` parks (the
+        // fp-soundness contract on `POISON_SETTLES`). Inert without flipsafe.
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        let mut fp_observer = |fp: u32, only_lits: u32| {
+            let mut settle = core
+                .settle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            settle
+                .entry(job.index)
+                .or_insert(SettleEntry {
+                    fp_and_only: None,
+                    verdict: None,
+                })
+                .fp_and_only = Some((fp, only_lits));
+            drop(settle);
+            core.settle_cv.notify_all();
+        };
         let used_only_literals = opt.optimize_and_flush(
             &job.block,
             0,
@@ -1550,6 +1781,13 @@ mod parallel_flush {
             &job.prev_observations,
             job.prev_num_observations,
             &mut w,
+            #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+            Some(&mut fp_observer),
+            #[cfg(all(
+                feature = "near-opt-parallel-flush",
+                not(feature = "near-opt-parallel-flush-flipsafe")
+            ))]
+            None,
         );
         // Chain: post this flush's EXIT state where job index+1's worker
         // will find it. Serial `run` just leaves `opt.costs` in place for the
@@ -1557,6 +1795,25 @@ mod parallel_flush {
         // mailbox (the pooled Optimizer's costs are re-seeded at every job
         // entry, so nothing else in it matters across jobs).
         record_exit_costs(core, job.index, opt.costs.clone());
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        {
+            // The definitive verdict for any settle still parked on this
+            // block (the fp-truncation path skipped it for resolved blocks;
+            // negative-margin blocks waited for exactly this).
+            let mut settle = core
+                .settle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            settle
+                .entry(job.index)
+                .or_insert(SettleEntry {
+                    fp_and_only: None,
+                    verdict: None,
+                })
+                .verdict = Some(used_only_literals);
+            drop(settle);
+            core.settle_cv.notify_all();
+        }
         let (bytes, pad_bits) = w.finish_unaligned();
         Fragment {
             bytes,
@@ -1759,6 +2016,23 @@ pub(super) fn run(
         let mut prev_end_block_check: Option<usize> = None;
         let mut change_detected = false;
         let mut next_observation = fill.in_next;
+
+        // [flipsafe] Serialize the ONE unserved freshness edge. The dispatch
+        // arms below assume the previous block's only-literals verdict was
+        // `false` (the serial arm's other value); when the last dispatched
+        // block sits inside the poison envelope, wait here and take its REAL
+        // verdict, so `min_len` below re-derives exactly what the serial arm
+        // derives. Outside the envelope the envelope's own guarantee makes
+        // the `false` assumption byte-identical to the serial arm's — no
+        // wait, no divergence (see `parallel_flush::settle_poison`).
+        #[cfg(all(
+            feature = "near-opt-parallel-flush",
+            feature = "near-opt-parallel-flush-flipsafe"
+        ))]
+        if flush_pipe.is_some() {
+            fill.prev_block_used_only_literals =
+                flush_pipe.as_mut().expect("checked Some").settle_poison();
+        }
 
         let min_len = if fill.prev_block_used_only_literals {
             MAX_MATCH_LEN + 1
@@ -1989,6 +2263,7 @@ pub(super) fn run(
                         &fill.prev_observations,
                         fill.prev_num_observations,
                         bw,
+                        None,
                     )
                 }),
             };
@@ -2079,6 +2354,7 @@ pub(super) fn run(
                         &fill.prev_observations,
                         fill.prev_num_observations,
                         bw,
+                        None,
                     )
                 }),
             };
