@@ -442,6 +442,14 @@ define_counters!(
     cost_sheet_equal_flags,
     nearopt_finite_skip_would_save,
     cost_sheet_equal_at_last_pass,
+    // Flip-safe lever (`near-opt-parallel-flush-flipsafe`): settles whose
+    // wait arm ran — the fill thread parked on a possibly-poison job's
+    // finished fragment and took its REAL `used_only_literals` verdict into
+    // the next block's `min_match_len`. The census's end-to-end witness that
+    // the wait arm engaged (the `poison_settles` probe surface serves the
+    // in-process unit probes; same unit, same call site). Zero increments in
+    // every other build.
+    near_opt_flip_safe_settles,
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,

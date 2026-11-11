@@ -1,0 +1,7 @@
+FLUSHSTAT len=8233 cache_end=19016 only_lits=38508 static=38748 best=30741 verdict=0
+FLUSHSTAT len=124323 cache_end=412721 only_lits=553801 static=4294967295 best=365191 verdict=0
+FLUSHSTAT len=148576 cache_end=495567 only_lits=662925 static=4294967295 best=432453 verdict=0
+FLUSHSTAT len=175677 cache_end=583786 only_lits=785397 static=4294967295 best=513751 verdict=0
+FLUSHSTAT len=291767 cache_end=956290 only_lits=1308666 static=4294967295 best=869875 verdict=0
+FLUSHSTAT len=242267 cache_end=817213 only_lits=1079667 static=4294967295 best=700260 verdict=0
+FLUSHSTAT len=57733 cache_end=190002 only_lits=260468 static=4294967295 best=170035 verdict=0

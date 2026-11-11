@@ -181,6 +181,12 @@ fn depth_split_d400_p4() {
 mod parallel_flush_probes {
     use super::*;
     use gzippy::compress::deflate::parse::near_opt_flush_probe;
+    /// The bt-probebudget probes toggle the process-global budget mid-suite;
+    /// the flush-identity probes pin it back to the factory state around
+    /// their arms (see `reset_budget`'s callers). Import path is cfg'd with
+    /// the budget feature alongside every call site below.
+    #[cfg(feature = "near-opt-bt-probebudget")]
+    use gzippy::compress::deflate::parse::near_opt_probebudget;
 
     /// Deterministic incompressible noise (own LCG, mirroring the bitstream
     /// tests' fixture style). Appended as a small tail to one identity
@@ -207,6 +213,16 @@ mod parallel_flush_probes {
         pool: bool,
     ) -> (Vec<u8>, u8, bool) {
         near_opt_flush_probe::set_force_serial_flush(!pool);
+        // Pin the shipped probe budget: the bt-probebudget probes in THIS
+        // file toggle the process-global budget around their arms. The
+        // budget is read at each near-opt run's start, so a toggle straddling
+        // a flush-identity test's serial-vs-pool arms changes the runs' match
+        // lists and manufactures a divergence that has nothing to do with
+        // the flush edge under test. Re-pinning per encode keeps every arm
+        // at the factory state regardless of interleaving. (CI runs each
+        // probe test solo; this matters only for whole-suite runs.)
+        #[cfg(feature = "near-opt-bt-probebudget")]
+        near_opt_probebudget::reset_budget();
         let mut out = Vec::with_capacity(body.len() / 2 + 1024);
         let meta = gzippy::compress::deflate::encode_deflate_splice_chunk_to_sink(
             body,
@@ -225,6 +241,9 @@ mod parallel_flush_probes {
     /// near-optimal parser).
     fn encode_l11t1(data: &[u8], pool: bool) -> Vec<u8> {
         near_opt_flush_probe::set_force_serial_flush(!pool);
+        // See `encode_l9t4`'s budget-pin note (same race, same fix).
+        #[cfg(feature = "near-opt-bt-probebudget")]
+        near_opt_probebudget::reset_budget();
         gzippy::compress::deflate::encode_deflate_bytes_to_vec(data, 11)
     }
 
@@ -293,6 +312,12 @@ mod parallel_flush_probes {
     /// it and re-checking serial bytes.
     #[test]
     fn chunks_are_byte_identical_to_the_serial_stream() {
+        // [flipsafe] when the suite runs with BOTH flush features, the
+        // flipsafe probe below races THIS test's process-wide statics
+        // (`set_force_serial_flush` + the WRITES counter) — take the probe
+        // lock for the whole body (solo in CI; uncontended there).
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        let __probe_lock = near_opt_flush_probe::probe_lock().lock().unwrap();
         // The four campaign corpora, sliced like the production chunk probe
         // (32 KiB dict + chunk body). silesia.tar / software.archive are
         // campaign-local fixtures and may be absent on other checkouts;
@@ -436,6 +461,104 @@ mod parallel_flush_probes {
             assert_eq!(ser, par, "vetoed runs must produce the serial bytes");
         }
         near_opt_flush_probe::set_stale_flag_for_tests(false);
+    }
+
+    /// [flipsafe] THE flip-safe bar, in-process: the fp-settle pool arm must
+    /// reproduce the serial build's stream bit-for-bit on corpora KNOWN to
+    /// flip (the 2026-11-10 flip record's in16m recipe: 6-11 only-literals
+    /// flushes at L9/L11 `-p4`, where the plain `near-opt-parallel-flush`
+    /// feature quarantines one chunk and diverges bytes). Uses the whole-file
+    /// parallel route (`compress_with_threads`) — the census shape — and
+    /// proves, per arm, that the pool engaged (`parallel_flush_writes`), the
+    /// settle arm resolved real blocks (`poison_settles` > 0 on a flip
+    /// corpus), the guard did NOT latch (flipsafe clears the quarantine by
+    /// construction), and the stream decompresses back to the input.
+    ///
+    /// Feature-gated: needs BOTH `near-opt-parallel-flush` and
+    /// `near-opt-parallel-flush-flipsafe` (after `mod`'s flush gate above).
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    #[test]
+    fn flipsafe_pool_stream_is_the_serial_stream() {
+        // [flipsafe] hold the probe lock: the force-serial toggles below are
+        // process-wide and would race the identity test's arms under the
+        // default parallel test harness (see `probe_lock`'s note).
+        let __probe_lock = near_opt_flush_probe::probe_lock().lock().unwrap();
+        // The flip record's corpus (16,085,866 B; the 2026-11-10 probe attests
+        // 6 flips L9 / 11 L11 with the feature ON). Locally staged corpus IS
+        // the flip class; absent, fall back to the probe corpus (which stays
+        // zero-flip — the settles witness then only proves the code path).
+        let (flip_data, flip_is_real): (Option<Vec<u8>>, bool) =
+            match std::fs::read("/Users/jackdanger/www/gzippy/.review-tmp/in16m.bin") {
+                Ok(bytes) => (Some(bytes), true),
+                Err(_) => (None, false),
+            };
+
+        // At least one shape that the settle arm must serve at FULL depth:
+        // an fp-negative-margin block (only-literals wins over the first
+        // pass) is what the weights-style zeros/binary noise tail makes —
+        // deterministic, no external file.
+        let mut noise = Vec::new();
+        {
+            let mut s: u32 = 0x0BADC0DE;
+            for _ in 0..64 * 1024 {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                noise.push((s >> 24) as u8);
+            }
+        }
+
+        for (name, data) in [
+            (
+                "in16m (flip record)",
+                flip_data.clone().unwrap_or_else(build_corpus),
+            ),
+            ("fp-negative synthetic", noise),
+        ] {
+            // Pin the shipped probe budget (the bt-probebudget probes in
+            // THIS file toggle the process-global mid-suite; a budget
+            // straddling these two arms changes their match lists and
+            // manufactures a divergence that has nothing to do with the
+            // flush edge under test — see `encode_l9t4`'s pin comment).
+            #[cfg(feature = "near-opt-bt-probebudget")]
+            near_opt_probebudget::reset_budget();
+            near_opt_flush_probe::set_force_serial_flush(false);
+            let writes_before = near_opt_flush_probe::parallel_flush_writes();
+            let settles_before = near_opt_flush_probe::poison_settles();
+            // The SAFE arm: flipsafe + flush features => the pool resolves
+            // the freshness edge exactly.
+            let stream = gzippy::compress_with_threads(&data, 9, 4).expect("safe encode");
+            let writes_delta = near_opt_flush_probe::parallel_flush_writes() - writes_before;
+            let settles_delta = near_opt_flush_probe::poison_settles() - settles_before;
+            assert!(
+                writes_delta > 0,
+                "{name}: the pool never engaged (feature wiring under test)"
+            );
+            assert!(
+                !near_opt_flush_probe::stale_flag_fired(),
+                "{name}: the stale-flag guard latched under flipsafe — the \
+                 construction (exact verdicts) forbids a byte-quarantine"
+            );
+            if flip_is_real && name != "fp-negative synthetic" {
+                assert!(
+                    settles_delta > 0,
+                    "{name}: the settle arm resolved nothing on the flip corpus"
+                );
+            }
+            // Re-pin BEFORE the serial arm: a concurrent budget probe could
+            // land between the two arms.
+            #[cfg(feature = "near-opt-bt-probebudget")]
+            near_opt_probebudget::reset_budget();
+            // The serial reference: force the pool off (same binary).
+            near_opt_flush_probe::set_force_serial_flush(true);
+            let serial = gzippy::compress_with_threads(&data, 9, 4).expect("serial encode");
+            near_opt_flush_probe::set_force_serial_flush(false);
+            assert_eq!(
+                stream, serial,
+                "{name}: the flip-safe pool arm diverged from the serial stream"
+            );
+            // Non-negotiable #1 on the pool arm's bytes: roundtrip.
+            let decoded = gzippy::decompress(&stream).expect("roundtrip decode");
+            assert_eq!(decoded, data, "{name}: pool-arm stream does not roundtrip");
+        }
     }
 }
 
@@ -725,7 +848,7 @@ mod bt_probebudget_probes {
     fn encode_full_arm(data: &[u8], budget: u32) -> Vec<u8> {
         near_opt_probebudget::set_budget(budget);
         let stream = gzippy::compress_with_threads(data, 9, 4).expect("encode should succeed");
-        near_opt_probebudget::set_budget(DEPTH);
+        near_opt_probebudget::reset_budget();
         stream
     }
 
@@ -765,7 +888,7 @@ mod bt_probebudget_probes {
             times.sort_by(|a, b| a.partial_cmp(b).unwrap());
             rows.push((label, times[0], bytes));
         }
-        near_opt_probebudget::set_budget(DEPTH);
+        near_opt_probebudget::reset_budget();
 
         let (_, ref_wall, ref_bytes) = rows[0];
         println!("-- bt-probebudget L9/T4 chunk (1.8 MB matrix corpus, depth 400, passes 2) --");
@@ -794,6 +917,15 @@ mod bt_probebudget_probes {
     /// so a byte delta is the DP's own choice among well-formed inputs.
     #[test]
     fn bt_probebudget_shape_lands_at_l9t4_production() {
+        // Serialize against the flush-probe tests when flipsafe is compiled
+        // in: this test's whole-file encodes engage the flush pool and bump
+        // the shared WRITES counter (breaking the identity test's exact
+        // delta) and toggle the budget under the identity tests' arms.
+        // Solo in CI; uncontended there.
+        #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+        let __probe_lock = gzippy::compress::deflate::parse::near_opt_flush_probe::probe_lock()
+            .lock()
+            .unwrap();
         let mut corpora: Vec<(String, Vec<u8>)> = Vec::new();
         {
             let data = build_corpus();
@@ -979,7 +1111,7 @@ mod bt_probebudget_probes {
             "the probe corpus must exercise budget cuts somewhere \
              (24 vs 400 differ) — else the prefix receipt never engaged"
         );
-        near_opt_probebudget::set_budget(DEPTH);
+        near_opt_probebudget::reset_budget();
     }
 
     /// The whole-NAMED-LOSS run: every budget arm over the ENTIRE

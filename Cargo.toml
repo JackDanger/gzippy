@@ -190,7 +190,6 @@ block-cost-probe = []
 # DEFAULT OFF: an adjudication-gated lever, not a shipped default — the wall
 # claim rides the probe variant's measured numbers before it can be promoted.
 near-opt-parallel-flush = []
-# Fixed-point pass-skip lever for the near-optimal refinement loop
 # (`optimize_and_flush`'s (c) iteration, src/compress/deflate/parse/
 # near_optimal.rs). With the feature off, the refinement loop's statement
 # sequence is today's shape byte-for-byte. With it on: after a pass ends and
@@ -212,6 +211,41 @@ near-opt-parallel-flush = []
 # counters ride `anatomy-counters` (the `cost_sheet_equal_flags`/
 # `nearopt_finite_skip_would_save` pair), see anatomy_counters.rs.
 nearopt-fixedpoint-skip = []
+
+# THE FLIP-SAFE SHAPE of `near-opt-parallel-flush` (branch
+# lever/flush-piplining-flipsafe, 2026-11-11; design doc
+# docs/board/records/2026-11-11-flush-flipsafe-design/README.md). Without
+# `near-opt-parallel-flush` as WELL this feature compiles to nothing (a
+# `near-opt-parallel-flush-flipsafe`-only build is byte-identical to the
+# default build — that identity is one arm of its own census). With BOTH
+# features on, the one freshness carrier the pool leaves dangling — the
+# `only_literals` verdict of flush block k feeding block k+1's
+# `min_match_len` (the dispatch arm passes literal `false`) — is closed by a
+# WAIT, not by an assumption:
+#
+# * the flush worker publishes `(F1, only_lits)` after the FIRST refinement
+#   pass (F1 = the first pass's true cost). By the (d) decision's shape,
+#   `verdict=true ⟹ only_lits < best_true_cost ≤ F1`, so `only_lits ≥ F1`
+#   resolves the settle to a PROVEN `false` without the remaining passes;
+#   a negative-margin block falls back to waiting for the real verdict.
+# * the block loop parks on the settle mailbox before computing block
+#   k+1's `min_len` and takes the verdict EXACTLY — bit-for-bit the serial
+#   semantics — so the parallel stream is byte-identical to the serial build
+#   on EVERY corpus, flip-shaped or not, with NO fill-side shape predicate
+#   (the fp-soundness is per-block and per-corpus by construction; the
+#   staged-corpus flip class spans matched ∈ [1..125_031] and len
+#   ∈ [5_000..300_126], which kills any (len, matched) envelope).
+# * the stale-flag quarantine (a flip latches the pool off for the process)
+#   is DISABLED here: with every verdict taken exactly, a flip never
+#   diverges bytes and the latch would needlessly serialize later chunks;
+#   the census matrix (52 members x L9-12 x -p2/-p4, ON == OFF, zero sha
+#   deltas) is the receipt. The wall prize at the 2026-11-10 coordinates
+#   rides on the early resolution (measured: fp-settle keeps most of the
+#   parallel-flush wall win; see the design record).
+#
+# The `near-opt-parallel-flush` feature is untouched: `flipsafe` OFF + flush
+# ON is exactly today's feature arm, flips included.
+near-opt-parallel-flush-flipsafe = []
 # LEVER #2 / d3 (docs/board/sprint-2026-09-25.md "Lever ledger", row 2): replace
 # the near-optimal fill's binary-tree matchfinder descent with a CHEAPER ordered
 # candidate gatherer under the SAME DP (`find_min_cost_path`'s trusted layout —
