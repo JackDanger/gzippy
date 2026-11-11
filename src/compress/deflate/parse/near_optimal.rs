@@ -974,7 +974,10 @@ pub(super) fn set_stale_flag_for_tests(v: bool) {
     parallel_flush::set_stale_flag_for_tests(v);
 }
 
-#[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+#[cfg(all(
+    feature = "near-opt-parallel-flush",
+    feature = "near-opt-parallel-flush-flipsafe"
+))]
 #[allow(dead_code)]
 pub(super) fn poison_settles() -> u64 {
     parallel_flush::poison_settles()
