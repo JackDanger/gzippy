@@ -114,6 +114,14 @@ pub(crate) struct LdxCompressor {
     /// chain walk (zlib `deflate_slow`). The legacy zlib arm carried it and won
     /// the L6 cells with it (see `level_uses_ldx`); 0 disables.
     pub(crate) good_match: u32,
+    /// Not in C and not in legacy-ldx (libdeflate's `hash3_tab` is a singleton).
+    /// The trigram-chain walk depth in `hc_matchfinder_longest_match` — gzip/zlib's
+    /// `UPDATE_HASH` + `prev[]` chain (`vendor/gzip/deflate.c:282`) against our
+    /// one-deep trigram head. Level-scoped (armed where the level's parse runs,
+    /// any `-p`), values from the legacy engine's own sweep on the dd79 layui cells:
+    /// L2 4 (saturates at 4; its banked receipt is this depth), L3 8. 0 keeps the
+    /// port bit-identical to the vendor shape (every other level).
+    pub(crate) hash3_chain_depth: u32,
     /// The far-len-3 cost gate (legacy `far_len3` module): accept a len-3 match
     /// at a far offset only when the block's cost model says it beats the three
     /// literals it replaces. L3 only; off everywhere else (see the level map).
@@ -134,13 +142,13 @@ impl LdxCompressor {
         // compressor exists. CLAUDE.md clause 5: no test pins these VALUES; the
         // invariant test lives in `compress_greedy` and checks that effort RISES.
         // MEASUREMENT-ONLY override (`ladder-tune` feature, never in default, no
-        // production caller reads the env in shipped builds): `GZIPPY_LDX_CFG=<level>:<depth>:<nice>[:<good>]`
-        // replaces that ONE level's triple so the config space is bisectable on
+        // production caller reads the env in shipped builds): `GZIPPY_LDX_CFG=<level>:<depth>:<nice>[:<good>[:<chain3>]]`
+        // replaces that ONE level's config so the config space is bisectable on
         // the port itself (the residual-card probe surface for the cadence band).
         #[cfg(feature = "ladder-tune")]
-        let mut cfg_override: Option<(u32, u32, u32)> = None;
+        let mut cfg_override: Option<(u32, u32, u32, u32)> = None;
         #[cfg(feature = "ladder-tune")]
-        for (lvl, depth, nice, good) in std::env::var("GZIPPY_LDX_CFG")
+        for (lvl, depth, nice, good, chain3) in std::env::var("GZIPPY_LDX_CFG")
             .ok()
             .map(|raw| {
                 raw.split(',')
@@ -150,62 +158,78 @@ impl LdxCompressor {
                         let d: u32 = it.next()?.parse().ok()?;
                         let n: u32 = it.next()?.parse().ok()?;
                         let g: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        Some((l, d, n, g))
+                        let c3: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        Some((l, d, n, g, c3))
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
         {
             if lvl == compression_level {
-                cfg_override = Some((depth, nice, good));
+                cfg_override = Some((depth, nice, good, chain3));
             }
         }
 
-        let (max_search_depth, nice_match_length, good_match) = match compression_level {
-            0 => {
-                // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
-                max_passthrough_size = usize::MAX;
-                (0, 0, 0)
-            }
-            // C: `c->impl = deflate_compress_fastest;` (:3926). `max_search_depth` is
-            // unused at this level — it is hardcoded in ht_matchfinder.h.
-            // No chain walk at this level, so good_match is inert.
-            1 => (0, 32, 0),
-            // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
-            2 => (6, 10, 0),
-            // L3 DIVERGES FROM LIBDEFLATE ON PURPOSE: libdeflate's L3 is
-            // GREEDY(12,14); ours is ZLIB-STYLE LAZY(12,14) plus the far-len-3
-            // cost gate (accept far len-3 when it beats the three literals it
-            // replaces) and the 224x sparse-blocks split hold. The config
-            // matches origin/main's L3 LevelParams EXACTLY (depth 12 — NOT 8:
-            // branch commit 37cb96c7 lowered the legacy arm's depth to 8 as a
-            // WALL tweak; that is a lost regression the port does not inherit —
-            // the port must reproduce the winning incumbent). Both arms' lazy
-            // parsers are Rust ports of the same C and agree byte-for-byte at
-            // equal configs (see the L5-L7 note below).
-            3 => (12, 14, 0),
-            4 => (16, 30, 0),
-            // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
-            // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) lost
-            // the L5 probe (dovi -4,149 B, logs +134,778 B); the lever is L6/L7
-            // only. L6-L7: the zlib arm's depth + good_match pair (winning
-            // config: good_length 8/32, chain 128/256). The port and the legacy
-            // L6/L7 arm agree byte-for-byte when the configs agree; whether the
-            // router sends a level here is `level_uses_ldx` in
-            // `src/compress/deflate/mod.rs`.
-            5 => (16, 30, 0),
-            6 => (128, 65, 8),
-            7 => (256, 130, 32),
-            // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
-            8 => (300, DEFLATE_MAX_MATCH_LEN, 0),
-            9 => (600, DEFLATE_MAX_MATCH_LEN, 0),
-            _ => return None,
-        };
+        let (max_search_depth, nice_match_length, good_match, hash3_chain_depth) =
+            match compression_level {
+                0 => {
+                    // C: `c->impl = NULL; c->max_passthrough_size = SIZE_MAX;` (:3922)
+                    max_passthrough_size = usize::MAX;
+                    (0, 0, 0, 0)
+                }
+                // C: `c->impl = deflate_compress_fastest;` (:3926). `max_search_depth` is
+                // unused at this level — it is hardcoded in ht_matchfinder.h.
+                // No chain walk at this level, so good_match is inert.
+                1 => (0, 32, 0, 0),
+                // C: `c->impl = deflate_compress_greedy;` (:3931, :3936, :3941)
+                // Trigram chain L2 = 4: the legacy sweep's dd79_bin6 L2 receipt
+                // (−4,469 B) was measured AT depth 4 and the sweep saturates there
+                // (depth 8 measured identical-or-a-byte-worse in size at more walk).
+                // Keep `choose_min_match_len` adaptive — a narrow-alphabet block keeps
+                // min_len >= 4 and the chain stays unreachable (l2min3 containment).
+                2 => (6, 10, 0, 4),
+                // L3 DIVERGES FROM LIBDEFLATE ON PURPOSE: libdeflate's L3 is
+                // GREEDY(12,14); ours is ZLIB-STYLE LAZY(12,14) plus the far-len-3
+                // cost gate (accept far len-3 when it beats the three literals it
+                // replaces) and the 224x sparse-blocks split hold. The config
+                // matches origin/main's L3 LevelParams EXACTLY (depth 12 — NOT 8:
+                // branch commit 37cb96c7 lowered the legacy arm's depth to 8 as a
+                // WALL tweak; that is a lost regression the port does not inherit —
+                // the port must reproduce the winning incumbent). Both arms' lazy
+                // parsers are Rust ports of the same C and agree byte-for-byte at
+                // equal configs (see the L5-L7 note below).
+                // Trigram chain L3 = 8: the sweep-saturated depth, the coordinate of
+                // the legacy receipt (dd79_bin6 L3 −11,304 B).
+                3 => (12, 14, 0, 8),
+                4 => (16, 30, 0, 0),
+                // C: `c->impl = deflate_compress_lazy;` (:3946, :3951, :3956)
+                // L5: UNCHANGED libdeflate config — the zlib-arm pair (24, 8) lost
+                // the L5 probe (dovi -4,149 B, logs +134,778 B); the lever is L6/L7
+                // only. L6-L7: the zlib arm's depth + good_match pair (winning
+                // config: good_length 8/32, chain 128/256). The port and the legacy
+                // L6/L7 arm agree byte-for-byte when the configs agree; whether the
+                // router sends a level here is `level_uses_ldx` in
+                // `src/compress/deflate/mod.rs`. Levels 4-9: chain unarmed — the
+                // legacy sweep measured the mechanism at L2/L3 only; do not
+                // generalise across levels unmeasured (CLAUDE.md hard stop 3).
+                5 => (16, 30, 0, 0),
+                6 => (128, 65, 8, 0),
+                7 => (256, 130, 32, 0),
+                // C: `c->impl = deflate_compress_lazy2;` (:3961, :3967)
+                8 => (300, DEFLATE_MAX_MATCH_LEN, 0, 0),
+                9 => (600, DEFLATE_MAX_MATCH_LEN, 0, 0),
+                _ => return None,
+            };
         // The override shadows the table ONLY under the measurement feature;
-        // shipped builds keep the table's own triple with no cfg dance.
+        // shipped builds keep the table's own config with no cfg dance.
         #[cfg(feature = "ladder-tune")]
-        let (max_search_depth, nice_match_length, good_match) =
-            cfg_override.unwrap_or((max_search_depth, nice_match_length, good_match));
+        let (max_search_depth, nice_match_length, good_match, hash3_chain_depth) = cfg_override
+            .unwrap_or((
+                max_search_depth,
+                nice_match_length,
+                good_match,
+                hash3_chain_depth,
+            ));
 
         let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
             // ⚠ PROBE (2026-09-28, the residual board's access.log L5 card):
@@ -238,6 +262,7 @@ impl LdxCompressor {
             max_search_depth,
             nice_match_length,
             good_match,
+            hash3_chain_depth,
             far_len3_gate,
             sparse_split_guard_mul,
             c: Compressor::new(),
@@ -267,6 +292,7 @@ impl LdxCompressor {
         let max_search_depth = self.max_search_depth;
         let nice_match_length = self.nice_match_length;
         let good_match = self.good_match;
+        let hash3_chain_depth = self.hash3_chain_depth;
         let far_len3_gate = self.far_len3_gate;
         let sparse_split_guard_mul = self.sparse_split_guard_mul;
         // PROBE (zopfli #119, ladder-tune builds only — a shipped binary reads
@@ -318,6 +344,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     ldx_probe,
                 );
                 #[cfg(not(feature = "ladder-tune"))]
@@ -330,6 +357,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                 );
             }
             (ParserState::Greedy(p), 3) => {
@@ -343,6 +371,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                     ldx_probe,
@@ -357,6 +386,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                 );
@@ -374,6 +404,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                     ldx_probe,
@@ -388,6 +419,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                 );
@@ -403,6 +435,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                     ldx_probe,
@@ -417,6 +450,7 @@ impl LdxCompressor {
                     max_search_depth,
                     nice_match_length,
                     good_match,
+                    hash3_chain_depth,
                     far_len3_gate,
                     sparse_split_guard_mul,
                 );

@@ -76,6 +76,9 @@ pub(crate) fn deflate_compress_greedy(
     max_search_depth: u32,
     nice_match_length: u32,
     good_match: u32,
+    // ours: trigram-chain walk depth (legacy `hash3_chain_depth`); 0 = vendor
+    // singleton. See `hc_matchfinder_longest_match` and the level map.
+    hash3_chain_depth: u32,
     #[cfg(feature = "ladder-tune")] probe: Option<(bool, bool)>,
 ) {
     let mut in_next: usize = 0;
@@ -152,6 +155,7 @@ pub(crate) fn deflate_compress_greedy(
                 nice_len,
                 max_search_depth,
                 good_match,
+                hash3_chain_depth,
                 &mut next_hashes,
                 &mut offset,
             );

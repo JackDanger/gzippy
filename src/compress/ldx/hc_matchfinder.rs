@@ -7,7 +7,31 @@
 //! first bytes of a potential match; a full extension is attempted only when those
 //! match.
 //!
-//! # `init` clears the HASH TABLES ONLY; `slide_window` rebases EVERYTHING
+//! # The trigram chain (`next3_tab` + `hash3_chain_depth`) — OUR deviation, vendor-named
+//!
+//! libdeflate's `hash3_tab` is a SINGLETON: one position per 15-bit trigram key, no
+//! chain (`hc_matchfinder.h:112-122`; "Update for length 3 matches" overwrites the
+//! head and no successor slot ever exists). gzip and zlib hash THREE bytes into
+//! their one big table and chain every insertion (`vendor/gzip/deflate.c:282`
+//! `UPDATE_HASH` + `prev[]`), so their L2/L3 walk many length-3 candidates per
+//! position. That is the vendor diff behind the board's `dd79_bin6:L2/L3` cells
+//! (gzip finds ~51% more of the SHORTEST matches there — aa memo §2.2), and it has
+//! an in-tree measured receipt: the legacy engine's own `next3_tab` +
+//! `hash3_chain_depth` sweep (`matchfinder/hc.rs`) measured dd79_bin6 L2 −4,469 B at
+//! depth 4 and L3 −11,304 B at depth 8 before the port replaced the legacy
+//! encoder (`docs/production-paths.md`). This port reproduces the legacy shape:
+//! `next3_tab[pos]` holds the PREVIOUS node in the same 15-bit trigram-key chain,
+//! `longest_match` walks it from the head while `best_len < 3`, and `skip_bytes`
+//! leaves `next3_tab` untouched — the legacy skip loop's exact shape, so the port's
+//! hottest loop (the shallow-level insert) gains no store. Stale links are safe the
+//! same way `next_tab`'s are (candidates are cutoff-checked before dereference and
+//! byte-verified before producing an offset); chains are only armed where the
+//! MIN_LEN-3 alphabet stands (`choose_min_match_len` stays adaptive), which is the
+//! l2min3 containment: a narrow-alphabet block never lowers `min_len` to 3, so the
+//! walk is unreachable on exactly the inputs that killed the forced-min shape.
+//! Cross-STREAM staleness is why `next3_tab` joins `init()` (below).
+//!
+//! # `init` clears the HASH TABLES plus `next3_tab`; `slide_window` rebases EVERYTHING
 //!
 //! `hc_matchfinder_init` passes `HC_MATCHFINDER_TOTAL_HASH_SIZE` — hash3 + hash4 —
 //! while `hc_matchfinder_slide_window` passes `sizeof(*mf)`, which additionally covers
@@ -16,6 +40,19 @@
 //! stale link entries are unreachable until they are overwritten. Initialising
 //! `next_tab` too would be 32768 extra stores per stream for nothing. Reproduced
 //! exactly — an "obvious" symmetry fix here is pure cost.
+//!
+//! `next3_tab` does NOT share that argument once the chain is armed: the head the
+//! walk starts from is fresh, but a head inserted by `skip_bytes` does NOT carry a
+//! fresh link, so the walk dereferences `next3_tab[head]` whose slot may hold the
+//! value written by a PREVIOUS stream at that index — and a previous stream's
+//! positive position can sit greater than this stream's `cur_pos`, i.e. AHEAD of the
+//! cursor (a follow-on member of a concatenated lookahead, or smaller buffers where
+//! `in_base + value` reads past the input slice). We therefore fill `next3_tab` at
+//! `init` — one 64 KiB sentinel pass per stream, the legacy engine's own answer
+//! (`hc.rs::reset` fills all four tables) — while `next_tab` keeps the vendor's
+//! hash-only init (its links are only reachable through fresh hash4 heads; the
+//! singleton trigram never walks a second link at all, which is why libdeflate
+//! never needed this).
 //!
 //! # Our shipping `deflate/matchfinder/hc.rs` IS a faithful port of this
 //!
@@ -38,18 +75,23 @@ const HASH3_LEN: usize = 1 << HC_MATCHFINDER_HASH3_ORDER;
 const HASH4_LEN: usize = 1 << HC_MATCHFINDER_HASH4_ORDER;
 const NEXT_LEN: usize = MATCHFINDER_WINDOW_SIZE as usize;
 const HASH_TABLE_LEN: usize = HASH3_LEN + HASH4_LEN;
-const HC_TABLE_LEN: usize = HASH_TABLE_LEN + NEXT_LEN;
+/// hash3 + hash4 + `next3_tab` (the trigram-chain links — ours, see the module docs).
+const HASH_AND_CHAIN_TABLE_LEN: usize = HASH_TABLE_LEN + NEXT_LEN;
+const HC_TABLE_LEN: usize = HASH_AND_CHAIN_TABLE_LEN + NEXT_LEN;
 
 /// C: `struct MATCHFINDER_ALIGNED hc_matchfinder`.
 ///
-/// The three tables must remain one object.  Besides allowing the one-pass C-shaped
+/// The tables must remain one object.  Besides allowing the one-pass C-shaped
 /// init/rebase operations below, this makes their addresses fixed offsets from one
-/// aligned base in the matchfinder's hot probe loop.  Three independent boxed slices
-/// are semantically equivalent but force three unrelated base loads there.
+/// aligned base in the matchfinder's hot probe loop.  Independent boxed slices
+/// are semantically equivalent but force unrelated base loads there.
 #[repr(C, align(32))]
 struct HcTables {
     hash3_tab: [MfPos; HASH3_LEN],
     hash4_tab: [MfPos; HASH4_LEN],
+    /// ours (legacy `matchfinder/hc.rs`'s `next3_tab`): the trigram-chain successor
+    /// slot. Filled at `init` (see module docs); rebased with everything.
+    next3_tab: [MfPos; NEXT_LEN],
     next_tab: [MfPos; NEXT_LEN],
 }
 
@@ -65,6 +107,18 @@ impl HcTables {
         // HC_MATCHFINDER_TOTAL_HASH_SIZE range requires.
         unsafe {
             core::slice::from_raw_parts_mut((self as *mut Self).cast::<MfPos>(), HASH_TABLE_LEN)
+        }
+    }
+
+    #[inline(always)]
+    fn hash_and_chain_tables_mut(&mut self) -> &mut [MfPos] {
+        // `repr(C)` puts `next3_tab` right after hash4, so hash3 + hash4 + next3 is
+        // one contiguous sentinel pass.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (self as *mut Self).cast::<MfPos>(),
+                HASH_AND_CHAIN_TABLE_LEN,
+            )
         }
     }
 
@@ -87,6 +141,7 @@ impl HcMatchfinder {
             tables: Box::new(HcTables {
                 hash3_tab: [0; HASH3_LEN],
                 hash4_tab: [0; HASH4_LEN],
+                next3_tab: [0; NEXT_LEN],
                 next_tab: [0; NEXT_LEN],
             }),
         };
@@ -96,15 +151,16 @@ impl HcMatchfinder {
 
     /// C: `hc_matchfinder_init(struct hc_matchfinder *mf)` (:135)
     ///
-    /// Prepare the matchfinder for a new input buffer. **Hash tables only** — see the
-    /// module docs for why `next_tab` is deliberately left alone.
+    /// Prepare the matchfinder for a new input buffer. **Hash tables plus
+    /// `next3_tab`** — see the module docs for why `next_tab` is deliberately left
+    /// alone and why `next3_tab` must NOT be.
     pub(crate) fn init(&mut self) {
-        matchfinder_init(self.tables.hash_tables_mut());
+        matchfinder_init(self.tables.hash_and_chain_tables_mut());
     }
 
     /// C: `hc_matchfinder_slide_window(struct hc_matchfinder *mf)` (:144)
     ///
-    /// Rebases ALL THREE arrays, including `next_tab` — the links are positions too.
+    /// Rebases EVERY array, including both link tables — the links are positions too.
     #[inline(always)]
     pub(crate) fn slide_window(&mut self) {
         matchfinder_rebase(self.tables.all_mut());
@@ -209,6 +265,10 @@ pub(crate) fn hc_matchfinder_longest_match(
     nice_len: u32,
     max_search_depth: u32,
     good_match: u32,
+    // ours (legacy `hash3_chain_depth`): trigram-chain walk depth. 0 keeps the
+    // vendor's singleton behaviour bit-for-bit (no `next3_tab` insert, head probe
+    // only); N > 0 walks up to N candidates per probe (`matchfinder/hc.rs:374-407`).
+    hash3_chain_depth: u32,
     next_hashes: &mut [u32; 2],
     offset_ret: &mut u32,
 ) -> u32 {
@@ -283,6 +343,16 @@ pub(crate) fn hc_matchfinder_longest_match(
         *mf.tables.next_tab.get_unchecked_mut(cur_pos as usize) = cur_node4;
     }
 
+    // ours: prepend the node for the current sequence to the LENGTH-3 chain, exactly
+    // as the hash4 line above prepends to the length-4 chain (legacy
+    // `matchfinder/hc.rs:334-336`). A position lives in both chains, so it needs its
+    // own successor slot. Gated on `hash3_chain_depth > 0` so the shipped
+    // singleton shape writes nothing extra.
+    debug_assert!((cur_pos as usize) < mf.tables.next3_tab.len());
+    if hash3_chain_depth > 0 {
+        unsafe { *mf.tables.next3_tab.get_unchecked_mut(cur_pos as usize) = cur_node3 };
+    }
+
     // Compute the next hash codes.
     let next_hashseq = unsafe { load_u32_ptr(in_next_ptr.add(1)) };
     crate::anatomy_count!(hc_hash_computations);
@@ -308,10 +378,41 @@ pub(crate) fn hc_matchfinder_longest_match(
         let seq4 = unsafe { load_u32_ptr(in_next_ptr) };
 
         if best_len < 3 {
-            matchptr = unsafe { in_base_ptr.offset(cur_node3 as isize) };
-            if unsafe { load_u24_ptr(matchptr) } == loaded_u32_to_u24(seq4) {
-                best_len = 3;
-                best_matchptr = matchptr;
+            // WALK the length-3 chain instead of probing its head only (legacy
+            // `matchfinder/hc.rs:374-407`). depth 0 reproduces the singleton probe
+            // exactly — the same single u24 compare at the head, no second
+            // dereference.
+            let mut node3 = cur_node3;
+            let mut left = hash3_chain_depth.max(1);
+            loop {
+                // SAFETY: `node3 > cutoff` (checked before entry for the head,
+                // after every advance below), so the candidate points at processed
+                // input; `load_u24_ptr` reads 4 bytes at a position < `in_next`,
+                // which stays in bounds under the parser's BUF_PAD contract.
+                matchptr = unsafe { in_base_ptr.offset(node3 as isize) };
+                if unsafe { load_u24_ptr(matchptr) } == loaded_u32_to_u24(seq4) {
+                    best_len = 3;
+                    best_matchptr = matchptr;
+                    break;
+                }
+                left -= 1;
+                if left == 0 || hash3_chain_depth == 0 {
+                    break;
+                }
+                // SAFETY: masked chain index `< next3_tab.len()`, same masking
+                // discipline as the `next_tab` reads below. The candidate at the
+                // loaded node is cutoff-checked immediately after (and byte-verified
+                // before it can produce an offset), so a stale link terminates or
+                // resolves to an in-window position without ever yielding a forged
+                // offset.
+                node3 = unsafe {
+                    *mf.tables
+                        .next3_tab
+                        .get_unchecked((node3 as i32 & (MATCHFINDER_WINDOW_SIZE - 1)) as usize)
+                };
+                if node3 <= cutoff {
+                    break;
+                }
             }
         }
 
@@ -860,6 +961,19 @@ mod tests {
     /// produces a corrupt stream.
     #[test]
     fn every_reported_match_is_real_and_in_window() {
+        every_reported_match_at_chain_depth(0);
+    }
+
+    /// Same oracle with the trigram chain armed: the walk takes the stale-link
+    /// paths (skip-inserted heads carry no fresh `next3_tab` store, by the legacy
+    /// shape) across window slides at every repetitive position, so any masked
+    /// chain-index or cutoff miss shows up as a phantom match here.
+    #[test]
+    fn every_reported_match_is_real_at_chain_depth_8() {
+        every_reported_match_at_chain_depth(8);
+    }
+
+    fn every_reported_match_at_chain_depth(chain3: u32) {
         let mut state: u32 = 0x5EED_1234;
         let mut buf: Vec<u8> = Vec::with_capacity(250_000);
         while buf.len() < 250_000 {
@@ -906,6 +1020,7 @@ mod tests {
                 core::cmp::min(32, max_len),
                 16,
                 0, // good_match: disabled in the oracle test
+                chain3,
                 &mut next_hashes,
                 &mut offset,
             );
@@ -982,6 +1097,7 @@ mod tests {
                     32,
                     16,
                     0, // good_match: disabled in the invariant test
+                    0, // chain3: vendor singleton in the invariant test
                     &mut next_hashes,
                     &mut offset,
                 );
@@ -1026,6 +1142,7 @@ mod tests {
                     258,
                     depth,
                     0, // good_match: disabled in the monotonicity test
+                    0, // chain3: exercised separately below
                     &mut next_hashes,
                     &mut offset,
                 );
@@ -1062,12 +1179,16 @@ mod tests {
         assert_eq!((mf.tables.hash3_tab[0], mf.tables.hash4_tab[0]), before);
     }
 
-    /// `init` clears the hash tables and deliberately does NOT touch `next_tab`. Pinned
-    /// so a later "symmetry fix" — 32768 pointless stores per stream — fails a test.
+    /// `init` clears the hash tables plus `next3_tab` and deliberately does NOT touch
+    /// `next_tab`. Pinned so a later "symmetry fix" — 32768 pointless stores per
+    /// stream — fails a test, AND so a later "we can skip the next3 fill too" change
+    /// (which would let a previous stream's chain positions leak past the cutoff as
+    /// phantom cursor-ahead candidates) fails a test as well.
     #[test]
-    fn init_clears_the_hash_tables_but_not_next_tab() {
+    fn init_clears_the_hash_tables_and_next3_but_not_next_tab() {
         let mut mf = HcMatchfinder::new();
         mf.tables.next_tab[0] = 1234;
+        mf.tables.next3_tab[0] = 4321;
         mf.tables.hash3_tab[7] = 99;
         mf.tables.hash4_tab[9] = 77;
 
@@ -1082,8 +1203,144 @@ mod tests {
             super::super::matchfinder_common::MATCHFINDER_INITVAL
         );
         assert_eq!(
+            mf.tables.next3_tab[0],
+            super::super::matchfinder_common::MATCHFINDER_INITVAL,
+            "a stale cross-stream trigram-can link must not survive init"
+        );
+        assert_eq!(
             mf.tables.next_tab[0], 1234,
             "C: hc_matchfinder_init passes TOTAL_HASH_SIZE, not sizeof(*mf)"
         );
+    }
+
+    /// The trigram-chain mechanism, pinned: when the trigram head holds a
+    /// key-COLLIDING trigram (same 15-bit bucket, different bytes), the singleton
+    /// probe finds nothing, but an armed chain walks back to the genuinely
+    /// matching earlier occurrence — the exact discovery gap gzip's `prev[]`
+    /// chain serves and libdeflate's singleton cannot. All insertion happens
+    /// through `longest_match` (the only path that writes `next3_tab` links),
+    /// stepped one position at a time exactly as the greedy parser advances;
+    /// the homogeneous filler keeps every other position out of the colliding
+    /// hash3 bucket, so the walk is deterministic.
+    #[test]
+    fn trigram_chain_finds_a_match_behind_a_colliding_head() {
+        use super::super::matchfinder_common::lz_hash;
+        let h3_of = |s: [u8; 3]| {
+            let seq = s[0] as u32 | (s[1] as u32) << 8 | (s[2] as u32) << 16;
+            lz_hash(seq, HC_MATCHFINDER_HASH3_ORDER)
+        };
+
+        // A,B,C is the real repeated trigram; [A,B2,C2] shares its hash3 bucket
+        // (found by a fixed scan — determines deterministically on every host)
+        // and X keeps the homogeneous filler out of the colliding bucket
+        // entirely.
+        let (a, b, c, x) = (0x41u8, 0x42u8, 0xEEu8, 0x55u8);
+        let trigram = [a, b, c];
+        let collide = (0u8..=255)
+            .find_map(|b2| {
+                (0u8..=255).find_map(|c2| {
+                    if (b2, c2) != (b, c)
+                        && b2 != x
+                        && c2 != x
+                        && h3_of([a, b2, c2]) == h3_of(trigram)
+                    {
+                        Some([a, b2, c2])
+                    } else {
+                        None
+                    }
+                })
+            })
+            .expect("32768 buckets over 65536 trigrams: a collision exists by pigeonhole");
+        assert_eq!(h3_of(collide), h3_of(trigram), "sanity: collision picked");
+        assert_ne!(
+            h3_of([x, x, x]),
+            h3_of(trigram),
+            "the homogeneous filler must stay out of the colliding bucket"
+        );
+        let junk = [x; 32];
+
+        // trigram @ q | junk | collide | junk | probe=A,B,C (bytes end; the
+        // rest is the parser's trailing pad).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&trigram);
+        let q = 0usize;
+        buf.extend_from_slice(&junk);
+        let _k = buf.len();
+        buf.extend_from_slice(&collide);
+        buf.extend_from_slice(&junk);
+        let probe = buf.len();
+        buf.extend_from_slice(&trigram);
+        buf.extend_from_slice(&[0u8; 16]);
+
+        // Drive the matchfinder one longest_match per position, advancing one
+        // byte, `next_hashes` built for each position from its own first four
+        // bytes.
+        let run = |chain3: u32| -> (u32, u32) {
+            let mut mf = HcMatchfinder::new();
+            let mut in_base = 0usize;
+            let mut scratch = 0u32;
+            for p in 0..probe {
+                let s3 = buf[p] as u32 | (buf[p + 1] as u32) << 8 | (buf[p + 2] as u32) << 16;
+                let s4 = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+                let mut nh = [
+                    lz_hash(s3, HC_MATCHFINDER_HASH3_ORDER),
+                    lz_hash(s4, HC_MATCHFINDER_HASH4_ORDER),
+                ];
+                hc_matchfinder_longest_match(
+                    &mut mf,
+                    &buf,
+                    &mut in_base,
+                    p,
+                    2, // min_len 3 — the only state where the chain engages
+                    258,
+                    258,
+                    2,
+                    0, // good_match disabled
+                    chain3,
+                    &mut nh,
+                    &mut scratch,
+                );
+            }
+            // The probe itself: its trigram's bucket head is the colliding
+            // trigram, inserted LAST among same-bucket positions.
+            let s3 =
+                buf[probe] as u32 | (buf[probe + 1] as u32) << 8 | (buf[probe + 2] as u32) << 16;
+            let s4 =
+                u32::from_le_bytes([buf[probe], buf[probe + 1], buf[probe + 2], buf[probe + 3]]);
+            let mut nh = [
+                lz_hash(s3, HC_MATCHFINDER_HASH3_ORDER),
+                lz_hash(s4, HC_MATCHFINDER_HASH4_ORDER),
+            ];
+            let mut offset = 0u32;
+            let len = hc_matchfinder_longest_match(
+                &mut mf,
+                &buf,
+                &mut in_base,
+                probe,
+                2,
+                258,
+                258,
+                2,
+                0,
+                chain3,
+                &mut nh,
+                &mut offset,
+            );
+            (len, offset)
+        };
+
+        // depth 0 = the vendor's singleton: the head (colliding) fails the u24
+        // compare and no len-3 is reported.
+        let (len0, _) = run(0);
+        assert!(len0 < 3, "singleton must not find the len-3 (got {len0})");
+        // depth >= 2 walks past the colliding head to `q` and reports the real
+        // len-3 at its distance.
+        for depth in [2u32, 8] {
+            let (len, offset) = run(depth);
+            assert_eq!(len, 3, "chain depth {depth} must recover the len-3");
+            let src = probe - offset as usize;
+            assert_eq!(src, q, "the match must be the earlier occurrence");
+            assert_eq!(&buf[src..src + 3], &trigram, "chain match must be real");
+        }
     }
 }
