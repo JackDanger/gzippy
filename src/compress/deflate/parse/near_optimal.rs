@@ -103,6 +103,24 @@ struct Optimizer {
     /// once more in `optimize_and_flush`'s final emit, so a fresh `Vec` per
     /// call was the same waste class as the pre-fix `sink`.
     header_scratch: HeaderScratch,
+    /// Lever A (near-opt DP fast path): the `.item` snapshot of the
+    /// static-Huffman DP (branch (b)), taken right where (b) restores
+    /// `costs_saved`, and restored by the "(d) static block is cheapest"
+    /// recovery branch instead of RE-RUNNING `find_min_cost_path` under
+    /// identical costs (the re-run reads only `costs` + `match_cache` + the
+    /// pinned sentinel costs — all unchanged since (b) — so it was a pure
+    /// re-derivation; the copy-back is byte-exact, sha-verified on the
+    /// corpus / 34-member / tabular cells). Pre-sized `[0; OPTIMUM_NODES_LEN]`;
+    /// only `[..block_length]` is ever touched.
+    path_items_static: Vec<u32>,
+    /// Lever A: the `.item` snapshot of the best dynamic pass, taken at the
+    /// exact statement where `costs_saved` is cloned in the refinement loop,
+    /// restored by the "(d) the final pass regressed" recovery branch — same
+    /// byte-exactness argument as `path_items_static` (under the restored
+    /// `costs_saved`, the re-run was deterministic and only re-produced these
+    /// items + the same codes, whose `set_from_codes` already holds in
+    /// `self.costs`).
+    path_items_best: Vec<u32>,
     code_scratch: CodeScratch,
 }
 
@@ -117,6 +135,8 @@ impl Optimizer {
             match_len_freqs: vec![0u32; MAX_MATCH_LEN as usize + 1],
             sink: Sink::new(),
             header_scratch: HeaderScratch::new(),
+            path_items_static: vec![0u32; OPTIMUM_NODES_LEN],
+            path_items_best: vec![0u32; OPTIMUM_NODES_LEN],
             code_scratch: CodeScratch {
                 budget,
                 ..Default::default()
@@ -370,6 +390,16 @@ impl Optimizer {
             self.find_min_cost_path(block_length, cache_end);
             static_cost = (self.optimum_nodes[0].cost_to_end / BIT_COST).wrapping_add(7);
             self.costs = self.costs_saved.clone();
+            // Lever A: freeze the static path's items NOW — the (d) static
+            // recovery branch used to re-derive them with a second
+            // `find_min_cost_path` under the SAME (restored) costs, i.e. a
+            // byte-identical duplicate of this DP pass (folded into
+            // [`save_path_items`]'s note).
+            save_path_items(
+                &self.optimum_nodes,
+                block_length,
+                &mut self.path_items_static,
+            );
         }
 
         // (c) iterative dynamic optimization.
@@ -397,6 +427,10 @@ impl Optimizer {
             }
             best_true_cost = true_cost;
             self.costs_saved = self.costs.clone();
+            // Lever A: the best pass's items, frozen at exactly the point
+            // `costs_saved` is cloned (the recovery branch restores them
+            // together with `costs_saved`; see [`save_path_items`]).
+            save_path_items(&self.optimum_nodes, block_length, &mut self.path_items_best);
             self.costs
                 .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
             num_passes_remaining -= 1;
@@ -406,6 +440,28 @@ impl Optimizer {
         }
 
         // (d) selection.
+        //
+        // ## Lever A (near-opt DP fast path)
+        //
+        // The two recovery branches below used to RE-RUN
+        // [`Self::find_min_cost_path`] under costs IDENTICAL to the pass whose
+        // path they recover (the static branch: `set_from_codes(statics)` —
+        // exactly branch (b)'s costs; the best-path branch: `costs =
+        // costs_saved`, exactly the seed costs of the best pass). The DP is a
+        // pure function of (`costs`, `match_cache[0..cache_end]`, the pinned
+        // sentinel `cost_to_end`s past `block_length`, and the backward
+        // walk's own outputs) — none of those change between the pass and the
+        // recovery, so each re-run re-derived the byte-identical `item`s (and
+        // codes) it had already computed. The lever pushes an `.item`
+        // snapshot taken where `costs_saved` is cloned and replaces each
+        // re-run with [`restore_path_items`] + [`Self::tally_and_build_codes`]
+        // (the DP's own tail, same codes, no second full-path scan of the
+        // match cache). Byte-exactness is sha-proven (corpus -9 -p2/-p4,
+        // tabular:L9:T1/T4, text, 34-member -p4 set) in the commit receipt.
+        // `optimum_nodes[*].cost_to_end` below `block_length` is stale after
+        // a restore but is not read downstream (the token walk reads `.item`
+        // only, and the next block's DP rewrites every node before reading
+        // it); past `block_length` the (a)-pinned sentinels stay untouched.
         let mut used_only_literals = false;
         if only_lits_cost.min(static_cost) < best_true_cost {
             if only_lits_cost < static_cost {
@@ -417,12 +473,24 @@ impl Optimizer {
                 // Static block is cheapest: regenerate its path.
                 self.costs
                     .set_from_codes(&statics.litcode.lens, &statics.offcode.lens);
-                self.find_min_cost_path(block_length, cache_end);
+                // Lever A: restore the static path instead of re-running
+                // `find_min_cost_path` under these identical costs (the
+                // snapshot IS that re-run's output; see the (d) note above).
+                restore_path_items(
+                    &mut self.optimum_nodes,
+                    &self.path_items_static,
+                    block_length,
+                );
             }
         } else if true_cost >= best_true_cost.wrapping_add(np.min_bits_to_use_nonfinal_path) {
             // The final pass regressed; recover the best non-final path.
             self.costs = self.costs_saved.clone();
-            let codes = self.find_min_cost_path(block_length, cache_end);
+            // Lever A: restore the best pass's items; the re-run's only other
+            // effect — rebuilding `codes` — is reproduced exactly by the tally
+            // of the restored path, because under `costs_saved` the DP was
+            // deterministic and its codes came from these same items.
+            restore_path_items(&mut self.optimum_nodes, &self.path_items_best, block_length);
+            let codes = self.tally_and_build_codes(block_length);
             self.costs
                 .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
         }
@@ -507,6 +575,31 @@ fn build_all_literals_codes(block: &[u8]) -> PathCodes {
     }
     litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
     build_codes(litlen_freqs, [0u32; DEFLATE_NUM_OFFSET_SYMS])
+}
+
+/// Lever A: freeze `nodes[0..block_length].item` into a flat snapshot buffer.
+/// Downstream (`optimize_and_flush`'s token walk, `tally_and_build_codes`)
+/// reads `.item` only, and only below `block_length`, so this is the complete
+/// observable state of a DP pass — see the `(d) selection` note.
+#[inline]
+fn save_path_items(nodes: &[OptimumNode], block_length: usize, dst: &mut [u32]) {
+    debug_assert!(nodes.len() >= block_length && dst.len() >= block_length);
+    for k in 0..block_length {
+        dst[k] = nodes[k].item;
+    }
+}
+
+/// Lever A: the restore direction of [`save_path_items`].
+#[inline]
+fn restore_path_items(nodes: &mut [OptimumNode], src: &[u32], block_length: usize) {
+    debug_assert!(nodes.len() >= block_length && src.len() >= block_length);
+    // `src[0..block_length]` is exactly the `item` column a re-run of
+    // `find_min_cost_path` would write under the same costs (the DP writes
+    // every node `0..block_length`), so this closes the recovery branch without
+    // the second full DP pass.
+    for k in 0..block_length {
+        nodes[k].item = src[k];
+    }
 }
 
 // ── `near-opt-parallel-flush` test/observability surface ────────────────────
