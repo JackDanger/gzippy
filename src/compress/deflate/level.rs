@@ -415,6 +415,17 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 /// chunked Lazy2-600 (see `default_params_parallel_route`). Everything else
 /// stays keyed on `parallel` alone. The T1/zlib whole-stream route never
 /// reaches this function — it keeps `params(level)`.
+///
+/// ⚠ A/A TRAP (wave-9, 2026-11-11): the `ladder-tune` arm below starts from bare
+/// `params_inner(11)`, which lacks the generic-T>1-route knobs the shipped routes
+/// compose on top of it (`try_exact_huffman = true`, the route's depth x4,
+/// `good_match = 0`). A probe like `GZIPPY_LADDER=nearoptimal:100:96:2` therefore
+/// measures a DIFFERENT stream than the shipped L9 `-p4` binary (wave-9 in16m
+/// pair: 3,731,478 B vs the verified 3,740,910 B shipped anchor, sha
+/// `327b083588efca21…`). Byte-exact reproduction of the shipped L9-T>1 route
+/// through this channel is impossible; re-establish a fresh A/A at the exact
+/// route coordinate (plain binary vs ladder binary, same command line) before
+/// reusing any ladder number on this route.
 pub fn params_parallel(level: u32, threads: usize) -> LevelParams {
     #[cfg(feature = "ladder-tune")]
     {
@@ -582,6 +593,23 @@ fn default_params_parallel_route(level: u32, threads: usize) -> LevelParams {
         //     100,112,2              232,057         3,736,221 (+0.059%)  34/34
         //     100,150,1 (v2 arm)     244,455 BREAK   3,749,220 (+0.407%)  34/34
         //
+        // ⚠ A/A TRAP (wave-9, 2026-11-11): the rows above are LADDER-channel
+        // numbers (a `--features ladder-tune` binary override
+        // `nearoptimal:<depth>:<nice>:<passes>` whose labels name the override's
+        // depth=100). The LADDER CANNOT probe this route byte-exactly: its base
+        // is bare `params_inner(11)` — no `try_exact_huffman = true`, no
+        // generic-route depth x4 (the shipped route x4s the L11 base; see the
+        // test pinning the recursion below), `good_match` at the table value —
+        // so at the same cfg numbers it emits a different stream than the
+        // shipped(binary) route: wave-9 in16m pair 3,731,478 (ladder) vs
+        // 3,740,910 (shipped `-9 -p4`, sha `327b083588efca21…` re-verified on
+        // main 2026-11-10 flush-rss receipt AND on this branch). The committed
+        // SHIPPED-row numbers (nice 96: 3,740,910; tabular:L9:T4 = 232,057 with
+        // the pinned stream sha) ARE the shipped-route receipts and hold as
+        // committed. Deltas here are relative to the ship-v1 anchor (nice 150),
+        // not to the currently shipped nice-96 stream. Do NOT re-run this
+        // bisection through GZIPPY_LADDER without a fresh byte-exact A/A.
+        //
         //   wall, in16m, interleaved medians (laptop, hypothesis-tier; box
         //   observed 1-min load 9-31 across the runs, each run medians of
         //   7-9 reps with alternating arm order). Three independent ladder
@@ -597,6 +625,14 @@ fn default_params_parallel_route(level: u32, threads: usize) -> LevelParams {
         //          in the quiet window): the -p4 cell vs C libdeflate is
         //          NOT closed by this retune, only narrowed.
         //     -p1: byte-identical to the shipped T1 route (35/35 files).
+        //     -p1 charter note (2026-11-11): -p1/T1 runs NO part of this
+        //          near-opt route at all — T1 is params_baseline(9) =
+        //          params_inner(9): the Lazy2/depth-600/nice-258 arm ("Lazy2-
+        //          600"), the same arm the wave-9 -p2 flip reuses for L9-12
+        //          chunk workers at threads <= 2 (Lazy2-300 is the L8-T>1
+        //          arm, two rungs down — do not conflate them). "byte-
+        //          identical" above means that T1 lazy2 stream, never this
+        //          config's near-opt T>1 stream.
         //
         //   validity: 112 decoder checks, zero failures — every claimed
         //   stream (corpus at -p1/-p2/-p4 + all 34 members at -p4) roundtrips
