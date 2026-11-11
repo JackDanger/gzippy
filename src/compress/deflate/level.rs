@@ -408,7 +408,14 @@ fn emit_declared_once(level: u32, p: &LevelParams) {
 /// (L0/L1 chainless, L3 already Lazy, L10-12 already NearOptimal) are
 /// returned unchanged, so T>1 output at those levels is untouched. L8 and L9 are the
 /// exceptions: they take the FULL step up to the near-optimal parser (first branch below).
-pub fn params_parallel(level: u32) -> LevelParams {
+///
+/// `threads` carries the caller's live worker count (0 = the caller does not
+/// speak for a chunk worker — the serial segment/slack callers). EXACTLY ONE
+/// route reads it today: the wave-9 `-p2` flip, `9..=12 && threads <= 2` →
+/// chunked Lazy2-600 (see `default_params_parallel_route`). Everything else
+/// stays keyed on `parallel` alone. The T1/zlib whole-stream route never
+/// reaches this function — it keeps `params(level)`.
+pub fn params_parallel(level: u32, threads: usize) -> LevelParams {
     #[cfg(feature = "ladder-tune")]
     {
         // measurement-only hook (the same discipline as params()): GZIPPY_LADDER
@@ -424,11 +431,31 @@ pub fn params_parallel(level: u32) -> LevelParams {
         unused_mut,
         unused_variables
     )]
-    let default_route: fn(u32) -> LevelParams = |l| default_params_parallel_route(l);
-    default_route(level)
+    let default_route: fn(u32, usize) -> LevelParams = |l, t| default_params_parallel_route(l, t);
+    default_route(level, threads)
 }
 
-fn default_params_parallel_route(level: u32) -> LevelParams {
+fn default_params_parallel_route(level: u32, threads: usize) -> LevelParams {
+    // [2026-11-11, wave-9] THE -p2 ROUTE FLIP: L9-L12 at threads <= 2 leave
+    // the chunked near-optimal route for the chunked Lazy2-600 arm (depth
+    // 600, nice 258 — the T1 L9 ladder arm, `params_inner(9)`).
+    //
+    // RECEIPT (wave-9 map, 16 MB corpus in16m = silesia blocks x2 + text x2
+    // = 16,085,866 B, stamped A/A): at `-p2` the chunked near-opt SHIP route
+    // measured 866-986 ms while the Lazy2-600 chunk arm measured 111.9-115.8
+    // ms (x0.129 — same ratio class as the L8 lazy2 receipt at x0.114/x0.135
+    // at -p2/-p4). The 600-vs-300 decision: FLIP300 measured faster
+    // (104.9 ms) but +3,382 B aggregate sizecrew — NO-SHIP on the size bar —
+    // so the depth-600 arm ships: 31/31 members at-or-below
+    // min(vendor gzip -9, vendor pigz -9), aggregate -2.4%, AND the
+    // per-member sizes land on the L9-T1 lazy2-600 size class. T3/T4 keep
+    // the near-optimal arm (the T4 ledger cells — tabular:L9:T4 = 236,201 &
+    // co — do not move), so the cross-N preserved band is renegotiated at
+    // T2 only (charter amendment; the per-thread-count pins in the test
+    // below are the gate).
+    if (9..=12).contains(&level) && (1..=2).contains(&threads) {
+        return params_inner(9);
+    }
     // L9 T>1 runs the NEAR-OPTIMAL parser at the L11 T>1 knobs — a level→config
     // routing decision (the map is free to change; CLAUDE.md "Every technique is
     // in scope"), measured in the crown-at-lower-levels study (M1,
@@ -590,7 +617,7 @@ fn default_params_parallel_route(level: u32) -> LevelParams {
         // ledger overshoot). NOT closed even after this: -p4 remains above
         // C libdeflate on wall; closing that cell needs near-opt engine
         // work (per-pass cost-sheet reuse), its own lever.
-        let mut p = default_params_parallel_route(11);
+        let mut p = default_params_parallel_route(11, threads);
         p.near_optimal.max_optim_passes = 2;
         p.nice_match_length = 96;
         return p;
@@ -1220,10 +1247,17 @@ mod tests {
     /// 2.6x C libdeflate -8 at `-p4`, the chunked lazy2 re-route is 0.35x,
     /// and the size sits below every rival at -8 since the ldx port made the
     /// lazy2 class byte-parity). L8-T>1 now shares the T1 engine.
+    ///
+    /// Renegotiated 2026-11-11 (wave-9 -p2 route flip): the routing is now
+    /// conditioned on the THREAD COUNT — `params_parallel(level, threads)` —
+    /// so every pin below carries one. At threads <= 2, L9-L12 flip to the
+    /// chunked Lazy2-600 arm (the T1 L9 arm); at threads > 2 the wave-5
+    /// near-opt route (nice 96 / passes 2) stands unchanged.
     #[test]
     fn l9_retune_vs_l8_alias_routing_is_deterministic() {
         let t1 = params(9);
-        let par = params_parallel(9);
+        // The T3/T4 arm (threads > 2): near-opt, NOT the T1 engine.
+        let par = params_parallel(9, 4);
         assert_eq!(t1.strategy, Strategy::Lazy2);
         assert_ne!(
             par.strategy,
@@ -1239,7 +1273,7 @@ mod tests {
         // Lazy2-300 arm as T1 (the 2.6x-of-C receipt). Depth stays in the
         // monotone T1 ladder (L7 256 < L8 300), unlike the L11-aliased
         // near-opt it replaced.
-        let par8 = params_parallel(8);
+        let par8 = params_parallel(8, 4);
         assert_eq!(
             par8.strategy,
             Strategy::Lazy2,
@@ -1261,6 +1295,50 @@ mod tests {
         );
         // the x4 depth branch applies to the recursive L9->L11 near-opt params
         assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
+
+        // WAVE-9 FLIP PINS, per thread count. At threads <= 2 the near-opt
+        // chunk route is replaced by the chunked Lazy2-600 arm for the
+        // ENTIRE 9..=12 band (receipt in `default_params_parallel_route`);
+        // outside the band the arm is thread-independent, so the L1-L8
+        // preserved band (T2 byte-identity vs T4) still rests on a
+        // thread-invariant params table.
+        for lvl in 9..=12u32 {
+            let flipped = params_parallel(lvl, 2);
+            assert_eq!(
+                flipped.strategy,
+                Strategy::Lazy2,
+                "L{lvl} T2 must run the chunked Lazy2 flip arm (wave-9)"
+            );
+            assert_eq!(
+                flipped.max_search_depth, 600,
+                "L{lvl} T2 flip arm is Lazy2-600 (the 600/258 wave-9 winner)"
+            );
+            assert_eq!(
+                flipped.nice_match_length, DEFLATE_MAX_MATCH_LEN,
+                "L{lvl} T2 flip arm nice is 258 (the 600/258 wave-9 winner)"
+            );
+            let t3 = params_parallel(lvl, 3);
+            let t4 = params_parallel(lvl, 4);
+            assert_eq!(
+                format!("{t3:?}"),
+                format!("{t4:?}"),
+                "L{lvl}: T3 and T4 keep the same arm above the flip band"
+            );
+            assert_ne!(
+                format!("{flipped:?}"),
+                format!("{t4:?}"),
+                "L{lvl}: the flip must be threads-<=2 conditional"
+            );
+        }
+        for lvl in 1..=8u32 {
+            let t2 = params_parallel(lvl, 2);
+            let t4 = params_parallel(lvl, 4);
+            assert_eq!(
+                (t2.strategy, t2.max_search_depth, t2.nice_match_length),
+                (t4.strategy, t4.max_search_depth, t4.nice_match_length),
+                "L{lvl} is outside the wave-9 flip band — T2 must not diverge from T4"
+            );
+        }
     }
 
     #[test]
@@ -1355,7 +1433,7 @@ mod tests {
     #[test]
     fn l1_match_reach_is_t1_only() {
         let t1 = params(1);
-        let t_gt_1 = params_parallel(1);
+        let t_gt_1 = params_parallel(1, 4);
 
         assert!(
             t1.fast_dense_interior_insert,
@@ -1413,7 +1491,7 @@ mod tests {
         for l in (0..=12u32).filter(|&l| l != 1) {
             for (name, p) in [
                 ("params", params(l)),
-                ("params_parallel", params_parallel(l)),
+                ("params_parallel", params_parallel(l, 4)),
             ] {
                 assert!(
                     !p.fast_dense_interior_insert,

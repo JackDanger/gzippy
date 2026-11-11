@@ -5,9 +5,11 @@
 //! over one 1.8 MB chunk + 32 KiB prefix dictionary, for the variants that
 //! discriminate the pigz-L9/T4-loss hypotheses:
 //!
-//! 1. production: `parallel=true, level=9`  → `params_parallel(9)` ≡
-//!    `params_parallel(11)` with the trunk's L9 retune: near-optimal, depth
-//!    400-alias knobs, **passes 2** (level.rs `max_optim_passes = 2`).
+//! 1. production: `parallel=true`, threads=4, `level=9`  → `params_parallel(9, 4)` ≡
+//!    `params_parallel(11, 4)` with the trunk's L9 retune: near-optimal, depth
+//!    400-alias knobs, **passes 2** (level.rs `max_optim_passes = 2`). (The
+//!    wave-9 -p2 route flip only fires at threads <= 2; this T4 shape is
+//!    unchanged.)
 //! 2. T1 engine:  `parallel=false, level=9` → `params(9)` (Lazy2, depth 600,
 //!    nice 258 — the ldx-shaped parse the T1 cells ship).
 //! 3. control:    `parallel=true, level=11` (L11 default knobs, **passes 4** —
@@ -86,6 +88,7 @@ fn run(
             true,
             &mut out,
             parallel,
+            if parallel { 4 } else { 0 },
             input_total_len,
         );
     }
@@ -99,6 +102,7 @@ fn run(
             true,
             &mut out,
             parallel,
+            if parallel { 4 } else { 0 },
             input_total_len,
         );
         times.push(t.elapsed().as_secs_f64());
@@ -211,6 +215,7 @@ mod parallel_flush_probes {
             true,
             &mut out,
             true,
+            4,
             input_total_len,
         );
         (out, meta.pad_bits, meta.needs_alignment)
@@ -389,6 +394,7 @@ mod parallel_flush_probes {
                 false,
                 &mut ser_out,
                 true,
+                4,
                 200 * 1024 * 1024,
             );
             near_opt_flush_probe::set_force_serial_flush(false);
@@ -401,6 +407,7 @@ mod parallel_flush_probes {
                 false,
                 &mut par_out,
                 true,
+                4,
                 200 * 1024 * 1024,
             );
             assert_eq!(
@@ -470,6 +477,7 @@ mod d3_probes {
             true,
             &mut out,
             true,
+            4,
             200 * 1024 * 1024,
         );
         near_opt_d3_probe::set_force_bt(false);
@@ -688,8 +696,8 @@ mod bt_probebudget_probes {
     use gzippy::compress::deflate::matchfinder::bt::BtMatchfinder;
     use gzippy::compress::deflate::parse::near_opt_probebudget;
 
-    /// The production L9-T4 fill depth (`params_parallel(9)` ≡
-    /// `params_parallel(11)` at depth 400 — the matrix's variant 1). A
+    /// The production L9-T4 fill depth (`params_parallel(9, 4)` ≡
+    /// `params_parallel(11, 4)` at depth 400 — the matrix's variant 1). A
     /// budget at this value is the inert production arm.
     const DEPTH: u32 = 400;
 
@@ -706,6 +714,7 @@ mod bt_probebudget_probes {
             true,
             &mut out,
             true,
+            4,
             200 * 1024 * 1024,
         );
         out

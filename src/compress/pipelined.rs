@@ -683,8 +683,11 @@ impl PipelinedGzEncoder {
     /// T1 remains a distinct whole-buffer stream class (a digest tie with the
     /// chunked route is structurally unreachable; the tie is sizes-only —
     /// `FINAL-ADJUDICATION.md:48`). The parallel path parses with
-    /// `level::params_parallel` + `HeaderBudget::Generous` keyed on
-    /// `parallel`, never on the thread count.
+    /// `level::params_parallel` + `HeaderBudget::Generous`, keyed on
+    /// `parallel` — plus, since the 2026-11-11 wave-9 `-p2` route flip, the
+    /// live thread count for ONE band: L9-L12 at threads <= 2 parse the
+    /// chunked Lazy2-600 arm instead of near-optimal (renegotiated T2 arm;
+    /// `tests/thread_byte_parity.rs` is the gate).
     fn compress_parallel_pipeline_pure<W: Write + Send>(
         &self,
         data: &[u8],
@@ -773,9 +776,10 @@ impl PipelinedGzEncoder {
                 // the seam at exactly those boundaries).
                 output.clear();
                 // `parallel = true`: this IS the T>1 chunk worker, so it uses
-                // `level::params_parallel` — the stronger parse the T4 wall slack pays for.
-                // The T1 path (`encode_gzip_slack_padded_to_vec`) never reaches here and is
-                // byte-unchanged.
+                // `level::params_parallel` — the stronger parse the T4 wall slack pays for
+                // (except the wave-9 -p2 flip: L9-L12 at <= 2 threads parse chunked
+                // Lazy2-600). The T1 path (`encode_gzip_slack_padded_to_vec`) never
+                // reaches here and is byte-unchanged.
                 let meta = deflate::encode_deflate_splice_chunk_to_sink(
                     block,
                     dict.unwrap_or(&[]),
@@ -783,6 +787,7 @@ impl PipelinedGzEncoder {
                     is_last,
                     output,
                     true,
+                    self.num_threads,
                     data_len,
                 );
 
