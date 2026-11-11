@@ -208,11 +208,31 @@ impl LdxCompressor {
             cfg_override.unwrap_or((max_search_depth, nice_match_length, good_match));
 
         let (far_len3_gate, sparse_split_guard_mul) = match compression_level {
-            // ⚠ PROBE (2026-09-28, the residual board's access.log L5 card):
-            // the fingerprint diff named 50,210 len-3 tokens in gzip's access.log
-            // stream where ours carries zero — the far-len-3 gate is the priced
-            // candidate at L5 too. MEASUREMENT-ONLY row until the sweep plus the
-            // wall check adjudicate it.
+            // ADJUDICATED — SHIPPED, not a probe row. The L5 card came from the
+            // 2026-09-28 residual board (the fingerprint diff named 50,210
+            // len-3 tokens in gzip's access.log stream where ours carried
+            // zero); PR #410 (b2eca3bc) shipped the row armed on 2026-09-29,
+            // and PR #442's adversarial re-measurement adjudicated it: main vs
+            // row-disarmed, 34 members (-5 -p1 -n), the ARMED row wins the
+            // aggregate (-263 B, -0.0066% on the composed corpus; every
+            // per-member delta inside the 0.1% tie band) with the wall TIED at
+            // -p1 and -p4 (all deltas <=1.9%, inside the measured A/A noise
+            // floor; 68/68 outputs round-trip on both arms). The PR's disarm
+            // failed its own `tie = NO-SHIP` falsifier line and was closed
+            // unmerged — this row stays shipped as an ordinary size/wall
+            // lever, in the same family as the `8 => (true, 224)` arm below
+            // (the L8 SIZE-RECLAIM lever, #453) and `far_len3_gate: true` at
+            // `level.rs:914` (L3 — lever 6165d87f) / `level.rs:1061` (L8).
+            // Receipt: `.review-tmp/p442.md`. What REMAINS measurement-only:
+            // the `ladder-tune`-gated `GZIPPY_LDX_*` probing just below — a
+            // shipped binary reads neither env — so any further gate variant
+            // (retuning the 224x modulator; the disarm variant, which lives
+            // armed under `ladder-tune`-only on the closed branch
+            // `compress/ldx-l5-farlen3-off`) is probed there, never by editing
+            // a shipped row; and re-opening the disarm question must sweep the
+            // WHOLE size board (15 of the 32 members the branch measured
+            // change bytes when the row flips), not just the residual members
+            // that named the card.
             3 => (true, 224),
             5 => (true, 224),
             // SIZE-RECLAIM LEVER (byte-freedom): Lazy2-300 ties libdeflate -8
