@@ -223,21 +223,25 @@ nearopt-fixedpoint-skip = []
 # `min_match_len` (the dispatch arm passes literal `false`) — is closed by a
 # WAIT, not by an assumption:
 #
-# * a fill-side predicate (measured envelope: flips occur on small,
-#   nearly-match-free blocks — every measured flip block on the staged corpus
-#   has <= K match-cache entries) latches "block k could go only-literals" at
-#   its dispatch;
-# * the block loop then PARKS on job k's finished fragment before computing
-#   block k+1's `min_len` and takes the TRUE verdict, bit-for-bit the serial
+# * the flush worker publishes `(F1, only_lits)` after the FIRST refinement
+#   pass (F1 = the first pass's true cost). By the (d) decision's shape,
+#   `verdict=true ⟹ only_lits < best_true_cost ≤ F1`, so `only_lits ≥ F1`
+#   resolves the settle to a PROVEN `false` without the remaining passes;
+#   a negative-margin block falls back to waiting for the real verdict.
+# * the block loop parks on the settle mailbox before computing block
+#   k+1's `min_len` and takes the verdict EXACTLY — bit-for-bit the serial
 #   semantics — so the parallel stream is byte-identical to the serial build
-#   on EVERY corpus, flip-shaped or not (the census matrix is the proof bar);
-# * the predicate is deliberately cheap and conservative: a false POSITIVE
-#   costs only one small-block wait (the envelope keeps those blocks
-#   <= 64 KiB, so the wait is a sub-ms park of the fill thread); a false
-#   NEGATIVE would reintroduce the one-chunk quarantine — the stale-flag
-#   guard stays wired as that backstop, and the census matrix
-#   (51 members x L9-12 x -p2/-p4, ON == OFF, zero sha deltas) is the
-#   measured-completeness receipt for the envelope at the shipped levels.
+#   on EVERY corpus, flip-shaped or not, with NO fill-side shape predicate
+#   (the fp-soundness is per-block and per-corpus by construction; the
+#   staged-corpus flip class spans matched ∈ [1..125_031] and len
+#   ∈ [5_000..300_126], which kills any (len, matched) envelope).
+# * the stale-flag quarantine (a flip latches the pool off for the process)
+#   is DISABLED here: with every verdict taken exactly, a flip never
+#   diverges bytes and the latch would needlessly serialize later chunks;
+#   the census matrix (52 members x L9-12 x -p2/-p4, ON == OFF, zero sha
+#   deltas) is the receipt. The wall prize at the 2026-11-10 coordinates
+#   rides on the early resolution (measured: fp-settle keeps most of the
+#   parallel-flush wall win; see the design record).
 #
 # The `near-opt-parallel-flush` feature is untouched: `flipsafe` OFF + flush
 # ON is exactly today's feature arm, flips included.

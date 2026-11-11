@@ -2022,12 +2022,14 @@ pub(super) fn run(
 
         // [flipsafe] Serialize the ONE unserved freshness edge. The dispatch
         // arms below assume the previous block's only-literals verdict was
-        // `false` (the serial arm's other value); when the last dispatched
-        // block sits inside the poison envelope, wait here and take its REAL
-        // verdict, so `min_len` below re-derives exactly what the serial arm
-        // derives. Outside the envelope the envelope's own guarantee makes
-        // the `false` assumption byte-identical to the serial arm's — no
-        // wait, no divergence (see `parallel_flush::settle_poison`).
+        // `false` (the serial arm's other value); the settle here takes that
+        // verdict EXACTLY (waiting only where the fp-soundness contract
+        // permits a proven-early false), so `min_len` below re-derives
+        // bit-for-bit what the serial arm derives — on every corpus, at
+        // every flip rate. When the parallel arm resolves early with the
+        // proven `false`, the wait costs nothing beyond the already-elided
+        // fill-to-flush overlap (see `parallel_flush::settle_poison` and the
+        // fp-soundness note on `POISON_SETTLES`).
         #[cfg(all(
             feature = "near-opt-parallel-flush",
             feature = "near-opt-parallel-flush-flipsafe"
