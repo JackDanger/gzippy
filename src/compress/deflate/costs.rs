@@ -2,7 +2,10 @@
 //!
 //! Faithful transliteration of the cost machinery in libdeflate
 //! `vendor/libdeflate/lib/deflate_compress.c`: the BIT_COST-scaled
-//! [`DeflateCosts`] (`:385-395`), the [`OptimumNode`] graph node (`:417-434`),
+//! [`DeflateCosts`] (`:385-395`), the DP node graph's `deflate_optimum_node`
+//! (`:417-434` — not kept as a struct here: its two fields live in
+//! `parse::near_optimal` as the SoA columns `node_costs`/`node_items`,
+//! Lever C's node-SoA split of the packed `Vec<OptimumNode>`),
 //! `deflate_set_costs_from_codes` (`:2924-2957`), the `default_litlen_costs`
 //! table + `deflate_choose_default_litlen_costs` (`:2986-3160`),
 //! `deflate_set_default_costs` / `deflate_adjust_costs` / `deflate_set_initial_costs`
@@ -68,17 +71,12 @@ impl Default for DeflateCosts {
     }
 }
 
-/// A node in the min-cost-path graph (`struct deflate_optimum_node`).
-#[derive(Clone, Copy, Default)]
-pub struct OptimumNode {
-    /// Minimum cost (BIT_COST-scaled) to reach the end of the block from here.
-    pub cost_to_end: u32,
-    /// The literal/match chosen from here on the min-cost path. Low
-    /// `OPTIMUM_OFFSET_SHIFT` bits = length (1 for a literal); high bits = offset
-    /// (or the literal byte).
-    pub item: u32,
-}
-
+/// (The min-cost-path DP node's field semantics, formerly `struct
+/// OptimumNode` here, now live as the SoA columns in `parse::near_optimal`:
+/// `node_costs` = `cost_to_end` (minimum BIT_COST-scaled cost to reach the end
+/// of the block), `node_items` = `item` (low `OPTIMUM_OFFSET_SHIFT` bits =
+/// length, 1 for a literal; high bits = offset, or the literal byte).)
+///
 /// The dense offset → offset-slot map (`offset_slot_full`), one entry per offset
 /// value `1..=32768` (`deflate_init_offset_slot_full`).
 pub struct OffsetSlotFull {
