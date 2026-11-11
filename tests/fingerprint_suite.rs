@@ -159,7 +159,23 @@ fn won_cells_stay_won() {
 /// decode-flavor stress test) therefore computes the PRE-promotion shapes,
 /// so grading it against these pins would fail on flavor, not mechanism.
 /// Byte pins live in the default-flavor runs only.
-#[cfg(feature = "near-opt-bt-probebudget")]
+///
+/// AND they are VANILLA-lane shapes gated additionally on
+/// `not(feature = "ladder-tune")` (2026-11-11, hygiene fix): with that
+/// feature every T>1 cell here is produced through the measurement hook
+/// (`level::params_parallel` -> bare `params_inner(11)` + GZIPPY_LADDER —
+/// the A/A-TRAP channel), which re-routes ALL TWELVE non-noise T4 cells
+/// measured in this suite (clean main at 06859145 fails this test
+/// identically: `FINGERPRINT MOVED` binary/tabular/text:L{1,2,6,9}:T4,
+/// e.g. tabular:L1:T4 file_bytes 229,799 vs the pinned 287,060) while
+/// every T1 pin and every noise:T4 pin holds. Grading the channel's
+/// streams against shipped pins fails on CHANNEL, not mechanism, so the
+/// snapshot keeps its pins to the vanilla lane — same reasoning as the
+/// probebudget gate below. The ledger leg (`won_cells_stay_won`) stays on
+/// in every flavor by design: it is monotone in size, and the hook's T>1
+/// streams only SHRANK the frozen fixtures in this invocation, so a real
+/// ledger regression still trips under the feature.
+#[cfg(all(feature = "near-opt-bt-probebudget", not(feature = "ladder-tune")))]
 #[test]
 fn fingerprints_match_pins() {
     let pinned_tsv = std::fs::read_to_string("tests/fingerprints/ours.tsv")
