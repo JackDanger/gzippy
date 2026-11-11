@@ -233,6 +233,18 @@ fn per_n_determinism_and_validity_with_renegotiated_grid() {
 /// first cut so a real seam-tax regression (the class substituting here)
 /// cannot hide inside the band. The seam count derives from the UNCHANGED
 /// T4 reference grid, so it does not move with the renegotiation.
+///
+/// LADDER-MODE RENEGOTIATION (2026-11-11, hygiene fix): the tie leg grades
+/// the SHIPPED T4 route. Under `--features ladder-tune` that route is not
+/// what `compress_with_threads(..., threads > 1)` executes — every T>1
+/// coordinate runs the measurement hook (bare `params_inner(11)` +
+/// GZIPPY_LADDER; the A/A-TRAP channel documented on
+/// `level::params_parallel`) — so the tie cannot hold there BY DESIGN, not
+/// because the contract broke: clean main at 06859145 fails this test
+/// identically (`L1: T1 (26832) vs T4 (24208) sizes differ beyond the tie
+/// (1024 B)` — the hook's near-opt chunk stream, not a seam-tax
+/// regression). Under the feature only the hook stream's VALIDITY is
+/// asserted; the T1 leg is unchanged in both modes.
 #[test]
 fn t1_stream_is_a_distinct_class_within_the_size_tie() {
     let len = 5_400_773;
@@ -243,16 +255,30 @@ fn t1_stream_is_a_distinct_class_within_the_size_tie() {
             matches!(gzippy::decompress(&t1), Ok(back) if back == data),
             "L{level}: T1 stream must roundtrip"
         );
-        let t4 = encode_at(&data, level, 4);
-        let seams =
-            (len / gzippy::compress::pipelined::pipelined_block_size(len, 4, level as u32)).max(1);
-        let slack = (len as f64 * 0.0025).min((seams * 128) as f64).max(1024.0);
-        let delta = (t1.len() as i64 - t4.len() as i64).abs();
-        assert!(
-            (delta as f64) <= slack,
-            "L{level}: T1 ({}) vs T4 ({}) sizes differ beyond the tie ({slack:.0} B)",
-            t1.len(),
-            t4.len()
-        );
+        #[cfg(not(feature = "ladder-tune"))]
+        {
+            let t4 = encode_at(&data, level, 4);
+            let seams = (len
+                / gzippy::compress::pipelined::pipelined_block_size(len, 4, level as u32))
+            .max(1);
+            let slack = (len as f64 * 0.0025).min((seams * 128) as f64).max(1024.0);
+            let delta = (t1.len() as i64 - t4.len() as i64).abs();
+            assert!(
+                (delta as f64) <= slack,
+                "L{level}: T1 ({}) vs T4 ({}) sizes differ beyond the tie ({slack:.0} B)",
+                t1.len(),
+                t4.len()
+            );
+        }
+        #[cfg(feature = "ladder-tune")]
+        {
+            // The T4 size here is the HOOK's stream, not the shipped route
+            // the tie band is graded against; pin validity only.
+            let t4 = encode_at(&data, level, 4);
+            assert!(
+                matches!(gzippy::decompress(&t4), Ok(back) if back == data),
+                "L{level}: ladder-hook T4 stream must roundtrip"
+            );
+        }
     }
 }

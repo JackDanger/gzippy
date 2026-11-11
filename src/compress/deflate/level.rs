@@ -1289,90 +1289,145 @@ mod tests {
     /// so every pin below carries one. At threads <= 2, L9-L12 flip to the
     /// chunked Lazy2-600 arm (the T1 L9 arm); at threads > 2 the wave-5
     /// near-opt route (nice 96 / passes 2) stands unchanged.
+    ///
+    /// Renegotiated again 2026-11-11 (hygiene fix): under
+    /// `--features ladder-tune` the shipped route is not reachable through
+    /// `params_parallel` at all — that function is the measurement hook (the
+    /// A/A-TRAP channel) and ignores level and threads by design — so the
+    /// shipped pins below are cfg(not(ladder-tune)) and the ladder build pins
+    /// the hook's contract instead.
     #[test]
     fn l9_retune_vs_l8_alias_routing_is_deterministic() {
         let t1 = params(9);
-        // The T3/T4 arm (threads > 2): near-opt, NOT the T1 engine.
-        let par = params_parallel(9, 4);
         assert_eq!(t1.strategy, Strategy::Lazy2);
-        assert_ne!(
-            par.strategy,
-            Strategy::Lazy2,
-            "T>1 L9 must not silently share the T1 engine"
-        );
-        // Replacement invariant (wave-5 adjudication, branch l9-retune-v3):
-        // L9 keeps near-opt at the L11 knobs with nice_match_length 96 and
-        // passes 2 — the frontier config that holds the tabular:L9:T4 ledger
-        // bar (236,201; passes 1 measured 244,455) and the 34-member rival
-        // bar at the best measured wall, level-conditional (not riding the
-        // 8/9 recursion). L8 left the near-opt ladder: T>1 now runs the same
-        // Lazy2-300 arm as T1 (the 2.6x-of-C receipt). Depth stays in the
-        // monotone T1 ladder (L7 256 < L8 300), unlike the L11-aliased
-        // near-opt it replaced.
-        let par8 = params_parallel(8, 4);
-        assert_eq!(
-            par8.strategy,
-            Strategy::Lazy2,
-            "L8-T>1 runs the plain lazy2 ladder arm"
-        );
-        assert_eq!(par8.max_search_depth, 300);
-        assert_ne!(
-            format!("{par:?}"),
-            format!("{par8:?}"),
-            "L9 retune is level-conditional"
-        );
-        assert_eq!(
-            par.nice_match_length, 96,
-            "L9 retune carries nice 96 (wave-5 adjudication receipt)"
-        );
-        assert_eq!(
-            par.near_optimal.max_optim_passes, 2,
-            "v2's passes 1 broke tabular:L9:T4 (244455 > 236201); retune keeps 2"
-        );
-        // the x4 depth branch applies to the recursive L9->L11 near-opt params
-        assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
 
-        // WAVE-9 FLIP PINS, per thread count. At threads <= 2 the near-opt
-        // chunk route is replaced by the chunked Lazy2-600 arm for the
-        // ENTIRE 9..=12 band (receipt in `default_params_parallel_route`);
-        // outside the band the arm is thread-independent, so the L1-L8
-        // preserved band (T2 byte-identity vs T4) still rests on a
-        // thread-invariant params table.
-        for lvl in 9..=12u32 {
-            let flipped = params_parallel(lvl, 2);
-            assert_eq!(
-                flipped.strategy,
-                Strategy::Lazy2,
-                "L{lvl} T2 must run the chunked Lazy2 flip arm (wave-9)"
-            );
-            assert_eq!(
-                flipped.max_search_depth, 600,
-                "L{lvl} T2 flip arm is Lazy2-600 (the 600/258 wave-9 winner)"
-            );
-            assert_eq!(
-                flipped.nice_match_length, DEFLATE_MAX_MATCH_LEN,
-                "L{lvl} T2 flip arm nice is 258 (the 600/258 wave-9 winner)"
-            );
-            let t3 = params_parallel(lvl, 3);
-            let t4 = params_parallel(lvl, 4);
-            assert_eq!(
-                format!("{t3:?}"),
-                format!("{t4:?}"),
-                "L{lvl}: T3 and T4 keep the same arm above the flip band"
-            );
+        // Every pin below this point reads the route built by the DEFAULT arm
+        // of `params_parallel`. Under `--features ladder-tune` that function
+        // IS the measurement hook — bare `params_inner(11)` with GZIPPY_LADDER
+        // applied, level and threads both unread (the A/A-TRAP channel
+        // documented on `params_parallel`) — so the shipped T>1 pins cannot
+        // hold there BY DESIGN, not because the routing is wrong. Reproducing
+        // the shipped route byte-exactly through the hook is impossible per
+        // that documented contract. Renegotiated 2026-11-11 (hygiene; this
+        // test was red on clean main under the feature ever since the wave-9
+        // thread-conditioned pins landed): cfg(not) keeps the shipped pins;
+        // the ladder build pins the OVERRIDE SHAPE — the hook wins at every
+        // level/threads coordinate and returns exactly the L11 bisection
+        // base — never the shipped route's stream identity.
+        #[cfg(not(feature = "ladder-tune"))]
+        {
+            // The T3/T4 arm (threads > 2): near-opt, NOT the T1 engine.
+            let par = params_parallel(9, 4);
             assert_ne!(
-                format!("{flipped:?}"),
-                format!("{t4:?}"),
-                "L{lvl}: the flip must be threads-<=2 conditional"
+                par.strategy,
+                Strategy::Lazy2,
+                "T>1 L9 must not silently share the T1 engine"
             );
-        }
-        for lvl in 1..=8u32 {
-            let t2 = params_parallel(lvl, 2);
-            let t4 = params_parallel(lvl, 4);
+            // Replacement invariant (wave-5 adjudication, branch l9-retune-v3):
+            // L9 keeps near-opt at the L11 knobs with nice_match_length 96 and
+            // passes 2 — the frontier config that holds the tabular:L9:T4 ledger
+            // bar (236,201; passes 1 measured 244,455) and the 34-member rival
+            // bar at the best measured wall, level-conditional (not riding the
+            // 8/9 recursion). L8 left the near-opt ladder: T>1 now runs the same
+            // Lazy2-300 arm as T1 (the 2.6x-of-C receipt). Depth stays in the
+            // monotone T1 ladder (L7 256 < L8 300), unlike the L11-aliased
+            // near-opt it replaced.
+            let par8 = params_parallel(8, 4);
             assert_eq!(
-                (t2.strategy, t2.max_search_depth, t2.nice_match_length),
-                (t4.strategy, t4.max_search_depth, t4.nice_match_length),
-                "L{lvl} is outside the wave-9 flip band — T2 must not diverge from T4"
+                par8.strategy,
+                Strategy::Lazy2,
+                "L8-T>1 runs the plain lazy2 ladder arm"
+            );
+            assert_eq!(par8.max_search_depth, 300);
+            assert_ne!(
+                format!("{par:?}"),
+                format!("{par8:?}"),
+                "L9 retune is level-conditional"
+            );
+            assert_eq!(
+                par.nice_match_length, 96,
+                "L9 retune carries nice 96 (wave-5 adjudication receipt)"
+            );
+            assert_eq!(
+                par.near_optimal.max_optim_passes, 2,
+                "v2's passes 1 broke tabular:L9:T4 (244455 > 236201); retune keeps 2"
+            );
+            // the x4 depth branch applies to the recursive L9->L11 near-opt params
+            assert!(par.max_search_depth.is_multiple_of(4) || par.strategy != t1.strategy);
+
+            // WAVE-9 FLIP PINS, per thread count. At threads <= 2 the near-opt
+            // chunk route is replaced by the chunked Lazy2-600 arm for the
+            // ENTIRE 9..=12 band (receipt in `default_params_parallel_route`);
+            // outside the band the arm is thread-independent, so the L1-L8
+            // preserved band (T2 byte-identity vs T4) still rests on a
+            // thread-invariant params table.
+            for lvl in 9..=12u32 {
+                let flipped = params_parallel(lvl, 2);
+                assert_eq!(
+                    flipped.strategy,
+                    Strategy::Lazy2,
+                    "L{lvl} T2 must run the chunked Lazy2 flip arm (wave-9)"
+                );
+                assert_eq!(
+                    flipped.max_search_depth, 600,
+                    "L{lvl} T2 flip arm is Lazy2-600 (the 600/258 wave-9 winner)"
+                );
+                assert_eq!(
+                    flipped.nice_match_length, DEFLATE_MAX_MATCH_LEN,
+                    "L{lvl} T2 flip arm nice is 258 (the 600/258 wave-9 winner)"
+                );
+                let t3 = params_parallel(lvl, 3);
+                let t4 = params_parallel(lvl, 4);
+                assert_eq!(
+                    format!("{t3:?}"),
+                    format!("{t4:?}"),
+                    "L{lvl}: T3 and T4 keep the same arm above the flip band"
+                );
+                assert_ne!(
+                    format!("{flipped:?}"),
+                    format!("{t4:?}"),
+                    "L{lvl}: the flip must be threads-<=2 conditional"
+                );
+            }
+            for lvl in 1..=8u32 {
+                let t2 = params_parallel(lvl, 2);
+                let t4 = params_parallel(lvl, 4);
+                assert_eq!(
+                    (t2.strategy, t2.max_search_depth, t2.nice_match_length),
+                    (t4.strategy, t4.max_search_depth, t4.nice_match_length),
+                    "L{lvl} is outside the wave-9 flip band — T2 must not diverge from T4"
+                );
+            }
+        }
+
+        #[cfg(feature = "ladder-tune")]
+        {
+            // The CHANNEL's contract, fail-closed (GZIPPY_LADDER must be unset
+            // for the equality ceilings: with it set the override legitimately
+            // rewrites strategy/depth/nice/passes). The hook ignores level and
+            // threads BY DESIGN, so pinning the bare params_inner(11) base at
+            // every coordinate is the check that nobody threads the shipped
+            // route (or the wave-9 threads<=2 flip) back into this channel:
+            // that would falsify the A/A-TRAP contract, which says every
+            // ladder-channel number needs its own fresh A/A against the
+            // shipped binary at the exact route coordinate.
+            let hook = format!("{:?}", params_inner(11));
+            for lvl in 0..=12u32 {
+                for threads in [0usize, 1, 2, 3, 4, 12] {
+                    assert_eq!(
+                        format!("{:?}", params_parallel(lvl, threads)),
+                        hook,
+                        "L{lvl}@{threads}: the ladder hook must return the bare \
+                         params_inner(11) base unchanged (see the A/A-TRAP \
+                         comment on params_parallel)"
+                    );
+                }
+            }
+            assert_ne!(
+                hook,
+                format!("{t1:?}"),
+                "the hook's bisection base is L11's near-opt table row, not the \
+                 T1 L9 lazy2-600 arm the shipped threads<=2 flip reuses"
             );
         }
     }
@@ -1466,10 +1521,15 @@ mod tests {
     /// REACH route ran at T>1 (recorded under the unscoped-lever commit).
     /// The interleaved route is a different monomorphization, priced
     /// separately.
+    ///
+    /// Renegotiated 2026-11-11 (hygiene fix): under `--features ladder-tune`
+    /// `params_parallel` is the measurement hook (the A/A-TRAP channel) and
+    /// the shipped T>1 L1 composition is not reachable through it, by design
+    /// — so the T>1 pins below are cfg(not(ladder-tune)) and the ladder
+    /// build pins the hook's contract instead.
     #[test]
     fn l1_match_reach_is_t1_only() {
         let t1 = params(1);
-        let t_gt_1 = params_parallel(1, 4);
 
         assert!(
             t1.fast_dense_interior_insert,
@@ -1488,32 +1548,68 @@ mod tests {
             !t1.fast_interleaved_bucket,
             "T1 L1 must not take the T>1 interleaved-bucket route"
         );
-
-        assert!(
-            !t_gt_1.fast_dense_interior_insert,
-            "T>1 L1 picked up the match-reach bucket shift. That is the \
-             two-array REACH route whose unscoped pricing failed the wall \
-             clause on pigz:ecoli.fastq:L1:T4:wall."
-        );
-        assert!(
-            t_gt_1.fast_interleaved_bucket,
-            "T>1 L1 lost the interleaved-bucket route — the lever that closes \
-             libdeflate:{{access.log,ecoli.fastq}}:L1:T4:size"
-        );
-        assert_eq!(
-            t_gt_1.fast_hash_update_inserts,
-            usize::MAX,
-            "T>1 L1 interleaved bucket pairs with dense interior insert"
-        );
-
         assert!(
             !(t1.fast_dense_interior_insert && t1.fast_interleaved_bucket),
             "REACH and INTERLEAVED are mutually exclusive on T1"
         );
-        assert!(
-            !(t_gt_1.fast_dense_interior_insert && t_gt_1.fast_interleaved_bucket),
-            "REACH and INTERLEAVED are mutually exclusive at T>1"
-        );
+
+        // The T>1 route built by the DEFAULT arm of `params_parallel`. Under
+        // `--features ladder-tune` that function is the measurement hook —
+        // bare `params_inner(11)` + GZIPPY_LADDER, level and threads unread
+        // (the A/A-TRAP channel documented on `params_parallel`) — and the
+        // shipped T>1 L1 composition (`apply_l1_fast_parallel_knobs`, the
+        // interleaved-bucket lever) is deliberately not reachable through it.
+        // The T>1 pins therefore only assert in the shipped build; the ladder
+        // build pins the CHANNEL's contract instead (the override wins and
+        // is the ladder shape). Renegotiated 2026-11-11 (hygiene; this test
+        // was red on clean main under the feature).
+        #[cfg(not(feature = "ladder-tune"))]
+        {
+            let t_gt_1 = params_parallel(1, 4);
+            assert!(
+                !t_gt_1.fast_dense_interior_insert,
+                "T>1 L1 picked up the match-reach bucket shift. That is the \
+                 two-array REACH route whose unscoped pricing failed the wall \
+                 clause on pigz:ecoli.fastq:L1:T4:wall."
+            );
+            assert!(
+                t_gt_1.fast_interleaved_bucket,
+                "T>1 L1 lost the interleaved-bucket route — the lever that closes \
+                 libdeflate:{{access.log,ecoli.fastq}}:L1:T4:size"
+            );
+            assert_eq!(
+                t_gt_1.fast_hash_update_inserts,
+                usize::MAX,
+                "T>1 L1 interleaved bucket pairs with dense interior insert"
+            );
+            assert!(
+                !(t_gt_1.fast_dense_interior_insert && t_gt_1.fast_interleaved_bucket),
+                "REACH and INTERLEAVED are mutually exclusive at T>1"
+            );
+        }
+
+        #[cfg(feature = "ladder-tune")]
+        {
+            // Fail-closed channel pin (GZIPPY_LADDER must be unset for the
+            // equality ceiling): with the feature on, params_parallel returns
+            // the bare L11 bisection base at EVERY (level, threads)
+            // coordinate, and `ladder_tune::apply` never touches the fast_*
+            // knobs — so the hook return carries NO L1 knob at all. If this
+            // fires, someone composed the shipped route (or the T>1 L1 lever)
+            // into the hook and the A/A-TRAP contract is void.
+            let hook_ret = params_parallel(1, 4);
+            assert_eq!(
+                format!("{hook_ret:?}"),
+                format!("{:?}", params_inner(11)),
+                "the ladder hook must return the bare params_inner(11) base \
+                 unchanged (see the A/A-TRAP comment on params_parallel)"
+            );
+            assert!(
+                !hook_ret.fast_interleaved_bucket && !hook_ret.fast_dense_interior_insert,
+                "the hook's bisection base carries no L1 knob; the shipped \
+                 T>1 L1 levers live only in the default arm's composition"
+            );
+        }
 
         // REACH is one lever on T1: dense insert and bucket shift move together.
         assert_eq!(
