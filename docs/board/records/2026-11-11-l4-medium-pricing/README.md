@@ -331,17 +331,22 @@ SIZE (deterministic, all 31 members, both arms round-tripped):
 - Ladder shape (memo D3): medium-L4 beats our own L5 on 12 members (log
   class -5..-17%) and our own L9 on 1 (weights, pre-existing inversion);
   the synthetic lattice ties modestly. An arming needs the conscious
-  one-level ladder-shape parseattention the memo's D3 planned.
+  one-level ladder-shape decision the memo's D3 planned (a per-level map
+  change, byte-freedom-legal, the level map owner's call).
 
 WALL (hypothesis-tier, same-binary mechanism pair):
 
 - NOT within noise: +2.5%..+29.2% T1 wall on the mechanism pair, mean
   ~+11-12%. The memo's +0-3% envelope is falsified (the slide's backward
   byte-pair walk is the price, and it scales with the deed table).
-- Against the SAME-LEVEL rivals, all measured cells STAY won on BOTH axes
-  with the rung on: ours-medium is 1.45-2.0x the wall of gzip -4's
-  advantage... (i.e., ours remains faster than BOTH rivals at each measured
-  member).
+- Against the SAME-LEVEL rivals, every measured member STAYS won on BOTH
+  axes with the rung on: ours-remains-FASTER-than-both (medium 273 ms vs
+  gzip -4 480 ms / pigz -p1 450 ms on data.sqlite; 299 vs 677/527 on
+  logs.txt; 377 vs 740/668 on tool.bin) — the +12-29% cost is paid out of
+  OUR OWN slack against the rivals, and the per-label wall bar stays green
+  at these coordinates. The pre-existing L4-T1 wall losses elsewhere on the
+  board (if any) are this lever's clause-7 live risk surface — the frozen
+  box adjudicates them.
 
 RECOMMENDATION for the lever PR (this probe does not ship anything):
 
