@@ -1,0 +1,62 @@
+FINAL-TREE CENSUS provenance (written as the sections ran; appended at end)
+===========================================================================
+
+Repo: /Users/jackdanger/www/gzippy, branch main @ b1502a07
+      main sha: b1502a078c20e18b646cf42d1a5af10a0f0dad1a
+      (b1502a07 = merge PR #467 lever/flush-piplining-flipsafe)
+
+Arm worktrees (submodules linked via scripts/dev/worktree-link.sh + the
+explicit vendor/isa-l symlink for the empty-dir case the script skips):
+
+  wt-a = .review-tmp/wC-final/wt-a  HEAD b1502a078c20e18b646cf42d1a5af10a0f0dad1a
+  wt-b = .review-tmp/wC-final/wt-b  HEAD 0685914554af42de2f923f593de73bd01759d4e1
+                 (06859145 = merge PR #466 probe/l4-deflate-medium;
+                  NOTE this tree CONTAINS #465 nearopt-fixedpoint-skip and
+                  #466 l4-deflate-medium — see the A/B-delta note below)
+
+Builds (explicit --target-dir per arm; vanilla cargo build --release,
+cargo 1.99.1, rustc 1.99.1):
+
+  arm A  .review-tmp/wC-final/tgt-a/release/gzippy
+         sha256 5398210241ef4bc3607583d34ed0abea124b281a20e47e0143fc78fec81aecbe
+  arm B  .review-tmp/wC-final/tgt-b/release/gzippy
+         sha256 c23ae453f879caee88c1f771746c44fe9675f4fb0f2e9b37e227b0be416c8708
+  both   report: gzippy 1.0.0 (parallel-sm+pure); sizes 1,744,112 B each
+
+A/B SOURCE DELTA (git receipts, not assumption):
+  first-parent chain of main: ... 84b910aa (#465) -> 06859145 (#466) ->
+  b1502a07 (#467). `git log --oneline 06859145..b1502a07` = exactly the six
+  #467 commits (fbdd3445 fp-settle feature, d97343ec gate, 8acb5926 records,
+  e3f9e92a test lock, 9a2f7e72 pins, b1502a07 merge). So the BINARY arms
+  differ by the #467 fp-settle code ALONE — compiled OFF in both (the trio
+  #465/#466/#467 are all build-time features, default-off), while #465/#466
+  source sits in BOTH trees (also compiled OFF). The task's arm-B gloss
+  ("pre-#465 state") does not match the SHA it pinned; the SHA is contract,
+  the gloss is recorded here as imprecise.
+
+Decoders (roundtrip legs):
+  /usr/bin/gzip  -> "Apple gzip 479.0.0.700.1"
+  vendor/pigz/pigz 2.8
+  python3 zlib member-chain: run/decode_sha.py (copied from the wave-B census
+  instrument .review-tmp/wC-bytes/run/decode_sha.py)
+  DEMOTED: /opt/homebrew/bin/gzip --version prints "gzippy 0.1.7" — an
+  installed gzippy argv0 alias on this box; NOT used as a decoder anywhere.
+
+Box: Mac16,7 (Apple M4 Pro), 14 CPUs, macOS; cargo 1.99.1. UNFROZEN: foreign
+co-runner processes observed during the byte phase (ps receipts in
+co-runner-note.txt) — every wall number in this census is therefore
+HYPOTHESIS-TIER (charter), restated per table.
+
+Anchor input: .review-tmp/in16m.bin == wave-9 pinned recipe
+  16,085,866 B, sha256 1010fa2f787d0a928fd10823085c62a9ee080fcff96b2608c5d216b2b8a1463c
+
+Corpus: run/members.tsv — the wave-B 30 members (12 silesia tar members
+staged .review-tmp/wC-bytes/run/corpus/silesia/, benchmark_data/logs.txt
+221,249,619 B, benchmark_data/software.archive 221,249,546 B, 8+8 even
+slices of both staged by the wave-B census); every input sha256 recorded
+fresh into members.tsv, and the slice reconstruction asserted
+(cat logs.part-a? | shasum == logs.txt sha; same for sw).
+
+Timeline: worktrees+builds 11:13-11:15 local; anchors 11:16; byte matrix
+launched 11:16; feature-arm builds launched 11:16 (sequential, one
+--target-dir spread).
