@@ -26,12 +26,12 @@
 use super::super::bitstream::BitWriter;
 use super::super::block_split::{BlockSplitStats, NUM_OBSERVATION_TYPES};
 use super::super::costs::{
-    set_initial_costs, DeflateCosts, OffsetSlotFull, OptimumNode, BIT_COST, OPTIMUM_LEN_MASK,
+    set_initial_costs, DeflateCosts, OffsetSlotFull, BIT_COST, OPTIMUM_LEN_MASK,
     OPTIMUM_OFFSET_SHIFT,
 };
 use super::super::encode_types::HeaderBudget;
 use super::super::huffman::{
-    build_dynamic_header, make_huffman_code, CodeScratch, HeaderScratch, HuffmanCode,
+    build_dynamic_header, make_huffman_code_into, CodeScratch, HeaderScratch, HuffmanCode,
 };
 use super::super::level::LevelParams;
 use super::super::matchfinder::bt::{LzMatch, BT_MATCHFINDER_REQUIRED_NBYTES, WINDOW_SIZE};
@@ -77,13 +77,15 @@ static LANE_IDX_0123: [u32; 4] = [0, 1, 2, 3];
 #[cfg(target_arch = "aarch64")]
 static LANE_IDX_4567: [u32; 4] = [4, 5, 6, 7];
 
-/// The min-cost-path result for one pass: the chosen path's symbol frequencies
-/// and the Huffman codes built from them.
-struct PathCodes {
+/// The min-cost-path result for one pass: the chosen path's symbol
+/// frequencies. The Huffman codes built from those frequencies
+/// (`deflate_make_huffman_codes`) are written into the Optimizer's pre-owned
+/// scratch pairs — [`Optimizer::pass_litcode`] / [`Optimizer::pass_offcode`]
+/// for the DP passes and recovery tail, [`Optimizer::only_lits_litcode`] /
+/// [`Optimizer::only_lits_offcode`] for the (a) candidate — see Lever C.
+struct PathFreqs {
     litlen_freqs: [u32; DEFLATE_NUM_LITLEN_SYMS],
     offset_freqs: [u32; DEFLATE_NUM_OFFSET_SYMS],
-    litcode: HuffmanCode,
-    offcode: HuffmanCode,
 }
 
 /// Everything the DP / flush phase needs (the fill matchfinder — production
@@ -91,7 +93,18 @@ struct PathCodes {
 /// [`run`] so it can write into `match_cache` without aliasing).
 struct Optimizer {
     match_cache: Vec<LzMatch>,
-    optimum_nodes: Vec<OptimumNode>,
+    /// The DP graph (`optimum_nodes`, vendor `:417-434`) in SoA form — Lever C,
+    /// node-SoA: `node_costs` is the `cost_to_end` column ONLY, contiguous, so
+    /// the aarch64 len-scan (`len_step8_neon`) streams it with plain
+    /// `vld1q_u32` loads; pre-#457-layout the scan's `vld2q_u32` deinterleave
+    /// also loaded the discarded `item` half of every node it touched. The two
+    /// columns are the same length by construction (`OPTIMUM_NODES_LEN`); the
+    /// DP writes both of them at every node it visits (`0..=block_length`), and
+    /// every reader's bounds argument (`find_min_cost_path`'s soundness
+    /// invariant, `tally_and_build_codes`'s path walk) holds per column exactly
+    /// as it held on the packed arrays.
+    node_costs: Vec<u32>,
+    node_items: Vec<u32>,
     costs: DeflateCosts,
     costs_saved: DeflateCosts,
     offset_slot_full: OffsetSlotFull,
@@ -129,13 +142,58 @@ struct Optimizer {
     /// `self.costs`).
     path_items_best: Vec<u32>,
     code_scratch: CodeScratch,
+    /// Lever C: pre-owned codes for the DP tail's per-pass builds.
+    ///
+    /// ## Receipt block (lever arms)
+    ///
+    /// Before this lever, `tally_and_build_codes` handed its freqs to the
+    /// ALLOCATING `make_huffman_code`, which built a fresh `lens` + `codewords`
+    /// `Vec` pair per code — four fresh `Vec`s per call, one pair of
+    /// calls per refinement pass, per recovery tail, per block, once more for
+    /// the (a) only-literals candidate. libdeflate's discipline is a FIXED
+    /// `c->codes` array inside the compressor
+    /// (vendor/libdeflate/lib/deflate_compress.c `:1414-1429`,
+    /// `deflate_make_huffman_codes` writing `codes->lens.*` + `codes->codewords.*`
+    /// in place, never reallocated). The `&mut`-params form already ran
+    /// through `make_huffman_code_into` (huffman/fast.rs) — the same arithmetic,
+    /// clear+resize over CALLER-OWNED buffers — which existed for the final
+    /// emit's `emit_block(... &mut self.code_scratch ...)` but was bypassed by
+    /// this module's per-pass tail.
+    ///
+    /// The lever arm: `tally_and_build_codes` and the (a) candidate call
+    /// [`build_code_pair`], which routes through `make_huffman_code_into` into
+    /// THESE buffers instead of handing fresh `Vec`s to the allocator. The
+    /// arithmetic is unchanged (same tree, same codewords — `make_huffman_code`
+    /// is a thin allocating wrapper around `make_huffman_code_into`), so the
+    /// output stream is byte-exact by construction, and the anatomy counter
+    /// `huffman_make_code_calls` counts builds INSIDE `make_huffman_code_into`,
+    /// so every pinned call count holds exactly (no pin may move).
+    ///
+    /// Allocation shape: `Vec` fields here (`HuffmanCode::default` = empty)
+    /// allocate only on the FIRST `resize` of each buffer and are reused for
+    /// the parser's lifetime after that — per-pass/per-block heap traffic from
+    /// this module drops to zero in steady state. (Startup anatomy note: the
+    /// pinned 1-byte counters don't see these buffers at all — `alloc_events`
+    /// pins the named `Vec::with_capacity` sites in `deflate/mod.rs` +
+    /// `header.rs`, and the renamed harness counters see no change of call
+    /// count — so the post-#457 `1byte:L9:T4 = 14` pin cannot move.)
+    pass_litcode: HuffmanCode,
+    pass_offcode: HuffmanCode,
+    /// Lever C: same pre-owned-scratch discipline for the (a) only-literals
+    /// candidate. SEPARATE pair from `pass_*` because the only-literals
+    /// candidate's costs must survive the refinement loop: branch (d)'s
+    /// `set_from_codes` re-reads these lens AFTER every pass has overwritten
+    /// `pass_*`. (Same four-`Vec`-per-pass starting point, same fix.)
+    only_lits_litcode: HuffmanCode,
+    only_lits_offcode: HuffmanCode,
 }
 
 impl Optimizer {
     fn new(budget: HeaderBudget) -> Self {
         Optimizer {
             match_cache: vec![LzMatch::default(); MATCH_CACHE_TOTAL],
-            optimum_nodes: vec![OptimumNode::default(); OPTIMUM_NODES_LEN],
+            node_costs: vec![0u32; OPTIMUM_NODES_LEN],
+            node_items: vec![0u32; OPTIMUM_NODES_LEN],
             costs: DeflateCosts::default(),
             costs_saved: DeflateCosts::default(),
             offset_slot_full: OffsetSlotFull::new(),
@@ -148,6 +206,10 @@ impl Optimizer {
                 budget,
                 ..Default::default()
             },
+            pass_litcode: HuffmanCode::default(),
+            pass_offcode: HuffmanCode::default(),
+            only_lits_litcode: HuffmanCode::default(),
+            only_lits_offcode: HuffmanCode::default(),
         }
     }
 
@@ -173,17 +235,21 @@ impl Optimizer {
     /// ## Safety (as compared to the scalar path's invariant doc)
     ///
     /// All eight `costs.length[len+k]` reads and eight
-    /// `optimum_nodes[node+len+k].cost_to_end` reads stay within the same bounds
-    /// the scalar iteration asserted (`len+7 <= m.length <= MAX_MATCH_LEN`
-    /// bounds the length table; the caller's `hi = min(block_length-1 +
-    /// MAX_MATCH_LEN, ...)` pin covers `node + len + 7`). The `vld2q_u32`
-    /// deinterleave reads BOTH fields of each node (the `item` column too) — a
-    /// read of state the caller owns; `offset_cost` is already in registers.
+    /// `node_costs[node+len+k]` reads stay within the same bounds the scalar
+    /// iteration asserted (`len+7 <= m.length <= MAX_MATCH_LEN` bounds the
+    /// length table; the caller's `hi = min(block_length-1 + MAX_MATCH_LEN,
+    /// ...)` pin covers `node + len + 7`). Lever C's node-SoA split makes the
+    /// cost column a standalone `u32` array at element stride 4, so the scan
+    /// reads ONLY that column (`vld1q_u32`, contiguous; the pre-split
+    /// `vld2q_u32` deinterleave additionally loaded the discarded `item` half
+    /// of each node); the candidate `item`s are computed arithmetically below,
+    /// never loaded — `offset_cost` is already in registers. A read of state
+    /// the caller owns.
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn len_step8_neon(
         costs_length_ptr: *const u32,
-        nodes_ptr: *const OptimumNode,
+        node_costs_ptr: *const u32,
         len: usize,
         node: usize,
         offset: u32,
@@ -191,18 +257,18 @@ impl Optimizer {
     ) -> (u32, u32) {
         use core::arch::aarch64::{
             uint32x4_t, vaddq_u32, vbslq_u32, vcgtq_u64, vdupq_n_u32, vgetq_lane_u64, vld1q_u32,
-            vld2q_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32, vzip1q_u32, vzip2q_u32,
+            vreinterpretq_u32_u64, vreinterpretq_u64_u32, vzip1q_u32, vzip2q_u32,
         };
 
         let off_bc = vdupq_n_u32(offset_cost);
         // Length costs for the 8 lens: `costs.length` is contiguous.
         let lc0 = unsafe { vld1q_u32(costs_length_ptr.add(len)) };
         let lc1 = unsafe { vld1q_u32(costs_length_ptr.add(len + 4)) };
-        // Node costs (`cost_to_end` first in `OptimumNode`): the item column is
-        // interleaved at stride 4 bytes, so one deinterleave load per half
-        // yields both (the item half is discarded).
-        let nc0 = unsafe { vld2q_u32(nodes_ptr.add(node + len) as *const u32).0 };
-        let nc1 = unsafe { vld2q_u32(nodes_ptr.add(node + len + 4) as *const u32).0 };
+        // Node costs: the SoA cost column (Lever C) is contiguous at stride 4
+        // bytes — two plain vector loads, no deinterleave, and the item column
+        // is not touched by this scan at all.
+        let nc0 = unsafe { vld1q_u32(node_costs_ptr.add(node + len)) };
+        let nc1 = unsafe { vld1q_u32(node_costs_ptr.add(node + len + 4)) };
         let c0 = vaddq_u32(vaddq_u32(off_bc, lc0), nc0);
         let c1 = vaddq_u32(vaddq_u32(off_bc, lc1), nc1);
 
@@ -251,11 +317,12 @@ impl Optimizer {
     }
 
     /// `deflate_find_min_cost_path` (`:3327-3399`): backward DP filling
-    /// `optimum_nodes[0..=block_length]`, then tally the resulting path into
-    /// symbol frequencies and build the Huffman codes.
+    /// `node_costs`/`node_items` over `[0..=block_length]`, then tally the
+    /// resulting path into symbol frequencies and build the Huffman codes into
+    /// the pre-owned `pass_*` scratch pair (Lever C).
     ///
     /// `cache_end` is the index one past the block's last position header in
-    /// `match_cache` (the C `cache_ptr`). The nodes at `block_length+1 ..` must
+    /// `match_cache` (the C `cache_ptr`). The costs at `block_length+1 ..` must
     /// already be pinned to `0x8000_0000` by the caller.
     ///
     /// ## Soundness invariant (unchecked-index hot loop)
@@ -270,11 +337,13 @@ impl Optimizer {
     ///    `num_matches` when rewound to `first`), always landing on a header
     ///    or match slot the FORWARD pass already wrote contiguously below
     ///    `cache_end` — so `cptr`/`mi` stay in `0..match_cache.len()`.
-    ///  * **`node` walks `optimum_nodes` backward**, from `block_length` down
-    ///    to `0`. `node+1` and `node+len` (`len <= m.length <= MAX_MATCH_LEN`)
-    ///    stay `<= hi < optimum_nodes.len()` because the caller
-    ///    (`optimize_and_flush`) pins `optimum_nodes[block_length..=hi]`
-    ///    (`hi = min(block_length-1+MAX_MATCH_LEN, optimum_nodes.len()-1)`)
+    ///  * **`node` walks the node columns backward**, from `block_length` down
+    ///    to `0` — Lever C keeps the graph as two parallel `OPTIMUM_NODES_LEN`
+    ///    columns (`node_costs`, `node_items`), every node index valid in BOTH.
+    ///    `node+1` and `node+len` (`len <= m.length <= MAX_MATCH_LEN`)
+    ///    stay `<= hi < node_costs.len() == node_items.len() == OPTIMUM_NODES_LEN`
+    ///    because the caller (`optimize_and_flush`) pins `node_costs[block_length..=hi]`
+    ///    (`hi = min(block_length-1+MAX_MATCH_LEN, OPTIMUM_NODES_LEN-1)`)
     ///    before calling — the exact invariant the checked code already
     ///    relied on to read sentinel costs past the block end.
     ///  * **`literal`** is a cache-header byte (`buf[pos] as u16` widened to
@@ -285,9 +354,9 @@ impl Optimizer {
     ///  * **`offset_slot`** comes from `OffsetSlotFull::slot_unchecked`,
     ///    itself bound to `offset in 1..=MAX_MATCH_OFFSET`, and the map only
     ///    ever emits the 30 real slots, so `< 32 == costs.offset_slot.len()`.
-    fn find_min_cost_path(&mut self, block_length: usize, cache_end: usize) -> PathCodes {
+    fn find_min_cost_path(&mut self, block_length: usize, cache_end: usize) -> PathFreqs {
         let mut node = block_length;
-        self.optimum_nodes[node].cost_to_end = 0;
+        self.node_costs[node] = 0;
         let mut cptr = cache_end;
 
         loop {
@@ -300,15 +369,15 @@ impl Optimizer {
             let literal = header.offset as u32;
 
             // A literal is always available.
-            // SAFETY: `literal < 256`; `node + 1 <= hi < optimum_nodes.len()`
-            // (invariant above).
+            // SAFETY: `literal < 256`; `node + 1 <= hi < node_costs.len()` ==
+            // `node_items.len()` (invariant above).
             debug_assert!((literal as usize) < self.costs.literal.len());
-            debug_assert!(node + 1 < self.optimum_nodes.len());
+            debug_assert!(node + 1 < self.node_costs.len());
             let mut best_cost = unsafe {
                 self.costs
                     .literal
                     .get_unchecked(literal as usize)
-                    .wrapping_add(self.optimum_nodes.get_unchecked(node + 1).cost_to_end)
+                    .wrapping_add(*self.node_costs.get_unchecked(node + 1))
             };
             let mut best_item = (literal << OPTIMUM_OFFSET_SHIFT) | 1;
 
@@ -343,11 +412,13 @@ impl Optimizer {
                         // SAFETY: `len + 7 <= m.length <= MAX_MATCH_LEN` so
                         // `costs.length.len()` bounds the 8-load, and
                         // `node + len + 7 <= hi` holds by the caller's pin
-                        // (same invariant the scalar iteration relies on).
+                        // (same invariant the scalar iteration relies on) —
+                        // `node_costs.len() == OPTIMUM_NODES_LEN` bounds the
+                        // SoA cost-column 8-load identically.
                         let (blk_cost, blk_item) = unsafe {
                             Self::len_step8_neon(
                                 self.costs.length.as_ptr(),
-                                self.optimum_nodes.as_ptr(),
+                                self.node_costs.as_ptr(),
                                 len,
                                 node,
                                 offset,
@@ -363,14 +434,14 @@ impl Optimizer {
                     if len <= m.length as usize {
                         loop {
                             // SAFETY: `len <= m.length <= MAX_MATCH_LEN` and
-                            // `node + len <= hi < optimum_nodes.len()` (invariant
+                            // `node + len <= hi < node_costs.len()` (invariant
                             // above).
                             debug_assert!(len < self.costs.length.len());
-                            debug_assert!(node + len < self.optimum_nodes.len());
+                            debug_assert!(node + len < self.node_costs.len());
                             let cost_to_end = offset_cost
                                 .wrapping_add(unsafe { *self.costs.length.get_unchecked(len) })
                                 .wrapping_add(unsafe {
-                                    self.optimum_nodes.get_unchecked(node + len).cost_to_end
+                                    *self.node_costs.get_unchecked(node + len)
                                 });
                             if cost_to_end < best_cost {
                                 best_cost = cost_to_end;
@@ -390,12 +461,13 @@ impl Optimizer {
                 cptr = first;
             }
 
-            // SAFETY: `node < optimum_nodes.len()` (invariant above).
-            debug_assert!(node < self.optimum_nodes.len());
+            // SAFETY: `node < node_costs.len() == node_items.len()` (invariant
+            // above).
+            debug_assert!(node < self.node_costs.len());
+            debug_assert!(node < self.node_items.len());
             unsafe {
-                let n = self.optimum_nodes.get_unchecked_mut(node);
-                n.item = best_item;
-                n.cost_to_end = best_cost;
+                *self.node_costs.get_unchecked_mut(node) = best_cost;
+                *self.node_items.get_unchecked_mut(node) = best_item;
             }
             if node == 0 {
                 break;
@@ -412,11 +484,11 @@ impl Optimizer {
     /// Same DP-output invariants `find_min_cost_path` already established, walked
     /// forward instead of backward:
     ///  * **`node`** only ever holds a value `< block_length` at the point it
-    ///    indexes `optimum_nodes` — the loop reads `optimum_nodes[node]`, then
+    ///    indexes the item column — the loop reads `node_items[node]`, then
     ///    advances `node += length` and breaks IMMEDIATELY if that lands exactly
     ///    on `block_length` (a chosen path always partitions `0..block_length`
     ///    exactly, per the DP), so `node < block_length <= MAX_BLOCK_LENGTH <
-    ///    optimum_nodes.len()` on every read.
+    ///    node_items.len() == OPTIMUM_NODES_LEN` on every read.
     ///  * **`hi` as a literal byte** (`length == 1`) is always `< 256 ==
     ///    litlen_freqs.len()` by the DP's own encoding (`best_item = (literal <<
     ///    SHIFT) | 1` with `literal < 256`, `find_min_cost_path`).
@@ -426,14 +498,14 @@ impl Optimizer {
     ///  * **`length`** is `MIN_MATCH_LEN..=MAX_MATCH_LEN`, so `length_slot`
     ///    returns `< NUM_LEN_SLOTS` and `DEFLATE_FIRST_LEN_SYM + ls <= 257 + 28
     ///    == 285 < 288 == litlen_freqs.len()`.
-    fn tally_and_build_codes(&self, block_length: usize) -> PathCodes {
+    fn tally_and_build_codes(&mut self, block_length: usize) -> PathFreqs {
         let mut litlen_freqs = [0u32; DEFLATE_NUM_LITLEN_SYMS];
         let mut offset_freqs = [0u32; DEFLATE_NUM_OFFSET_SYMS];
 
         let mut node = 0usize;
         loop {
-            debug_assert!(node < self.optimum_nodes.len());
-            let item = unsafe { self.optimum_nodes.get_unchecked(node).item };
+            debug_assert!(node < self.node_items.len());
+            let item = unsafe { *self.node_items.get_unchecked(node) };
             let length = (item & OPTIMUM_LEN_MASK) as usize;
             let hi = item >> OPTIMUM_OFFSET_SHIFT;
             if length == 1 {
@@ -462,32 +534,74 @@ impl Optimizer {
         }
         litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
 
-        build_codes(litlen_freqs, offset_freqs)
+        build_code_pair(
+            &litlen_freqs,
+            &offset_freqs,
+            &mut self.pass_litcode,
+            &mut self.pass_offcode,
+        );
+        PathFreqs {
+            litlen_freqs,
+            offset_freqs,
+        }
     }
 
     /// `deflate_compute_true_cost` (`:2889-2921`): exact whole-bit cost of the
-    /// block if the tallied path were coded with the built Huffman codes.
-    fn compute_true_cost(&mut self, codes: &PathCodes) -> u32 {
-        let header = build_dynamic_header(
-            &codes.litcode.lens,
-            &codes.offcode.lens,
-            &mut self.header_scratch,
-        );
+    /// block if the tallied path were coded with the built Huffman codes. The
+    /// codes are identified by their length columns — the pre-owned scratch
+    /// pair the caller just wrote (`pass_*` per DP pass and recovery tail,
+    /// `only_lits_*` for branch (a)) — passing them keeps this reader agnostic
+    /// to WHICH scratch pair holds the code.
+    ///
+    /// (A free fn, not a method: the callers pass disjoint field borrows of
+    /// `self` (`lens` from one scratch field + `&mut self.header_scratch`),
+    /// which a `&mut self` receiver would lock out.)
+    fn compute_true_cost(
+        freqs: &PathFreqs,
+        lit_lens: &[u8],
+        off_lens: &[u8],
+        header_scratch: &mut HeaderScratch,
+    ) -> u32 {
+        let header = build_dynamic_header(lit_lens, off_lens, header_scratch);
         let mut cost: u64 = header.header_bits();
 
         for sym in 0..DEFLATE_FIRST_LEN_SYM {
-            cost += codes.litlen_freqs[sym] as u64 * codes.litcode.lens[sym] as u64;
+            cost += freqs.litlen_freqs[sym] as u64 * lit_lens[sym] as u64;
         }
         for slot in 0..NUM_LEN_SLOTS {
             let sym = DEFLATE_FIRST_LEN_SYM + slot;
-            cost += codes.litlen_freqs[sym] as u64
-                * (codes.litcode.lens[sym] as u64 + LENGTH_EXTRA_BITS[slot] as u64);
+            cost += freqs.litlen_freqs[sym] as u64
+                * (lit_lens[sym] as u64 + LENGTH_EXTRA_BITS[slot] as u64);
         }
         for slot in 0..OFFSET_EXTRA_BITS.len() {
-            cost += codes.offset_freqs[slot] as u64
-                * (codes.offcode.lens[slot] as u64 + OFFSET_EXTRA_BITS[slot] as u64);
+            cost += freqs.offset_freqs[slot] as u64
+                * (off_lens[slot] as u64 + OFFSET_EXTRA_BITS[slot] as u64);
         }
         cost as u32
+    }
+
+    /// `deflate_choose_all_literals`: frequencies for an all-literal block +
+    /// their code pair, into the pre-owned `only_lits_*` scratch (Lever C —
+    /// this was `build_all_literals_codes` handing a fresh owned pair to every
+    /// block; see [`build_code_pair`]'s receipt). The offset alphabet is
+    /// unused and its code gets exactly the two 1-bit padding codewords.
+    fn build_only_literals_codes(&mut self, block: &[u8]) -> PathFreqs {
+        let mut litlen_freqs = [0u32; DEFLATE_NUM_LITLEN_SYMS];
+        for &b in block {
+            litlen_freqs[b as usize] += 1;
+        }
+        litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
+        let offset_freqs = [0u32; DEFLATE_NUM_OFFSET_SYMS];
+        build_code_pair(
+            &litlen_freqs,
+            &offset_freqs,
+            &mut self.only_lits_litcode,
+            &mut self.only_lits_offcode,
+        );
+        PathFreqs {
+            litlen_freqs,
+            offset_freqs,
+        }
     }
 
     /// `deflate_optimize_and_flush_block` (`:3416-3530`). Chooses the token path
@@ -512,14 +626,22 @@ impl Optimizer {
         let block = &buf[block_begin..block_begin + block_length];
         let np = &params.near_optimal;
 
-        // (a) only-literals candidate.
-        let only_lits_codes = build_all_literals_codes(block);
-        let only_lits_cost = self.compute_true_cost(&only_lits_codes);
+        // (a) only-literals candidate. Lever C: the codes are built into the
+        // pre-owned `only_lits_*` scratch pair (a SEPARATE pair from `pass_*`
+        // — branch (d) re-reads these lens below, after every pass has
+        // overwritten the pass pair).
+        let only_lits_freqs = self.build_only_literals_codes(block);
+        let only_lits_cost = Self::compute_true_cost(
+            &only_lits_freqs,
+            &self.only_lits_litcode.lens,
+            &self.only_lits_offcode.lens,
+            &mut self.header_scratch,
+        );
 
-        // Pin the nodes past the block end so a match cannot extend past it.
-        let hi = (block_length - 1 + MAX_MATCH_LEN as usize).min(self.optimum_nodes.len() - 1);
+        // Pin the costs past the block end so a match cannot extend past it.
+        let hi = (block_length - 1 + MAX_MATCH_LEN as usize).min(self.node_costs.len() - 1);
         for i in block_length..=hi {
-            self.optimum_nodes[i].cost_to_end = 0x8000_0000;
+            self.node_costs[i] = 0x8000_0000;
         }
 
         // (b) static-Huffman-optimized candidate (small blocks only).
@@ -528,19 +650,15 @@ impl Optimizer {
             self.costs_saved = self.costs.clone();
             self.costs
                 .set_from_codes(&statics.litcode.lens, &statics.offcode.lens);
-            self.find_min_cost_path(block_length, cache_end);
-            static_cost = (self.optimum_nodes[0].cost_to_end / BIT_COST).wrapping_add(7);
+            let _ = self.find_min_cost_path(block_length, cache_end);
+            static_cost = (self.node_costs[0] / BIT_COST).wrapping_add(7);
             self.costs = self.costs_saved.clone();
             // Lever A: freeze the static path's items NOW — the (d) static
             // recovery branch used to re-derive them with a second
             // `find_min_cost_path` under the SAME (restored) costs, i.e. a
             // byte-identical duplicate of this DP pass (folded into
             // [`save_path_items`]'s note).
-            save_path_items(
-                &self.optimum_nodes,
-                block_length,
-                &mut self.path_items_static,
-            );
+            save_path_items(&self.node_items, block_length, &mut self.path_items_static);
         }
 
         // (c) iterative dynamic optimization.
@@ -561,8 +679,13 @@ impl Optimizer {
         let mut true_cost;
         let mut num_passes_remaining = np.max_optim_passes;
         loop {
-            let codes = self.find_min_cost_path(block_length, cache_end);
-            true_cost = self.compute_true_cost(&codes);
+            let freqs = self.find_min_cost_path(block_length, cache_end);
+            true_cost = Self::compute_true_cost(
+                &freqs,
+                &self.pass_litcode.lens,
+                &self.pass_offcode.lens,
+                &mut self.header_scratch,
+            );
             if true_cost.wrapping_add(np.min_improvement_to_continue) > best_true_cost {
                 break;
             }
@@ -571,9 +694,9 @@ impl Optimizer {
             // Lever A: the best pass's items, frozen at exactly the point
             // `costs_saved` is cloned (the recovery branch restores them
             // together with `costs_saved`; see [`save_path_items`]).
-            save_path_items(&self.optimum_nodes, block_length, &mut self.path_items_best);
+            save_path_items(&self.node_items, block_length, &mut self.path_items_best);
             self.costs
-                .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
+                .set_from_codes(&self.pass_litcode.lens, &self.pass_offcode.lens);
             num_passes_remaining -= 1;
             if num_passes_remaining == 0 {
                 break;
@@ -599,17 +722,17 @@ impl Optimizer {
         // (the DP's own tail, same codes, no second full-path scan of the
         // match cache). Byte-exactness is sha-proven (corpus -9 -p2/-p4,
         // tabular:L9:T1/T4, text, 34-member -p4 set) in the commit receipt.
-        // `optimum_nodes[*].cost_to_end` below `block_length` is stale after
-        // a restore but is not read downstream (the token walk reads `.item`
-        // only, and the next block's DP rewrites every node before reading
-        // it); past `block_length` the (a)-pinned sentinels stay untouched.
+        // `node_costs` below `block_length` is stale after a restore but is
+        // not read downstream (the token walk reads `node_items` only, and
+        // the next block's DP rewrites every cost before reading it); past
+        // `block_length` the (a)-pinned sentinels stay untouched.
         let mut used_only_literals = false;
         if only_lits_cost.min(static_cost) < best_true_cost {
             if only_lits_cost < static_cost {
                 // Only literals is cheapest.
                 used_only_literals = true;
                 self.costs
-                    .set_from_codes(&only_lits_codes.litcode.lens, &only_lits_codes.offcode.lens);
+                    .set_from_codes(&self.only_lits_litcode.lens, &self.only_lits_offcode.lens);
             } else {
                 // Static block is cheapest: regenerate its path.
                 self.costs
@@ -617,11 +740,7 @@ impl Optimizer {
                 // Lever A: restore the static path instead of re-running
                 // `find_min_cost_path` under these identical costs (the
                 // snapshot IS that re-run's output; see the (d) note above).
-                restore_path_items(
-                    &mut self.optimum_nodes,
-                    &self.path_items_static,
-                    block_length,
-                );
+                restore_path_items(&mut self.node_items, &self.path_items_static, block_length);
             }
         } else if true_cost >= best_true_cost.wrapping_add(np.min_bits_to_use_nonfinal_path) {
             // The final pass regressed; recover the best non-final path.
@@ -630,12 +749,14 @@ impl Optimizer {
             // effect — rebuilding `codes` — is reproduced exactly by the tally
             // of the restored path, because under `costs_saved` the DP was
             // deterministic and its codes came from these same items.
-            restore_path_items(&mut self.optimum_nodes, &self.path_items_best, block_length);
-            let codes = self.tally_and_build_codes(block_length);
+            // Lever C: the rebuilt pair lands in the pre-owned `pass_*`
+            // scratch (not fresh `Vec`s).
+            restore_path_items(&mut self.node_items, &self.path_items_best, block_length);
+            self.tally_and_build_codes(block_length);
             self.costs
-                .set_from_codes(&codes.litcode.lens, &codes.offcode.lens);
+                .set_from_codes(&self.pass_litcode.lens, &self.pass_offcode.lens);
         }
-        // else: optimum_nodes already holds the final (good) path.
+        // else: node_items already holds the final (good) path.
 
         // Build the token stream for the chosen path and emit. Reuse the
         // persistent `self.sink` (cleared, capacity kept) instead of a fresh
@@ -648,7 +769,7 @@ impl Optimizer {
         } else {
             let mut node = 0usize;
             while node < block_length {
-                let item = self.optimum_nodes[node].item;
+                let item = self.node_items[node];
                 let length = (item & OPTIMUM_LEN_MASK) as usize;
                 let hi = item >> OPTIMUM_OFFSET_SHIFT;
                 if length == 1 {
@@ -685,61 +806,72 @@ impl Optimizer {
     }
 }
 
-/// `deflate_make_huffman_codes`: build the litlen + offset codes from freqs.
-fn build_codes(
-    litlen_freqs: [u32; DEFLATE_NUM_LITLEN_SYMS],
-    offset_freqs: [u32; DEFLATE_NUM_OFFSET_SYMS],
-) -> PathCodes {
-    let litcode = make_huffman_code(
+/// `deflate_make_huffman_codes`: build the litlen + offset codes from freqs,
+/// into CALLER-OWNED [`HuffmanCode`] buffers (Lever C).
+///
+/// ## Receipt block (Lever C — scratch-routed pass codes)
+///
+/// This used to call the ALLOCATING `make_huffman_code` and return the pair
+/// inside `PathCodes`, so every DP tail called it with four fresh `Vec`s per
+/// call — one pair of calls per refinement pass, per recovery tail, per
+/// only-literals candidate, per block. libdeflate's mirror is a FIXED
+/// `c->codes` array inside the compressor
+/// (`vendor/libdeflate/lib/deflate_compress.c:1414-1429`): `deflate_make_huffman_codes`
+/// writes lengths + codewords into that never-reallocated state for every
+/// block. The `&mut`-params builder (`make_huffman_code_into`,
+/// huffman/fast.rs) is exactly that shape and already existed for the final
+/// emit's `code_scratch`; the per-pass tail simply bypassed it. The routing is
+/// now uniform: every non-emit build in this module goes through here into the
+/// optimizer's pre-owned pairs.
+///
+/// Byte-exactness: `make_huffman_code` IS a thin wrapper over
+/// `make_huffman_code_into` (same sort, same stripped tree, same generator —
+/// only the buffer ownership differs), so the built lens/codewords are
+/// bit-identical and the only observable difference is allocation traffic.
+/// If a future caller needs an OWNED pair, add callers of the allocating
+/// `make_huffman_code` — this site stays scratch-routed.
+fn build_code_pair(
+    litlen_freqs: &[u32; DEFLATE_NUM_LITLEN_SYMS],
+    offset_freqs: &[u32; DEFLATE_NUM_OFFSET_SYMS],
+    out_litcode: &mut HuffmanCode,
+    out_offcode: &mut HuffmanCode,
+) {
+    make_huffman_code_into(
+        out_litcode,
         DEFLATE_NUM_LITLEN_SYMS,
         MAX_LITLEN_CODEWORD_LEN,
-        &litlen_freqs,
+        litlen_freqs,
     );
-    let offcode = make_huffman_code(
+    make_huffman_code_into(
+        out_offcode,
         DEFLATE_NUM_OFFSET_SYMS,
         MAX_OFFSET_CODEWORD_LEN,
-        &offset_freqs,
-    );
-    PathCodes {
-        litlen_freqs,
         offset_freqs,
-        litcode,
-        offcode,
-    }
+    );
 }
 
-/// `deflate_choose_all_literals`: frequencies + codes for an all-literal block.
-fn build_all_literals_codes(block: &[u8]) -> PathCodes {
-    let mut litlen_freqs = [0u32; DEFLATE_NUM_LITLEN_SYMS];
-    for &b in block {
-        litlen_freqs[b as usize] += 1;
-    }
-    litlen_freqs[DEFLATE_END_OF_BLOCK] += 1;
-    build_codes(litlen_freqs, [0u32; DEFLATE_NUM_OFFSET_SYMS])
-}
-
-/// Lever A: freeze `nodes[0..block_length].item` into a flat snapshot buffer.
+/// Lever A: freeze `node_items[0..block_length]` into a flat snapshot buffer.
 /// Downstream (`optimize_and_flush`'s token walk, `tally_and_build_codes`)
-/// reads `.item` only, and only below `block_length`, so this is the complete
-/// observable state of a DP pass — see the `(d) selection` note.
+/// reads the item column only, and only below `block_length`, so this is the
+/// complete observable state of a DP pass — see the `(d) selection` note.
 #[inline]
-fn save_path_items(nodes: &[OptimumNode], block_length: usize, dst: &mut [u32]) {
-    debug_assert!(nodes.len() >= block_length && dst.len() >= block_length);
+fn save_path_items(node_items: &[u32], block_length: usize, dst: &mut [u32]) {
+    debug_assert!(node_items.len() >= block_length && dst.len() >= block_length);
     for k in 0..block_length {
-        dst[k] = nodes[k].item;
+        dst[k] = node_items[k];
     }
 }
 
 /// Lever A: the restore direction of [`save_path_items`].
 #[inline]
-fn restore_path_items(nodes: &mut [OptimumNode], src: &[u32], block_length: usize) {
-    debug_assert!(nodes.len() >= block_length && src.len() >= block_length);
-    // `src[0..block_length]` is exactly the `item` column a re-run of
+fn restore_path_items(node_items: &mut [u32], src: &[u32], block_length: usize) {
+    debug_assert!(node_items.len() >= block_length && src.len() >= block_length);
+    // `src[0..block_length]` is exactly the item column a re-run of
     // `find_min_cost_path` would write under the same costs (the DP writes
     // every node `0..block_length`), so this closes the recovery branch without
     // the second full DP pass.
     for k in 0..block_length {
-        nodes[k].item = src[k];
+        node_items[k] = src[k];
     }
 }
 
