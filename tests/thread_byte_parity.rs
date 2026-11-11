@@ -37,6 +37,21 @@
 //! Payload grids derive from `pipelined_block_size` itself — the gates must
 //! never hardcode chunk sizes the encoder is free to retune.
 //! Charter v2 (2026-11-07, PR #447): this cross--p contract is pre-authorized for in-lever renegotiation — it stays law until a lever deliberately renegotiates it.
+//!
+//! WAVE-9 AMENDMENT (2026-11-11, lever `lever/l9-b2-route`, the `-p2` route
+//! flip): within the preserved band, the T2 leg at L9-L12 is renegotiated.
+//! `params_parallel` now takes the live thread count and routes L9-L12 at
+//! threads <= 2 to the chunked Lazy2-600 arm (wave-9 receipt: at -p2 the
+//! near-opt SHIP route measured 866-986 ms, the Lazy2-600 chunk arm
+//! 111.9-115.8 ms — x0.129 — with 31/31 members at-or-below
+//! min(gzip -9, pigz -9), -2.4% aggregate; FLIP300 was rejected on a
+//! +3,382 B sizecrew). Consequence:
+//!   * L1-L8: the band stays whole — T2/T3/T4 byte-identical (asserted);
+//!   * L9-L12: T3 == T4 everywhere (asserted); the T2 arm becomes
+//!     run-to-run determinism + roundtrip (asserted), and its bytes are a
+//!     distinct stream class from T3/T4 (expected, deliberately NOT
+//!     asserted);
+//!   * T4 fingerprint rows do not move (the flip never fires at threads > 2).
 
 use gzippy::compress::pipelined::{pipelined_block_size, GRID_REF_THREADS};
 
@@ -132,8 +147,12 @@ fn grid_is_reference_anchored_below_4_and_scales_above() {
 }
 
 /// THE PRESERVED BAND: `-p` 2/3/4 remain byte-identical ACROSS `-p` at every
-/// level (this is what keeps the T4 fingerprint rows and the board's dominant
-/// cells put), with roundtrip protection at T4.
+/// level BELOW the wave-9 flip band (L1-L8 — this keeps the T4 fingerprint
+/// rows and the board's dominant cells put), with roundtrip protection at
+/// T4. At L9-L12 the T2 leg is renegotiated (wave-9 amendment): run-to-run
+/// determinism + roundtrip instead of a cross-N digest tie — `params_parallel`
+/// routes threads <= 2 there to the chunked Lazy2-600 arm — while T3 keeps
+/// T4's bytes everywhere.
 #[test]
 fn preserved_band_n_le_4_bytes_are_across_p_identical() {
     let len = 5_400_773;
@@ -145,6 +164,24 @@ fn preserved_band_n_le_4_bytes_are_across_p_identical() {
             "L{level}: T4 stream must roundtrip"
         );
         for threads in [2usize, 3] {
+            // WAVE-9 -p2 ROUTE FLIP (charter renegotiation clause): L9-L12 at
+            // threads <= 2 parse the chunked Lazy2-600 arm, so their T2 bytes
+            // are a distinct stream class from the T3/T4 near-opt route. The
+            // T2 gate for those levels becomes determinism + roundtrip.
+            if level >= 9 && threads == 2 {
+                let a = encode_at(&data, level, threads);
+                let b = encode_at(&data, level, threads);
+                assert_eq!(
+                    a, b,
+                    "L{level} T2: flipped-arm (chunked Lazy2-600) output is not \
+                     run-to-run deterministic"
+                );
+                assert!(
+                    matches!(gzippy::decompress(&a), Ok(back) if back == data),
+                    "L{level} T2: flipped-arm stream must roundtrip"
+                );
+                continue;
+            }
             let stream = encode_at(&data, level, threads);
             assert_eq!(
                 stream, reference,

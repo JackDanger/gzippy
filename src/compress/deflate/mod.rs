@@ -177,6 +177,7 @@ pub fn encode_deflate_segment_to_sink(
             is_last,
             true,
             parallel,
+            0,
         );
     } else {
         // Preset-dictionary chunk: prepend the dictionary into one padded buffer
@@ -201,6 +202,7 @@ pub fn encode_deflate_segment_to_sink(
             is_last,
             true,
             parallel,
+            0,
         );
     }
 
@@ -236,6 +238,13 @@ pub fn encode_deflate_segment_to_sink(
 /// The final chunk (`is_last`) still sets BFINAL on its last block; its
 /// trailing pad, if any, is reported like any other so the splicer can shift
 /// it too, then zero-pad the whole stream once at the very end.
+///
+/// `parallel` keeps its meaning (T>1 chunk worker ⇒ `params_parallel` +
+/// `HeaderBudget::Generous`). `threads` — the live worker count passed down
+/// from the pipelined caller — conditions EXACTLY ONE route: the wave-9
+/// `-p2` route flip parses L9-L12 at `threads <= 2` with the chunked
+/// Lazy2-600 arm (`level::params_parallel(level, threads)`; 0 = serial or
+/// unspecified ⇒ no flip). Byte-invariant for every caller outside that band.
 pub fn encode_deflate_splice_chunk_to_sink(
     data: &[u8],
     dict: &[u8],
@@ -243,6 +252,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
     is_last: bool,
     out: &mut Vec<u8>,
     parallel: bool,
+    threads: usize,
     input_total_len: usize,
 ) -> bitstream::ChunkMeta {
     STORED_BLOCK_EMITTED.with(|f| f.set(false));
@@ -265,6 +275,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
             is_last,
             false,
             parallel,
+            threads,
         );
     } else {
         let dict_len = dict.len();
@@ -286,6 +297,7 @@ pub fn encode_deflate_splice_chunk_to_sink(
             is_last,
             false,
             parallel,
+            threads,
         );
     }
 
@@ -360,6 +372,7 @@ fn deflate_into(
     is_last: bool,
     sync_flush: bool,
     parallel: bool,
+    threads: usize,
 ) {
     debug_assert!(buf.len() >= in_end + parse::BUF_PAD);
     if in_end == data_start {
@@ -383,7 +396,7 @@ fn deflate_into(
         // effort, or a deeper regular search) measured on the size AND wall
         // boards before it ships.
         let params = if parallel {
-            level::params_parallel(level)
+            level::params_parallel(level, threads)
         } else {
             level::params(level)
         };
@@ -443,6 +456,7 @@ pub fn encode_deflate_slack_padded_to_sink(
         true,
         true,
         false,
+        0,
     );
     *out = bw.finish();
 }
