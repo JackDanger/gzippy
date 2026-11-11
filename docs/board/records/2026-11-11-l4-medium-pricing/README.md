@@ -340,7 +340,7 @@ WALL (hypothesis-tier, same-binary mechanism pair):
   ~+11-12%. The memo's +0-3% envelope is falsified (the slide's backward
   byte-pair walk is the price, and it scales with the deed table).
 - Against the SAME-LEVEL rivals, every measured member STAYS won on BOTH
-  axes with the rung on: ours-remains-FASTER-than-both (medium 273 ms vs
+  axes with the rung on: ours stays FASTER than both (medium 273 ms vs
   gzip -4 480 ms / pigz -p1 450 ms on data.sqlite; 299 vs 677/527 on
   logs.txt; 377 vs 740/668 on tool.bin) — the +12-29% cost is paid out of
   OUR OWN slack against the rivals, and the per-label wall bar stays green
@@ -358,7 +358,7 @@ RECOMMENDATION for the lever PR (this probe does not ship anything):
    per-member size column is the clause-5 capital it spends.
 2. The -p1 SIZE table above is the frozen-box sweep's expectation: 31/31
    non-regressing, 3 hairline members essentially unchanged (weights/photo/
-   movie |< -0.01%|).
+   movie, all under 0.01% magnitude).
 3. The value is on the LOG/sqlite class. If the owner prices the class under
    clause 5, the probe's per-member row set gives the exact cell map the box
    will sweep (sizes.tsv in scratch/).
