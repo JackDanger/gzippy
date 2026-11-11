@@ -770,6 +770,14 @@ mod tests {
             m.len() <= g.len(),
             "bulk: medium  > greedy is impossible here"
         );
+        // The phase-aligned family drives the slide to completion (c0 — the
+        // vendor's `c_len <= 1` boundary; what the design memo's sketch
+        // excluded), so c0 is PINNED here. c1 (the chain stops one byte
+        // short) is the corpus-dominant shape — 62-99% of commits on every
+        // size-moving member of the pricing record's deed table — and rides
+        // that receipt; pinning it synthetically needs corpus-shaped data.
+        // If c0 regresses to zero, someone "tightened" the commit rule to
+        // `c_len == 1` — exactly the deviation this rung's vendoring rests on.
         assert!(
             saw_c0,
             "the fixed family no longer exercises the c_len == 0 commit — \
