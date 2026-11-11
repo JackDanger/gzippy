@@ -509,7 +509,7 @@ level	threads	counter	value
 9	4	histogram_updates	1
 9	4	huffman_exact_code_chosen	0
 9	4	huffman_length_limited_calls	0
-9	4	huffman_make_code_calls	16
+9	4	huffman_make_code_calls	14
 9	4	huffman_tree_nodes_visited	0
 9	4	literals_emitted	1
 9	4	literals_emitted_fast	0
