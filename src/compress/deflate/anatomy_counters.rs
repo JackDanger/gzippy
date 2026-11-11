@@ -399,6 +399,49 @@ define_counters!(
     // returns; `near_opt_flush_blocks` counts every flush, for the rate.
     near_opt_flush_blocks,
     near_opt_only_literals_blocks,
+    // ── Near-opt fixed-point skip instruments (`optimize_and_flush`'s (c)
+    // refinement loop; lever `nearopt-fixedpoint-skip` pricing) ──
+    // - `nearopt_pass_entries`: every entry of the (c) refinement loop, i.e.
+    //   every near-opt DP pass STARTED (`find_min_cost_path` +
+    //   `compute_true_cost`) across every block, including each block's
+    //   final pass. Upper bound: max_optim_passes x blocks.
+    // - `set_from_codes_calls`: production calls to
+    //   `DeflateCosts::set_from_codes` (counted inside the method, so this
+    //   covers all near_optimal.rs sites: branch (b)'s static seed, one at
+    //   each refinement-pass end, and the (d) selection's).
+    // - `cost_sheet_equal_flags`: how often the NEW sheet (post
+    //   `set_from_codes` at a pass end) is bitwise-equal, over the ranges
+    //   `find_min_cost_path` actually reads (`DeflateCosts::
+    //   dp_input_sheet_eq` — it ignores the three never-read entries
+    //   `length[0..3]` / `offset_slot[30..32]`), to the sheet the
+    //   just-finished pass CONSUMED (`costs_saved`, cloned in the same
+    //   iteration BEFORE the overwrite). With
+    //   `min_improvement_to_continue >= 1` (every shipped route) each such
+    //   event makes the NEXT pass — when one exists — a pure recomputation
+    //   that breaks at the improvement gate identically. HOW MANY passes a
+    //   flag can actually save is split by the two counters below: at a
+    //   `num_passes_remaining == 0` pass end (the route's exhaustion
+    //   boundary, e.g. every `passes=2` route's pass-2 end at L9) NO pass
+    //   follows, so the event cannot save one — it is a duplicate-sheet
+    //   exit, not a skip opportunity.
+    // - `nearopt_finite_skip_would_save`: passes the break saves at
+    //   equality events THAT HAVE A NEXT PASS — 1 per event while
+    //   `min_improvement_to_continue >= 1` (the identical pass trips the
+    //   gate and stops there), `num_passes_remaining` while it is 0 (the
+    //   gate would NOT trip on the identical pass, so every remaining pass
+    //   reruns the same fixed point; no shipped route has 0). Same
+    //   first-event-per-block semantics as before, and exhaustion-boundary
+    //   events are EXCLUDED (they have no pass to skip; they land in
+    //   `cost_sheet_equal_at_last_pass` instead).
+    // - `cost_sheet_equal_at_last_pass`: the split of
+    //   `cost_sheet_equal_flags` events observed at a pass end with
+    //   `num_passes_remaining == 0` — a bitwise-stable exit (the route
+    //   converged), which represents NO skippable DP work.
+    nearopt_pass_entries,
+    set_from_codes_calls,
+    cost_sheet_equal_flags,
+    nearopt_finite_skip_would_save,
+    cost_sheet_equal_at_last_pass,
     // Allocation events (deflate/mod.rs, huffman/header.rs).
     alloc_events,
     alloc_bytes,

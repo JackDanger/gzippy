@@ -1,0 +1,14 @@
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/deps/assert_cmd-7a1cfced34b620c2.d: /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/lib.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/macros.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/assert.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cargo.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cmd.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/output.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/color.rs /Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/assert_cmd-380cc56f9f8e9e05/out/current_target.txt
+
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/deps/libassert_cmd-7a1cfced34b620c2.rmeta: /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/lib.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/macros.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/assert.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cargo.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cmd.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/output.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/color.rs /Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/assert_cmd-380cc56f9f8e9e05/out/current_target.txt
+
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/lib.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/macros.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/assert.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cargo.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/cmd.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/output.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/assert_cmd-2.2.1/src/color.rs:
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/assert_cmd-380cc56f9f8e9e05/out/current_target.txt:
+
+# env-dep:OUT_DIR=/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/assert_cmd-380cc56f9f8e9e05/out

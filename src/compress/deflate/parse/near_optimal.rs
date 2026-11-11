@@ -679,6 +679,7 @@ impl Optimizer {
         let mut true_cost;
         let mut num_passes_remaining = np.max_optim_passes;
         loop {
+            crate::anatomy_count!(nearopt_pass_entries);
             let freqs = self.find_min_cost_path(block_length, cache_end);
             true_cost = Self::compute_true_cost(
                 &freqs,
@@ -698,6 +699,52 @@ impl Optimizer {
             self.costs
                 .set_from_codes(&self.pass_litcode.lens, &self.pass_offcode.lens);
             num_passes_remaining -= 1;
+            // Fixed-point skip (lever `nearopt-fixedpoint-skip`, instrument
+            // counters under `anatomy-counters`): the sheet this pass
+            // CONSUMED is `costs_saved` (cloned one step above, before the
+            // overwrite); the sheet the NEXT pass would consume is the
+            // `set_from_codes` result now in `self.costs`. If the two are
+            // bitwise-equal over the DP-read ranges, the next pass is a
+            // pure recomputation — identical DP inputs ⇒ identical items and
+            // codes ⇒ the same `true_cost` ⇒ the improvement gate breaks it
+            // identically (best_true_cost == true_cost here, and every
+            // shipped route has min_improvement_to_continue >= 1, so
+            // `best + mi > best` holds). Break BEFORE the recomputation;
+            // every observable state below the loop (`true_cost`,
+            // `best_true_cost`, `costs_saved`, `path_items_best`,
+            // `optimum_nodes`, and the `costs` the next block's
+            // `set_initial_costs` blends from) is already identical to the
+            // no-break run — the lemma and its whole-stream sha receipts
+            // live in the feature comment (Cargo.toml) and the record under
+            // `docs/board/records/2026-11-11-nearopt-fixedpoint/`.
+            #[cfg(any(feature = "anatomy-counters", feature = "nearopt-fixedpoint-skip"))]
+            if self.costs.dp_input_sheet_eq(&self.costs_saved) {
+                crate::anatomy_count!(cost_sheet_equal_flags);
+                // Passes the break saves, split by whether a next pass even
+                // exists: at `num_passes_remaining == 0` (a route's
+                // exhaustion boundary — e.g. every L9/L10 `-p4` pass-2 end)
+                // the loop exits here with no further DP, so the duplicate
+                // sheet is a stable exit, not skippable work; otherwise the
+                // next pass IS the recomputation — 1 pass saved while the
+                // improvement gate trips on the identical pass (mi >= 1;
+                // a route shipping `min_improvement_to_continue == 0` would
+                // not trip and would rerun every remaining pass, so the
+                // block's skip volume is all remaining passes — no shipped
+                // route has 0).
+                #[cfg(feature = "anatomy-counters")]
+                if num_passes_remaining > 0 {
+                    let would_save = if np.min_improvement_to_continue == 0 {
+                        num_passes_remaining as u64
+                    } else {
+                        1u64
+                    };
+                    crate::anatomy_count!(nearopt_finite_skip_would_save, would_save);
+                } else {
+                    crate::anatomy_count!(cost_sheet_equal_at_last_pass);
+                }
+                #[cfg(feature = "nearopt-fixedpoint-skip")]
+                break;
+            }
             if num_passes_remaining == 0 {
                 break;
             }

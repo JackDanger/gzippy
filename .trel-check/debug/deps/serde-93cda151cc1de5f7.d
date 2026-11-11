@@ -1,0 +1,14 @@
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/deps/serde-93cda151cc1de5f7.d: /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/serde-278cdbf9f51b9743/out/private.rs
+
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/deps/libserde-93cda151cc1de5f7.rlib: /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/serde-278cdbf9f51b9743/out/private.rs
+
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/deps/libserde-93cda151cc1de5f7.rmeta: /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/serde-278cdbf9f51b9743/out/private.rs
+
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/jackdanger/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/serde-278cdbf9f51b9743/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/jackdanger/www/gzippy/.review-tmp/wA-fixpoint/.trel-check/debug/build/serde-278cdbf9f51b9743/out

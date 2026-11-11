@@ -190,6 +190,28 @@ block-cost-probe = []
 # DEFAULT OFF: an adjudication-gated lever, not a shipped default — the wall
 # claim rides the probe variant's measured numbers before it can be promoted.
 near-opt-parallel-flush = []
+# Fixed-point pass-skip lever for the near-optimal refinement loop
+# (`optimize_and_flush`'s (c) iteration, src/compress/deflate/parse/
+# near_optimal.rs). With the feature off, the refinement loop's statement
+# sequence is today's shape byte-for-byte. With it on: after a pass ends and
+# its `set_from_codes` derives the NEXT pass's cost model, the loop BREAKS
+# BEFORE running that next pass when the new model is bitwise-equal (over the
+# ranges the DP reads, `DeflateCosts::dp_input_sheet_eq`) to the sheet the
+# just-finished pass CONSUMED. The skipped pass would be a pure-function
+# recomputation: `find_min_cost_path` is a pure function of (costs,
+# match_cache[0..cache_end], the pinned sentinel costs past block_length),
+# none of which changed, so it reproduces identical items and codes, the same
+# true cost, and trips the `min_improvement_to_continue` gate identically
+# (every shipped route carries min_improvement >= 1, so `best + mi > best`
+# holds) — a no-op dedupe under the same byte-exactness lemma PR #457's
+# item-snapshot restore used (pure re-derivation of unchanged state, pinned
+# by whole-stream sha receipts). Inert at `-p2` since the wave-9 route flip
+# (`9..=12 && threads <= 2` -> chunked Lazy2-600): the near-optimal DP never
+# runs there, so `nearopt_pass_entries` stays 0 and every `-p2` cell is an
+# exact tie by route, not by measurement. DEFAULT OFF; the instrumented
+# counters ride `anatomy-counters` (the `cost_sheet_equal_flags`/
+# `nearopt_finite_skip_would_save` pair), see anatomy_counters.rs.
+nearopt-fixedpoint-skip = []
 # LEVER #2 / d3 (docs/board/sprint-2026-09-25.md "Lever ledger", row 2): replace
 # the near-optimal fill's binary-tree matchfinder descent with a CHEAPER ordered
 # candidate gatherer under the SAME DP (`find_min_cost_path`'s trusted layout —

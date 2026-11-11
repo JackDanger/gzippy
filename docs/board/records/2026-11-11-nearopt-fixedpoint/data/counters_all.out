@@ -1,0 +1,7 @@
+members done:      205 rows
+--- p2 inert rows ---
+counters_all done: /Users/jackdanger/www/gzippy/.review-tmp/fixpt/counters_cntr.csv / /Users/jackdanger/www/gzippy/.review-tmp/fixpt/counters_skipc.csv
+instrument-arm streams L9 p4: cntr=327b083588efca2178d97f977cbdca37e9a3815b7440aea5ccbe099e566c5475 skipc=327b083588efca2178d97f977cbdca37e9a3815b7440aea5ccbe099e566c5475
+instrument-arm streams L10 p4: cntr=e22bd698ff79983bf875d3b950309a8926d41cc4f62fc6ee0e63d6063b04c32d skipc=e22bd698ff79983bf875d3b950309a8926d41cc4f62fc6ee0e63d6063b04c32d
+instrument-arm streams L11 p4: cntr=1d4aed15d917fd4c5e92f9bb4a5f8fa0346587e5ab119c53136e5379ce65f1bc skipc=1d4aed15d917fd4c5e92f9bb4a5f8fa0346587e5ab119c53136e5379ce65f1bc
+instrument-arm streams L12 p4: cntr=bcabfc5fcb3c564111598905345a5e0d4ca888918bf8b2f324a4d953f2733037 skipc=bcabfc5fcb3c564111598905345a5e0d4ca888918bf8b2f324a4d953f2733037
