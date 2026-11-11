@@ -1,0 +1,65 @@
+GATE: waiting for a quiet window (load1 < 3.0 twice in a row) before the wall battery
+gate tick load1=27.1 streak=0 07:15:48
+gate tick load1=12.4 streak=0 07:16:48
+gate tick load1=6.5 streak=0 07:17:48
+gate tick load1=6.8 streak=0 07:18:48
+gate tick load1=5.2 streak=0 07:19:48
+gate tick load1=19.6 streak=0 07:20:48
+gate tick load1=23.3 streak=0 07:21:48
+gate tick load1=31.5 streak=0 07:22:48
+gate tick load1=40.9 streak=0 07:23:48
+gate tick load1=38.9 streak=0 07:24:48
+gate tick load1=37.5 streak=0 07:25:48
+gate tick load1=39.0 streak=0 07:26:48
+gate tick load1=19.8 streak=0 07:27:48
+gate tick load1=11.7 streak=0 07:28:48
+gate tick load1=6.9 streak=0 07:29:48
+gate tick load1=4.8 streak=0 07:30:48
+gate tick load1=8.1 streak=0 07:31:48
+gate tick load1=22.6 streak=0 07:32:48
+gate tick load1=15.0 streak=0 07:33:48
+gate tick load1=17.4 streak=0 07:34:48
+gate tick load1=10.0 streak=0 07:35:48
+gate tick load1=6.5 streak=0 07:36:48
+gate tick load1=5.9 streak=0 07:37:48
+gate tick load1=5.0 streak=0 07:38:48
+gate tick load1=4.6 streak=0 07:39:48
+gate tick load1=4.7 streak=0 07:40:48
+gate tick load1=3.5 streak=0 07:41:48
+gate tick load1=3.2 streak=0 07:42:48
+gate tick load1=2.9 streak=1 07:43:48
+gate tick load1=5.6 streak=0 07:44:48
+gate tick load1=6.0 streak=0 07:45:48
+gate tick load1=14.3 streak=0 07:46:48
+gate tick load1=19.4 streak=0 07:47:48
+gate tick load1=31.9 streak=0 07:48:48
+gate tick load1=22.5 streak=0 07:49:48
+gate tick load1=10.2 streak=0 07:50:48
+gate tick load1=5.8 streak=0 07:51:48
+gate tick load1=4.7 streak=0 07:52:48
+gate tick load1=4.3 streak=0 07:53:48
+gate tick load1=4.4 streak=0 07:54:48
+gate tick load1=4.6 streak=0 07:55:48
+gate tick load1=2.8 streak=1 07:56:48
+gate tick load1=2.6 streak=2 07:57:48
+quiet window detected — launching wall battery 07:57:48
+L4 -p1 l5/dickens             ship     71.2 ms | medium     81.3 ms | B/A = 1.1421 | load1 med 2.6
+L4 -p1 l5/logs.txt            ship    238.2 ms | medium    299.4 ms | B/A = 1.2568 | load1 med 2.7
+L4 -p1 l5/logs.txt-card26m    ship     33.6 ms | medium     40.9 ms | B/A = 1.2165 | load1 med 2.7
+L4 -p1 l5/mozilla             ship    264.1 ms | medium    313.5 ms | B/A = 1.1874 | load1 med 2.9
+L4 -p1 l5/mr                  ship     54.2 ms | medium     63.8 ms | B/A = 1.1764 | load1 med 2.9
+L4 -p1 l5/nci                 ship     77.9 ms | medium     94.1 ms | B/A = 1.2077 | load1 med 2.8
+L4 -p1 l5/ooffice             ship     48.1 ms | medium     55.9 ms | B/A = 1.1626 | load1 med 2.8
+L4 -p1 l5/osdb                ship     54.0 ms | medium     61.3 ms | B/A = 1.1356 | load1 med 2.8
+L4 -p1 l5/reymont             ship     38.1 ms | medium     44.6 ms | B/A = 1.1705 | load1 med 2.8
+L4 -p1 l5/samba               ship     86.6 ms | medium    100.8 ms | B/A = 1.1638 | load1 med 2.9
+L4 -p1 l5/sao                 ship     67.3 ms | medium     79.8 ms | B/A = 1.1861 | load1 med 2.9
+L4 -p1 l5/software.archive    ship    237.0 ms | medium    248.6 ms | B/A = 1.0487 | load1 med 2.9
+L4 -p1 l5/webster             ship    218.6 ms | medium    252.1 ms | B/A = 1.1534 | load1 med 2.9
+L4 -p1 l5/x-ray               ship     66.4 ms | medium     76.0 ms | B/A = 1.1443 | load1 med 2.9
+L4 -p1 l5/xml                 ship     18.6 ms | medium     21.3 ms | B/A = 1.1398 | load1 med 2.9
+L4 -p1 data.sqlite            ship    232.7 ms | medium    278.4 ms | B/A = 1.1968 | load1 med 3.0
+L4 -p1 aozora.txt             ship     75.5 ms | medium     90.3 ms | B/A = 1.1970 | load1 med 3.0
+L4 -p1 data.json              ship     36.2 ms | medium     42.7 ms | B/A = 1.1819 | load1 med 3.0
+L4 -p1 tool.bin               ship    324.8 ms | medium    381.2 ms | B/A = 1.1738 | load1 med 3.0
+L4 -p1 minjs.min.js           ship     21.5 ms | medium     25.2 ms | B/A = 1.1696 | load1 med 3.0

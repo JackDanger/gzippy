@@ -311,6 +311,17 @@ impl LdxCompressor {
         } else {
             None
         };
+        // PROBE (zlib-ng deflate_medium, ladder-tune builds only — a shipped
+        // binary reads neither env): `GZIPPY_LDX_MEDIUM=1` routes the L4 arm to
+        // `compress_medium::deflate_compress_medium` — the vendor-precedented
+        // look-ahead-probe + fizzle parser sharing greedy's knobs, accept
+        // predicate and emission helpers (that module's header documents the
+        // eight deviations from the vendor). Throttled to L4 for the
+        // data.sqlite:L4:T1 pricing cell; every other level keeps the shipped
+        // parser verbatim.
+        #[cfg(feature = "ladder-tune")]
+        let medium_probe = self.compression_level == 4
+            && std::env::var("GZIPPY_LDX_MEDIUM").ok().as_deref() == Some("1");
         match (&mut self.parser, self.compression_level) {
             (ParserState::Fastest(p), 1) => deflate_compress_fastest(
                 &mut self.c,
@@ -321,13 +332,14 @@ impl LdxCompressor {
                 nice_match_length,
             ),
             // L2 stays on libdeflate's greedy parser; L4 is the greedy arm of
-            // the #119 probe (data.sqlite L4 cell); L3 runs the lazy parser
-            // (the measured divergence documented in the level map) and is
-            // deliberately OUTSIDE the probe levels — its shipped far-len-3
-            // gate is a landed lever and must not move. The far-len-3 gate
-            // and split-hold knobs are lazy-parser machinery (L3) — the
-            // greedy parser takes no such parameters.
-            (ParserState::Greedy(p), 2 | 4) => {
+            // the #119 probe (data.sqlite L4 cell) and — under
+            // `GZIPPY_LDX_MEDIUM` — the zlib-ng-medium arm of the 2026-11-11 L4
+            // rung; L3 runs the lazy parser (the measured divergence documented
+            // in the level map) and is deliberately OUTSIDE the probe levels —
+            // its shipped far-len-3 gate is a landed lever and must not move.
+            // The far-len-3 gate and split-hold knobs are lazy-parser machinery
+            // (L3) — the greedy parser takes no such parameters.
+            (ParserState::Greedy(p), 2) => {
                 #[cfg(feature = "ladder-tune")]
                 deflate_compress_greedy(
                     &mut self.c,
@@ -340,6 +352,47 @@ impl LdxCompressor {
                     good_match,
                     ldx_probe,
                 );
+                #[cfg(not(feature = "ladder-tune"))]
+                deflate_compress_greedy(
+                    &mut self.c,
+                    p.get_or_insert_with(GreedyState::new),
+                    r#in,
+                    in_nbytes,
+                    &mut os,
+                    max_search_depth,
+                    nice_match_length,
+                    good_match,
+                );
+            }
+            (ParserState::Greedy(p), 4) => {
+                // The medium arm exists only in a ladder-tune build (the module
+                // itself is cfg'd out otherwise); shipped dispatch below is
+                // byte-for-byte the old `2 | 4` arm.
+                #[cfg(feature = "ladder-tune")]
+                if medium_probe {
+                    super::compress_medium::deflate_compress_medium(
+                        &mut self.c,
+                        p.get_or_insert_with(GreedyState::new),
+                        r#in,
+                        in_nbytes,
+                        &mut os,
+                        max_search_depth,
+                        nice_match_length,
+                        good_match,
+                    );
+                } else {
+                    deflate_compress_greedy(
+                        &mut self.c,
+                        p.get_or_insert_with(GreedyState::new),
+                        r#in,
+                        in_nbytes,
+                        &mut os,
+                        max_search_depth,
+                        nice_match_length,
+                        good_match,
+                        ldx_probe,
+                    );
+                }
                 #[cfg(not(feature = "ladder-tune"))]
                 deflate_compress_greedy(
                     &mut self.c,
