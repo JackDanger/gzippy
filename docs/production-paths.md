@@ -110,9 +110,13 @@ Input (reader, args, opt_config)
 │   → encode_gzip_reader_to_writer_sized
 │     [src/compress/deflate/mod.rs]
 │     ONE route for EVERY level 0-12; the per-level engine choice lives in
-│     `level_uses_ldx` [deflate/mod.rs:637]:
-│     ├─ 0, 2-5, 7-9 → the libdeflate port (src/compress/ldx/)
-│     ├─ 1, 6       → gzippy's own legacy arms (measured wins)
+│     `level_uses_ldx` [deflate/mod.rs:569]:
+│     ├─ 0, 2-9    → the libdeflate port (src/compress/ldx/; L6 routed here
+│     │              2026-11-08 by PR #449 — the legacy-lazy arm remains
+│     │              only for L1)
+│     ├─ 1         → gzippy's own legacy arm (the measured win: our
+│     │              igzip-derived L1 beats pigz -1 on text where the port
+│     │              does not, 43,980 vs 42,384)
 │     └─ 10-12      → parse/near_optimal (near-optimal parse)
 │     (plain `-11`/`--max` do NOT route through the zopfli branch; the
 │      encoder picks the cheapest of stored/static/dynamic per block,
