@@ -96,6 +96,23 @@ pub mod near_opt_flush_probe {
     pub fn poison_settles() -> u64 {
         super::near_optimal::poison_settles()
     }
+    /// [flipsafe] ONE test lock for the flush probes: `set_force_serial_flush`
+    /// and the WRITES/POISON_SETTLES counters are process-wide statics, so
+    /// two probe tests running under cargo's default parallel harness
+    /// would toggle each other's arms mid-encode (observed as spurious
+    /// identity failures when the whole suite runs with both flush
+    /// features). Every probe test that touches the flush statics takes
+    /// this lock for its whole body; CI runs each probe test solo (the
+    /// given `--test ... <test-name>` filters), so the lock is uncontended
+    /// there and costs nothing. It is not about production: the lock is
+    /// compiled only into the probe module.
+    #[cfg(feature = "near-opt-parallel-flush-flipsafe")]
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn probe_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 }
 
 /// Test/observability handle for the near-optimal d3 FILL probe (lever #2 /
@@ -133,9 +150,22 @@ pub mod near_opt_d3_probe {
 pub mod near_opt_probebudget {
     /// Set the per-descent probe budget for subsequent near-optimal runs
     /// (the shipped default is 48; probe arms override).
+    ///
+    /// [flipsafe-era suite hygiene] there is NO mid-test value that may
+    /// survive a probe: `cargo test` runs the probe files' tests in ONE
+    /// process by default, and a leaked 24/90/150 budget reshapes every
+    /// LATER near-optimal test in that process (the flipsafe identity
+    /// probe fails loudly across arms under such a leak: its two arms
+    /// straddled the restore). Use [`Self::reset_budget`] to hand the
+    /// factory state back.
     #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
     pub fn set_budget(v: u32) {
         super::near_optimal::set_probe_budget(v);
+    }
+    /// The factory state: the shipped budget 48 (see `set_budget`).
+    #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
+    pub fn reset_budget() {
+        super::near_optimal::set_probe_budget(48);
     }
     /// The current budget (the probe's arm witness).
     #[allow(dead_code)] // driven by tests/l9_t4_chunk_cost_probe.rs; unused in the binary
