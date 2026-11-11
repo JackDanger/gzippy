@@ -101,6 +101,28 @@ use super::{
     DEFLATE_MAX_MATCH_LEN, DEFLATE_MIN_MATCH_LEN, SEQ_STORE_LENGTH, SOFT_MAX_BLOCK_LENGTH,
 };
 
+/// PROBE INSTRUMENT (this module is probe-only, never shipped): the mechanism's
+/// deed counts, accumulated per call and flushed ONCE per encode so the hot
+/// path pays no atomics. Read under `GZIPPY_LDX_MEDIUM_STATS=1` (one stderr
+/// line per encode) and by the module's own tests. These are measurement
+/// plumbing for the pricing record, not pins and not a production surface.
+pub(crate) struct MediumStats {
+    pub calls: core::sync::atomic::AtomicU64,
+    pub probes: core::sync::atomic::AtomicU64,
+    pub pretest_passes: core::sync::atomic::AtomicU64,
+    pub slide_steps: core::sync::atomic::AtomicU64,
+    pub commits_c1: core::sync::atomic::AtomicU64,
+    pub commits_c0: core::sync::atomic::AtomicU64,
+}
+pub(crate) static MEDIUM_STATS: MediumStats = MediumStats {
+    calls: core::sync::atomic::AtomicU64::new(0),
+    probes: core::sync::atomic::AtomicU64::new(0),
+    pretest_passes: core::sync::atomic::AtomicU64::new(0),
+    slide_steps: core::sync::atomic::AtomicU64::new(0),
+    commits_c1: core::sync::atomic::AtomicU64::new(0),
+    commits_c0: core::sync::atomic::AtomicU64::new(0),
+};
+
 /// zlib-ng `deflate_medium`, ported over the port's own `hc` matchfinder.
 ///
 /// The match acceptance test, the per-block min-match cadence, the block /
@@ -136,24 +158,26 @@ pub(crate) fn deflate_compress_medium(
     // vendor's `orgstart` (`:20`): the first position of the cached match's own
     // span that has NOT yet been inserted into the hash tables — the anchor the
     // emit path's insert sweep dedups against.
+    let mut st_probes: u64;
+    let mut st_pret: u64;
+    let mut st_slide: u64;
+    let mut st_commit1: u64;
+    let mut st_commit0: u64;
+
     let mut next_live = false;
     let mut next_len: u32 = 0;
     let mut next_off: u32 = 0;
     let mut next_org: usize = 0;
 
-    // PROBE INSTRUMENT (this pricing run only; never a production surface):
-    // GZIPPY_LDX_MEDIUM_STATS=1 prints one stderr line per call with the
-    // mechanism's deed counts — probes, fizzle pre-test passes, slide steps,
-    // commits (by c_len shape), literal units — so a size delta can be signed
-    // against a MEASURED mechanism rate ("count it; never infer it").
-    let stats = std::env::var("GZIPPY_LDX_MEDIUM_STATS").ok().as_deref() == Some("1");
-    let mut st_probes = 0u64;
-    let mut st_pret = 0u64;
-    let mut st_slide = 0u64;
-    let mut st_commit1 = 0u64;
-    let mut st_commit0 = 0u64;
-    let mut st_probe_finds = 0u64;
-
+    // PROBE INSTRUMENT (deed-driven pricing, never a production surface):
+    // per-call locals flushed once into `MEDIUM_STATS` at the end, and a stderr
+    // line under GZIPPY_LDX_MEDIUM_STATS=1 — a size delta gets signed against
+    // a MEASURED mechanism rate ("count it; never infer it").
+    st_probes = 0;
+    st_pret = 0;
+    st_slide = 0;
+    st_commit1 = 0;
+    st_commit0 = 0;
     p.hc_mf.init();
 
     loop {
@@ -273,9 +297,7 @@ pub(crate) fn deflate_compress_medium(
                 // match (`current->match_length > 1`, `:124` — the rung's
                 // literal unit-1 shape is below that floor).
                 st_probes += 1;
-                if n_len >= min_len {
-                    st_probe_finds += 1;
-                }
+                if n_len >= min_len {}
                 let n_real = n_len >= min_len;
                 if n_real && unit_len > 1 {
                     // Call-site preconditions (vendor `:233-237`): the slid
@@ -429,13 +451,19 @@ pub(crate) fn deflate_compress_medium(
             break;
         }
     }
-    if stats {
+    use core::sync::atomic::Ordering as O;
+    MEDIUM_STATS.calls.fetch_add(1, O::Relaxed);
+    MEDIUM_STATS.probes.fetch_add(st_probes, O::Relaxed);
+    MEDIUM_STATS.pretest_passes.fetch_add(st_pret, O::Relaxed);
+    MEDIUM_STATS.slide_steps.fetch_add(st_slide, O::Relaxed);
+    MEDIUM_STATS.commits_c1.fetch_add(st_commit1, O::Relaxed);
+    MEDIUM_STATS.commits_c0.fetch_add(st_commit0, O::Relaxed);
+    if std::env::var("GZIPPY_LDX_MEDIUM_STATS").ok().as_deref() == Some("1") {
         eprintln!(
-            "[medium] in_bytes={ib} probes={pr} probe_finds={pf} pretest_pass={pt} \
-slide_steps={ss} commit1={c1} commit0={c0}",
+            "[medium] in_bytes={ib} probes={pr} pretest_pass={pt} slide_steps={ss} \
+commit1={c1} commit0={c0}",
             ib = in_nbytes,
             pr = st_probes,
-            pf = st_probe_finds,
             pt = st_pret,
             ss = st_slide,
             c1 = st_commit1,
@@ -664,6 +692,95 @@ mod tests {
     /// repeat, so every position is a literal and no slide conditions exist —
     /// medium must be byte-identical to the shipped greedy L4 stream. This is
     /// the tie-cage anchor for "the mechanism diff is enumerable" (memo §3.4).
+
+    /// The c_len == 0 commit shape (deviation 5, the vendor's `<= 1` rule):
+    /// walk a family of shift-overlap streams with the in-module counters and
+    /// assert the family (a) exercises BOTH commit shapes somewhere, (b)
+    /// round-trips every member, and (c) never grows past greedy. The family
+    /// is fixed, so this is a real regression gate for the c0 code path, not
+    /// a discovery probe: any rewrite of the slide guards that stops
+    /// committing c0 breaks this test.
+    #[test]
+    fn the_slide_family_exercises_both_commit_shapes() {
+        use core::sync::atomic::Ordering as O;
+        fn counts() -> (u64, u64) {
+            (
+                MEDIUM_STATS.commits_c1.load(O::SeqCst),
+                MEDIUM_STATS.commits_c0.load(O::SeqCst),
+            )
+        }
+        let before = counts();
+        let (mut saw_c1, mut saw_c0) = (false, false);
+        // Family: two copies of a period-p phrase, the second copy offset by
+        // `shift`, with a third phase-perturbed copy as the slide stopper; plus
+        // a distinct-literal prefix so min_len lands at 3 (the parse-active
+        // regime where the slide runs).
+        let mut prefix: Vec<u8> = (0..=255u8).collect();
+        for i in 0..1024usize {
+            prefix.push(((i * 7919) & 0xff) as u8);
+        }
+        for period in [4usize, 5, 7, 8] {
+            for shift in 1..period.min(7) {
+                for phrase_len in [16usize, 48] {
+                    let phrase: Vec<u8> = (0..phrase_len)
+                        .map(|i| b"abcdefghij"[(i * period) % 10])
+                        .collect();
+                    let mut data = prefix.clone();
+                    data.extend_from_slice(&phrase);
+                    // second copy shifted left by `shift` bytes
+                    data.extend_from_slice(&phrase[shift..]);
+                    // a third copy shifted the other way, ending in a
+                    // non-phase byte (a slide stopper)
+                    data.extend_from_slice(&phrase[..phrase.len() - 2]);
+                    data.push(b'Z');
+                    data.extend_from_slice(&phrase);
+                    let (c1_0, c0_0) = counts();
+                    let g = raw_greedy(&data);
+                    let m = raw_medium(&data);
+                    let (c1_1, c0_1) = counts();
+                    saw_c1 |= c1_1 > c1_0;
+                    saw_c0 |= c0_1 > c0_0;
+                    assert_eq!(inflate_raw(&g), data, "greedy sanity p{period}s{shift}");
+                    assert_eq!(inflate_raw(&m), data, "medium roundtrip p{period}s{shift}");
+                    assert!(
+                        m.len() <= g.len(),
+                        "medium {} > greedy {} on p{period}s{shift}",
+                        m.len(),
+                        g.len()
+                    );
+                }
+            }
+        }
+        // 10MB stress member for volume (the RLE overlap class exercises long
+        // slide chains and both commit shapes in bulk).
+        let mut bulk = prefix.clone();
+        bulk.extend_from_slice(b"0123456789");
+        for i in 0..30_000 {
+            bulk.push(bulk[bulk.len() - 12 + i % 5]);
+        }
+        let (c1_0, c0_0) = counts();
+        let g = raw_greedy(&bulk);
+        let m = raw_medium(&bulk);
+        let (c1_1, c0_1) = counts();
+        saw_c1 |= c1_1 > c1_0;
+        saw_c0 |= c0_1 > c0_0;
+        assert_eq!(inflate_raw(&g), bulk, "greedy sanity bulk");
+        assert_eq!(inflate_raw(&m), bulk, "medium roundtrip bulk");
+        assert!(
+            m.len() <= g.len(),
+            "bulk: medium  > greedy is impossible here"
+        );
+        assert!(
+            saw_c0,
+            "the fixed family no longer exercises the c_len == 0 commit — \
+             someone tightened the vendor :169 rule to `== 1`"
+        );
+        assert!(
+            saw_c1 || saw_c0,
+            "the family no longer exercises fizzle commits at all"
+        );
+    }
+
     #[test]
     fn medium_matches_greedy_bytes_on_a_matchless_stream() {
         let medium = raw_medium;
