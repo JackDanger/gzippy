@@ -1,0 +1,10 @@
+co-runner observation 2026-11-11 11:17:10 — box state during the byte phase (ps receipts, load from uptime):
+11:17  up 15 days, 15:07, 2 users, load averages: 150.52 88.29 47.71
+  PID  %CPU      TIME COMM
+54141 268.3  22:15.22 /Users/jackdanger/www/gzippy/.review-tmp/tgt-wc-full/debug/deps/gzippy-5c78cfc596e36659
+70489 248.3   0:05.44 /Users/jackdanger/www/gzippy/.review-tmp/wC-final/tgt-a/release/gzippy
+63370  82.9  14:55.03 /Users/jackdanger/www/gzippy/.review-tmp/wA-hyg2/../tgt-hyg2/debug/deps/gzippy-d525909903c9ba1e
+70461  71.5   0:03.46 /Users/jackdanger/www/gzippy/.review-tmp/wC-final/tgt-b/release/gzippy
+70501  69.8   0:00.64 /usr/libexec/networkserviceproxy
+70456  67.6   0:04.43 /Users/jackdanger/www/gzippy/.review-tmp/wC-final/tgt-a/release/gzippy
+70490  65.8   0:01.41 /Users/jackdanger/www/gzippy/.review-tmp/wC-final/tgt-b/release/gzippy
