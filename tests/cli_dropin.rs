@@ -564,3 +564,56 @@ fn compressing_a_gz_file_warns_and_leaves_it_unchanged() {
         "gzip(1) suffix clause: no double-suffixed output may be created"
     );
 }
+
+// ── `-v` route-assert stderr contract (the parity/Gate-4 census needle) ──────
+//
+// scripts/campaign/parity-census.sh requires every T>1 encode to NAME the
+// requested thread count on **-v stderr** ("threads=N"), and Gate-4's
+// shipped-flavor check the `path=`/`encode-path=` spellings. The print is
+// gated `GZIPPY_DEBUG || -v` (src/utils.rs route_assert_enabled). The
+// duplicate-storage falsifier this guards against is asserted IN A CHILD
+// PROCESS (assert_cmd): a process-global OnceLock cannot be probed in-process
+// (the test fleet shares it; 2026-11-12 CI run 43276266526 failed exactly
+// that way in the first version of this guard).
+
+#[test]
+fn v_flag_prints_route_line_on_stderr() {
+    let bytes = sample_bytes();
+    // BB-sized input: the parallel pipeline's own -v output names the count.
+    let mut big = bytes.clone();
+    while big.len() < 400_000 {
+        big.extend_from_slice(&big.clone());
+    }
+    let dir = tempdir();
+    let file = write_file(dir.path(), "vroute.bin", &big);
+    let dirp = dir.path();
+
+    let with_v = run_piped(
+        dirp,
+        &["-6", "-p2", "-v", "-c", file.to_str().unwrap()],
+        &[],
+    );
+    assert!(
+        with_v.status.success(),
+        "-v compress must succeed; stderr: {}",
+        String::from_utf8_lossy(&with_v.stderr)
+    );
+    let err = String::from_utf8_lossy(&with_v.stderr);
+    assert!(
+        err.contains("threads=2") || err.contains("(2 threads)"),
+        "-v stderr must name the requested thread count; got: {}",
+        err
+    );
+    assert!(
+        err.contains("path=") || err.contains("encode-path=") || err.contains("route="),
+        "-v stderr must carry the route spelling Gate-4/parity parse; got: {}",
+        err
+    );
+
+    let without_v = run_piped(dirp, &["-6", "-p2", "-c", file.to_str().unwrap()], &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&without_v.stderr).len(),
+        0,
+        "plain compress must stay silent on stderr (no -v, no GZIPPY_DEBUG)"
+    );
+}

@@ -309,20 +309,3 @@ pub fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
         *exit_code = new_code;
     }
 }
-
-#[cfg(test)]
-mod verbose_state_tests {
-    use super::*;
-
-    /// The contract the parity census relies on: set then read agrees, within
-    /// one compiled tree. A duplicated-storage refactor (the 2026-11-12 first
-    /// cut hid its OnceLock inside each function) fails exactly this shape.
-    #[test]
-    fn set_then_route_assert_agrees() {
-        set_verbose(true);
-        assert!(
-            route_assert_enabled() || debug_enabled(),
-            "after set_verbose(true), route_assert must hold when debug is off"
-        );
-    }
-}
