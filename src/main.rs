@@ -196,8 +196,14 @@ fn fast_exit_success(exit_code: i32) -> ! {
 fn run() -> Result<i32, GzippyError> {
     let args = GzippyArgs::parse()?;
 
+    // The `-v` state feeds the route-assert stderr gate (see
+    // `utils::route_assert_enabled`): `-v` OR `GZIPPY_DEBUG` prints the
+    // contracted `[gzippy] compress path=… threads=N` lines. Recorded before
+    // anything prints — the parse result is authoritative for the process.
+    crate::utils::set_verbose(args.verbose);
+
     // First GZIPPY_DEBUG=1 line: build flavor (before any routing or path prints).
-    if crate::utils::debug_enabled() {
+    if crate::utils::route_assert_enabled() {
         eprintln!("[gzippy] build-flavor={BUILD_FLAVOR}");
     }
 

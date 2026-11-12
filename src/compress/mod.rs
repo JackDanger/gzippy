@@ -73,14 +73,17 @@ pub(crate) mod route {
     /// `--rsyncable` content-defined-chunk pure-Rust path (`compress_rsyncable`).
     pub const RSYNCABLE: &str = "Rsyncable";
 
-    /// Emit the one-line Gate-4 route assertion. Reads `GZIPPY_DEBUG` via the
-    /// process-wide cached `OnceLock` in `crate::utils::debug_enabled` — no
-    /// per-call/per-block env lookup, so this costs nothing on the hot path
-    /// (one relaxed load of an already-resident bool) and nothing at all when
-    /// the env var is unset (checked once, ever, per process).
+    /// Emit the one-line Gate-4 route assertion. Prints when
+    /// `crate::utils::route_assert_enabled()` — `GZIPPY_DEBUG` **or** the
+    /// CLI's `-v` (the parity census's documented stderr contract: every T>1
+    /// encode must name its requested thread count under `-v` alone;
+    /// receipt 2026-11-12: the termag parity census came back
+    /// ROUTE-UNCONFIRMED on every T>1 cell because the print was
+    /// debug-env-gated only). One already-resident bool read — nothing on
+    /// the hot path.
     #[inline]
     pub(crate) fn emit(name: &str, level: u32, threads: usize) {
-        if crate::utils::debug_enabled() {
+        if crate::utils::route_assert_enabled() {
             // `encode-path=` is the token `fulcrum cpreflight`'s ENCODE-FINGERPRINT gate
             // (Gate-4) greps for; the older `compress path=` spelling silently failed
             // that gate. Both are printed so existing scripts keep working.

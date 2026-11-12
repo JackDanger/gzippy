@@ -10,6 +10,40 @@ pub fn debug_enabled() -> bool {
     *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
 }
 
+/// Whether `-v` was passed on the CLI. The route-assert stderr lines
+/// (`[gzippy] compress path=… threads=N`, the documented parity-census /
+/// Gate-4 contract) print under **either** this or `GZIPPY_DEBUG`. ONE
+/// module-scope static shared by `set_verbose`/`verbose_enabled` — the first
+/// cut of this (2026-11-12) hid its `OnceLock` inside each function, which
+/// yields two independent storages for identically-named function-local
+/// statics: `set_verbose(true)` then read back `false` forever
+/// (receipt: the probe test `set_then_route_assert_agrees`, below).
+static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set once from the parsed args in `main::run` — anything before the first
+/// call wins, which is fine because the CLI only routes after parsing. The
+/// only caller is the binary target (`src/main.rs`), which the lib target
+/// legitimately sees as dead — hence the allow.
+#[allow(dead_code)]
+#[inline]
+pub fn set_verbose(on: bool) {
+    let _ = VERBOSE.set(on);
+}
+
+/// Read the `-v` state (`false` unless the binary recorded it).
+#[inline]
+pub fn verbose_enabled() -> bool {
+    *VERBOSE.get_or_init(|| false)
+}
+
+/// True when the route-assert stderr prints belong to this invocation: the
+/// `GZIPPY_DEBUG` diagnostic channel or an explicit `-v`. Print-gated at
+/// startup only — nothing here touches the hot loop.
+#[inline]
+pub fn route_assert_enabled() -> bool {
+    debug_enabled() || verbose_enabled()
+}
+
 // ── gzip's suffix recognition ────────────────────────────────────────────────
 
 /// The suffix set gzip RECOGNIZES as its own, verbatim from the vendored
@@ -273,5 +307,22 @@ pub fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
         *exit_code = 1;
     } else if new_code != 0 && *exit_code == 0 {
         *exit_code = new_code;
+    }
+}
+
+#[cfg(test)]
+mod verbose_state_tests {
+    use super::*;
+
+    /// The contract the parity census relies on: set then read agrees, within
+    /// one compiled tree. A duplicated-storage refactor (the 2026-11-12 first
+    /// cut hid its OnceLock inside each function) fails exactly this shape.
+    #[test]
+    fn set_then_route_assert_agrees() {
+        set_verbose(true);
+        assert!(
+            route_assert_enabled() || debug_enabled(),
+            "after set_verbose(true), route_assert must hold when debug is off"
+        );
     }
 }
