@@ -1,0 +1,1585 @@
+rival	corpus	level	threads	status	gzippy_bytes	rival_bytes	ratio	bigger	roundtrip_ok	gzippy_size_source	rival_size_source	error
+gzip	dickens	1	1	OK	4867101	5399605	0.901381	false	true	measured	measured	
+gzip	dickens	1	2	OK	4867397	5399605	0.901436	false	true	measured	measured	
+gzip	dickens	1	4	OK	4867397	5399605	0.901436	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	1	1	OK	4867101	5405640	0.900375	false	true	measured	measured	
+pigz	dickens	1	2	OK	4867397	5399887	0.901389	false	true	measured	measured	
+pigz	dickens	1	4	OK	4867397	5399887	0.901389	false	true	measured	measured	
+libdeflate	dickens	1	1	OK	4867101	4972688	0.978767	false	true	measured	measured	
+libdeflate	dickens	1	2	OK	4867397	4972688	0.978826	false	true	measured	measured	
+libdeflate	dickens	1	4	OK	4867397	4972688	0.978826	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	1	1	OK	4867101	5419854	0.898013	false	true	measured	measured	
+igzip	dickens	1	2	OK	4867397	5419854	0.898068	false	true	measured	measured	
+igzip	dickens	1	4	OK	4867397	5419854	0.898068	false	true	measured	measured	
+gzip	dickens	2	1	OK	4772260	5160974	0.924682	false	true	measured	measured	
+gzip	dickens	2	2	OK	4664632	5160974	0.903828	false	true	measured	measured	
+gzip	dickens	2	4	OK	4664632	5160974	0.903828	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	2	1	OK	4772260	5167504	0.923514	false	true	measured	measured	
+pigz	dickens	2	2	OK	4664632	5161016	0.903820	false	true	measured	measured	
+pigz	dickens	2	4	OK	4664632	5161016	0.903820	false	true	measured	measured	
+libdeflate	dickens	2	1	OK	4772260	4772260	1.000000	false	true	measured	measured	
+libdeflate	dickens	2	2	OK	4664632	4772260	0.977447	false	true	measured	measured	
+libdeflate	dickens	2	4	OK	4664632	4772260	0.977447	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	2	1	OK	4772260	5305889	0.899427	false	true	measured	measured	
+igzip	dickens	2	2	OK	4664632	5305889	0.879142	false	true	measured	measured	
+igzip	dickens	2	4	OK	4664632	5305889	0.879142	false	true	measured	measured	
+gzip	dickens	3	1	OK	4609149	4930065	0.934906	false	true	measured	measured	
+gzip	dickens	3	2	OK	4547245	4930065	0.922350	false	true	measured	measured	
+gzip	dickens	3	4	OK	4547245	4930065	0.922350	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	3	1	OK	4609149	4936817	0.933628	false	true	measured	measured	
+pigz	dickens	3	2	OK	4547245	4925516	0.923202	false	true	measured	measured	
+pigz	dickens	3	4	OK	4547245	4925516	0.923202	false	true	measured	measured	
+libdeflate	dickens	3	1	OK	4609149	4695827	0.981541	false	true	measured	measured	
+libdeflate	dickens	3	2	OK	4547245	4695827	0.968359	false	true	measured	measured	
+libdeflate	dickens	3	4	OK	4547245	4695827	0.968359	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	3	1	OK	4609149	5119631	0.900289	false	true	measured	measured	
+igzip	dickens	3	2	OK	4547245	5119631	0.888198	false	true	measured	measured	
+igzip	dickens	3	4	OK	4547245	5119631	0.888198	false	true	measured	measured	
+gzip	dickens	4	1	OK	4672714	4809514	0.971556	false	true	measured	measured	
+gzip	dickens	4	2	OK	4528293	4809514	0.941528	false	true	measured	measured	
+gzip	dickens	4	4	OK	4528293	4809514	0.941528	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	4	1	OK	4672714	4816466	0.970154	false	true	measured	measured	
+pigz	dickens	4	2	OK	4528293	4816466	0.940169	false	true	measured	measured	
+pigz	dickens	4	4	OK	4528293	4816466	0.940169	false	true	measured	measured	
+libdeflate	dickens	4	1	OK	4672714	4672714	1.000000	false	true	measured	measured	
+libdeflate	dickens	4	2	OK	4528293	4672714	0.969093	false	true	measured	measured	
+libdeflate	dickens	4	4	OK	4528293	4672714	0.969093	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	4	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	4	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	4	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	5	1	OK	4582861	4638377	0.988031	false	true	measured	measured	
+gzip	dickens	5	2	OK	4512965	4638377	0.972962	false	true	measured	measured	
+gzip	dickens	5	4	OK	4512965	4638377	0.972962	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	5	1	OK	4582861	4645055	0.986611	false	true	measured	measured	
+pigz	dickens	5	2	OK	4512965	4645055	0.971563	false	true	measured	measured	
+pigz	dickens	5	4	OK	4512965	4645055	0.971563	false	true	measured	measured	
+libdeflate	dickens	5	1	OK	4582861	4582861	1.000000	false	true	measured	measured	
+libdeflate	dickens	5	2	OK	4512965	4582861	0.984748	false	true	measured	measured	
+libdeflate	dickens	5	4	OK	4512965	4582861	0.984748	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	5	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	5	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	5	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	6	1	OK	4510046	4545544	0.992191	false	true	measured	measured	
+gzip	dickens	6	2	OK	4503029	4545544	0.990647	false	true	measured	measured	
+gzip	dickens	6	4	OK	4503029	4545544	0.990647	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	6	1	OK	4510046	4552344	0.990709	false	true	measured	measured	
+pigz	dickens	6	2	OK	4503029	4552344	0.989167	false	true	measured	measured	
+pigz	dickens	6	4	OK	4503029	4552344	0.989167	false	true	measured	measured	
+libdeflate	dickens	6	1	OK	4510046	4539505	0.993511	false	true	measured	measured	
+libdeflate	dickens	6	2	OK	4503029	4539505	0.991965	false	true	measured	measured	
+libdeflate	dickens	6	4	OK	4503029	4539505	0.991965	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	6	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	6	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	6	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	7	1	OK	4503880	4531451	0.993916	false	true	measured	measured	
+gzip	dickens	7	2	OK	4502831	4531451	0.993684	false	true	measured	measured	
+gzip	dickens	7	4	OK	4502831	4531451	0.993684	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	7	1	OK	4503880	4538284	0.992419	false	true	measured	measured	
+pigz	dickens	7	2	OK	4502831	4538284	0.992188	false	true	measured	measured	
+pigz	dickens	7	4	OK	4502831	4538284	0.992188	false	true	measured	measured	
+libdeflate	dickens	7	1	OK	4503880	4512043	0.998191	false	true	measured	measured	
+libdeflate	dickens	7	2	OK	4502831	4512043	0.997958	false	true	measured	measured	
+libdeflate	dickens	7	4	OK	4502831	4512043	0.997958	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	7	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	7	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	7	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	8	1	OK	4482027	4526499	0.990175	false	true	measured	measured	
+gzip	dickens	8	2	OK	4482255	4526499	0.990226	false	true	measured	measured	
+gzip	dickens	8	4	OK	4482255	4526499	0.990226	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	8	1	OK	4482027	4533208	0.988710	false	true	measured	measured	
+pigz	dickens	8	2	OK	4482255	4533208	0.988760	false	true	measured	measured	
+pigz	dickens	8	4	OK	4482255	4533208	0.988760	false	true	measured	measured	
+libdeflate	dickens	8	1	OK	4482027	4482027	1.000000	false	true	measured	measured	
+libdeflate	dickens	8	2	OK	4482255	4482027	1.000051	true	true	measured	measured	
+libdeflate	dickens	8	4	OK	4482255	4482027	1.000051	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	8	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	8	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	8	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	9	1	OK	4480689	4526495	0.989880	false	true	measured	measured	
+gzip	dickens	9	2	OK	4480887	4526495	0.989924	false	true	measured	measured	
+gzip	dickens	9	4	OK	4335897	4526495	0.957893	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	dickens	9	1	OK	4480689	4533204	0.988415	false	true	measured	measured	
+pigz	dickens	9	2	OK	4480887	4533204	0.988459	false	true	measured	measured	
+pigz	dickens	9	4	OK	4335897	4533204	0.956475	false	true	measured	measured	
+libdeflate	dickens	9	1	OK	4480689	4480689	1.000000	false	true	measured	measured	
+libdeflate	dickens	9	2	OK	4480887	4480689	1.000044	true	true	measured	measured	
+libdeflate	dickens	9	4	OK	4335897	4480689	0.967685	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	9	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	9	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	9	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	10	1	ABSENT	0	0	NaN	false	false			
+gzip	dickens	10	2	ABSENT	0	0	NaN	false	false			
+gzip	dickens	10	4	ABSENT	0	0	NaN	false	false			
+pigz	dickens	10	1	ABSENT	0	0	NaN	false	false			
+pigz	dickens	10	2	ABSENT	0	0	NaN	false	false			
+pigz	dickens	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	dickens	10	1	OK	4322131	4322131	1.000000	false	true	measured	measured	
+libdeflate	dickens	10	2	OK	4480887	4322131	1.036731	true	true	measured	measured	
+libdeflate	dickens	10	4	OK	4335897	4322131	1.003185	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	10	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	10	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	10	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	11	1	ABSENT	0	0	NaN	false	false			
+gzip	dickens	11	2	ABSENT	0	0	NaN	false	false			
+gzip	dickens	11	4	ABSENT	0	0	NaN	false	false			
+pigz	dickens	11	1	OK	4318863	4324393	0.998721	false	true	measured	measured	
+pigz	dickens	11	2	OK	4480887	4324393	1.036189	true	true	measured	measured	
+pigz	dickens	11	4	OK	4332922	4324393	1.001972	true	true	measured	measured	
+libdeflate	dickens	11	1	OK	4318863	4318863	1.000000	false	true	measured	measured	
+libdeflate	dickens	11	2	OK	4480887	4318863	1.037515	true	true	measured	measured	
+libdeflate	dickens	11	4	OK	4332922	4318863	1.003255	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	11	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	11	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	11	4	ABSENT	0	0	NaN	false	false			
+gzip	dickens	12	1	ABSENT	0	0	NaN	false	false			
+gzip	dickens	12	2	ABSENT	0	0	NaN	false	false			
+gzip	dickens	12	4	ABSENT	0	0	NaN	false	false			
+pigz	dickens	12	1	ABSENT	0	0	NaN	false	false			
+pigz	dickens	12	2	ABSENT	0	0	NaN	false	false			
+pigz	dickens	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	dickens	12	1	OK	4318553	4318553	1.000000	false	true	measured	measured	
+libdeflate	dickens	12	2	OK	4480887	4318553	1.037590	true	true	measured	measured	
+libdeflate	dickens	12	4	OK	4332448	4318553	1.003218	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	dickens	12	1	ABSENT	0	0	NaN	false	false			
+igzip	dickens	12	2	ABSENT	0	0	NaN	false	false			
+igzip	dickens	12	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	1	1	OK	4482994	5101481	0.878763	false	true	measured	measured	
+gzip	aozora.txt	1	2	OK	4482755	5101481	0.878716	false	true	measured	measured	
+gzip	aozora.txt	1	4	OK	4482755	5101481	0.878716	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	1	1	OK	4482994	5106210	0.877949	false	true	measured	measured	
+pigz	aozora.txt	1	2	OK	4482755	5099636	0.879034	false	true	measured	measured	
+pigz	aozora.txt	1	4	OK	4482755	5099636	0.879034	false	true	measured	measured	
+libdeflate	aozora.txt	1	1	OK	4482994	4566347	0.981746	false	true	measured	measured	
+libdeflate	aozora.txt	1	2	OK	4482755	4566347	0.981694	false	true	measured	measured	
+libdeflate	aozora.txt	1	4	OK	4482755	4566347	0.981694	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	1	1	OK	4482994	5047328	0.888192	false	true	measured	measured	
+igzip	aozora.txt	1	2	OK	4482755	5047328	0.888144	false	true	measured	measured	
+igzip	aozora.txt	1	4	OK	4482755	5047328	0.888144	false	true	measured	measured	
+gzip	aozora.txt	2	1	OK	4339267	4859094	0.893020	false	true	measured	measured	
+gzip	aozora.txt	2	2	OK	4195135	4859094	0.863357	false	true	measured	measured	
+gzip	aozora.txt	2	4	OK	4195135	4859094	0.863357	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	2	1	OK	4339267	4863781	0.892159	false	true	measured	measured	
+pigz	aozora.txt	2	2	OK	4195135	4855373	0.864019	false	true	measured	measured	
+pigz	aozora.txt	2	4	OK	4195135	4855373	0.864019	false	true	measured	measured	
+libdeflate	aozora.txt	2	1	OK	4339267	4339267	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	2	2	OK	4195135	4339267	0.966784	false	true	measured	measured	
+libdeflate	aozora.txt	2	4	OK	4195135	4339267	0.966784	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	2	1	OK	4339267	4940275	0.878345	false	true	measured	measured	
+igzip	aozora.txt	2	2	OK	4195135	4940275	0.849170	false	true	measured	measured	
+igzip	aozora.txt	2	4	OK	4195135	4940275	0.849170	false	true	measured	measured	
+gzip	aozora.txt	3	1	OK	4173796	4557760	0.915756	false	true	measured	measured	
+gzip	aozora.txt	3	2	OK	4085624	4557760	0.896411	false	true	measured	measured	
+gzip	aozora.txt	3	4	OK	4085624	4557760	0.896411	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	3	1	OK	4173796	4563202	0.914664	false	true	measured	measured	
+pigz	aozora.txt	3	2	OK	4085624	4551546	0.897634	false	true	measured	measured	
+pigz	aozora.txt	3	4	OK	4085624	4551546	0.897634	false	true	measured	measured	
+libdeflate	aozora.txt	3	1	OK	4173796	4233761	0.985836	false	true	measured	measured	
+libdeflate	aozora.txt	3	2	OK	4085624	4233761	0.965011	false	true	measured	measured	
+libdeflate	aozora.txt	3	4	OK	4085624	4233761	0.965011	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	3	1	OK	4173796	4737062	0.881094	false	true	measured	measured	
+igzip	aozora.txt	3	2	OK	4085624	4737062	0.862481	false	true	measured	measured	
+igzip	aozora.txt	3	4	OK	4085624	4737062	0.862481	false	true	measured	measured	
+gzip	aozora.txt	4	1	OK	4197277	4354688	0.963853	false	true	measured	measured	
+gzip	aozora.txt	4	2	OK	4051923	4354688	0.930474	false	true	measured	measured	
+gzip	aozora.txt	4	4	OK	4051923	4354688	0.930474	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	4	1	OK	4197277	4359494	0.962790	false	true	measured	measured	
+pigz	aozora.txt	4	2	OK	4051923	4359494	0.929448	false	true	measured	measured	
+pigz	aozora.txt	4	4	OK	4051923	4359494	0.929448	false	true	measured	measured	
+libdeflate	aozora.txt	4	1	OK	4197277	4197277	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	4	2	OK	4051923	4197277	0.965369	false	true	measured	measured	
+libdeflate	aozora.txt	4	4	OK	4051923	4197277	0.965369	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	4	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	4	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	4	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	5	1	OK	4136911	4199679	0.985054	false	true	measured	measured	
+gzip	aozora.txt	5	2	OK	4019670	4199679	0.957137	false	true	measured	measured	
+gzip	aozora.txt	5	4	OK	4019670	4199679	0.957137	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	5	1	OK	4136911	4204382	0.983952	false	true	measured	measured	
+pigz	aozora.txt	5	2	OK	4019670	4204382	0.956067	false	true	measured	measured	
+pigz	aozora.txt	5	4	OK	4019670	4204382	0.956067	false	true	measured	measured	
+libdeflate	aozora.txt	5	1	OK	4136911	4137211	0.999927	false	true	measured	measured	
+libdeflate	aozora.txt	5	2	OK	4019670	4137211	0.971589	false	true	measured	measured	
+libdeflate	aozora.txt	5	4	OK	4019670	4137211	0.971589	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	5	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	5	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	5	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	6	1	OK	4013389	4049212	0.991153	false	true	measured	measured	
+gzip	aozora.txt	6	2	OK	3991973	4049212	0.985864	false	true	measured	measured	
+gzip	aozora.txt	6	4	OK	3991973	4049212	0.985864	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	6	1	OK	4013389	4053967	0.989991	false	true	measured	measured	
+pigz	aozora.txt	6	2	OK	3991973	4053967	0.984708	false	true	measured	measured	
+pigz	aozora.txt	6	4	OK	3991973	4053967	0.984708	false	true	measured	measured	
+libdeflate	aozora.txt	6	1	OK	4013389	4072294	0.985535	false	true	measured	measured	
+libdeflate	aozora.txt	6	2	OK	3991973	4072294	0.980276	false	true	measured	measured	
+libdeflate	aozora.txt	6	4	OK	3991973	4072294	0.980276	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	6	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	6	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	6	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	7	1	OK	3997089	4008298	0.997204	false	true	measured	measured	
+gzip	aozora.txt	7	2	OK	3991384	4008298	0.995780	false	true	measured	measured	
+gzip	aozora.txt	7	4	OK	3991384	4008298	0.995780	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	7	1	OK	3997089	4013311	0.995958	false	true	measured	measured	
+pigz	aozora.txt	7	2	OK	3991384	4013311	0.994536	false	true	measured	measured	
+pigz	aozora.txt	7	4	OK	3991384	4013311	0.994536	false	true	measured	measured	
+libdeflate	aozora.txt	7	1	OK	3997089	4017941	0.994810	false	true	measured	measured	
+libdeflate	aozora.txt	7	2	OK	3991384	4017941	0.993390	false	true	measured	measured	
+libdeflate	aozora.txt	7	4	OK	3991384	4017941	0.993390	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	7	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	7	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	7	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	8	1	OK	3995240	3995971	0.999817	false	true	measured	measured	
+gzip	aozora.txt	8	2	OK	3995509	3995971	0.999884	false	true	measured	measured	
+gzip	aozora.txt	8	4	OK	3995509	3995971	0.999884	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	8	1	OK	3995240	4000901	0.998585	false	true	measured	measured	
+pigz	aozora.txt	8	2	OK	3995509	4000901	0.998652	false	true	measured	measured	
+pigz	aozora.txt	8	4	OK	3995509	4000901	0.998652	false	true	measured	measured	
+libdeflate	aozora.txt	8	1	OK	3995240	3994998	1.000061	true	true	measured	measured	
+libdeflate	aozora.txt	8	2	OK	3995509	3994998	1.000128	true	true	measured	measured	
+libdeflate	aozora.txt	8	4	OK	3995509	3994998	1.000128	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	8	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	8	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	8	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	9	1	OK	3990863	3995964	0.998723	false	true	measured	measured	
+gzip	aozora.txt	9	2	OK	3990398	3995964	0.998607	false	true	measured	measured	
+gzip	aozora.txt	9	4	OK	3783180	3995964	0.946750	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	aozora.txt	9	1	OK	3990863	4000888	0.997494	false	true	measured	measured	
+pigz	aozora.txt	9	2	OK	3990398	4000888	0.997378	false	true	measured	measured	
+pigz	aozora.txt	9	4	OK	3783180	4000888	0.945585	false	true	measured	measured	
+libdeflate	aozora.txt	9	1	OK	3990863	3990863	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	9	2	OK	3990398	3990863	0.999883	false	true	measured	measured	
+libdeflate	aozora.txt	9	4	OK	3783180	3990863	0.947960	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	9	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	9	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	9	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	10	1	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	10	2	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	10	4	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	10	1	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	10	2	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	aozora.txt	10	1	OK	3781386	3781386	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	10	2	OK	3990398	3781386	1.055274	true	true	measured	measured	
+libdeflate	aozora.txt	10	4	OK	3783120	3781386	1.000459	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	10	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	10	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	10	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	11	1	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	11	2	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	11	4	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	11	1	OK	3778840	3779492	0.999827	false	true	measured	measured	
+pigz	aozora.txt	11	2	OK	3990398	3779492	1.055803	true	true	measured	measured	
+pigz	aozora.txt	11	4	OK	3778886	3779492	0.999840	false	true	measured	measured	
+libdeflate	aozora.txt	11	1	OK	3778840	3778840	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	11	2	OK	3990398	3778840	1.055985	true	true	measured	measured	
+libdeflate	aozora.txt	11	4	OK	3778886	3778840	1.000012	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	11	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	11	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	11	4	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	12	1	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	12	2	ABSENT	0	0	NaN	false	false			
+gzip	aozora.txt	12	4	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	12	1	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	12	2	ABSENT	0	0	NaN	false	false			
+pigz	aozora.txt	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	aozora.txt	12	1	OK	3777926	3777926	1.000000	false	true	measured	measured	
+libdeflate	aozora.txt	12	2	OK	3990398	3777926	1.056240	true	true	measured	measured	
+libdeflate	aozora.txt	12	4	OK	3778683	3777926	1.000200	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	aozora.txt	12	1	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	12	2	ABSENT	0	0	NaN	false	false			
+igzip	aozora.txt	12	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	1	1	OK	1757511	2043074	0.860229	false	true	measured	measured	
+gzip	data.json	1	2	OK	1757071	2043074	0.860013	false	true	measured	measured	
+gzip	data.json	1	4	OK	1757071	2043074	0.860013	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	1	1	OK	1757511	2048449	0.857972	false	true	measured	measured	
+pigz	data.json	1	2	OK	1757071	2041545	0.860657	false	true	measured	measured	
+pigz	data.json	1	4	OK	1757071	2041545	0.860657	false	true	measured	measured	
+libdeflate	data.json	1	1	OK	1757511	1840461	0.954930	false	true	measured	measured	
+libdeflate	data.json	1	2	OK	1757071	1840461	0.954691	false	true	measured	measured	
+libdeflate	data.json	1	4	OK	1757071	1840461	0.954691	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	1	1	OK	1757511	1999042	0.879177	false	true	measured	measured	
+igzip	data.json	1	2	OK	1757071	1999042	0.878957	false	true	measured	measured	
+igzip	data.json	1	4	OK	1757071	1999042	0.878957	false	true	measured	measured	
+gzip	data.json	2	1	OK	1819196	1980838	0.918397	false	true	measured	measured	
+gzip	data.json	2	2	OK	1793015	1980838	0.905180	false	true	measured	measured	
+gzip	data.json	2	4	OK	1793015	1980838	0.905180	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	2	1	OK	1819196	1986506	0.915777	false	true	measured	measured	
+pigz	data.json	2	2	OK	1793015	1978035	0.906463	false	true	measured	measured	
+pigz	data.json	2	4	OK	1793015	1978035	0.906463	false	true	measured	measured	
+libdeflate	data.json	2	1	OK	1819196	1819196	1.000000	false	true	measured	measured	
+libdeflate	data.json	2	2	OK	1793015	1819196	0.985608	false	true	measured	measured	
+libdeflate	data.json	2	4	OK	1793015	1819196	0.985608	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	2	1	OK	1819196	1994152	0.912265	false	true	measured	measured	
+igzip	data.json	2	2	OK	1793015	1994152	0.899137	false	true	measured	measured	
+igzip	data.json	2	4	OK	1793015	1994152	0.899137	false	true	measured	measured	
+gzip	data.json	3	1	OK	1710468	1912288	0.894462	false	true	measured	measured	
+gzip	data.json	3	2	OK	1695405	1912288	0.886585	false	true	measured	measured	
+gzip	data.json	3	4	OK	1695405	1912288	0.886585	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	3	1	OK	1710468	1918085	0.891758	false	true	measured	measured	
+pigz	data.json	3	2	OK	1695405	1905434	0.889774	false	true	measured	measured	
+pigz	data.json	3	4	OK	1695405	1905434	0.889774	false	true	measured	measured	
+libdeflate	data.json	3	1	OK	1710468	1781402	0.960181	false	true	measured	measured	
+libdeflate	data.json	3	2	OK	1695405	1781402	0.951725	false	true	measured	measured	
+libdeflate	data.json	3	4	OK	1695405	1781402	0.951725	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	3	1	OK	1710468	1917499	0.892031	false	true	measured	measured	
+igzip	data.json	3	2	OK	1695405	1917499	0.884175	false	true	measured	measured	
+igzip	data.json	3	4	OK	1695405	1917499	0.884175	false	true	measured	measured	
+gzip	data.json	4	1	OK	1736197	1786014	0.972107	false	true	measured	measured	
+gzip	data.json	4	2	OK	1616870	1786014	0.905295	false	true	measured	measured	
+gzip	data.json	4	4	OK	1616870	1786014	0.905295	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	4	1	OK	1736197	1790722	0.969551	false	true	measured	measured	
+pigz	data.json	4	2	OK	1616870	1790722	0.902915	false	true	measured	measured	
+pigz	data.json	4	4	OK	1616870	1790722	0.902915	false	true	measured	measured	
+libdeflate	data.json	4	1	OK	1736197	1736197	1.000000	false	true	measured	measured	
+libdeflate	data.json	4	2	OK	1616870	1736197	0.931271	false	true	measured	measured	
+libdeflate	data.json	4	4	OK	1616870	1736197	0.931271	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	4	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	4	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	4	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	5	1	OK	1637948	1679107	0.975488	false	true	measured	measured	
+gzip	data.json	5	2	OK	1605165	1679107	0.955963	false	true	measured	measured	
+gzip	data.json	5	4	OK	1605165	1679107	0.955963	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	5	1	OK	1637948	1676682	0.976898	false	true	measured	measured	
+pigz	data.json	5	2	OK	1605165	1676682	0.957346	false	true	measured	measured	
+pigz	data.json	5	4	OK	1605165	1676682	0.957346	false	true	measured	measured	
+libdeflate	data.json	5	1	OK	1637948	1637948	1.000000	false	true	measured	measured	
+libdeflate	data.json	5	2	OK	1605165	1637948	0.979985	false	true	measured	measured	
+libdeflate	data.json	5	4	OK	1605165	1637948	0.979985	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	5	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	5	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	5	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	6	1	OK	1539384	1584504	0.971524	false	true	measured	measured	
+gzip	data.json	6	2	OK	1518955	1584504	0.958631	false	true	measured	measured	
+gzip	data.json	6	4	OK	1518955	1584504	0.958631	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	6	1	OK	1539384	1578745	0.975068	false	true	measured	measured	
+pigz	data.json	6	2	OK	1518955	1578745	0.962128	false	true	measured	measured	
+pigz	data.json	6	4	OK	1518955	1578745	0.962128	false	true	measured	measured	
+libdeflate	data.json	6	1	OK	1539384	1550030	0.993132	false	true	measured	measured	
+libdeflate	data.json	6	2	OK	1518955	1550030	0.979952	false	true	measured	measured	
+libdeflate	data.json	6	4	OK	1518955	1550030	0.979952	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	6	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	6	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	6	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	7	1	OK	1478038	1557094	0.949228	false	true	measured	measured	
+gzip	data.json	7	2	OK	1474002	1557094	0.946636	false	true	measured	measured	
+gzip	data.json	7	4	OK	1474002	1557094	0.946636	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	7	1	OK	1478038	1550834	0.953060	false	true	measured	measured	
+pigz	data.json	7	2	OK	1474002	1550834	0.950458	false	true	measured	measured	
+pigz	data.json	7	4	OK	1474002	1550834	0.950458	false	true	measured	measured	
+libdeflate	data.json	7	1	OK	1478038	1478781	0.999498	false	true	measured	measured	
+libdeflate	data.json	7	2	OK	1474002	1478781	0.996768	false	true	measured	measured	
+libdeflate	data.json	7	4	OK	1474002	1478781	0.996768	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	7	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	7	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	7	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	8	1	OK	1447115	1508138	0.959538	false	true	measured	measured	
+gzip	data.json	8	2	OK	1447326	1508138	0.959677	false	true	measured	measured	
+gzip	data.json	8	4	OK	1447326	1508138	0.959677	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	8	1	OK	1447115	1501982	0.963470	false	true	measured	measured	
+pigz	data.json	8	2	OK	1447326	1501982	0.963611	false	true	measured	measured	
+pigz	data.json	8	4	OK	1447326	1501982	0.963611	false	true	measured	measured	
+libdeflate	data.json	8	1	OK	1447115	1447115	1.000000	false	true	measured	measured	
+libdeflate	data.json	8	2	OK	1447326	1447115	1.000146	true	true	measured	measured	
+libdeflate	data.json	8	4	OK	1447326	1447115	1.000146	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	8	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	8	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	8	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	9	1	OK	1447035	1507735	0.959741	false	true	measured	measured	
+gzip	data.json	9	2	OK	1447248	1507735	0.959882	false	true	measured	measured	
+gzip	data.json	9	4	OK	1440007	1507735	0.955080	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.json	9	1	OK	1447035	1501577	0.963677	false	true	measured	measured	
+pigz	data.json	9	2	OK	1447248	1501577	0.963819	false	true	measured	measured	
+pigz	data.json	9	4	OK	1440007	1501577	0.958996	false	true	measured	measured	
+libdeflate	data.json	9	1	OK	1447035	1447035	1.000000	false	true	measured	measured	
+libdeflate	data.json	9	2	OK	1447248	1447035	1.000147	true	true	measured	measured	
+libdeflate	data.json	9	4	OK	1440007	1447035	0.995143	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	9	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	9	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	9	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	10	1	ABSENT	0	0	NaN	false	false			
+gzip	data.json	10	2	ABSENT	0	0	NaN	false	false			
+gzip	data.json	10	4	ABSENT	0	0	NaN	false	false			
+pigz	data.json	10	1	ABSENT	0	0	NaN	false	false			
+pigz	data.json	10	2	ABSENT	0	0	NaN	false	false			
+pigz	data.json	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.json	10	1	OK	1455311	1455311	1.000000	false	true	measured	measured	
+libdeflate	data.json	10	2	OK	1447248	1455311	0.994460	false	true	measured	measured	
+libdeflate	data.json	10	4	OK	1456229	1455311	1.000631	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	10	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	10	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	10	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	11	1	ABSENT	0	0	NaN	false	false			
+gzip	data.json	11	2	ABSENT	0	0	NaN	false	false			
+gzip	data.json	11	4	ABSENT	0	0	NaN	false	false			
+pigz	data.json	11	1	OK	1415433	1419427	0.997186	false	true	measured	measured	
+pigz	data.json	11	2	OK	1447248	1419427	1.019600	true	true	measured	measured	
+pigz	data.json	11	4	OK	1415535	1419427	0.997258	false	true	measured	measured	
+libdeflate	data.json	11	1	OK	1415433	1415433	1.000000	false	true	measured	measured	
+libdeflate	data.json	11	2	OK	1447248	1415433	1.022477	true	true	measured	measured	
+libdeflate	data.json	11	4	OK	1415535	1415433	1.000072	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	11	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	11	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	11	4	ABSENT	0	0	NaN	false	false			
+gzip	data.json	12	1	ABSENT	0	0	NaN	false	false			
+gzip	data.json	12	2	ABSENT	0	0	NaN	false	false			
+gzip	data.json	12	4	ABSENT	0	0	NaN	false	false			
+pigz	data.json	12	1	ABSENT	0	0	NaN	false	false			
+pigz	data.json	12	2	ABSENT	0	0	NaN	false	false			
+pigz	data.json	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.json	12	1	OK	1415408	1415408	1.000000	false	true	measured	measured	
+libdeflate	data.json	12	2	OK	1447248	1415408	1.022495	true	true	measured	measured	
+libdeflate	data.json	12	4	OK	1415487	1415408	1.000056	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.json	12	1	ABSENT	0	0	NaN	false	false			
+igzip	data.json	12	2	ABSENT	0	0	NaN	false	false			
+igzip	data.json	12	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	1	1	OK	3713299	4630620	0.801901	false	true	measured	measured	
+gzip	data.csv	1	2	OK	3712592	4630620	0.801748	false	true	measured	measured	
+gzip	data.csv	1	4	OK	3712592	4630620	0.801748	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	1	1	OK	3713299	4626107	0.802683	false	true	measured	measured	
+pigz	data.csv	1	2	OK	3712592	4625856	0.802574	false	true	measured	measured	
+pigz	data.csv	1	4	OK	3712592	4625856	0.802574	false	true	measured	measured	
+libdeflate	data.csv	1	1	OK	3713299	3932419	0.944279	false	true	measured	measured	
+libdeflate	data.csv	1	2	OK	3712592	3932419	0.944099	false	true	measured	measured	
+libdeflate	data.csv	1	4	OK	3712592	3932419	0.944099	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	1	1	OK	3713299	4526882	0.820277	false	true	measured	measured	
+igzip	data.csv	1	2	OK	3712592	4526882	0.820121	false	true	measured	measured	
+igzip	data.csv	1	4	OK	3712592	4526882	0.820121	false	true	measured	measured	
+gzip	data.csv	2	1	OK	3923216	4430234	0.885555	false	true	measured	measured	
+gzip	data.csv	2	2	OK	3810311	4430234	0.860070	false	true	measured	measured	
+gzip	data.csv	2	4	OK	3810311	4430234	0.860070	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	2	1	OK	3923216	4425984	0.886405	false	true	measured	measured	
+pigz	data.csv	2	2	OK	3810311	4422989	0.861479	false	true	measured	measured	
+pigz	data.csv	2	4	OK	3810311	4422989	0.861479	false	true	measured	measured	
+libdeflate	data.csv	2	1	OK	3923216	3923216	1.000000	false	true	measured	measured	
+libdeflate	data.csv	2	2	OK	3810311	3923216	0.971221	false	true	measured	measured	
+libdeflate	data.csv	2	4	OK	3810311	3923216	0.971221	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	2	1	OK	3923216	4528455	0.866348	false	true	measured	measured	
+igzip	data.csv	2	2	OK	3810311	4528455	0.841415	false	true	measured	measured	
+igzip	data.csv	2	4	OK	3810311	4528455	0.841415	false	true	measured	measured	
+gzip	data.csv	3	1	OK	3663248	4271557	0.857591	false	true	measured	measured	
+gzip	data.csv	3	2	OK	3615273	4271557	0.846360	false	true	measured	measured	
+gzip	data.csv	3	4	OK	3615273	4271557	0.846360	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	3	1	OK	3663248	4266037	0.858700	false	true	measured	measured	
+pigz	data.csv	3	2	OK	3615273	4257948	0.849065	false	true	measured	measured	
+pigz	data.csv	3	4	OK	3615273	4257948	0.849065	false	true	measured	measured	
+libdeflate	data.csv	3	1	OK	3663248	3752841	0.976127	false	true	measured	measured	
+libdeflate	data.csv	3	2	OK	3615273	3752841	0.963343	false	true	measured	measured	
+libdeflate	data.csv	3	4	OK	3615273	3752841	0.963343	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	3	1	OK	3663248	4288276	0.854247	false	true	measured	measured	
+igzip	data.csv	3	2	OK	3615273	4288276	0.843060	false	true	measured	measured	
+igzip	data.csv	3	4	OK	3615273	4288276	0.843060	false	true	measured	measured	
+gzip	data.csv	4	1	OK	3645905	3687335	0.988764	false	true	measured	measured	
+gzip	data.csv	4	2	OK	3367880	3687335	0.913364	false	true	measured	measured	
+gzip	data.csv	4	4	OK	3367880	3687335	0.913364	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	4	1	OK	3645905	3683515	0.989790	false	true	measured	measured	
+pigz	data.csv	4	2	OK	3367880	3683515	0.914311	false	true	measured	measured	
+pigz	data.csv	4	4	OK	3367880	3683515	0.914311	false	true	measured	measured	
+libdeflate	data.csv	4	1	OK	3645905	3645905	1.000000	false	true	measured	measured	
+libdeflate	data.csv	4	2	OK	3367880	3645905	0.923743	false	true	measured	measured	
+libdeflate	data.csv	4	4	OK	3367880	3645905	0.923743	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	4	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	4	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	4	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	5	1	OK	3429411	3491253	0.982287	false	true	measured	measured	
+gzip	data.csv	5	2	OK	3346481	3491253	0.958533	false	true	measured	measured	
+gzip	data.csv	5	4	OK	3346481	3491253	0.958533	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	5	1	OK	3429411	3486484	0.983630	false	true	measured	measured	
+pigz	data.csv	5	2	OK	3346481	3486484	0.959844	false	true	measured	measured	
+pigz	data.csv	5	4	OK	3346481	3486484	0.959844	false	true	measured	measured	
+libdeflate	data.csv	5	1	OK	3429411	3429411	1.000000	false	true	measured	measured	
+libdeflate	data.csv	5	2	OK	3346481	3429411	0.975818	false	true	measured	measured	
+libdeflate	data.csv	5	4	OK	3346481	3429411	0.975818	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	5	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	5	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	5	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	6	1	OK	3351460	3450120	0.971404	false	true	measured	measured	
+gzip	data.csv	6	2	OK	3321753	3450120	0.962793	false	true	measured	measured	
+gzip	data.csv	6	4	OK	3321753	3450120	0.962793	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	6	1	OK	3351460	3445176	0.972798	false	true	measured	measured	
+pigz	data.csv	6	2	OK	3321753	3445176	0.964175	false	true	measured	measured	
+pigz	data.csv	6	4	OK	3321753	3445176	0.964175	false	true	measured	measured	
+libdeflate	data.csv	6	1	OK	3351460	3372612	0.993728	false	true	measured	measured	
+libdeflate	data.csv	6	2	OK	3321753	3372612	0.984920	false	true	measured	measured	
+libdeflate	data.csv	6	4	OK	3321753	3372612	0.984920	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	6	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	6	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	6	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	7	1	OK	3325524	3355339	0.991114	false	true	measured	measured	
+gzip	data.csv	7	2	OK	3320501	3355339	0.989617	false	true	measured	measured	
+gzip	data.csv	7	4	OK	3320501	3355339	0.989617	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	7	1	OK	3325524	3349481	0.992848	false	true	measured	measured	
+pigz	data.csv	7	2	OK	3320501	3349481	0.991348	false	true	measured	measured	
+pigz	data.csv	7	4	OK	3320501	3349481	0.991348	false	true	measured	measured	
+libdeflate	data.csv	7	1	OK	3325524	3335724	0.996942	false	true	measured	measured	
+libdeflate	data.csv	7	2	OK	3320501	3335724	0.995436	false	true	measured	measured	
+libdeflate	data.csv	7	4	OK	3320501	3335724	0.995436	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	7	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	7	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	7	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	8	1	OK	3302918	3334362	0.990570	false	true	measured	measured	
+gzip	data.csv	8	2	OK	3302855	3334362	0.990551	false	true	measured	measured	
+gzip	data.csv	8	4	OK	3302855	3334362	0.990551	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	8	1	OK	3302918	3329147	0.992121	false	true	measured	measured	
+pigz	data.csv	8	2	OK	3302855	3329147	0.992102	false	true	measured	measured	
+pigz	data.csv	8	4	OK	3302855	3329147	0.992102	false	true	measured	measured	
+libdeflate	data.csv	8	1	OK	3302918	3302918	1.000000	false	true	measured	measured	
+libdeflate	data.csv	8	2	OK	3302855	3302918	0.999981	false	true	measured	measured	
+libdeflate	data.csv	8	4	OK	3302855	3302918	0.999981	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	8	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	8	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	8	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	9	1	OK	3300291	3334455	0.989754	false	true	measured	measured	
+gzip	data.csv	9	2	OK	3300490	3334455	0.989814	false	true	measured	measured	
+gzip	data.csv	9	4	OK	2818610	3334455	0.845299	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.csv	9	1	OK	3300291	3329220	0.991311	false	true	measured	measured	
+pigz	data.csv	9	2	OK	3300490	3329220	0.991370	false	true	measured	measured	
+pigz	data.csv	9	4	OK	2818610	3329220	0.846628	false	true	measured	measured	
+libdeflate	data.csv	9	1	OK	3300291	3300291	1.000000	false	true	measured	measured	
+libdeflate	data.csv	9	2	OK	3300490	3300291	1.000060	true	true	measured	measured	
+libdeflate	data.csv	9	4	OK	2818610	3300291	0.854049	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	9	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	9	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	9	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	10	1	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	10	2	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	10	4	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	10	1	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	10	2	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.csv	10	1	OK	2818735	2818735	1.000000	false	true	measured	measured	
+libdeflate	data.csv	10	2	OK	3300490	2818735	1.170912	true	true	measured	measured	
+libdeflate	data.csv	10	4	OK	2818610	2818735	0.999956	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	10	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	10	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	10	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	11	1	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	11	2	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	11	4	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	11	1	OK	2809802	2800296	1.003395	true	true	measured	measured	
+pigz	data.csv	11	2	OK	3300490	2800296	1.178622	true	true	measured	measured	
+pigz	data.csv	11	4	OK	2809477	2800296	1.003279	true	true	measured	measured	
+libdeflate	data.csv	11	1	OK	2809802	2807081	1.000969	true	true	measured	measured	
+libdeflate	data.csv	11	2	OK	3300490	2807081	1.175773	true	true	measured	measured	
+libdeflate	data.csv	11	4	OK	2809477	2807081	1.000854	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	11	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	11	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	11	4	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	12	1	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	12	2	ABSENT	0	0	NaN	false	false			
+gzip	data.csv	12	4	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	12	1	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	12	2	ABSENT	0	0	NaN	false	false			
+pigz	data.csv	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.csv	12	1	OK	2808434	2808217	1.000077	true	true	measured	measured	
+libdeflate	data.csv	12	2	OK	3300490	2808217	1.175297	true	true	measured	measured	
+libdeflate	data.csv	12	4	OK	2808054	2808217	0.999942	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.csv	12	1	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	12	2	ABSENT	0	0	NaN	false	false			
+igzip	data.csv	12	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	1	1	OK	14261579	14582415	0.977998	false	true	measured	measured	
+gzip	data.parquet	1	2	OK	14259091	14582415	0.977828	false	true	measured	measured	
+gzip	data.parquet	1	4	OK	14259091	14582415	0.977828	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	1	1	OK	14261579	14548205	0.980298	false	true	measured	measured	
+pigz	data.parquet	1	2	OK	14259091	14540260	0.980663	false	true	measured	measured	
+pigz	data.parquet	1	4	OK	14259091	14540260	0.980663	false	true	measured	measured	
+libdeflate	data.parquet	1	1	OK	14261579	14386710	0.991302	false	true	measured	measured	
+libdeflate	data.parquet	1	2	OK	14259091	14386710	0.991129	false	true	measured	measured	
+libdeflate	data.parquet	1	4	OK	14259091	14386710	0.991129	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	1	1	OK	14261579	14812683	0.962795	false	true	measured	measured	
+igzip	data.parquet	1	2	OK	14259091	14812683	0.962627	false	true	measured	measured	
+igzip	data.parquet	1	4	OK	14259091	14812683	0.962627	false	true	measured	measured	
+gzip	data.parquet	2	1	OK	14204370	14508275	0.979053	false	true	measured	measured	
+gzip	data.parquet	2	2	OK	14165805	14508275	0.976395	false	true	measured	measured	
+gzip	data.parquet	2	4	OK	14165805	14508275	0.976395	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	2	1	OK	14204370	14469696	0.981663	false	true	measured	measured	
+pigz	data.parquet	2	2	OK	14165805	14457889	0.979798	false	true	measured	measured	
+pigz	data.parquet	2	4	OK	14165805	14457889	0.979798	false	true	measured	measured	
+libdeflate	data.parquet	2	1	OK	14204370	14204370	1.000000	false	true	measured	measured	
+libdeflate	data.parquet	2	2	OK	14165805	14204370	0.997285	false	true	measured	measured	
+libdeflate	data.parquet	2	4	OK	14165805	14204370	0.997285	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	2	1	OK	14204370	14678248	0.967716	false	true	measured	measured	
+igzip	data.parquet	2	2	OK	14165805	14678248	0.965088	false	true	measured	measured	
+igzip	data.parquet	2	4	OK	14165805	14678248	0.965088	false	true	measured	measured	
+gzip	data.parquet	3	1	OK	14072655	14424971	0.975576	false	true	measured	measured	
+gzip	data.parquet	3	2	OK	14057451	14424971	0.974522	false	true	measured	measured	
+gzip	data.parquet	3	4	OK	14057451	14424971	0.974522	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	3	1	OK	14072655	14399250	0.977319	false	true	measured	measured	
+pigz	data.parquet	3	2	OK	14057451	14387287	0.977074	false	true	measured	measured	
+pigz	data.parquet	3	4	OK	14057451	14387287	0.977074	false	true	measured	measured	
+libdeflate	data.parquet	3	1	OK	14072655	14179081	0.992494	false	true	measured	measured	
+libdeflate	data.parquet	3	2	OK	14057451	14179081	0.991422	false	true	measured	measured	
+libdeflate	data.parquet	3	4	OK	14057451	14179081	0.991422	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	3	1	OK	14072655	14609221	0.963272	false	true	measured	measured	
+igzip	data.parquet	3	2	OK	14057451	14609221	0.962231	false	true	measured	measured	
+igzip	data.parquet	3	4	OK	14057451	14609221	0.962231	false	true	measured	measured	
+gzip	data.parquet	4	1	OK	14160264	14267022	0.992517	false	true	measured	measured	
+gzip	data.parquet	4	2	OK	14047643	14267022	0.984623	false	true	measured	measured	
+gzip	data.parquet	4	4	OK	14047643	14267022	0.984623	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	4	1	OK	14160264	14254671	0.993377	false	true	measured	measured	
+pigz	data.parquet	4	2	OK	14047643	14254671	0.985476	false	true	measured	measured	
+pigz	data.parquet	4	4	OK	14047643	14254671	0.985476	false	true	measured	measured	
+libdeflate	data.parquet	4	1	OK	14160264	14160264	1.000000	false	true	measured	measured	
+libdeflate	data.parquet	4	2	OK	14047643	14160264	0.992047	false	true	measured	measured	
+libdeflate	data.parquet	4	4	OK	14047643	14160264	0.992047	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	4	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	4	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	4	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	5	1	OK	14056000	14195050	0.990204	false	true	measured	measured	
+gzip	data.parquet	5	2	OK	14040717	14195050	0.989128	false	true	measured	measured	
+gzip	data.parquet	5	4	OK	14040717	14195050	0.989128	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	5	1	OK	14056000	14183004	0.991045	false	true	measured	measured	
+pigz	data.parquet	5	2	OK	14040717	14183004	0.989968	false	true	measured	measured	
+pigz	data.parquet	5	4	OK	14040717	14183004	0.989968	false	true	measured	measured	
+libdeflate	data.parquet	5	1	OK	14056000	14063949	0.999435	false	true	measured	measured	
+libdeflate	data.parquet	5	2	OK	14040717	14063949	0.998348	false	true	measured	measured	
+libdeflate	data.parquet	5	4	OK	14040717	14063949	0.998348	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	5	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	5	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	5	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	6	1	OK	14038545	14155101	0.991766	false	true	measured	measured	
+gzip	data.parquet	6	2	OK	14027801	14155101	0.991007	false	true	measured	measured	
+gzip	data.parquet	6	4	OK	14027801	14155101	0.991007	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	6	1	OK	14038545	14144697	0.992495	false	true	measured	measured	
+pigz	data.parquet	6	2	OK	14027801	14144697	0.991736	false	true	measured	measured	
+pigz	data.parquet	6	4	OK	14027801	14144697	0.991736	false	true	measured	measured	
+libdeflate	data.parquet	6	1	OK	14038545	14046168	0.999457	false	true	measured	measured	
+libdeflate	data.parquet	6	2	OK	14027801	14046168	0.998692	false	true	measured	measured	
+libdeflate	data.parquet	6	4	OK	14027801	14046168	0.998692	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	6	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	6	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	6	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	7	1	OK	14032801	14143538	0.992170	false	true	measured	measured	
+gzip	data.parquet	7	2	OK	14023349	14143538	0.991502	false	true	measured	measured	
+gzip	data.parquet	7	4	OK	14023349	14143538	0.991502	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	7	1	OK	14032801	14134403	0.992812	false	true	measured	measured	
+pigz	data.parquet	7	2	OK	14023349	14134403	0.992143	false	true	measured	measured	
+pigz	data.parquet	7	4	OK	14023349	14134403	0.992143	false	true	measured	measured	
+libdeflate	data.parquet	7	1	OK	14032801	14037355	0.999676	false	true	measured	measured	
+libdeflate	data.parquet	7	2	OK	14023349	14037355	0.999002	false	true	measured	measured	
+libdeflate	data.parquet	7	4	OK	14023349	14037355	0.999002	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	7	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	7	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	7	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	8	1	OK	14014922	14135189	0.991492	false	true	measured	measured	
+gzip	data.parquet	8	2	OK	14012313	14135189	0.991307	false	true	measured	measured	
+gzip	data.parquet	8	4	OK	14012313	14135189	0.991307	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	8	1	OK	14014922	14122360	0.992392	false	true	measured	measured	
+pigz	data.parquet	8	2	OK	14012313	14122360	0.992208	false	true	measured	measured	
+pigz	data.parquet	8	4	OK	14012313	14122360	0.992208	false	true	measured	measured	
+libdeflate	data.parquet	8	1	OK	14014922	14023607	0.999381	false	true	measured	measured	
+libdeflate	data.parquet	8	2	OK	14012313	14023607	0.999195	false	true	measured	measured	
+libdeflate	data.parquet	8	4	OK	14012313	14023607	0.999195	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	8	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	8	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	8	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	9	1	OK	14020375	14127690	0.992404	false	true	measured	measured	
+gzip	data.parquet	9	2	OK	14018811	14127690	0.992293	false	true	measured	measured	
+gzip	data.parquet	9	4	OK	13766561	14127690	0.974438	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	data.parquet	9	1	OK	14020375	14115447	0.993265	false	true	measured	measured	
+pigz	data.parquet	9	2	OK	14018811	14115447	0.993154	false	true	measured	measured	
+pigz	data.parquet	9	4	OK	13766561	14115447	0.975283	false	true	measured	measured	
+libdeflate	data.parquet	9	1	OK	14020375	14020375	1.000000	false	true	measured	measured	
+libdeflate	data.parquet	9	2	OK	14018811	14020375	0.999888	false	true	measured	measured	
+libdeflate	data.parquet	9	4	OK	13766561	14020375	0.981897	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	9	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	9	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	9	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	10	1	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	10	2	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	10	4	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	10	1	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	10	2	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.parquet	10	1	OK	13764796	13764796	1.000000	false	true	measured	measured	
+libdeflate	data.parquet	10	2	OK	14018811	13764796	1.018454	true	true	measured	measured	
+libdeflate	data.parquet	10	4	OK	13763683	13764796	0.999919	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	10	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	10	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	10	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	11	1	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	11	2	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	11	4	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	11	1	OK	13748806	13647792	1.007401	true	true	measured	measured	
+pigz	data.parquet	11	2	OK	14018811	13647792	1.027185	true	true	measured	measured	
+pigz	data.parquet	11	4	OK	13744855	13647792	1.007112	true	true	measured	measured	
+libdeflate	data.parquet	11	1	OK	13748806	13748731	1.000005	true	true	measured	measured	
+libdeflate	data.parquet	11	2	OK	14018811	13748731	1.019644	true	true	measured	measured	
+libdeflate	data.parquet	11	4	OK	13744855	13748731	0.999718	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	11	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	11	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	11	4	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	12	1	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	12	2	ABSENT	0	0	NaN	false	false			
+gzip	data.parquet	12	4	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	12	1	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	12	2	ABSENT	0	0	NaN	false	false			
+pigz	data.parquet	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	data.parquet	12	1	OK	13746404	13745986	1.000030	true	true	measured	measured	
+libdeflate	data.parquet	12	2	OK	14018811	13745986	1.019848	true	true	measured	measured	
+libdeflate	data.parquet	12	4	OK	13740886	13745986	0.999629	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	data.parquet	12	1	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	12	2	ABSENT	0	0	NaN	false	false			
+igzip	data.parquet	12	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	1	1	OK	1155524	1280966	0.902072	false	true	measured	measured	
+gzip	minjs.min.js	1	2	OK	1154897	1280966	0.901583	false	true	measured	measured	
+gzip	minjs.min.js	1	4	OK	1154897	1280966	0.901583	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	1	1	OK	1155524	1281482	0.901709	false	true	measured	measured	
+pigz	minjs.min.js	1	2	OK	1154897	1279468	0.902638	false	true	measured	measured	
+pigz	minjs.min.js	1	4	OK	1154897	1279468	0.902638	false	true	measured	measured	
+libdeflate	minjs.min.js	1	1	OK	1155524	1184930	0.975183	false	true	measured	measured	
+libdeflate	minjs.min.js	1	2	OK	1154897	1184930	0.974654	false	true	measured	measured	
+libdeflate	minjs.min.js	1	4	OK	1154897	1184930	0.974654	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	1	1	OK	1155524	1274370	0.906741	false	true	measured	measured	
+igzip	minjs.min.js	1	2	OK	1154897	1274370	0.906249	false	true	measured	measured	
+igzip	minjs.min.js	1	4	OK	1154897	1274370	0.906249	false	true	measured	measured	
+gzip	minjs.min.js	2	1	OK	1159530	1237716	0.936830	false	true	measured	measured	
+gzip	minjs.min.js	2	2	OK	1145171	1237716	0.925229	false	true	measured	measured	
+gzip	minjs.min.js	2	4	OK	1145171	1237716	0.925229	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	2	1	OK	1159530	1238252	0.936425	false	true	measured	measured	
+pigz	minjs.min.js	2	2	OK	1145171	1236134	0.926413	false	true	measured	measured	
+pigz	minjs.min.js	2	4	OK	1145171	1236134	0.926413	false	true	measured	measured	
+libdeflate	minjs.min.js	2	1	OK	1159530	1159530	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	2	2	OK	1145171	1159530	0.987617	false	true	measured	measured	
+libdeflate	minjs.min.js	2	4	OK	1145171	1159530	0.987617	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	2	1	OK	1159530	1260073	0.920209	false	true	measured	measured	
+igzip	minjs.min.js	2	2	OK	1145171	1260073	0.908813	false	true	measured	measured	
+igzip	minjs.min.js	2	4	OK	1145171	1260073	0.908813	false	true	measured	measured	
+gzip	minjs.min.js	3	1	OK	1113223	1208586	0.921095	false	true	measured	measured	
+gzip	minjs.min.js	3	2	OK	1104001	1208586	0.913465	false	true	measured	measured	
+gzip	minjs.min.js	3	4	OK	1104001	1208586	0.913465	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	3	1	OK	1113223	1209399	0.920476	false	true	measured	measured	
+pigz	minjs.min.js	3	2	OK	1104001	1206187	0.915282	false	true	measured	measured	
+pigz	minjs.min.js	3	4	OK	1104001	1206187	0.915282	false	true	measured	measured	
+libdeflate	minjs.min.js	3	1	OK	1113223	1140454	0.976123	false	true	measured	measured	
+libdeflate	minjs.min.js	3	2	OK	1104001	1140454	0.968036	false	true	measured	measured	
+libdeflate	minjs.min.js	3	4	OK	1104001	1140454	0.968036	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	3	1	OK	1113223	1210558	0.919595	false	true	measured	measured	
+igzip	minjs.min.js	3	2	OK	1104001	1210558	0.911977	false	true	measured	measured	
+igzip	minjs.min.js	3	4	OK	1104001	1210558	0.911977	false	true	measured	measured	
+gzip	minjs.min.js	4	1	OK	1129252	1135951	0.994103	false	true	measured	measured	
+gzip	minjs.min.js	4	2	OK	1091863	1135951	0.961188	false	true	measured	measured	
+gzip	minjs.min.js	4	4	OK	1091863	1135951	0.961188	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	4	1	OK	1129252	1136540	0.993588	false	true	measured	measured	
+pigz	minjs.min.js	4	2	OK	1091863	1136540	0.960690	false	true	measured	measured	
+pigz	minjs.min.js	4	4	OK	1091863	1136540	0.960690	false	true	measured	measured	
+libdeflate	minjs.min.js	4	1	OK	1129252	1129252	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	4	2	OK	1091863	1129252	0.966890	false	true	measured	measured	
+libdeflate	minjs.min.js	4	4	OK	1091863	1129252	0.966890	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	4	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	4	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	4	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	5	1	OK	1101520	1099255	1.002060	true	true	measured	measured	
+gzip	minjs.min.js	5	2	OK	1089165	1099255	0.990821	false	true	measured	measured	
+gzip	minjs.min.js	5	4	OK	1089165	1099255	0.990821	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	5	1	OK	1101520	1099533	1.001807	true	true	measured	measured	
+pigz	minjs.min.js	5	2	OK	1089165	1099533	0.990571	false	true	measured	measured	
+pigz	minjs.min.js	5	4	OK	1089165	1099533	0.990571	false	true	measured	measured	
+libdeflate	minjs.min.js	5	1	OK	1101520	1101333	1.000170	true	true	measured	measured	
+libdeflate	minjs.min.js	5	2	OK	1089165	1101333	0.988952	false	true	measured	measured	
+libdeflate	minjs.min.js	5	4	OK	1089165	1101333	0.988952	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	5	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	5	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	5	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	6	1	OK	1087222	1088768	0.998580	false	true	measured	measured	
+gzip	minjs.min.js	6	2	OK	1085345	1088768	0.996856	false	true	measured	measured	
+gzip	minjs.min.js	6	4	OK	1085345	1088768	0.996856	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	6	1	OK	1087222	1089100	0.998276	false	true	measured	measured	
+pigz	minjs.min.js	6	2	OK	1085345	1089100	0.996552	false	true	measured	measured	
+pigz	minjs.min.js	6	4	OK	1085345	1089100	0.996552	false	true	measured	measured	
+libdeflate	minjs.min.js	6	1	OK	1087222	1092487	0.995181	false	true	measured	measured	
+libdeflate	minjs.min.js	6	2	OK	1085345	1092487	0.993463	false	true	measured	measured	
+libdeflate	minjs.min.js	6	4	OK	1085345	1092487	0.993463	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	6	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	6	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	6	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	7	1	OK	1085182	1086898	0.998421	false	true	measured	measured	
+gzip	minjs.min.js	7	2	OK	1085050	1086898	0.998300	false	true	measured	measured	
+gzip	minjs.min.js	7	4	OK	1085050	1086898	0.998300	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	7	1	OK	1085182	1087052	0.998280	false	true	measured	measured	
+pigz	minjs.min.js	7	2	OK	1085050	1087052	0.998158	false	true	measured	measured	
+pigz	minjs.min.js	7	4	OK	1085050	1087052	0.998158	false	true	measured	measured	
+libdeflate	minjs.min.js	7	1	OK	1085182	1086304	0.998967	false	true	measured	measured	
+libdeflate	minjs.min.js	7	2	OK	1085050	1086304	0.998846	false	true	measured	measured	
+libdeflate	minjs.min.js	7	4	OK	1085050	1086304	0.998846	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	7	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	7	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	7	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	8	1	OK	1079656	1085972	0.994184	false	true	measured	measured	
+gzip	minjs.min.js	8	2	OK	1078907	1085972	0.993494	false	true	measured	measured	
+gzip	minjs.min.js	8	4	OK	1078907	1085972	0.993494	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	8	1	OK	1079656	1086077	0.994088	false	true	measured	measured	
+pigz	minjs.min.js	8	2	OK	1078907	1086077	0.993398	false	true	measured	measured	
+pigz	minjs.min.js	8	4	OK	1078907	1086077	0.993398	false	true	measured	measured	
+libdeflate	minjs.min.js	8	1	OK	1079656	1079262	1.000365	true	true	measured	measured	
+libdeflate	minjs.min.js	8	2	OK	1078907	1079262	0.999671	false	true	measured	measured	
+libdeflate	minjs.min.js	8	4	OK	1078907	1079262	0.999671	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	8	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	8	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	8	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	9	1	OK	1079072	1085965	0.993653	false	true	measured	measured	
+gzip	minjs.min.js	9	2	OK	1078967	1085965	0.993556	false	true	measured	measured	
+gzip	minjs.min.js	9	4	OK	1048680	1085965	0.965666	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	minjs.min.js	9	1	OK	1079072	1086066	0.993560	false	true	measured	measured	
+pigz	minjs.min.js	9	2	OK	1078967	1086066	0.993464	false	true	measured	measured	
+pigz	minjs.min.js	9	4	OK	1048680	1086066	0.965577	false	true	measured	measured	
+libdeflate	minjs.min.js	9	1	OK	1079072	1079072	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	9	2	OK	1078967	1079072	0.999903	false	true	measured	measured	
+libdeflate	minjs.min.js	9	4	OK	1048680	1079072	0.971835	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	9	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	9	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	9	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	10	1	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	10	2	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	10	4	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	10	1	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	10	2	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	minjs.min.js	10	1	OK	1049199	1049199	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	10	2	OK	1078967	1049199	1.028372	true	true	measured	measured	
+libdeflate	minjs.min.js	10	4	OK	1048814	1049199	0.999633	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	10	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	10	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	10	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	11	1	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	11	2	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	11	4	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	11	1	OK	1048557	1045780	1.002655	true	true	measured	measured	
+pigz	minjs.min.js	11	2	OK	1078967	1045780	1.031734	true	true	measured	measured	
+pigz	minjs.min.js	11	4	OK	1048253	1045780	1.002365	true	true	measured	measured	
+libdeflate	minjs.min.js	11	1	OK	1048557	1048557	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	11	2	OK	1078967	1048557	1.029002	true	true	measured	measured	
+libdeflate	minjs.min.js	11	4	OK	1048253	1048557	0.999710	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	11	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	11	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	11	4	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	12	1	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	12	2	ABSENT	0	0	NaN	false	false			
+gzip	minjs.min.js	12	4	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	12	1	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	12	2	ABSENT	0	0	NaN	false	false			
+pigz	minjs.min.js	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	minjs.min.js	12	1	OK	1048679	1048679	1.000000	false	true	measured	measured	
+libdeflate	minjs.min.js	12	2	OK	1078967	1048679	1.028882	true	true	measured	measured	
+libdeflate	minjs.min.js	12	4	OK	1048335	1048679	0.999672	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	minjs.min.js	12	1	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	12	2	ABSENT	0	0	NaN	false	false			
+igzip	minjs.min.js	12	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	1	1	OK	588967	617178	0.954290	false	true	measured	measured	
+gzip	armexe.elf	1	2	OK	589405	617178	0.955000	false	true	measured	measured	
+gzip	armexe.elf	1	4	OK	589405	617178	0.955000	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	1	1	OK	588967	616086	0.955982	false	true	measured	measured	
+pigz	armexe.elf	1	2	OK	589405	615561	0.957509	false	true	measured	measured	
+pigz	armexe.elf	1	4	OK	589405	615561	0.957509	false	true	measured	measured	
+libdeflate	armexe.elf	1	1	OK	588967	621027	0.948376	false	true	measured	measured	
+libdeflate	armexe.elf	1	2	OK	589405	621027	0.949081	false	true	measured	measured	
+libdeflate	armexe.elf	1	4	OK	589405	621027	0.949081	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	1	1	OK	588967	652872	0.902117	false	true	measured	measured	
+igzip	armexe.elf	1	2	OK	589405	652872	0.902788	false	true	measured	measured	
+igzip	armexe.elf	1	4	OK	589405	652872	0.902788	false	true	measured	measured	
+gzip	armexe.elf	2	1	OK	590859	607750	0.972207	false	true	measured	measured	
+gzip	armexe.elf	2	2	OK	585644	607750	0.963626	false	true	measured	measured	
+gzip	armexe.elf	2	4	OK	585644	607750	0.963626	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	2	1	OK	590859	606963	0.973468	false	true	measured	measured	
+pigz	armexe.elf	2	2	OK	585644	606327	0.965888	false	true	measured	measured	
+pigz	armexe.elf	2	4	OK	585644	606327	0.965888	false	true	measured	measured	
+libdeflate	armexe.elf	2	1	OK	590859	590859	1.000000	false	true	measured	measured	
+libdeflate	armexe.elf	2	2	OK	585644	590859	0.991174	false	true	measured	measured	
+libdeflate	armexe.elf	2	4	OK	585644	590859	0.991174	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	2	1	OK	590859	642627	0.919443	false	true	measured	measured	
+igzip	armexe.elf	2	2	OK	585644	642627	0.911328	false	true	measured	measured	
+igzip	armexe.elf	2	4	OK	585644	642627	0.911328	false	true	measured	measured	
+gzip	armexe.elf	3	1	OK	577863	598860	0.964938	false	true	measured	measured	
+gzip	armexe.elf	3	2	OK	576537	598860	0.962724	false	true	measured	measured	
+gzip	armexe.elf	3	4	OK	576537	598860	0.962724	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	3	1	OK	577863	599844	0.963355	false	true	measured	measured	
+pigz	armexe.elf	3	2	OK	576537	599162	0.962239	false	true	measured	measured	
+pigz	armexe.elf	3	4	OK	576537	599162	0.962239	false	true	measured	measured	
+libdeflate	armexe.elf	3	1	OK	577863	588801	0.981423	false	true	measured	measured	
+libdeflate	armexe.elf	3	2	OK	576537	588801	0.979171	false	true	measured	measured	
+libdeflate	armexe.elf	3	4	OK	576537	588801	0.979171	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	3	1	OK	577863	634911	0.910148	false	true	measured	measured	
+igzip	armexe.elf	3	2	OK	576537	634911	0.908060	false	true	measured	measured	
+igzip	armexe.elf	3	4	OK	576537	634911	0.908060	false	true	measured	measured	
+gzip	armexe.elf	4	1	OK	586728	591498	0.991936	false	true	measured	measured	
+gzip	armexe.elf	4	2	OK	575953	591498	0.973719	false	true	measured	measured	
+gzip	armexe.elf	4	4	OK	575953	591498	0.973719	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	4	1	OK	586728	592711	0.989906	false	true	measured	measured	
+pigz	armexe.elf	4	2	OK	575953	592711	0.971727	false	true	measured	measured	
+pigz	armexe.elf	4	4	OK	575953	592711	0.971727	false	true	measured	measured	
+libdeflate	armexe.elf	4	1	OK	586728	586728	1.000000	false	true	measured	measured	
+libdeflate	armexe.elf	4	2	OK	575953	586728	0.981635	false	true	measured	measured	
+libdeflate	armexe.elf	4	4	OK	575953	586728	0.981635	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	4	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	4	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	4	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	5	1	OK	575419	584462	0.984528	false	true	measured	measured	
+gzip	armexe.elf	5	2	OK	575633	584462	0.984894	false	true	measured	measured	
+gzip	armexe.elf	5	4	OK	575633	584462	0.984894	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	5	1	OK	575419	586097	0.981781	false	true	measured	measured	
+pigz	armexe.elf	5	2	OK	575633	586097	0.982146	false	true	measured	measured	
+pigz	armexe.elf	5	4	OK	575633	586097	0.982146	false	true	measured	measured	
+libdeflate	armexe.elf	5	1	OK	575419	577166	0.996973	false	true	measured	measured	
+libdeflate	armexe.elf	5	2	OK	575633	577166	0.997344	false	true	measured	measured	
+libdeflate	armexe.elf	5	4	OK	575633	577166	0.997344	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	5	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	5	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	5	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	6	1	OK	575598	582313	0.988468	false	true	measured	measured	
+gzip	armexe.elf	6	2	OK	574963	582313	0.987378	false	true	measured	measured	
+gzip	armexe.elf	6	4	OK	574963	582313	0.987378	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	6	1	OK	575598	583886	0.985805	false	true	measured	measured	
+pigz	armexe.elf	6	2	OK	574963	583886	0.984718	false	true	measured	measured	
+pigz	armexe.elf	6	4	OK	574963	583886	0.984718	false	true	measured	measured	
+libdeflate	armexe.elf	6	1	OK	575598	576037	0.999238	false	true	measured	measured	
+libdeflate	armexe.elf	6	2	OK	574963	576037	0.998136	false	true	measured	measured	
+libdeflate	armexe.elf	6	4	OK	574963	576037	0.998136	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	6	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	6	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	6	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	7	1	OK	575206	581873	0.988542	false	true	measured	measured	
+gzip	armexe.elf	7	2	OK	574743	581873	0.987746	false	true	measured	measured	
+gzip	armexe.elf	7	4	OK	574743	581873	0.987746	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	7	1	OK	575206	583373	0.986000	false	true	measured	measured	
+pigz	armexe.elf	7	2	OK	574743	583373	0.985207	false	true	measured	measured	
+pigz	armexe.elf	7	4	OK	574743	583373	0.985207	false	true	measured	measured	
+libdeflate	armexe.elf	7	1	OK	575206	575555	0.999394	false	true	measured	measured	
+libdeflate	armexe.elf	7	2	OK	574743	575555	0.998589	false	true	measured	measured	
+libdeflate	armexe.elf	7	4	OK	574743	575555	0.998589	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	7	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	7	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	7	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	8	1	OK	573024	580960	0.986340	false	true	measured	measured	
+gzip	armexe.elf	8	2	OK	572857	580960	0.986052	false	true	measured	measured	
+gzip	armexe.elf	8	4	OK	572857	580960	0.986052	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	8	1	OK	573024	582794	0.983236	false	true	measured	measured	
+pigz	armexe.elf	8	2	OK	572857	582794	0.982949	false	true	measured	measured	
+pigz	armexe.elf	8	4	OK	572857	582794	0.982949	false	true	measured	measured	
+libdeflate	armexe.elf	8	1	OK	573024	574877	0.996777	false	true	measured	measured	
+libdeflate	armexe.elf	8	2	OK	572857	574877	0.996486	false	true	measured	measured	
+libdeflate	armexe.elf	8	4	OK	572857	574877	0.996486	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	8	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	8	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	8	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	9	1	OK	574689	580694	0.989659	false	true	measured	measured	
+gzip	armexe.elf	9	2	OK	574413	580694	0.989184	false	true	measured	measured	
+gzip	armexe.elf	9	4	OK	561540	580694	0.967015	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	armexe.elf	9	1	OK	574689	582516	0.986563	false	true	measured	measured	
+pigz	armexe.elf	9	2	OK	574413	582516	0.986090	false	true	measured	measured	
+pigz	armexe.elf	9	4	OK	561540	582516	0.963991	false	true	measured	measured	
+libdeflate	armexe.elf	9	1	OK	574689	574689	1.000000	false	true	measured	measured	
+libdeflate	armexe.elf	9	2	OK	574413	574689	0.999520	false	true	measured	measured	
+libdeflate	armexe.elf	9	4	OK	561540	574689	0.977120	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	9	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	9	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	9	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	10	1	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	10	2	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	10	4	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	10	1	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	10	2	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	armexe.elf	10	1	OK	561389	561389	1.000000	false	true	measured	measured	
+libdeflate	armexe.elf	10	2	OK	574413	561389	1.023200	true	true	measured	measured	
+libdeflate	armexe.elf	10	4	OK	561525	561389	1.000242	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	10	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	10	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	10	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	11	1	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	11	2	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	11	4	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	11	1	OK	561134	558350	1.004986	true	true	measured	measured	
+pigz	armexe.elf	11	2	OK	574413	558350	1.028769	true	true	measured	measured	
+pigz	armexe.elf	11	4	OK	561432	558350	1.005520	true	true	measured	measured	
+libdeflate	armexe.elf	11	1	OK	561134	561122	1.000021	true	true	measured	measured	
+libdeflate	armexe.elf	11	2	OK	574413	561122	1.023686	true	true	measured	measured	
+libdeflate	armexe.elf	11	4	OK	561432	561122	1.000552	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	11	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	11	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	11	4	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	12	1	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	12	2	ABSENT	0	0	NaN	false	false			
+gzip	armexe.elf	12	4	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	12	1	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	12	2	ABSENT	0	0	NaN	false	false			
+pigz	armexe.elf	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	armexe.elf	12	1	OK	561271	561378	0.999809	false	true	measured	measured	
+libdeflate	armexe.elf	12	2	OK	574413	561378	1.023220	true	true	measured	measured	
+libdeflate	armexe.elf	12	4	OK	561477	561378	1.000176	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	armexe.elf	12	1	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	12	2	ABSENT	0	0	NaN	false	false			
+igzip	armexe.elf	12	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	1	1	OK	21815237	23407301	0.931984	false	true	measured	measured	
+gzip	tool.bin	1	2	OK	21819557	23407301	0.932169	false	true	measured	measured	
+gzip	tool.bin	1	4	OK	21819557	23407301	0.932169	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	1	1	OK	21815237	23360989	0.933832	false	true	measured	measured	
+pigz	tool.bin	1	2	OK	21819557	23346933	0.934579	false	true	measured	measured	
+pigz	tool.bin	1	4	OK	21819557	23346933	0.934579	false	true	measured	measured	
+libdeflate	tool.bin	1	1	OK	21815237	22673676	0.962139	false	true	measured	measured	
+libdeflate	tool.bin	1	2	OK	21819557	22673676	0.962330	false	true	measured	measured	
+libdeflate	tool.bin	1	4	OK	21819557	22673676	0.962330	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	1	1	OK	21815237	24116005	0.904596	false	true	measured	measured	
+igzip	tool.bin	1	2	OK	21819557	24116005	0.904775	false	true	measured	measured	
+igzip	tool.bin	1	4	OK	21819557	24116005	0.904775	false	true	measured	measured	
+gzip	tool.bin	2	1	OK	21781555	22827782	0.954169	false	true	measured	measured	
+gzip	tool.bin	2	2	OK	21512051	22827782	0.942363	false	true	measured	measured	
+gzip	tool.bin	2	4	OK	21512051	22827782	0.942363	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	2	1	OK	21781555	22779854	0.956176	false	true	measured	measured	
+pigz	tool.bin	2	2	OK	21512051	22767555	0.944856	false	true	measured	measured	
+pigz	tool.bin	2	4	OK	21512051	22767555	0.944856	false	true	measured	measured	
+libdeflate	tool.bin	2	1	OK	21781555	21781555	1.000000	false	true	measured	measured	
+libdeflate	tool.bin	2	2	OK	21512051	21781555	0.987627	false	true	measured	measured	
+libdeflate	tool.bin	2	4	OK	21512051	21781555	0.987627	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	2	1	OK	21781555	23870635	0.912483	false	true	measured	measured	
+igzip	tool.bin	2	2	OK	21512051	23870635	0.901193	false	true	measured	measured	
+igzip	tool.bin	2	4	OK	21512051	23870635	0.901193	false	true	measured	measured	
+gzip	tool.bin	3	1	OK	21153661	22324821	0.947540	false	true	measured	measured	
+gzip	tool.bin	3	2	OK	20997967	22324821	0.940566	false	true	measured	measured	
+gzip	tool.bin	3	4	OK	20997967	22324821	0.940566	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	3	1	OK	21153661	22293036	0.948891	false	true	measured	measured	
+pigz	tool.bin	3	2	OK	20997967	22264384	0.943119	false	true	measured	measured	
+pigz	tool.bin	3	4	OK	20997967	22264384	0.943119	false	true	measured	measured	
+libdeflate	tool.bin	3	1	OK	21153661	21565021	0.980925	false	true	measured	measured	
+libdeflate	tool.bin	3	2	OK	20997967	21565021	0.973705	false	true	measured	measured	
+libdeflate	tool.bin	3	4	OK	20997967	21565021	0.973705	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	3	1	OK	21153661	23266878	0.909175	false	true	measured	measured	
+igzip	tool.bin	3	2	OK	20997967	23266878	0.902483	false	true	measured	measured	
+igzip	tool.bin	3	4	OK	20997967	23266878	0.902483	false	true	measured	measured	
+gzip	tool.bin	4	1	OK	21400590	21729748	0.984852	false	true	measured	measured	
+gzip	tool.bin	4	2	OK	20824342	21729748	0.958333	false	true	measured	measured	
+gzip	tool.bin	4	4	OK	20824342	21729748	0.958333	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	4	1	OK	21400590	21683081	0.986972	false	true	measured	measured	
+pigz	tool.bin	4	2	OK	20824342	21683081	0.960396	false	true	measured	measured	
+pigz	tool.bin	4	4	OK	20824342	21683081	0.960396	false	true	measured	measured	
+libdeflate	tool.bin	4	1	OK	21400590	21400590	1.000000	false	true	measured	measured	
+libdeflate	tool.bin	4	2	OK	20824342	21400590	0.973073	false	true	measured	measured	
+libdeflate	tool.bin	4	4	OK	20824342	21400590	0.973073	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	4	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	4	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	4	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	5	1	OK	20965916	21240502	0.987073	false	true	measured	measured	
+gzip	tool.bin	5	2	OK	20779202	21240502	0.978282	false	true	measured	measured	
+gzip	tool.bin	5	4	OK	20779202	21240502	0.978282	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	5	1	OK	20965916	21194935	0.989195	false	true	measured	measured	
+pigz	tool.bin	5	2	OK	20779202	21194935	0.980385	false	true	measured	measured	
+pigz	tool.bin	5	4	OK	20779202	21194935	0.980385	false	true	measured	measured	
+libdeflate	tool.bin	5	1	OK	20965916	20981817	0.999242	false	true	measured	measured	
+libdeflate	tool.bin	5	2	OK	20779202	20981817	0.990343	false	true	measured	measured	
+libdeflate	tool.bin	5	4	OK	20779202	20981817	0.990343	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	5	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	5	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	5	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	6	1	OK	20734751	21008088	0.986989	false	true	measured	measured	
+gzip	tool.bin	6	2	OK	20678455	21008088	0.984309	false	true	measured	measured	
+gzip	tool.bin	6	4	OK	20678455	21008088	0.984309	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	6	1	OK	20734751	20963493	0.989089	false	true	measured	measured	
+pigz	tool.bin	6	2	OK	20678455	20963493	0.986403	false	true	measured	measured	
+pigz	tool.bin	6	4	OK	20678455	20963493	0.986403	false	true	measured	measured	
+libdeflate	tool.bin	6	1	OK	20734751	20825308	0.995652	false	true	measured	measured	
+libdeflate	tool.bin	6	2	OK	20678455	20825308	0.992948	false	true	measured	measured	
+libdeflate	tool.bin	6	4	OK	20678455	20825308	0.992948	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	6	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	6	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	6	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	7	1	OK	20695376	20951732	0.987764	false	true	measured	measured	
+gzip	tool.bin	7	2	OK	20660564	20951732	0.986103	false	true	measured	measured	
+gzip	tool.bin	7	4	OK	20660564	20951732	0.986103	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	7	1	OK	20695376	20908038	0.989829	false	true	measured	measured	
+pigz	tool.bin	7	2	OK	20660564	20908038	0.988164	false	true	measured	measured	
+pigz	tool.bin	7	4	OK	20660564	20908038	0.988164	false	true	measured	measured	
+libdeflate	tool.bin	7	1	OK	20695376	20730171	0.998322	false	true	measured	measured	
+libdeflate	tool.bin	7	2	OK	20660564	20730171	0.996642	false	true	measured	measured	
+libdeflate	tool.bin	7	4	OK	20660564	20730171	0.996642	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	7	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	7	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	7	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	8	1	OK	20657704	20887709	0.988989	false	true	measured	measured	
+gzip	tool.bin	8	2	OK	20648266	20887709	0.988537	false	true	measured	measured	
+gzip	tool.bin	8	4	OK	20648266	20887709	0.988537	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	8	1	OK	20657704	20845602	0.990986	false	true	measured	measured	
+pigz	tool.bin	8	2	OK	20648266	20845602	0.990533	false	true	measured	measured	
+pigz	tool.bin	8	4	OK	20648266	20845602	0.990533	false	true	measured	measured	
+libdeflate	tool.bin	8	1	OK	20657704	20674811	0.999173	false	true	measured	measured	
+libdeflate	tool.bin	8	2	OK	20648266	20674811	0.998716	false	true	measured	measured	
+libdeflate	tool.bin	8	4	OK	20648266	20674811	0.998716	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	8	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	8	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	8	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	9	1	OK	20662134	20874360	0.989833	false	true	measured	measured	
+gzip	tool.bin	9	2	OK	20652075	20874360	0.989351	false	true	measured	measured	
+gzip	tool.bin	9	4	OK	20086656	20874360	0.962265	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	tool.bin	9	1	OK	20662134	20832322	0.991831	false	true	measured	measured	
+pigz	tool.bin	9	2	OK	20652075	20832322	0.991348	false	true	measured	measured	
+pigz	tool.bin	9	4	OK	20086656	20832322	0.964206	false	true	measured	measured	
+libdeflate	tool.bin	9	1	OK	20662134	20662134	1.000000	false	true	measured	measured	
+libdeflate	tool.bin	9	2	OK	20652075	20662134	0.999513	false	true	measured	measured	
+libdeflate	tool.bin	9	4	OK	20086656	20662134	0.972148	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	9	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	9	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	9	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	10	1	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	10	2	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	10	4	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	10	1	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	10	2	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	tool.bin	10	1	OK	20105241	20105241	1.000000	false	true	measured	measured	
+libdeflate	tool.bin	10	2	OK	20652075	20105241	1.027199	true	true	measured	measured	
+libdeflate	tool.bin	10	4	OK	20094424	20105241	0.999462	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	10	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	10	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	10	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	11	1	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	11	2	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	11	4	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	11	1	OK	20074197	19978833	1.004773	true	true	measured	measured	
+pigz	tool.bin	11	2	OK	20652075	19978833	1.033698	true	true	measured	measured	
+pigz	tool.bin	11	4	OK	20064628	19978833	1.004294	true	true	measured	measured	
+libdeflate	tool.bin	11	1	OK	20074197	20073160	1.000052	true	true	measured	measured	
+libdeflate	tool.bin	11	2	OK	20652075	20073160	1.028840	true	true	measured	measured	
+libdeflate	tool.bin	11	4	OK	20064628	20073160	0.999575	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	11	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	11	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	11	4	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	12	1	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	12	2	ABSENT	0	0	NaN	false	false			
+gzip	tool.bin	12	4	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	12	1	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	12	2	ABSENT	0	0	NaN	false	false			
+pigz	tool.bin	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	tool.bin	12	1	OK	20066350	20065091	1.000063	true	true	measured	measured	
+libdeflate	tool.bin	12	2	OK	20652075	20065091	1.029254	true	true	measured	measured	
+libdeflate	tool.bin	12	4	OK	20058292	20065091	0.999661	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	tool.bin	12	1	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	12	2	ABSENT	0	0	NaN	false	false			
+igzip	tool.bin	12	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	1	1	OK	414347	446629	0.927721	false	true	measured	measured	
+gzip	engine.wasm	1	2	OK	414059	446629	0.927076	false	true	measured	measured	
+gzip	engine.wasm	1	4	OK	414059	446629	0.927076	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	1	1	OK	414347	445803	0.929440	false	true	measured	measured	
+pigz	engine.wasm	1	2	OK	414059	445601	0.929215	false	true	measured	measured	
+pigz	engine.wasm	1	4	OK	414059	445601	0.929215	false	true	measured	measured	
+libdeflate	engine.wasm	1	1	OK	414347	421013	0.984167	false	true	measured	measured	
+libdeflate	engine.wasm	1	2	OK	414059	421013	0.983483	false	true	measured	measured	
+libdeflate	engine.wasm	1	4	OK	414059	421013	0.983483	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	1	1	OK	414347	446955	0.927044	false	true	measured	measured	
+igzip	engine.wasm	1	2	OK	414059	446955	0.926400	false	true	measured	measured	
+igzip	engine.wasm	1	4	OK	414059	446955	0.926400	false	true	measured	measured	
+gzip	engine.wasm	2	1	OK	412230	436023	0.945432	false	true	measured	measured	
+gzip	engine.wasm	2	2	OK	407836	436023	0.935354	false	true	measured	measured	
+gzip	engine.wasm	2	4	OK	407836	436023	0.935354	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	2	1	OK	412230	434836	0.948013	false	true	measured	measured	
+pigz	engine.wasm	2	2	OK	407836	434564	0.938495	false	true	measured	measured	
+pigz	engine.wasm	2	4	OK	407836	434564	0.938495	false	true	measured	measured	
+libdeflate	engine.wasm	2	1	OK	412230	412230	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	2	2	OK	407836	412230	0.989341	false	true	measured	measured	
+libdeflate	engine.wasm	2	4	OK	407836	412230	0.989341	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	2	1	OK	412230	442360	0.931888	false	true	measured	measured	
+igzip	engine.wasm	2	2	OK	407836	442360	0.921955	false	true	measured	measured	
+igzip	engine.wasm	2	4	OK	407836	442360	0.921955	false	true	measured	measured	
+gzip	engine.wasm	3	1	OK	400342	425241	0.941447	false	true	measured	measured	
+gzip	engine.wasm	3	2	OK	398127	425241	0.936239	false	true	measured	measured	
+gzip	engine.wasm	3	4	OK	398127	425241	0.936239	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	3	1	OK	400342	424566	0.942944	false	true	measured	measured	
+pigz	engine.wasm	3	2	OK	398127	424375	0.938149	false	true	measured	measured	
+pigz	engine.wasm	3	4	OK	398127	424375	0.938149	false	true	measured	measured	
+libdeflate	engine.wasm	3	1	OK	400342	409855	0.976789	false	true	measured	measured	
+libdeflate	engine.wasm	3	2	OK	398127	409855	0.971385	false	true	measured	measured	
+libdeflate	engine.wasm	3	4	OK	398127	409855	0.971385	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	3	1	OK	400342	431537	0.927712	false	true	measured	measured	
+igzip	engine.wasm	3	2	OK	398127	431537	0.922579	false	true	measured	measured	
+igzip	engine.wasm	3	4	OK	398127	431537	0.922579	false	true	measured	measured	
+gzip	engine.wasm	4	1	OK	409051	414967	0.985743	false	true	measured	measured	
+gzip	engine.wasm	4	2	OK	397843	414967	0.958734	false	true	measured	measured	
+gzip	engine.wasm	4	4	OK	397843	414967	0.958734	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	4	1	OK	409051	414624	0.986559	false	true	measured	measured	
+pigz	engine.wasm	4	2	OK	397843	414624	0.959527	false	true	measured	measured	
+pigz	engine.wasm	4	4	OK	397843	414624	0.959527	false	true	measured	measured	
+libdeflate	engine.wasm	4	1	OK	409051	409051	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	4	2	OK	397843	409051	0.972600	false	true	measured	measured	
+libdeflate	engine.wasm	4	4	OK	397843	409051	0.972600	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	4	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	4	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	4	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	5	1	OK	399253	406749	0.981571	false	true	measured	measured	
+gzip	engine.wasm	5	2	OK	397402	406749	0.977020	false	true	measured	measured	
+gzip	engine.wasm	5	4	OK	397402	406749	0.977020	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	5	1	OK	399253	406507	0.982155	false	true	measured	measured	
+pigz	engine.wasm	5	2	OK	397402	406507	0.977602	false	true	measured	measured	
+pigz	engine.wasm	5	4	OK	397402	406507	0.977602	false	true	measured	measured	
+libdeflate	engine.wasm	5	1	OK	399253	399523	0.999324	false	true	measured	measured	
+libdeflate	engine.wasm	5	2	OK	397402	399523	0.994691	false	true	measured	measured	
+libdeflate	engine.wasm	5	4	OK	397402	399523	0.994691	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	5	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	5	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	5	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	6	1	OK	397369	403059	0.985883	false	true	measured	measured	
+gzip	engine.wasm	6	2	OK	396978	403059	0.984913	false	true	measured	measured	
+gzip	engine.wasm	6	4	OK	396978	403059	0.984913	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	6	1	OK	397369	402479	0.987304	false	true	measured	measured	
+pigz	engine.wasm	6	2	OK	396978	402479	0.986332	false	true	measured	measured	
+pigz	engine.wasm	6	4	OK	396978	402479	0.986332	false	true	measured	measured	
+libdeflate	engine.wasm	6	1	OK	397369	398123	0.998106	false	true	measured	measured	
+libdeflate	engine.wasm	6	2	OK	396978	398123	0.997124	false	true	measured	measured	
+libdeflate	engine.wasm	6	4	OK	396978	398123	0.997124	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	6	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	6	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	6	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	7	1	OK	397202	402239	0.987478	false	true	measured	measured	
+gzip	engine.wasm	7	2	OK	396972	402239	0.986906	false	true	measured	measured	
+gzip	engine.wasm	7	4	OK	396972	402239	0.986906	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	7	1	OK	397202	401631	0.988972	false	true	measured	measured	
+pigz	engine.wasm	7	2	OK	396972	401631	0.988400	false	true	measured	measured	
+pigz	engine.wasm	7	4	OK	396972	401631	0.988400	false	true	measured	measured	
+libdeflate	engine.wasm	7	1	OK	397202	397340	0.999653	false	true	measured	measured	
+libdeflate	engine.wasm	7	2	OK	396972	397340	0.999074	false	true	measured	measured	
+libdeflate	engine.wasm	7	4	OK	396972	397340	0.999074	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	7	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	7	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	7	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	8	1	OK	396041	402099	0.984934	false	true	measured	measured	
+gzip	engine.wasm	8	2	OK	395945	402099	0.984695	false	true	measured	measured	
+gzip	engine.wasm	8	4	OK	395945	402099	0.984695	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	8	1	OK	396041	401332	0.986816	false	true	measured	measured	
+pigz	engine.wasm	8	2	OK	395945	401332	0.986577	false	true	measured	measured	
+pigz	engine.wasm	8	4	OK	395945	401332	0.986577	false	true	measured	measured	
+libdeflate	engine.wasm	8	1	OK	396041	396254	0.999462	false	true	measured	measured	
+libdeflate	engine.wasm	8	2	OK	395945	396254	0.999220	false	true	measured	measured	
+libdeflate	engine.wasm	8	4	OK	395945	396254	0.999220	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	8	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	8	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	8	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	9	1	OK	396244	402095	0.985449	false	true	measured	measured	
+gzip	engine.wasm	9	2	OK	396140	402095	0.985190	false	true	measured	measured	
+gzip	engine.wasm	9	4	OK	383748	402095	0.954371	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	engine.wasm	9	1	OK	396244	401328	0.987332	false	true	measured	measured	
+pigz	engine.wasm	9	2	OK	396140	401328	0.987073	false	true	measured	measured	
+pigz	engine.wasm	9	4	OK	383748	401328	0.956195	false	true	measured	measured	
+libdeflate	engine.wasm	9	1	OK	396244	396244	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	9	2	OK	396140	396244	0.999738	false	true	measured	measured	
+libdeflate	engine.wasm	9	4	OK	383748	396244	0.968464	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	9	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	9	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	9	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	10	1	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	10	2	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	10	4	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	10	1	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	10	2	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	engine.wasm	10	1	OK	383919	383919	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	10	2	OK	396140	383919	1.031832	true	true	measured	measured	
+libdeflate	engine.wasm	10	4	OK	383749	383919	0.999557	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	10	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	10	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	10	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	11	1	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	11	2	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	11	4	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	11	1	OK	383725	381693	1.005324	true	true	measured	measured	
+pigz	engine.wasm	11	2	OK	396140	381693	1.037850	true	true	measured	measured	
+pigz	engine.wasm	11	4	OK	383501	381693	1.004737	true	true	measured	measured	
+libdeflate	engine.wasm	11	1	OK	383725	383725	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	11	2	OK	396140	383725	1.032354	true	true	measured	measured	
+libdeflate	engine.wasm	11	4	OK	383501	383725	0.999416	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	11	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	11	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	11	4	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	12	1	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	12	2	ABSENT	0	0	NaN	false	false			
+gzip	engine.wasm	12	4	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	12	1	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	12	2	ABSENT	0	0	NaN	false	false			
+pigz	engine.wasm	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	engine.wasm	12	1	OK	383711	383711	1.000000	false	true	measured	measured	
+libdeflate	engine.wasm	12	2	OK	396140	383711	1.032392	true	true	measured	measured	
+libdeflate	engine.wasm	12	4	OK	383502	383711	0.999455	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	engine.wasm	12	1	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	12	2	ABSENT	0	0	NaN	false	false			
+igzip	engine.wasm	12	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	1	1	OK	385517	407288	0.946546	false	true	measured	measured	
+gzip	symbols.dwarf	1	2	OK	385358	407288	0.946156	false	true	measured	measured	
+gzip	symbols.dwarf	1	4	OK	385358	407288	0.946156	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	1	1	OK	385517	404305	0.953530	false	true	measured	measured	
+pigz	symbols.dwarf	1	2	OK	385358	404202	0.953380	false	true	measured	measured	
+pigz	symbols.dwarf	1	4	OK	385358	404202	0.953380	false	true	measured	measured	
+libdeflate	symbols.dwarf	1	1	OK	385517	396048	0.973410	false	true	measured	measured	
+libdeflate	symbols.dwarf	1	2	OK	385358	396048	0.973008	false	true	measured	measured	
+libdeflate	symbols.dwarf	1	4	OK	385358	396048	0.973008	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	1	1	OK	385517	412998	0.933460	false	true	measured	measured	
+igzip	symbols.dwarf	1	2	OK	385358	412998	0.933075	false	true	measured	measured	
+igzip	symbols.dwarf	1	4	OK	385358	412998	0.933075	false	true	measured	measured	
+gzip	symbols.dwarf	2	1	OK	382091	400125	0.954929	false	true	measured	measured	
+gzip	symbols.dwarf	2	2	OK	379917	400125	0.949496	false	true	measured	measured	
+gzip	symbols.dwarf	2	4	OK	379917	400125	0.949496	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	2	1	OK	382091	397301	0.961717	false	true	measured	measured	
+pigz	symbols.dwarf	2	2	OK	379917	397212	0.956459	false	true	measured	measured	
+pigz	symbols.dwarf	2	4	OK	379917	397212	0.956459	false	true	measured	measured	
+libdeflate	symbols.dwarf	2	1	OK	382091	382091	1.000000	false	true	measured	measured	
+libdeflate	symbols.dwarf	2	2	OK	379917	382091	0.994310	false	true	measured	measured	
+libdeflate	symbols.dwarf	2	4	OK	379917	382091	0.994310	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	2	1	OK	382091	408420	0.935534	false	true	measured	measured	
+igzip	symbols.dwarf	2	2	OK	379917	408420	0.930212	false	true	measured	measured	
+igzip	symbols.dwarf	2	4	OK	379917	408420	0.930212	false	true	measured	measured	
+gzip	symbols.dwarf	3	1	OK	371725	393438	0.944812	false	true	measured	measured	
+gzip	symbols.dwarf	3	2	OK	370972	393438	0.942898	false	true	measured	measured	
+gzip	symbols.dwarf	3	4	OK	370972	393438	0.942898	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	3	1	OK	371725	393309	0.945122	false	true	measured	measured	
+pigz	symbols.dwarf	3	2	OK	370972	393104	0.943699	false	true	measured	measured	
+pigz	symbols.dwarf	3	4	OK	370972	393104	0.943699	false	true	measured	measured	
+libdeflate	symbols.dwarf	3	1	OK	371725	380400	0.977195	false	true	measured	measured	
+libdeflate	symbols.dwarf	3	2	OK	370972	380400	0.975216	false	true	measured	measured	
+libdeflate	symbols.dwarf	3	4	OK	370972	380400	0.975216	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	3	1	OK	371725	408916	0.909050	false	true	measured	measured	
+igzip	symbols.dwarf	3	2	OK	370972	408916	0.907208	false	true	measured	measured	
+igzip	symbols.dwarf	3	4	OK	370972	408916	0.907208	false	true	measured	measured	
+gzip	symbols.dwarf	4	1	OK	378809	382149	0.991260	false	true	measured	measured	
+gzip	symbols.dwarf	4	2	OK	368042	382149	0.963085	false	true	measured	measured	
+gzip	symbols.dwarf	4	4	OK	368042	382149	0.963085	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	4	1	OK	378809	382305	0.990855	false	true	measured	measured	
+pigz	symbols.dwarf	4	2	OK	368042	382305	0.962692	false	true	measured	measured	
+pigz	symbols.dwarf	4	4	OK	368042	382305	0.962692	false	true	measured	measured	
+libdeflate	symbols.dwarf	4	1	OK	378809	378809	1.000000	false	true	measured	measured	
+libdeflate	symbols.dwarf	4	2	OK	368042	378809	0.971577	false	true	measured	measured	
+libdeflate	symbols.dwarf	4	4	OK	368042	378809	0.971577	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	4	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	4	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	4	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	5	1	OK	370913	376231	0.985865	false	true	measured	measured	
+gzip	symbols.dwarf	5	2	OK	366967	376231	0.975377	false	true	measured	measured	
+gzip	symbols.dwarf	5	4	OK	366967	376231	0.975377	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	5	1	OK	370913	376040	0.986366	false	true	measured	measured	
+pigz	symbols.dwarf	5	2	OK	366967	376040	0.975872	false	true	measured	measured	
+pigz	symbols.dwarf	5	4	OK	366967	376040	0.975872	false	true	measured	measured	
+libdeflate	symbols.dwarf	5	1	OK	370913	370707	1.000556	true	true	measured	measured	
+libdeflate	symbols.dwarf	5	2	OK	366967	370707	0.989911	false	true	measured	measured	
+libdeflate	symbols.dwarf	5	4	OK	366967	370707	0.989911	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	5	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	5	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	5	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	6	1	OK	367682	373991	0.983131	false	true	measured	measured	
+gzip	symbols.dwarf	6	2	OK	365866	373991	0.978275	false	true	measured	measured	
+gzip	symbols.dwarf	6	4	OK	365866	373991	0.978275	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	6	1	OK	367682	373597	0.984167	false	true	measured	measured	
+pigz	symbols.dwarf	6	2	OK	365866	373597	0.979307	false	true	measured	measured	
+pigz	symbols.dwarf	6	4	OK	365866	373597	0.979307	false	true	measured	measured	
+libdeflate	symbols.dwarf	6	1	OK	367682	369135	0.996064	false	true	measured	measured	
+libdeflate	symbols.dwarf	6	2	OK	365866	369135	0.991144	false	true	measured	measured	
+libdeflate	symbols.dwarf	6	4	OK	365866	369135	0.991144	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	6	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	6	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	6	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	7	1	OK	366682	372774	0.983658	false	true	measured	measured	
+gzip	symbols.dwarf	7	2	OK	365677	372774	0.980962	false	true	measured	measured	
+gzip	symbols.dwarf	7	4	OK	365677	372774	0.980962	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	7	1	OK	366682	372407	0.984627	false	true	measured	measured	
+pigz	symbols.dwarf	7	2	OK	365677	372407	0.981928	false	true	measured	measured	
+pigz	symbols.dwarf	7	4	OK	365677	372407	0.981928	false	true	measured	measured	
+libdeflate	symbols.dwarf	7	1	OK	366682	367135	0.998766	false	true	measured	measured	
+libdeflate	symbols.dwarf	7	2	OK	365677	367135	0.996029	false	true	measured	measured	
+libdeflate	symbols.dwarf	7	4	OK	365677	367135	0.996029	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	7	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	7	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	7	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	8	1	OK	366388	371584	0.986017	false	true	measured	measured	
+gzip	symbols.dwarf	8	2	OK	366347	371584	0.985906	false	true	measured	measured	
+gzip	symbols.dwarf	8	4	OK	366347	371584	0.985906	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	8	1	OK	366388	371584	0.986017	false	true	measured	measured	
+pigz	symbols.dwarf	8	2	OK	366347	371584	0.985906	false	true	measured	measured	
+pigz	symbols.dwarf	8	4	OK	366347	371584	0.985906	false	true	measured	measured	
+libdeflate	symbols.dwarf	8	1	OK	366388	366616	0.999378	false	true	measured	measured	
+libdeflate	symbols.dwarf	8	2	OK	366347	366616	0.999266	false	true	measured	measured	
+libdeflate	symbols.dwarf	8	4	OK	366347	366616	0.999266	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	8	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	8	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	8	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	9	1	OK	366624	371524	0.986811	false	true	measured	measured	
+gzip	symbols.dwarf	9	2	OK	366692	371524	0.986994	false	true	measured	measured	
+gzip	symbols.dwarf	9	4	OK	354462	371524	0.954076	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	symbols.dwarf	9	1	OK	366624	371455	0.986994	false	true	measured	measured	
+pigz	symbols.dwarf	9	2	OK	366692	371455	0.987177	false	true	measured	measured	
+pigz	symbols.dwarf	9	4	OK	354462	371455	0.954253	false	true	measured	measured	
+libdeflate	symbols.dwarf	9	1	OK	366624	366624	1.000000	false	true	measured	measured	
+libdeflate	symbols.dwarf	9	2	OK	366692	366624	1.000185	true	true	measured	measured	
+libdeflate	symbols.dwarf	9	4	OK	354462	366624	0.966827	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	9	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	9	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	9	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	10	1	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	10	2	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	10	4	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	10	1	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	10	2	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	symbols.dwarf	10	1	OK	354996	354996	1.000000	false	true	measured	measured	
+libdeflate	symbols.dwarf	10	2	OK	366692	354996	1.032947	true	true	measured	measured	
+libdeflate	symbols.dwarf	10	4	OK	354455	354996	0.998476	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	10	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	10	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	10	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	11	1	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	11	2	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	11	4	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	11	1	OK	354162	350833	1.009489	true	true	measured	measured	
+pigz	symbols.dwarf	11	2	OK	366692	350833	1.045204	true	true	measured	measured	
+pigz	symbols.dwarf	11	4	OK	353875	350833	1.008671	true	true	measured	measured	
+libdeflate	symbols.dwarf	11	1	OK	354162	354162	1.000000	false	true	measured	measured	
+libdeflate	symbols.dwarf	11	2	OK	366692	354162	1.035379	true	true	measured	measured	
+libdeflate	symbols.dwarf	11	4	OK	353875	354162	0.999190	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	11	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	11	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	11	4	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	12	1	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	12	2	ABSENT	0	0	NaN	false	false			
+gzip	symbols.dwarf	12	4	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	12	1	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	12	2	ABSENT	0	0	NaN	false	false			
+pigz	symbols.dwarf	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	symbols.dwarf	12	1	OK	354048	354046	1.000006	true	true	measured	measured	
+libdeflate	symbols.dwarf	12	2	OK	366692	354046	1.035719	true	true	measured	measured	
+libdeflate	symbols.dwarf	12	4	OK	353937	354046	0.999692	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	symbols.dwarf	12	1	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	12	2	ABSENT	0	0	NaN	false	false			
+igzip	symbols.dwarf	12	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	1	1	OK	12900399	12907152	0.999477	false	true	measured	measured	
+gzip	movie.mp4	1	2	OK	12899956	12907152	0.999442	false	true	measured	measured	
+gzip	movie.mp4	1	4	OK	12899956	12907152	0.999442	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	1	1	OK	12900399	12911812	0.999116	false	true	measured	measured	
+pigz	movie.mp4	1	2	OK	12899956	12911792	0.999083	false	true	measured	measured	
+pigz	movie.mp4	1	4	OK	12899956	12911792	0.999083	false	true	measured	measured	
+libdeflate	movie.mp4	1	1	OK	12900399	12901167	0.999940	false	true	measured	measured	
+libdeflate	movie.mp4	1	2	OK	12899956	12901167	0.999906	false	true	measured	measured	
+libdeflate	movie.mp4	1	4	OK	12899956	12901167	0.999906	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	1	1	OK	12900399	12907108	0.999480	false	true	measured	measured	
+igzip	movie.mp4	1	2	OK	12899956	12907108	0.999446	false	true	measured	measured	
+igzip	movie.mp4	1	4	OK	12899956	12907108	0.999446	false	true	measured	measured	
+gzip	movie.mp4	2	1	OK	12891898	12907756	0.998771	false	true	measured	measured	
+gzip	movie.mp4	2	2	OK	12891610	12907756	0.998749	false	true	measured	measured	
+gzip	movie.mp4	2	4	OK	12891610	12907756	0.998749	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	2	1	OK	12891898	12912182	0.998429	false	true	measured	measured	
+pigz	movie.mp4	2	2	OK	12891610	12912181	0.998407	false	true	measured	measured	
+pigz	movie.mp4	2	4	OK	12891610	12912181	0.998407	false	true	measured	measured	
+libdeflate	movie.mp4	2	1	OK	12891898	12891898	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	2	2	OK	12891610	12891898	0.999978	false	true	measured	measured	
+libdeflate	movie.mp4	2	4	OK	12891610	12891898	0.999978	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	2	1	OK	12891898	12904355	0.999035	false	true	measured	measured	
+igzip	movie.mp4	2	2	OK	12891610	12904355	0.999012	false	true	measured	measured	
+igzip	movie.mp4	2	4	OK	12891610	12904355	0.999012	false	true	measured	measured	
+gzip	movie.mp4	3	1	OK	12889865	12907902	0.998603	false	true	measured	measured	
+gzip	movie.mp4	3	2	OK	12889723	12907902	0.998592	false	true	measured	measured	
+gzip	movie.mp4	3	4	OK	12889723	12907902	0.998592	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	3	1	OK	12889865	12912490	0.998248	false	true	measured	measured	
+pigz	movie.mp4	3	2	OK	12889723	12912484	0.998237	false	true	measured	measured	
+pigz	movie.mp4	3	4	OK	12889723	12912484	0.998237	false	true	measured	measured	
+libdeflate	movie.mp4	3	1	OK	12889865	12891366	0.999884	false	true	measured	measured	
+libdeflate	movie.mp4	3	2	OK	12889723	12891366	0.999873	false	true	measured	measured	
+libdeflate	movie.mp4	3	4	OK	12889723	12891366	0.999873	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	3	1	OK	12889865	12902640	0.999010	false	true	measured	measured	
+igzip	movie.mp4	3	2	OK	12889723	12902640	0.998999	false	true	measured	measured	
+igzip	movie.mp4	3	4	OK	12889723	12902640	0.998999	false	true	measured	measured	
+gzip	movie.mp4	4	1	OK	12891391	12904994	0.998946	false	true	measured	measured	
+gzip	movie.mp4	4	2	OK	12890407	12904994	0.998870	false	true	measured	measured	
+gzip	movie.mp4	4	4	OK	12890407	12904994	0.998870	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	4	1	OK	12891391	12910815	0.998496	false	true	measured	measured	
+pigz	movie.mp4	4	2	OK	12890407	12910815	0.998419	false	true	measured	measured	
+pigz	movie.mp4	4	4	OK	12890407	12910815	0.998419	false	true	measured	measured	
+libdeflate	movie.mp4	4	1	OK	12891391	12891391	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	4	2	OK	12890407	12891391	0.999924	false	true	measured	measured	
+libdeflate	movie.mp4	4	4	OK	12890407	12891391	0.999924	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	4	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	4	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	4	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	5	1	OK	12889949	12904483	0.998874	false	true	measured	measured	
+gzip	movie.mp4	5	2	OK	12890396	12904483	0.998908	false	true	measured	measured	
+gzip	movie.mp4	5	4	OK	12890396	12904483	0.998908	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	5	1	OK	12889949	12910466	0.998411	false	true	measured	measured	
+pigz	movie.mp4	5	2	OK	12890396	12910466	0.998445	false	true	measured	measured	
+pigz	movie.mp4	5	4	OK	12890396	12910466	0.998445	false	true	measured	measured	
+libdeflate	movie.mp4	5	1	OK	12889949	12890419	0.999964	false	true	measured	measured	
+libdeflate	movie.mp4	5	2	OK	12890396	12890419	0.999998	false	true	measured	measured	
+libdeflate	movie.mp4	5	4	OK	12890396	12890419	0.999998	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	5	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	5	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	5	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	6	1	OK	12890509	12903678	0.998979	false	true	measured	measured	
+gzip	movie.mp4	6	2	OK	12890389	12903678	0.998970	false	true	measured	measured	
+gzip	movie.mp4	6	4	OK	12890389	12903678	0.998970	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	6	1	OK	12890509	12909742	0.998510	false	true	measured	measured	
+pigz	movie.mp4	6	2	OK	12890389	12909742	0.998501	false	true	measured	measured	
+pigz	movie.mp4	6	4	OK	12890389	12909742	0.998501	false	true	measured	measured	
+libdeflate	movie.mp4	6	1	OK	12890509	12890404	1.000008	true	true	measured	measured	
+libdeflate	movie.mp4	6	2	OK	12890389	12890404	0.999999	false	true	measured	measured	
+libdeflate	movie.mp4	6	4	OK	12890389	12890404	0.999999	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	6	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	6	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	6	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	7	1	OK	12890467	12903380	0.998999	false	true	measured	measured	
+gzip	movie.mp4	7	2	OK	12890389	12903380	0.998993	false	true	measured	measured	
+gzip	movie.mp4	7	4	OK	12890389	12903380	0.998993	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	7	1	OK	12890467	12909466	0.998528	false	true	measured	measured	
+pigz	movie.mp4	7	2	OK	12890389	12909466	0.998522	false	true	measured	measured	
+pigz	movie.mp4	7	4	OK	12890389	12909466	0.998522	false	true	measured	measured	
+libdeflate	movie.mp4	7	1	OK	12890467	12890510	0.999997	false	true	measured	measured	
+libdeflate	movie.mp4	7	2	OK	12890389	12890510	0.999991	false	true	measured	measured	
+libdeflate	movie.mp4	7	4	OK	12890389	12890510	0.999991	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	7	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	7	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	7	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	8	1	OK	12889493	12902526	0.998990	false	true	measured	measured	
+gzip	movie.mp4	8	2	OK	12889638	12902526	0.999001	false	true	measured	measured	
+gzip	movie.mp4	8	4	OK	12889638	12902526	0.999001	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	8	1	OK	12889493	12909127	0.998479	false	true	measured	measured	
+pigz	movie.mp4	8	2	OK	12889638	12909127	0.998490	false	true	measured	measured	
+pigz	movie.mp4	8	4	OK	12889638	12909127	0.998490	false	true	measured	measured	
+libdeflate	movie.mp4	8	1	OK	12889493	12890409	0.999929	false	true	measured	measured	
+libdeflate	movie.mp4	8	2	OK	12889638	12890409	0.999940	false	true	measured	measured	
+libdeflate	movie.mp4	8	4	OK	12889638	12890409	0.999940	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	8	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	8	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	8	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	9	1	OK	12890409	12902396	0.999071	false	true	measured	measured	
+gzip	movie.mp4	9	2	OK	12890240	12902396	0.999058	false	true	measured	measured	
+gzip	movie.mp4	9	4	OK	12888674	12902396	0.998936	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+pigz	movie.mp4	9	1	OK	12890409	12908977	0.998562	false	true	measured	measured	
+pigz	movie.mp4	9	2	OK	12890240	12908977	0.998549	false	true	measured	measured	
+pigz	movie.mp4	9	4	OK	12888674	12908977	0.998427	false	true	measured	measured	
+libdeflate	movie.mp4	9	1	OK	12890409	12890409	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	9	2	OK	12890240	12890409	0.999987	false	true	measured	measured	
+libdeflate	movie.mp4	9	4	OK	12888674	12890409	0.999865	false	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	9	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	9	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	9	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	10	1	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	10	2	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	10	4	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	10	1	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	10	2	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	10	4	ABSENT	0	0	NaN	false	false			
+libdeflate	movie.mp4	10	1	OK	12887792	12887792	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	10	2	OK	12890240	12887792	1.000190	true	true	measured	measured	
+libdeflate	movie.mp4	10	4	OK	12888674	12887792	1.000068	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	10	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	10	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	10	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	11	1	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	11	2	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	11	4	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	11	1	OK	12887682	12887009	1.000052	true	true	measured	measured	
+pigz	movie.mp4	11	2	OK	12890240	12887009	1.000251	true	true	measured	measured	
+pigz	movie.mp4	11	4	OK	12887905	12887009	1.000070	true	true	measured	measured	
+libdeflate	movie.mp4	11	1	OK	12887682	12887682	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	11	2	OK	12890240	12887682	1.000198	true	true	measured	measured	
+libdeflate	movie.mp4	11	4	OK	12887905	12887682	1.000017	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	11	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	11	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	11	4	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	12	1	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	12	2	ABSENT	0	0	NaN	false	false			
+gzip	movie.mp4	12	4	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	12	1	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	12	2	ABSENT	0	0	NaN	false	false			
+pigz	movie.mp4	12	4	ABSENT	0	0	NaN	false	false			
+libdeflate	movie.mp4	12	1	OK	12887660	12887660	1.000000	false	true	measured	measured	
+libdeflate	movie.mp4	12	2	OK	12890240	12887660	1.000200	true	true	measured	measured	
+libdeflate	movie.mp4	12	4	OK	12887852	12887660	1.000015	true	true	measured	structural-invariant (template has no {threads} token; copied from T2)	
+igzip	movie.mp4	12	1	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	12	2	ABSENT	0	0	NaN	false	false			
+igzip	movie.mp4	12	4	ABSENT	0	0	NaN	false	false			
