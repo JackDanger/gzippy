@@ -1,0 +1,165 @@
+SIZECENSUS gzippy_sha256=a69c0eabab60 commit=e2c73d4456b48b273faefc4cf22f46220d35e1e1 host=Linux aarch64
+  rival gzip         gzip 1.12
+  rival pigz         pigz 2.8
+  rival libdeflate   gzip compression program v1.19
+  rival igzip        igzip command line interface 2.31.1
+  corpus files: 11 (shas stamped in the JSON artifact)
+
+FAILING CELLS (gzippy strictly BIGGER): 101 of 1122 measured cells
+
+vs gzip (1 of 297 measured, worst +0.21%):
+  L5  T1  minjs.min.js              1101520 vs      1099255  +0.21%
+
+vs igzip (0 of 99 measured, worst +0.00%):
+
+vs libdeflate (71 of 396 measured, worst +17.58%):
+  L11 T2  data.csv                  3300490 vs      2807081  +17.58%
+  L12 T2  data.csv                  3300490 vs      2808217  +17.53%
+  L10 T2  data.csv                  3300490 vs      2818735  +17.09%
+  L12 T2  aozora.txt                3990398 vs      3777926  +5.62%
+  L11 T2  aozora.txt                3990398 vs      3778840  +5.60%
+  L10 T2  aozora.txt                3990398 vs      3781386  +5.53%
+  L12 T2  dickens                   4480887 vs      4318553  +3.76%
+  L11 T2  dickens                   4480887 vs      4318863  +3.75%
+  L10 T2  dickens                   4480887 vs      4322131  +3.67%
+  L12 T2  symbols.dwarf              366692 vs       354046  +3.57%
+  L11 T2  symbols.dwarf              366692 vs       354162  +3.54%
+  L10 T2  symbols.dwarf              366692 vs       354996  +3.29%
+  L12 T2  engine.wasm                396140 vs       383711  +3.24%
+  L11 T2  engine.wasm                396140 vs       383725  +3.24%
+  L10 T2  engine.wasm                396140 vs       383919  +3.18%
+  L12 T2  tool.bin                 20652075 vs     20065091  +2.93%
+  L11 T2  minjs.min.js              1078967 vs      1048557  +2.90%
+  L12 T2  minjs.min.js              1078967 vs      1048679  +2.89%
+  L11 T2  tool.bin                 20652075 vs     20073160  +2.88%
+  L10 T2  minjs.min.js              1078967 vs      1049199  +2.84%
+  L10 T2  tool.bin                 20652075 vs     20105241  +2.72%
+  L11 T2  armexe.elf                 574413 vs       561122  +2.37%
+  L12 T2  armexe.elf                 574413 vs       561378  +2.32%
+  L10 T2  armexe.elf                 574413 vs       561389  +2.32%
+  L12 T2  data.json                 1447248 vs      1415408  +2.25%
+  L11 T2  data.json                 1447248 vs      1415433  +2.25%
+  L12 T2  data.parquet             14018811 vs     13745986  +1.98%
+  L11 T2  data.parquet             14018811 vs     13748731  +1.96%
+  L10 T2  data.parquet             14018811 vs     13764796  +1.85%
+  L11 T4  dickens                   4332922 vs      4318863  +0.33%
+  L12 T4  dickens                   4332448 vs      4318553  +0.32%
+  L10 T4  dickens                   4335897 vs      4322131  +0.32%
+  L11 T1  data.csv                  2809802 vs      2807081  +0.10%
+  L11 T4  data.csv                  2809477 vs      2807081  +0.09%
+  L10 T4  data.json                 1456229 vs      1455311  +0.06%
+  L5  T1  symbols.dwarf              370913 vs       370707  +0.06%
+  L11 T4  armexe.elf                 561432 vs       561122  +0.06%
+  L10 T4  aozora.txt                3783120 vs      3781386  +0.05%
+  L8  T1  minjs.min.js              1079656 vs      1079262  +0.04%
+  L10 T4  armexe.elf                 561525 vs       561389  +0.02%
+  L12 T4  aozora.txt                3778683 vs      3777926  +0.02%
+  L12 T2  movie.mp4                12890240 vs     12887660  +0.02%
+  L11 T2  movie.mp4                12890240 vs     12887682  +0.02%
+  L10 T2  movie.mp4                12890240 vs     12887792  +0.02%
+  L9  T2  symbols.dwarf              366692 vs       366624  +0.02%
+  L12 T4  armexe.elf                 561477 vs       561378  +0.02%
+  L5  T1  minjs.min.js              1101520 vs      1101333  +0.02%
+  L9  T2  data.json                 1447248 vs      1447035  +0.01%
+  L8  T2  data.json                 1447326 vs      1447115  +0.01%
+  L8  T4  data.json                 1447326 vs      1447115  +0.01%
+  L8  T2  aozora.txt                3995509 vs      3994998  +0.01%
+  L8  T4  aozora.txt                3995509 vs      3994998  +0.01%
+  L12 T1  data.csv                  2808434 vs      2808217  +0.01%
+  L11 T4  data.json                 1415535 vs      1415433  +0.01%
+  L10 T4  movie.mp4                12888674 vs     12887792  +0.01%
+  L12 T1  tool.bin                 20066350 vs     20065091  +0.01%
+  L8  T1  aozora.txt                3995240 vs      3994998  +0.01%
+  L9  T2  data.csv                  3300490 vs      3300291  +0.01%
+  L12 T4  data.json                 1415487 vs      1415408  +0.01%
+  L11 T1  tool.bin                 20074197 vs     20073160  +0.01%
+  L8  T2  dickens                   4482255 vs      4482027  +0.01%
+  L8  T4  dickens                   4482255 vs      4482027  +0.01%
+  L9  T2  dickens                   4480887 vs      4480689  +0.00%
+  L12 T1  data.parquet             13746404 vs     13745986  +0.00%
+  L11 T1  armexe.elf                 561134 vs       561122  +0.00%
+  L11 T4  movie.mp4                12887905 vs     12887682  +0.00%
+  L12 T4  movie.mp4                12887852 vs     12887660  +0.00%
+  L11 T4  aozora.txt                3778886 vs      3778840  +0.00%
+  L6  T1  movie.mp4                12890509 vs     12890404  +0.00%
+  L12 T1  symbols.dwarf              354048 vs       354046  +0.00%
+  L11 T1  data.parquet             13748806 vs     13748731  +0.00%
+
+vs pigz (29 of 330 measured, worst +17.86%):
+  L11 T2  data.csv                  3300490 vs      2800296  +17.86%
+  L11 T2  aozora.txt                3990398 vs      3779492  +5.58%
+  L11 T2  symbols.dwarf              366692 vs       350833  +4.52%
+  L11 T2  engine.wasm                396140 vs       381693  +3.78%
+  L11 T2  dickens                   4480887 vs      4324393  +3.62%
+  L11 T2  tool.bin                 20652075 vs     19978833  +3.37%
+  L11 T2  minjs.min.js              1078967 vs      1045780  +3.17%
+  L11 T2  armexe.elf                 574413 vs       558350  +2.88%
+  L11 T2  data.parquet             14018811 vs     13647792  +2.72%
+  L11 T2  data.json                 1447248 vs      1419427  +1.96%
+  L11 T1  symbols.dwarf              354162 vs       350833  +0.95%
+  L11 T4  symbols.dwarf              353875 vs       350833  +0.87%
+  L11 T1  data.parquet             13748806 vs     13647792  +0.74%
+  L11 T4  data.parquet             13744855 vs     13647792  +0.71%
+  L11 T4  armexe.elf                 561432 vs       558350  +0.55%
+  L11 T1  engine.wasm                383725 vs       381693  +0.53%
+  L11 T1  armexe.elf                 561134 vs       558350  +0.50%
+  L11 T1  tool.bin                 20074197 vs     19978833  +0.48%
+  L11 T4  engine.wasm                383501 vs       381693  +0.47%
+  L11 T4  tool.bin                 20064628 vs     19978833  +0.43%
+  L11 T1  data.csv                  2809802 vs      2800296  +0.34%
+  L11 T4  data.csv                  2809477 vs      2800296  +0.33%
+  L11 T1  minjs.min.js              1048557 vs      1045780  +0.27%
+  L11 T4  minjs.min.js              1048253 vs      1045780  +0.24%
+  L11 T4  dickens                   4332922 vs      4324393  +0.20%
+  L5  T1  minjs.min.js              1101520 vs      1099533  +0.18%
+  L11 T2  movie.mp4                12890240 vs     12887009  +0.03%
+  L11 T4  movie.mp4                12887905 vs     12887009  +0.01%
+  L11 T1  movie.mp4                12887682 vs     12887009  +0.01%
+
+THREAD SHORTCUT VOIDED this run (44 group(s) — every declared T>=2 was measured individually for these, never projected; see module doc):
+  ours L09 dickens: witness T2 (compressed sha256=6e0bf8a83494) != witness T4 (compressed sha256=66b3d6feebb2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 dickens: witness T2 (compressed sha256=6e0bf8a83494) != witness T4 (compressed sha256=9f5b15dfb2c2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 dickens: witness T2 (compressed sha256=6e0bf8a83494) != witness T4 (compressed sha256=b1044e4ce465) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 dickens: witness T2 (compressed sha256=6e0bf8a83494) != witness T4 (compressed sha256=c47e00406b23) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 aozora.txt: witness T2 (compressed sha256=01222b84d951) != witness T4 (compressed sha256=2087660ae8f2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 aozora.txt: witness T2 (compressed sha256=01222b84d951) != witness T4 (compressed sha256=6376e8dc3d71) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 aozora.txt: witness T2 (compressed sha256=01222b84d951) != witness T4 (compressed sha256=5643c034098c) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 aozora.txt: witness T2 (compressed sha256=01222b84d951) != witness T4 (compressed sha256=215045cc9eb1) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 data.json: witness T2 (compressed sha256=b8bcffc5aa87) != witness T4 (compressed sha256=5e7459ce4204) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 data.json: witness T2 (compressed sha256=b8bcffc5aa87) != witness T4 (compressed sha256=9db5c24ad8d7) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 data.json: witness T2 (compressed sha256=b8bcffc5aa87) != witness T4 (compressed sha256=fda85160c8fd) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 data.json: witness T2 (compressed sha256=b8bcffc5aa87) != witness T4 (compressed sha256=d5aa3085df53) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 data.csv: witness T2 (compressed sha256=8cdd167c3802) != witness T4 (compressed sha256=b1a140cec750) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 data.csv: witness T2 (compressed sha256=8cdd167c3802) != witness T4 (compressed sha256=b1a140cec750) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 data.csv: witness T2 (compressed sha256=8cdd167c3802) != witness T4 (compressed sha256=5153fffe7687) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 data.csv: witness T2 (compressed sha256=8cdd167c3802) != witness T4 (compressed sha256=2f7456882f7c) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 data.parquet: witness T2 (compressed sha256=981359884f24) != witness T4 (compressed sha256=ef122626f6b2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 data.parquet: witness T2 (compressed sha256=981359884f24) != witness T4 (compressed sha256=4e33a9eff1e3) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 data.parquet: witness T2 (compressed sha256=981359884f24) != witness T4 (compressed sha256=605052629f4a) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 data.parquet: witness T2 (compressed sha256=981359884f24) != witness T4 (compressed sha256=e637c94fb9d1) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 minjs.min.js: witness T2 (compressed sha256=87ad7406b757) != witness T4 (compressed sha256=04171ca166f8) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 minjs.min.js: witness T2 (compressed sha256=87ad7406b757) != witness T4 (compressed sha256=939ee6957b3b) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 minjs.min.js: witness T2 (compressed sha256=87ad7406b757) != witness T4 (compressed sha256=9b355d697e29) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 minjs.min.js: witness T2 (compressed sha256=87ad7406b757) != witness T4 (compressed sha256=b15af5c72c87) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 armexe.elf: witness T2 (compressed sha256=87062d74ad69) != witness T4 (compressed sha256=0cf914678549) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 armexe.elf: witness T2 (compressed sha256=87062d74ad69) != witness T4 (compressed sha256=950da7fa0762) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 armexe.elf: witness T2 (compressed sha256=87062d74ad69) != witness T4 (compressed sha256=a1ce4db4bfe0) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 armexe.elf: witness T2 (compressed sha256=87062d74ad69) != witness T4 (compressed sha256=be122525507f) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 tool.bin: witness T2 (compressed sha256=93c35f59d90c) != witness T4 (compressed sha256=be8ec5e84cbe) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 tool.bin: witness T2 (compressed sha256=93c35f59d90c) != witness T4 (compressed sha256=cc23f3d2b09b) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 tool.bin: witness T2 (compressed sha256=93c35f59d90c) != witness T4 (compressed sha256=7ec8e579e932) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 tool.bin: witness T2 (compressed sha256=93c35f59d90c) != witness T4 (compressed sha256=a5724543d8f2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 engine.wasm: witness T2 (compressed sha256=af4e1404b8fb) != witness T4 (compressed sha256=8ca21c2c1099) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 engine.wasm: witness T2 (compressed sha256=af4e1404b8fb) != witness T4 (compressed sha256=54d6795ab9e4) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 engine.wasm: witness T2 (compressed sha256=af4e1404b8fb) != witness T4 (compressed sha256=f524cfb35f3c) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 engine.wasm: witness T2 (compressed sha256=af4e1404b8fb) != witness T4 (compressed sha256=81fab16cd9fb) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 symbols.dwarf: witness T2 (compressed sha256=cb3db3549283) != witness T4 (compressed sha256=3d1dbd58a626) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 symbols.dwarf: witness T2 (compressed sha256=cb3db3549283) != witness T4 (compressed sha256=e9524a401eb1) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 symbols.dwarf: witness T2 (compressed sha256=cb3db3549283) != witness T4 (compressed sha256=613f468efdf3) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 symbols.dwarf: witness T2 (compressed sha256=cb3db3549283) != witness T4 (compressed sha256=c5bf7a0876d2) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L09 movie.mp4: witness T2 (compressed sha256=26d70486d688) != witness T4 (compressed sha256=c7be92fcd35f) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L10 movie.mp4: witness T2 (compressed sha256=26d70486d688) != witness T4 (compressed sha256=83c5bad9a204) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L11 movie.mp4: witness T2 (compressed sha256=26d70486d688) != witness T4 (compressed sha256=71d7b5498075) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+  ours L12 movie.mp4: witness T2 (compressed sha256=26d70486d688) != witness T4 (compressed sha256=2785b7ddc4ac) on this run — shortcut VOIDED, every declared T>=2 measured individually as fallback
+
+SIZECENSUS declared=1584 measured_ok=1122 absent=462 rival_unavailable=0 void=0 bigger=101 thread_shortcut_voided=44 gzip_bigger=1 igzip_bigger=0 libdeflate_bigger=71 pigz_bigger=29
