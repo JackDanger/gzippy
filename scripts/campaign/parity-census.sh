@@ -140,8 +140,19 @@ IFS=',' read -r -a THREAD_ARR <<< "$THREADS"
 
 # A cell that cannot PROVE it ran the parallel route for its requested thread
 # count is a divergence-class failure (see the header receipt).
+#
+# TWO accepted proofs (both name the REQUESTED count exactly, so an unproven
+# parallel route stays a FAIL): the historical "($t threads)" phrasing AND the
+# shipped 1.0.0 format "threads=$t" (from `compress path=... threads=N`,
+# `src/compress/pipelined.rs:728-729`). The receipt 2026-11-12: the first
+# fulcrum-parity census on the termag box (parity-a69c0eabab60-11121146) came
+# back ROUTE-UNCONFIRMED on every T>1 cell — the needle predates the 1.0 `-v`
+# rephrase; nothing on the box (or in any CI leg) ever checked the other
+# spelling, so the format drift was invisible to both sides. A format drift
+# here must interrupt, not silently unproven — any THIRD preferred spelling
+# needs this helper extended, not a looser needle.
 route_proven() {  # route_proven <errfile> <threads>
-  grep -q "($2 threads)" "$1"
+  grep -q "($2 threads)" "$1" || grep -qE "threads=$2([^0-9]|$)" "$1"
 }
 
 FAILS=0
