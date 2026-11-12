@@ -1,0 +1,1585 @@
+rival	corpus	level	threads	status	wall_class	wall_ratio	a_cpu_pct	b_cpu_pct	pin_ok	pin_unmeasurable	a_median_ms	b_median_ms	n	error
+gzip	dickens	1	1	OK	WIN	0.554999	100.2	100.1	true	false	94.4857	170.3154	9	
+gzip	dickens	1	2	OK	WIN	0.303121	284.2	100.1	true	false	51.6169	170.5511	9	
+gzip	dickens	1	4	OK	WIN	0.169316	436.7	100.1	true	false	28.8108	170.3389	9	
+gzip	dickens	2	1	OK	WIN	0.519003	100.1	100.1	true	false	98.7204	189.5774	9	
+gzip	dickens	2	2	OK	WIN	0.380527	289.4	100.1	true	false	72.1628	189.4908	9	
+gzip	dickens	2	4	OK	WIN	0.210366	452.5	100.1	true	false	39.8519	189.5349	9	
+gzip	dickens	3	1	OK	WIN	0.531317	100.1	100.1	true	false	138.9452	260.5032	9	
+gzip	dickens	3	2	OK	WIN	0.379246	291.3	100.1	true	false	98.8898	260.4635	9	
+gzip	dickens	3	4	OK	WIN	0.205489	460.6	100.1	true	false	53.5512	260.6032	9	
+gzip	dickens	4	1	OK	WIN	0.491069	100.1	100.1	true	false	118.8165	242.4599	9	
+gzip	dickens	4	2	OK	WIN	0.457786	292.4	100.1	true	false	110.9273	242.4208	9	
+gzip	dickens	4	4	OK	WIN	0.246678	463.4	100.1	true	false	59.8209	242.4757	9	
+gzip	dickens	5	1	OK	WIN	0.385159	100.1	100.0	true	false	149.8787	389.9689	9	
+gzip	dickens	5	2	OK	WIN	0.333889	293.0	100.1	true	false	130.2976	390.2795	9	
+gzip	dickens	5	4	OK	WIN	0.178860	464.3	100.1	true	false	69.8476	390.3516	9	
+gzip	dickens	6	1	OK	WIN	0.404580	100.1	100.0	true	false	248.6327	614.0376	9	
+gzip	dickens	6	2	OK	WIN	0.257594	296.1	100.0	true	false	158.2645	613.6982	9	
+gzip	dickens	6	4	OK	WIN	0.134974	476.3	100.0	true	false	82.8664	614.0256	9	
+gzip	dickens	7	1	OK	WIN	0.404090	100.1	100.0	true	false	290.3881	718.7065	9	
+gzip	dickens	7	2	OK	WIN	0.221207	296.1	100.0	true	false	158.9680	719.6869	9	
+gzip	dickens	7	4	OK	WIN	0.116620	477.7	100.0	true	false	83.7151	717.4054	9	
+gzip	dickens	8	1	OK	WIN	0.431184	100.1	100.0	true	false	356.4344	827.7730	9	
+gzip	dickens	8	2	OK	WIN	0.227788	294.6	100.0	true	false	188.2998	826.5418	9	
+gzip	dickens	8	4	OK	WIN	0.119538	473.8	100.0	true	false	99.0073	828.8664	9	
+gzip	dickens	9	1	OK	WIN	0.462645	100.0	100.0	true	false	383.0229	828.0228	9	
+gzip	dickens	9	2	VOID	VOID	0.269572	295.8	100.0	true	false	219.7423	830.2121	9	paired verdict: VOID-aa_bias=0.0013
+gzip	dickens	9	4	OK	WIN	0.315427	476.9	100.0	true	false	260.7544	825.5053	9	
+gzip	dickens	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	dickens	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	1	1	OK	WIN	0.709959	100.2	100.2	true	false	94.2542	132.6910	9	
+pigz	dickens	1	2	OK	WIN	0.726843	285.1	199.6	true	false	50.8668	70.6554	9	
+pigz	dickens	1	4	OK	WIN	0.823862	439.9	382.7	true	false	28.3844	37.4750	9	
+pigz	dickens	2	1	OK	WIN	0.641267	100.4	100.3	true	false	98.7784	153.2694	9	
+pigz	dickens	2	2	OK	TIE	0.948281	212.6	146.7	true	false	101.2190	106.8535	9	
+pigz	dickens	2	4	OK	TIE	0.987595	282.3	240.9	true	false	73.7232	80.0035	9	
+pigz	dickens	3	1	OK	WIN	0.612827	94.5	99.7	true	false	138.9567	226.2529	9	
+pigz	dickens	3	2	OK	WIN	0.822738	291.7	199.0	true	false	147.0873	163.2518	9	
+pigz	dickens	3	4	OK	WIN	0.916440	261.7	236.6	true	false	99.9046	110.9025	9	
+pigz	dickens	4	1	OK	WIN	0.534780	83.1	99.9	true	false	119.3903	223.3763	9	
+pigz	dickens	4	2	OK	TIE	1.124670	196.7	154.3	true	false	140.7615	123.0601	9	
+pigz	dickens	4	4	OK	TIE	1.054099	257.2	252.1	true	false	110.2284	112.0094	9	
+pigz	dickens	5	1	OK	WIN	0.401766	100.2	100.1	true	false	150.5998	373.0792	9	
+pigz	dickens	5	2	OK	WIN	0.668357	292.9	198.6	true	false	130.3488	194.8797	9	
+pigz	dickens	5	4	OK	WIN	0.691581	466.6	387.3	true	false	69.4523	100.5937	9	
+pigz	dickens	6	1	OK	WIN	0.414367	100.1	100.0	true	false	248.5602	598.9536	9	
+pigz	dickens	6	2	OK	WIN	0.513957	295.3	199.1	true	false	157.9494	307.2027	9	
+pigz	dickens	6	4	OK	WIN	0.525605	476.0	388.2	true	false	82.9129	157.7294	9	
+pigz	dickens	7	1	OK	WIN	0.413235	100.1	100.0	true	false	290.2585	702.1759	9	
+pigz	dickens	7	2	OK	WIN	0.442611	296.1	198.9	true	false	158.8922	359.1162	9	
+pigz	dickens	7	4	OK	WIN	0.454915	478.5	388.6	true	false	83.6068	183.9464	9	
+pigz	dickens	8	1	OK	WIN	0.440828	100.0	100.0	true	false	356.6410	808.6498	9	
+pigz	dickens	8	2	OK	WIN	0.458508	294.8	198.8	true	false	188.4509	410.8108	9	
+pigz	dickens	8	4	OK	WIN	0.470229	473.8	389.4	true	false	98.9760	210.4524	9	
+pigz	dickens	9	1	OK	WIN	0.473341	100.0	100.0	true	false	383.2319	809.6792	9	
+pigz	dickens	9	2	OK	WIN	0.485915	295.7	199.6	true	false	199.5428	410.9379	9	
+pigz	dickens	9	4	OK	LOSS	1.243879	477.0	389.3	true	false	262.0121	210.4250	9	
+pigz	dickens	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	11	1	OK	WIN	0.062334	100.0	100.0	true	false	1205.4098	19340.1137	9	
+pigz	dickens	11	2	OK	WIN	0.020676	295.9	199.2	true	false	200.0304	9668.0237	9	
+pigz	dickens	11	4	OK	WIN	0.065824	481.6	395.7	true	false	320.8331	4872.0144	9	
+pigz	dickens	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	dickens	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	dickens	1	1	OK	LOSS	1.522277	100.2	100.3	true	false	94.0691	61.8707	9	
+libdeflate	dickens	1	2	OK	WIN	0.831571	284.9	100.3	true	false	51.6884	61.9791	9	
+libdeflate	dickens	1	4	OK	WIN	0.811005	234.1	105.3	true	false	50.2434	62.4378	9	
+libdeflate	dickens	2	1	OK	LOSS	1.032680	100.1	100.2	true	false	97.5825	94.5877	9	
+libdeflate	dickens	2	2	OK	WIN	0.763090	289.3	100.2	true	false	72.1848	94.6235	9	
+libdeflate	dickens	2	4	OK	WIN	0.421309	454.0	100.2	true	false	39.9781	94.6715	9	
+libdeflate	dickens	3	1	OK	LOSS	1.226520	100.1	100.2	true	false	138.9148	112.8201	9	
+libdeflate	dickens	3	2	OK	WIN	0.874877	291.6	100.2	true	false	98.6912	112.8145	9	
+libdeflate	dickens	3	4	OK	WIN	0.475370	464.6	100.1	true	false	53.5870	112.8833	9	
+libdeflate	dickens	4	1	OK	WIN	0.964361	100.1	100.1	true	false	118.8285	123.3546	9	
+libdeflate	dickens	4	2	OK	WIN	0.900475	292.2	100.2	true	false	111.0220	123.3969	9	
+libdeflate	dickens	4	4	OK	WIN	0.485194	464.7	100.2	true	false	59.7972	123.4912	9	
+libdeflate	dickens	5	1	OK	LOSS	1.013201	100.1	100.1	true	false	150.8953	148.3470	9	
+libdeflate	dickens	5	2	OK	WIN	0.883543	277.9	99.9	true	false	130.8464	148.5279	9	
+libdeflate	dickens	5	4	OK	WIN	0.468653	467.3	100.1	true	false	69.4990	148.4393	9	
+libdeflate	dickens	6	1	OK	LOSS	1.289983	100.1	100.1	true	false	248.0550	192.4060	9	
+libdeflate	dickens	6	2	OK	WIN	0.820881	295.5	100.1	true	false	158.0180	192.4449	9	
+libdeflate	dickens	6	4	OK	WIN	0.433312	475.3	100.1	true	false	83.4844	192.4023	9	
+libdeflate	dickens	7	1	OK	LOSS	1.117936	100.1	100.1	true	false	290.1021	259.3641	9	
+libdeflate	dickens	7	2	OK	WIN	0.613118	296.0	100.1	true	false	158.9040	259.2578	9	
+libdeflate	dickens	7	4	OK	WIN	0.322100	476.2	100.1	true	false	83.4653	259.4034	9	
+libdeflate	dickens	8	1	OK	WIN	0.930631	100.0	100.1	true	false	356.4388	382.9274	9	
+libdeflate	dickens	8	2	OK	WIN	0.491252	294.7	100.0	true	false	188.2254	383.0818	9	
+libdeflate	dickens	8	4	OK	WIN	0.257934	473.8	100.0	true	false	98.8255	383.0846	9	
+libdeflate	dickens	9	1	OK	WIN	0.927122	100.0	100.0	true	false	383.2144	413.1764	9	
+libdeflate	dickens	9	2	OK	WIN	0.482721	295.8	100.0	true	false	199.5418	413.2213	9	
+libdeflate	dickens	9	4	OK	WIN	0.631651	477.5	100.0	true	false	261.0485	413.1569	9	
+libdeflate	dickens	10	1	OK	WIN	0.936683	100.0	100.0	true	false	949.1487	1013.3638	9	
+libdeflate	dickens	10	2	OK	WIN	0.197109	295.4	100.0	true	false	199.7968	1014.4012	9	
+libdeflate	dickens	10	4	OK	WIN	0.257652	477.2	100.0	true	false	261.5515	1015.4883	9	
+libdeflate	dickens	11	1	OK	WIN	0.872000	100.0	100.0	true	false	1205.4329	1382.0404	9	
+libdeflate	dickens	11	2	OK	WIN	0.144506	296.0	100.0	true	false	199.7057	1382.2007	9	
+libdeflate	dickens	11	4	OK	WIN	0.231703	483.8	100.0	true	false	320.4125	1382.9449	9	
+libdeflate	dickens	12	1	OK	WIN	0.777497	100.0	100.0	true	false	1367.8389	1759.4762	9	
+libdeflate	dickens	12	2	OK	WIN	0.113480	295.7	100.0	true	false	199.5372	1759.2742	9	
+libdeflate	dickens	12	4	OK	WIN	0.208597	484.1	100.0	true	false	366.8710	1759.1523	9	
+igzip	dickens	1	1	OK	LOSS	1.455934	100.2	100.3	true	false	94.4210	64.7929	9	
+igzip	dickens	1	2	OK	WIN	0.796534	284.4	100.3	true	false	51.6343	64.6774	9	
+igzip	dickens	1	4	VOID		NaN	288.6	100.8	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=288.6 (ok=true) rival cpu%=100.8 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	dickens	2	1	OK	LOSS	1.639565	100.2	100.3	true	false	97.6126	59.6685	9	
+igzip	dickens	2	2	OK	LOSS	1.206980	290.2	100.3	true	false	72.0611	59.6640	9	
+igzip	dickens	2	4	VOID		NaN	301.8	100.9	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=301.8 (ok=true) rival cpu%=100.9 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	dickens	3	1	OK	LOSS	1.096933	100.1	100.1	true	false	139.0223	126.4697	9	
+igzip	dickens	3	2	OK	WIN	0.781068	291.7	100.1	true	false	98.7921	126.4344	9	
+igzip	dickens	3	4	VOID		NaN	316.6	100.4	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=316.6 (ok=true) rival cpu%=100.4 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	dickens	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	dickens	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	1	1	OK	WIN	0.509662	100.2	100.1	true	false	87.8590	172.4328	9	
+gzip	aozora.txt	1	2	OK	WIN	0.279011	285.4	100.1	true	false	48.0581	172.5055	9	
+gzip	aozora.txt	1	4	OK	WIN	0.155910	439.1	100.1	true	false	26.8766	172.4321	9	
+gzip	aozora.txt	2	1	OK	WIN	0.469676	100.2	100.1	true	false	89.2882	189.7092	9	
+gzip	aozora.txt	2	2	OK	WIN	0.537147	218.2	100.3	true	false	97.2990	189.8096	9	
+gzip	aozora.txt	2	4	OK	WIN	0.187056	455.7	100.1	true	false	35.4329	189.8087	9	
+gzip	aozora.txt	3	1	OK	WIN	0.462094	100.1	100.1	true	false	119.7769	259.2643	9	
+gzip	aozora.txt	3	2	OK	WIN	0.336777	292.8	100.1	true	false	87.0733	259.2267	9	
+gzip	aozora.txt	3	4	OK	WIN	0.181518	465.3	100.1	true	false	47.0659	259.3222	9	
+gzip	aozora.txt	4	1	OK	WIN	0.457126	100.2	100.1	true	false	106.7251	233.4735	9	
+gzip	aozora.txt	4	2	OK	WIN	0.444715	294.2	100.1	true	false	103.4919	233.5018	9	
+gzip	aozora.txt	4	4	OK	WIN	0.236100	470.8	100.1	true	false	55.3389	233.7440	9	
+gzip	aozora.txt	5	1	OK	WIN	0.359865	100.1	100.1	true	false	130.9458	363.7309	9	
+gzip	aozora.txt	5	2	OK	WIN	0.368254	294.8	100.0	true	false	134.0182	364.0612	9	
+gzip	aozora.txt	5	4	OK	WIN	0.192789	478.7	100.1	true	false	70.1271	364.0629	9	
+gzip	aozora.txt	6	1	OK	WIN	0.374175	100.1	100.0	true	false	256.3559	685.4943	9	
+gzip	aozora.txt	6	2	OK	WIN	0.298774	295.6	100.0	true	false	204.7550	685.2481	9	
+gzip	aozora.txt	6	4	OK	WIN	0.157172	472.3	100.0	true	false	107.6978	686.2350	9	
+gzip	aozora.txt	7	1	OK	WIN	0.366548	100.0	100.0	true	false	350.7313	956.9685	9	
+gzip	aozora.txt	7	2	OK	WIN	0.217473	295.1	100.0	true	false	208.3529	958.2796	9	
+gzip	aozora.txt	7	4	OK	WIN	0.114266	475.0	100.0	true	false	109.4985	956.8795	9	
+gzip	aozora.txt	8	1	OK	WIN	0.351348	100.0	100.0	true	false	430.1862	1227.3244	9	
+gzip	aozora.txt	8	2	OK	WIN	0.182162	296.6	100.0	true	false	223.2041	1225.2053	9	
+gzip	aozora.txt	8	4	OK	WIN	0.095383	478.6	100.0	true	false	116.5369	1223.6700	9	
+gzip	aozora.txt	9	1	OK	WIN	0.403942	100.0	100.0	true	false	494.4014	1223.8547	9	
+gzip	aozora.txt	9	2	OK	WIN	0.206516	296.6	100.0	true	false	252.7766	1224.7466	9	
+gzip	aozora.txt	9	4	OK	WIN	0.239148	492.9	100.0	true	false	292.9312	1224.4293	9	
+gzip	aozora.txt	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	aozora.txt	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	1	1	OK	WIN	0.643749	100.2	100.1	true	false	87.7007	136.2504	9	
+pigz	aozora.txt	1	2	OK	WIN	0.757181	194.2	176.3	true	false	73.8132	95.6255	9	
+pigz	aozora.txt	1	4	OK	WIN	0.719059	441.6	390.1	true	false	26.6692	37.1285	9	
+pigz	aozora.txt	2	1	OK	WIN	0.572508	100.2	100.1	true	false	88.7204	155.3768	9	
+pigz	aozora.txt	2	2	OK	WIN	0.795509	290.8	201.3	true	false	64.2719	80.9080	9	
+pigz	aozora.txt	2	4	OK	WIN	0.824166	457.8	390.9	true	false	35.7904	42.0085	9	
+pigz	aozora.txt	3	1	OK	WIN	0.529176	100.1	100.1	true	false	119.8912	226.6323	9	
+pigz	aozora.txt	3	2	OK	WIN	0.748641	292.3	200.7	true	false	87.4116	116.9912	9	
+pigz	aozora.txt	3	4	OK	WIN	0.786869	466.4	393.0	true	false	47.2691	60.0428	9	
+pigz	aozora.txt	4	1	OK	WIN	0.488361	100.1	100.1	true	false	106.4606	217.9903	9	
+pigz	aozora.txt	4	2	OK	TIE	0.934341	127.6	143.1	true	false	136.7748	139.1216	9	
+pigz	aozora.txt	4	4	OK	WIN	0.958613	469.7	392.9	true	false	55.2378	57.6861	9	
+pigz	aozora.txt	5	1	OK	WIN	0.374169	100.1	100.1	true	false	131.0554	350.3166	9	
+pigz	aozora.txt	5	2	OK	WIN	0.750229	294.7	200.1	true	false	134.1575	178.6014	9	
+pigz	aozora.txt	5	4	OK	WIN	0.773636	461.0	367.7	true	false	70.2679	90.9381	9	
+pigz	aozora.txt	6	1	OK	WIN	0.380474	100.1	100.0	true	false	256.2003	673.8405	9	
+pigz	aozora.txt	6	2	OK	WIN	0.601844	295.2	199.9	true	false	204.8242	340.3782	9	
+pigz	aozora.txt	6	4	OK	WIN	0.626515	474.3	396.2	true	false	107.8202	172.1204	9	
+pigz	aozora.txt	7	1	OK	WIN	0.369092	100.0	100.0	true	false	350.3871	950.8948	9	
+pigz	aozora.txt	7	2	OK	WIN	0.435358	295.2	199.6	true	false	208.3449	478.6349	9	
+pigz	aozora.txt	7	4	OK	WIN	0.454298	474.9	396.8	true	false	109.5310	241.0826	9	
+pigz	aozora.txt	8	1	OK	WIN	0.354613	100.0	100.0	true	false	430.3049	1213.5131	9	
+pigz	aozora.txt	8	2	OK	WIN	0.363289	295.9	199.5	true	false	223.0745	613.4101	9	
+pigz	aozora.txt	8	4	OK	WIN	0.377737	477.8	395.2	true	false	116.8127	308.9744	9	
+pigz	aozora.txt	9	1	OK	WIN	0.406975	100.0	100.0	true	false	494.1881	1216.1991	9	
+pigz	aozora.txt	9	2	OK	WIN	0.412834	296.7	199.3	true	false	253.3372	613.4669	9	
+pigz	aozora.txt	9	4	OK	WIN	0.954042	492.9	396.1	true	false	294.9475	309.0868	9	
+pigz	aozora.txt	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	11	1	OK	WIN	0.052813	100.0	100.0	true	false	1441.1527	27241.0841	9	
+pigz	aozora.txt	11	2	OK	WIN	0.019155	296.7	198.9	true	false	254.4858	13656.2617	9	
+pigz	aozora.txt	11	4	OK	WIN	0.070489	344.5	390.6	true	false	455.7202	6982.3830	9	
+pigz	aozora.txt	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	aozora.txt	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	aozora.txt	1	1	OK	LOSS	1.510308	100.2	100.4	true	false	87.9924	58.1777	9	
+libdeflate	aozora.txt	1	2	OK	WIN	0.869840	278.6	100.3	true	false	51.7577	58.2269	9	
+libdeflate	aozora.txt	1	4	OK	WIN	0.588291	371.6	100.3	true	false	33.8571	58.2322	9	
+libdeflate	aozora.txt	2	1	OK	LOSS	1.063541	100.2	100.2	true	false	89.1063	83.8133	9	
+libdeflate	aozora.txt	2	2	OK	WIN	0.775665	289.7	100.2	true	false	64.4206	83.7961	9	
+libdeflate	aozora.txt	2	4	OK	WIN	0.437865	454.6	100.2	true	false	35.9629	83.7722	9	
+libdeflate	aozora.txt	3	1	OK	LOSS	1.203379	100.1	100.2	true	false	120.1096	99.8655	9	
+libdeflate	aozora.txt	3	2	OK	WIN	0.881417	292.9	100.2	true	false	88.0496	99.8108	9	
+libdeflate	aozora.txt	3	4	OK	WIN	0.471003	465.1	100.2	true	false	46.8289	99.6769	9	
+libdeflate	aozora.txt	4	1	OK	WIN	0.969137	100.2	100.2	true	false	106.2812	109.8153	9	
+libdeflate	aozora.txt	4	2	OK	WIN	0.951296	294.5	100.2	true	false	104.6461	109.9003	9	
+libdeflate	aozora.txt	4	4	OK	WIN	0.502854	458.5	100.2	true	false	55.2749	109.9103	9	
+libdeflate	aozora.txt	5	1	OK	LOSS	1.016948	100.1	100.2	true	false	131.0520	128.8498	9	
+libdeflate	aozora.txt	5	2	OK	LOSS	1.041504	237.8	100.4	true	false	134.0338	128.9340	9	
+libdeflate	aozora.txt	5	4	OK	WIN	0.546659	475.1	100.1	true	false	70.4732	128.9994	9	
+libdeflate	aozora.txt	6	1	OK	LOSS	1.483299	100.1	100.1	true	false	256.3119	172.8626	9	
+libdeflate	aozora.txt	6	2	OK	LOSS	1.184780	296.0	100.1	true	false	205.0602	173.0232	9	
+libdeflate	aozora.txt	6	4	OK	WIN	0.625027	474.1	100.1	true	false	107.9647	173.0199	9	
+libdeflate	aozora.txt	7	1	OK	LOSS	1.281642	100.0	100.1	true	false	351.5291	273.9186	9	
+libdeflate	aozora.txt	7	2	OK	WIN	0.762452	294.7	100.1	true	false	208.5467	273.7497	9	
+libdeflate	aozora.txt	7	4	OK	WIN	0.400555	472.5	100.1	true	false	109.4655	273.5657	9	
+libdeflate	aozora.txt	8	1	OK	WIN	0.920090	100.0	100.0	true	false	430.0414	468.2921	9	
+libdeflate	aozora.txt	8	2	OK	WIN	0.476721	296.7	100.0	true	false	223.3634	468.3025	9	
+libdeflate	aozora.txt	8	4	OK	WIN	0.249243	478.5	100.0	true	false	116.7123	468.3002	9	
+libdeflate	aozora.txt	9	1	OK	WIN	0.913686	100.0	100.0	true	false	494.1541	540.5591	9	
+libdeflate	aozora.txt	9	2	OK	WIN	0.467838	296.8	100.0	true	false	253.2456	540.7828	9	
+libdeflate	aozora.txt	9	4	OK	WIN	0.546259	492.6	100.0	true	false	295.2625	540.5648	9	
+libdeflate	aozora.txt	10	1	OK	WIN	0.905672	100.0	100.0	true	false	1119.9614	1236.2276	9	
+libdeflate	aozora.txt	10	2	OK	WIN	0.205049	296.4	100.0	true	false	253.6772	1236.6456	9	
+libdeflate	aozora.txt	10	4	OK	WIN	0.238749	492.3	100.0	true	false	294.9092	1235.5017	9	
+libdeflate	aozora.txt	11	1	OK	WIN	0.820153	100.0	100.0	true	false	1441.8738	1758.2255	9	
+libdeflate	aozora.txt	11	2	OK	WIN	0.144226	296.1	100.0	true	false	253.5625	1756.5605	9	
+libdeflate	aozora.txt	11	4	OK	WIN	0.251942	474.4	100.0	true	false	375.7487	1757.1350	9	
+libdeflate	aozora.txt	12	1	OK	WIN	0.769375	100.0	100.0	true	false	1612.7056	2095.3760	9	
+libdeflate	aozora.txt	12	2	OK	WIN	0.127814	250.9	100.0	true	false	255.1585	2096.4781	9	
+libdeflate	aozora.txt	12	4	OK	WIN	0.219121	433.8	100.0	true	false	449.3031	2090.1405	9	
+igzip	aozora.txt	1	1	OK	LOSS	1.467664	100.2	100.3	true	false	87.7542	59.7915	9	
+igzip	aozora.txt	1	2	OK	WIN	0.803049	284.1	100.3	true	false	48.0301	59.8670	9	
+igzip	aozora.txt	1	4	VOID		NaN	437.3	100.3	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=437.3 (ok=true) rival cpu%=100.3 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	aozora.txt	2	1	OK	LOSS	1.547427	100.2	100.3	true	false	88.9875	57.6026	9	
+igzip	aozora.txt	2	2	OK	LOSS	1.121583	289.2	100.3	true	false	64.4939	57.5887	9	
+igzip	aozora.txt	2	4	VOID		NaN	452.6	100.3	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=452.6 (ok=true) rival cpu%=100.3 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	aozora.txt	3	1	OK	WIN	0.945995	100.1	100.1	true	false	119.8643	126.8096	9	
+igzip	aozora.txt	3	2	OK	WIN	0.689064	292.6	100.2	true	false	87.1673	126.7949	9	
+igzip	aozora.txt	3	4	VOID		NaN	465.2	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=465.2 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	aozora.txt	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	aozora.txt	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	1	1	OK	WIN	0.573314	100.4	100.2	true	false	51.5225	90.1797	9	
+gzip	data.json	1	2	OK	WIN	0.343017	267.2	100.2	true	false	30.9206	90.2391	9	
+gzip	data.json	1	4	OK	WIN	0.218086	376.2	100.2	true	false	19.6101	90.1491	9	
+gzip	data.json	2	1	OK	WIN	0.546359	100.3	100.2	true	false	50.3431	92.0773	9	
+gzip	data.json	2	2	OK	WIN	0.371465	274.6	100.2	true	false	34.2490	92.2584	9	
+gzip	data.json	2	4	OK	WIN	0.248555	381.6	100.2	true	false	22.9375	92.3022	9	
+gzip	data.json	3	1	OK	WIN	0.584159	100.3	100.2	true	false	57.6841	98.6600	9	
+gzip	data.json	3	2	OK	WIN	0.386515	278.2	100.2	true	false	38.1043	98.7367	9	
+gzip	data.json	3	4	OK	WIN	0.255271	387.4	100.2	true	false	25.1661	98.7093	9	
+gzip	data.json	4	1	OK	WIN	0.497128	100.3	100.2	true	false	56.0128	112.6112	9	
+gzip	data.json	4	2	OK	WIN	0.403997	280.2	100.2	true	false	45.4460	112.5847	9	
+gzip	data.json	4	4	OK	WIN	0.262235	387.1	100.2	true	false	29.4664	112.5722	9	
+gzip	data.json	5	1	OK	WIN	0.479056	100.3	100.1	true	false	63.1635	131.7212	9	
+gzip	data.json	5	2	OK	WIN	0.394764	281.0	100.1	true	false	52.0538	131.8994	9	
+gzip	data.json	5	4	OK	WIN	0.250759	394.7	100.1	true	false	32.9993	131.8882	9	
+gzip	data.json	6	1	OK	WIN	0.519523	100.2	100.1	true	false	88.5694	170.5769	9	
+gzip	data.json	6	2	OK	WIN	0.391218	285.4	100.1	true	false	66.7269	170.6977	9	
+gzip	data.json	6	4	OK	WIN	0.241706	406.7	100.1	true	false	41.1767	170.6880	9	
+gzip	data.json	7	1	OK	WIN	0.607724	100.1	100.1	true	false	118.5893	195.0482	9	
+gzip	data.json	7	2	OK	WIN	0.375609	285.4	100.1	true	false	73.2717	194.9386	9	
+gzip	data.json	7	4	OK	WIN	0.235227	404.7	100.1	true	false	45.7776	195.0399	9	
+gzip	data.json	8	1	OK	WIN	0.567589	100.1	100.1	true	false	161.0326	284.2442	9	
+gzip	data.json	8	2	OK	WIN	0.315696	285.7	100.1	true	false	89.7506	284.0938	9	
+gzip	data.json	8	4	OK	WIN	0.214756	405.5	100.1	true	false	56.0933	284.3694	9	
+gzip	data.json	9	1	OK	WIN	0.524524	100.1	100.1	true	false	164.7007	314.0392	9	
+gzip	data.json	9	2	OK	WIN	0.286158	285.8	100.1	true	false	90.0930	314.4911	9	
+gzip	data.json	9	4	OK	LOSS	1.338817	420.6	100.1	true	false	420.8736	313.7705	9	
+gzip	data.json	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.json	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	1	1	OK	WIN	0.893413	100.3	100.4	true	false	51.5588	57.6788	9	
+pigz	data.json	1	2	OK	WIN	0.965645	267.6	203.8	true	false	30.8083	31.9893	9	
+pigz	data.json	1	4	OK	LOSS	1.117463	379.8	381.3	true	false	19.4924	17.3877	9	
+pigz	data.json	2	1	OK	WIN	0.835420	100.2	100.3	true	false	50.3168	60.2104	9	
+pigz	data.json	2	2	OK	LOSS	1.028051	276.3	204.5	true	false	34.0833	33.1478	9	
+pigz	data.json	2	4	OK	LOSS	1.257922	382.9	380.9	true	false	22.5605	18.0178	9	
+pigz	data.json	3	1	OK	WIN	0.860585	100.3	100.2	true	false	57.4658	66.7853	9	
+pigz	data.json	3	2	OK	LOSS	1.028933	278.3	203.7	true	false	38.0584	36.9837	9	
+pigz	data.json	3	4	OK	LOSS	1.249858	389.8	383.6	true	false	24.8897	19.9213	9	
+pigz	data.json	4	1	OK	WIN	0.513545	100.4	100.2	true	false	55.9953	108.7655	9	
+pigz	data.json	4	2	OK	WIN	0.783634	280.6	202.4	true	false	45.5914	58.1727	9	
+pigz	data.json	4	4	OK	WIN	0.959313	387.5	386.8	true	false	29.5514	30.6888	9	
+pigz	data.json	5	1	OK	WIN	0.497867	100.3	100.1	true	false	63.1982	127.5000	9	
+pigz	data.json	5	2	OK	WIN	0.777152	281.3	202.0	true	false	52.3919	67.3705	9	
+pigz	data.json	5	4	OK	WIN	0.936684	395.5	388.2	true	false	33.0331	35.2884	9	
+pigz	data.json	6	1	OK	WIN	0.538710	100.2	100.1	true	false	88.5691	164.4150	9	
+pigz	data.json	6	2	OK	WIN	0.772733	284.3	201.7	true	false	66.7699	86.2518	9	
+pigz	data.json	6	4	OK	WIN	0.944167	406.6	390.4	true	false	41.2333	44.8765	9	
+pigz	data.json	7	1	OK	WIN	0.625458	100.1	100.1	true	false	118.3951	189.8534	9	
+pigz	data.json	7	2	OK	WIN	0.738305	284.3	201.1	true	false	73.0073	98.8879	9	
+pigz	data.json	7	4	OK	WIN	0.896933	401.4	391.2	true	false	46.0363	51.2967	9	
+pigz	data.json	8	1	OK	WIN	0.579041	100.1	100.1	true	false	161.2955	277.9996	9	
+pigz	data.json	8	2	OK	WIN	0.627876	285.7	200.5	true	false	89.8679	143.2703	9	
+pigz	data.json	8	4	OK	WIN	0.756985	403.4	391.9	true	false	55.7772	73.7042	9	
+pigz	data.json	9	1	OK	WIN	0.529659	100.1	100.1	true	false	164.7808	311.4713	9	
+pigz	data.json	9	2	OK	WIN	0.571184	285.2	200.7	true	false	90.4725	158.3712	9	
+pigz	data.json	9	4	OK	LOSS	5.196072	420.6	392.3	true	false	422.5261	81.3098	9	
+pigz	data.json	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	11	1	OK	WIN	0.077202	100.0	100.0	true	false	2128.9307	27570.4977	9	
+pigz	data.json	11	2	OK	WIN	0.006556	286.2	199.9	true	false	90.5079	13798.3463	9	
+pigz	data.json	11	4	OK	WIN	0.104429	412.8	397.8	true	false	725.4621	6940.8095	9	
+pigz	data.json	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.json	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	data.json	1	1	OK	LOSS	1.507658	100.4	100.5	true	false	51.7362	34.3147	9	
+libdeflate	data.json	1	2	OK	WIN	0.906247	267.7	100.5	true	false	31.1363	34.3166	9	
+libdeflate	data.json	1	4	OK	WIN	0.575041	376.6	100.5	true	false	19.6943	34.2573	9	
+libdeflate	data.json	2	1	OK	LOSS	1.051305	100.3	100.4	true	false	50.2851	47.8547	9	
+libdeflate	data.json	2	2	OK	WIN	0.712180	276.6	100.4	true	false	34.0910	47.9319	9	
+libdeflate	data.json	2	4	OK	WIN	0.478917	377.9	100.3	true	false	22.9274	47.8955	9	
+libdeflate	data.json	3	1	OK	LOSS	1.130477	100.3	100.3	true	false	57.5103	50.8801	9	
+libdeflate	data.json	3	2	OK	WIN	0.746423	278.5	100.3	true	false	38.0718	50.9659	9	
+libdeflate	data.json	3	4	OK	WIN	0.494369	382.9	100.4	true	false	25.1280	51.0512	9	
+libdeflate	data.json	4	1	OK	LOSS	1.007914	100.3	100.3	true	false	56.1343	55.6620	9	
+libdeflate	data.json	4	2	OK	WIN	0.821613	279.7	100.3	true	false	45.6057	55.6068	9	
+libdeflate	data.json	4	4	OK	WIN	0.565438	393.7	100.4	true	false	29.6983	55.7281	9	
+libdeflate	data.json	5	1	OK	LOSS	1.046176	100.3	100.3	true	false	63.2006	60.4517	9	
+libdeflate	data.json	5	2	OK	WIN	0.865557	281.9	100.3	true	false	52.3122	60.4908	9	
+libdeflate	data.json	5	4	OK	WIN	0.549749	394.3	100.3	true	false	33.2759	60.4204	9	
+libdeflate	data.json	6	1	OK	LOSS	1.161195	100.2	100.2	true	false	88.8391	76.4840	9	
+libdeflate	data.json	6	2	OK	WIN	0.877029	284.8	100.3	true	false	67.0175	76.4533	9	
+libdeflate	data.json	6	4	OK	WIN	0.544246	405.4	100.2	true	false	41.5646	76.4400	9	
+libdeflate	data.json	7	1	OK	WIN	0.980425	100.1	100.2	true	false	118.6095	121.0790	9	
+libdeflate	data.json	7	2	OK	WIN	0.605935	284.6	100.2	true	false	73.4416	121.3752	9	
+libdeflate	data.json	7	4	OK	WIN	0.381162	400.4	100.1	true	false	46.1301	121.2874	9	
+libdeflate	data.json	8	1	OK	WIN	0.944058	100.1	100.1	true	false	161.1420	171.1700	9	
+libdeflate	data.json	8	2	OK	WIN	0.524771	285.1	100.1	true	false	89.7952	171.1592	9	
+libdeflate	data.json	8	4	OK	WIN	0.325102	403.3	100.1	true	false	55.6071	171.1813	9	
+libdeflate	data.json	9	1	OK	WIN	0.944333	100.1	100.1	true	false	165.3920	175.1401	9	
+libdeflate	data.json	9	2	OK	WIN	0.515746	286.4	100.1	true	false	90.4474	175.1370	9	
+libdeflate	data.json	9	4	OK	LOSS	2.405357	421.1	100.1	true	false	421.2266	175.1000	9	
+libdeflate	data.json	10	1	OK	WIN	0.936031	100.0	100.0	true	false	1100.5161	1175.1649	9	
+libdeflate	data.json	10	2	OK	WIN	0.076938	286.2	100.0	true	false	90.5483	1177.1597	9	
+libdeflate	data.json	10	4	OK	WIN	0.302591	420.8	100.0	true	false	355.6010	1175.9281	9	
+libdeflate	data.json	11	1	OK	WIN	0.760766	100.0	100.0	true	false	2132.5871	2803.8010	9	
+libdeflate	data.json	11	2	OK	WIN	0.032253	285.4	100.0	true	false	90.4241	2805.7975	9	
+libdeflate	data.json	11	4	OK	WIN	0.258472	413.1	100.0	true	false	724.6217	2804.2766	9	
+libdeflate	data.json	12	1	OK	WIN	0.647820	100.0	100.0	true	false	2411.3427	3722.0114	9	
+libdeflate	data.json	12	2	OK	WIN	0.024332	286.1	100.0	true	false	90.4229	3717.6882	9	
+libdeflate	data.json	12	4	OK	WIN	0.228409	415.1	100.0	true	false	849.9999	3722.5478	9	
+igzip	data.json	1	1	OK	LOSS	1.635829	100.8	101.6	true	false	52.2033	31.7625	9	
+igzip	data.json	1	2	OK	WIN	0.990749	268.7	100.6	true	false	31.1040	31.3812	9	
+igzip	data.json	1	4	VOID		NaN	376.5	100.6	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=376.5 (ok=true) rival cpu%=100.6 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.json	2	1	OK	LOSS	1.507847	78.5	92.9	true	false	51.0016	32.3554	9	
+igzip	data.json	2	2	OK	LOSS	1.079242	220.0	100.6	true	false	34.5028	31.9879	9	
+igzip	data.json	2	4	VOID		NaN	382.0	100.6	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=382.0 (ok=true) rival cpu%=100.6 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.json	3	1	OK	WIN	0.560264	100.3	100.2	true	false	57.8128	103.1262	9	
+igzip	data.json	3	2	OK	WIN	0.373459	276.2	100.2	true	false	38.5545	103.1448	9	
+igzip	data.json	3	4	VOID		NaN	388.7	100.2	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=388.7 (ok=true) rival cpu%=100.2 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.json	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.json	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	1	1	OK	WIN	0.492632	100.2	100.1	true	false	96.4853	195.7645	9	
+gzip	data.csv	1	2	OK	WIN	0.283131	280.1	100.1	true	false	55.4523	195.6083	9	
+gzip	data.csv	1	4	OK	WIN	0.157278	435.6	100.1	true	false	30.7954	195.7260	9	
+gzip	data.csv	2	1	OK	WIN	0.476941	100.2	100.1	true	false	100.3331	210.3103	9	
+gzip	data.csv	2	2	OK	WIN	0.322814	287.4	100.1	true	false	68.0482	210.4528	9	
+gzip	data.csv	2	4	OK	WIN	0.183600	442.0	100.1	true	false	38.4163	210.1772	9	
+gzip	data.csv	3	1	OK	WIN	0.440442	100.2	100.1	true	false	123.4762	280.0883	9	
+gzip	data.csv	3	2	OK	WIN	0.391980	234.8	100.1	true	false	111.7340	280.4667	9	
+gzip	data.csv	3	4	OK	WIN	0.304112	257.3	100.0	true	false	85.5630	280.2243	9	
+gzip	data.csv	4	1	OK	WIN	0.566366	100.0	100.2	true	false	135.5783	239.5283	9	
+gzip	data.csv	4	2	OK	WIN	0.757121	242.0	98.7	true	false	183.6516	239.4999	9	
+gzip	data.csv	4	4	OK	WIN	0.532325	269.0	100.2	true	false	124.9507	239.1372	9	
+gzip	data.csv	5	1	OK	WIN	0.476371	99.9	99.7	true	false	162.7336	341.4518	9	
+gzip	data.csv	5	2	OK	WIN	0.568817	257.1	100.1	true	false	188.1324	341.6991	9	
+gzip	data.csv	5	4	OK	WIN	0.495776	471.5	100.1	true	false	169.9986	343.1265	9	
+gzip	data.csv	6	1	OK	WIN	0.638369	98.4	100.1	true	false	350.8374	550.2451	9	
+gzip	data.csv	6	2	OK	WIN	0.838271	292.3	100.0	true	false	460.8536	549.7449	9	
+gzip	data.csv	6	4	OK	WIN	0.656813	464.6	100.0	true	false	364.9304	550.3583	9	
+gzip	data.csv	7	1	OK	WIN	0.779570	100.0	100.0	true	false	654.1619	839.5641	9	
+gzip	data.csv	7	2	OK	WIN	0.770942	284.4	100.1	true	false	633.6298	839.9012	9	
+gzip	data.csv	7	4	OK	WIN	0.394736	467.7	100.0	true	false	331.5840	839.2776	9	
+gzip	data.csv	8	1	OK	WIN	0.395546	100.0	100.0	true	false	885.0447	2241.2769	9	
+gzip	data.csv	8	2	OK	WIN	0.207667	274.0	100.0	true	false	454.2106	2239.5255	9	
+gzip	data.csv	8	4	OK	WIN	0.113153	416.6	100.0	true	false	249.6828	2240.2502	9	
+gzip	data.csv	9	1	OK	WIN	0.507339	100.0	100.0	true	false	1271.5298	2505.5767	9	
+gzip	data.csv	9	2	OK	WIN	0.256399	291.7	100.0	true	false	642.1504	2505.6847	9	
+gzip	data.csv	9	4	OK	WIN	0.294466	468.4	100.0	true	false	736.9894	2502.8069	9	
+gzip	data.csv	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.csv	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	1	1	OK	WIN	0.759651	100.1	100.2	true	false	96.5532	127.0213	9	
+pigz	data.csv	1	2	OK	WIN	0.830694	279.6	207.3	true	false	56.1276	67.6321	9	
+pigz	data.csv	1	4	OK	WIN	0.892888	432.4	397.9	true	false	31.3961	35.5346	9	
+pigz	data.csv	2	1	OK	WIN	0.704748	100.1	100.1	true	false	100.6398	142.7861	9	
+pigz	data.csv	2	2	OK	WIN	0.902082	287.1	206.4	true	false	68.2624	75.6619	9	
+pigz	data.csv	2	4	OK	WIN	0.990898	440.3	397.8	true	false	39.1683	39.6260	9	
+pigz	data.csv	3	1	OK	WIN	0.576852	100.2	100.1	true	false	123.5694	214.2386	9	
+pigz	data.csv	3	2	OK	WIN	0.718920	289.9	204.5	true	false	80.7795	112.3118	9	
+pigz	data.csv	3	4	OK	WIN	0.783083	433.8	398.3	true	false	45.4788	58.0594	9	
+pigz	data.csv	4	1	OK	WIN	0.618526	100.2	100.1	true	false	135.3496	218.8433	9	
+pigz	data.csv	4	2	OK	LOSS	1.186589	292.7	204.4	true	false	135.3293	114.0252	9	
+pigz	data.csv	4	4	OK	LOSS	1.195734	467.0	397.6	true	false	73.0801	59.0092	9	
+pigz	data.csv	5	1	OK	WIN	0.501136	100.1	100.1	true	false	162.7879	324.9440	9	
+pigz	data.csv	5	2	OK	LOSS	1.123025	295.4	203.1	true	false	187.7315	167.2163	9	
+pigz	data.csv	5	4	OK	LOSS	1.164546	472.8	396.8	true	false	99.7385	85.7616	9	
+pigz	data.csv	6	1	OK	WIN	0.655192	100.0	100.0	true	false	350.8247	535.0956	9	
+pigz	data.csv	6	2	OK	LOSS	1.692501	292.3	202.0	true	false	461.4127	272.6021	9	
+pigz	data.csv	6	4	OK	LOSS	1.767287	463.9	396.7	true	false	245.4636	138.9414	9	
+pigz	data.csv	7	1	OK	WIN	0.791584	100.0	100.0	true	false	654.4528	827.1978	9	
+pigz	data.csv	7	2	OK	LOSS	1.500523	292.7	201.3	true	false	628.6127	419.0736	9	
+pigz	data.csv	7	4	OK	LOSS	1.560759	467.6	398.1	true	false	331.8853	212.5299	9	
+pigz	data.csv	8	1	OK	WIN	0.393478	100.0	100.0	true	false	883.0582	2247.9994	9	
+pigz	data.csv	8	2	OK	WIN	0.401233	291.1	200.4	true	false	453.4227	1129.0919	9	
+pigz	data.csv	8	4	OK	WIN	0.424125	462.5	399.8	true	false	240.1221	566.3331	9	
+pigz	data.csv	9	1	OK	WIN	0.505827	100.0	100.0	true	false	1271.7954	2513.8422	9	
+pigz	data.csv	9	2	OK	WIN	0.507542	291.6	200.3	true	false	641.8921	1264.2798	9	
+pigz	data.csv	9	4	OK	LOSS	1.161200	468.6	399.8	true	false	734.4307	633.8709	9	
+pigz	data.csv	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	11	1	OK	WIN	0.031952	100.0	100.0	true	false	3533.0151	110642.3448	9	
+pigz	data.csv	11	2	OK	WIN	0.011582	291.5	199.5	true	false	641.7338	55423.7119	9	
+pigz	data.csv	11	4	OK	WIN	0.035102	468.2	397.4	true	false	977.2160	27826.5195	9	
+pigz	data.csv	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.csv	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	data.csv	1	1	OK	LOSS	1.412804	99.4	100.3	true	false	96.0024	67.9210	9	
+libdeflate	data.csv	1	2	OK	WIN	0.821829	280.6	100.3	true	false	55.7997	67.9344	9	
+libdeflate	data.csv	1	4	OK	WIN	0.454506	435.0	100.3	true	false	30.8113	67.9780	9	
+libdeflate	data.csv	2	1	OK	LOSS	1.041591	100.2	100.2	true	false	99.9890	96.0527	9	
+libdeflate	data.csv	2	2	OK	WIN	0.705088	286.7	100.2	true	false	67.7930	96.1994	9	
+libdeflate	data.csv	2	4	OK	WIN	0.403076	437.7	100.2	true	false	38.7720	96.1920	9	
+libdeflate	data.csv	3	1	OK	LOSS	1.121097	99.6	100.2	true	false	123.2667	109.9576	9	
+libdeflate	data.csv	3	2	OK	WIN	0.730725	289.8	100.2	true	false	80.3206	109.8884	9	
+libdeflate	data.csv	3	4	OK	WIN	0.410447	448.5	100.2	true	false	45.0727	109.9365	9	
+libdeflate	data.csv	4	1	OK	WIN	0.951529	100.1	100.1	true	false	134.7496	141.6077	9	
+libdeflate	data.csv	4	2	OK	WIN	0.950254	293.9	100.1	true	false	134.6202	141.6046	9	
+libdeflate	data.csv	4	4	OK	WIN	0.524540	466.1	100.1	true	false	72.4158	141.6811	9	
+libdeflate	data.csv	5	1	OK	TIE	1.000977	100.1	100.1	true	false	162.3923	162.1418	9	
+libdeflate	data.csv	5	2	OK	LOSS	1.154909	295.3	100.1	true	false	187.1988	162.0932	9	
+libdeflate	data.csv	5	4	OK	WIN	0.612973	474.9	100.1	true	false	99.3481	162.0448	9	
+libdeflate	data.csv	6	1	OK	LOSS	1.458658	100.0	100.1	true	false	349.8448	239.8154	9	
+libdeflate	data.csv	6	2	OK	LOSS	1.922545	292.5	100.1	true	false	460.8937	239.8220	9	
+libdeflate	data.csv	6	4	OK	LOSS	1.020357	464.2	100.1	true	false	244.7725	239.8696	9	
+libdeflate	data.csv	7	1	OK	LOSS	1.468646	100.0	100.0	true	false	653.5767	444.8919	9	
+libdeflate	data.csv	7	2	OK	LOSS	1.411545	293.3	100.0	true	false	627.8951	444.9936	9	
+libdeflate	data.csv	7	4	OK	WIN	0.744058	467.5	100.0	true	false	331.4492	444.8455	9	
+libdeflate	data.csv	8	1	OK	WIN	0.910650	100.0	100.0	true	false	882.0371	968.1385	9	
+libdeflate	data.csv	8	2	VOID	VOID	0.467962	290.9	100.0	true	false	452.8905	967.9847	9	paired verdict: VOID-aa_bias=0.0011
+libdeflate	data.csv	8	4	OK	WIN	0.247636	462.4	100.0	true	false	239.7514	967.9678	9	
+libdeflate	data.csv	9	1	OK	WIN	0.901673	100.0	100.0	true	false	1271.3689	1410.9589	9	
+libdeflate	data.csv	9	2	VOID	VOID	0.454630	291.5	100.0	true	false	641.5030	1411.0870	9	paired verdict: VOID-aa_bias=0.0014
+libdeflate	data.csv	9	4	OK	WIN	0.518901	468.3	100.0	true	false	732.3542	1410.6438	9	
+libdeflate	data.csv	10	1	OK	WIN	0.797743	100.0	100.0	true	false	2566.2779	3217.5598	9	
+libdeflate	data.csv	10	2	OK	WIN	0.209912	291.4	100.0	true	false	662.8366	3227.9039	9	
+libdeflate	data.csv	10	4	OK	WIN	0.249280	368.2	100.0	true	false	733.7142	3217.9974	9	
+libdeflate	data.csv	11	1	OK	WIN	0.695359	99.9	100.0	true	false	3521.9071	5065.1279	9	
+libdeflate	data.csv	11	2	OK	WIN	0.126789	291.8	100.0	true	false	641.7667	5063.0504	9	
+libdeflate	data.csv	11	4	OK	WIN	0.192195	468.1	100.0	true	false	972.7626	5061.6317	9	
+libdeflate	data.csv	12	1	OK	WIN	0.633368	100.0	100.0	true	false	4324.3452	6826.7451	9	
+libdeflate	data.csv	12	2	OK	WIN	0.094044	291.5	100.0	true	false	641.5823	6825.2705	9	
+libdeflate	data.csv	12	4	OK	WIN	0.177800	463.4	100.0	true	false	1213.6705	6826.4718	9	
+igzip	data.csv	1	1	OK	LOSS	1.520463	100.2	100.3	true	false	96.1899	63.1510	9	
+igzip	data.csv	1	2	OK	WIN	0.868415	281.0	100.3	true	false	54.8862	63.2859	9	
+igzip	data.csv	1	4	VOID		NaN	438.9	100.3	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=438.9 (ok=true) rival cpu%=100.3 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.csv	2	1	OK	LOSS	1.583783	100.2	100.3	true	false	99.9059	63.1063	9	
+igzip	data.csv	2	2	OK	LOSS	1.067700	287.7	100.3	true	false	67.3652	63.1063	9	
+igzip	data.csv	2	4	VOID		NaN	445.6	100.3	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=445.6 (ok=true) rival cpu%=100.3 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.csv	3	1	OK	WIN	0.630689	100.1	100.1	true	false	122.9286	194.9247	9	
+igzip	data.csv	3	2	OK	WIN	0.409900	289.2	100.1	true	false	79.8365	195.0659	9	
+igzip	data.csv	3	4	VOID		NaN	453.2	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=453.2 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.csv	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.csv	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	1	1	OK	WIN	0.566253	100.1	100.0	true	false	256.0727	452.4723	9	
+gzip	data.parquet	1	2	OK	WIN	0.283800	291.0	100.0	true	false	128.3294	452.4741	9	
+gzip	data.parquet	1	4	OK	WIN	0.166111	429.4	100.0	true	false	75.0864	452.3039	9	
+gzip	data.parquet	2	1	OK	WIN	0.411558	100.1	100.0	true	false	199.3781	484.3311	9	
+gzip	data.parquet	2	2	OK	WIN	0.366684	280.4	100.0	true	false	177.5888	484.4864	9	
+gzip	data.parquet	2	4	OK	WIN	0.211199	417.5	100.0	true	false	102.4500	484.4061	9	
+gzip	data.parquet	3	1	OK	WIN	0.429892	100.1	100.0	true	false	236.5570	549.5208	9	
+gzip	data.parquet	3	2	OK	WIN	0.345254	283.5	100.0	true	false	189.6416	549.4469	9	
+gzip	data.parquet	3	4	OK	WIN	0.198975	422.1	100.0	true	false	109.3488	549.3729	9	
+gzip	data.parquet	4	1	OK	WIN	0.351615	100.1	100.0	true	false	206.4133	586.6138	9	
+gzip	data.parquet	4	2	OK	WIN	0.327391	284.0	100.0	true	false	191.8742	586.3601	9	
+gzip	data.parquet	4	4	OK	WIN	0.190339	419.5	100.0	true	false	111.7024	586.6316	9	
+gzip	data.parquet	5	1	OK	WIN	0.348586	100.1	100.0	true	false	241.2309	692.2593	9	
+gzip	data.parquet	5	2	VOID	VOID	0.293426	283.4	100.0	true	false	203.2713	692.9591	9	paired verdict: VOID-aa_bias=0.0011
+gzip	data.parquet	5	4	OK	WIN	0.170466	379.1	100.0	true	false	118.0979	692.6914	9	
+gzip	data.parquet	6	1	OK	WIN	0.325645	100.0	100.0	true	false	284.2649	872.7074	9	
+gzip	data.parquet	6	2	OK	WIN	0.266734	286.7	100.0	true	false	232.7801	872.7574	9	
+gzip	data.parquet	6	4	VOID	VOID	0.145486	450.8	100.0	true	false	127.1120	873.0708	9	paired verdict: VOID-aa_bias=0.0008
+gzip	data.parquet	7	1	OK	WIN	0.315370	100.1	100.0	true	false	313.2390	992.9419	9	
+gzip	data.parquet	7	2	OK	WIN	0.248466	294.6	100.0	true	false	246.6515	992.7725	9	
+gzip	data.parquet	7	4	OK	WIN	0.152797	430.4	100.0	true	false	149.8364	994.3627	9	
+gzip	data.parquet	8	1	OK	WIN	0.256737	100.1	100.0	true	false	350.6509	1365.8221	9	
+gzip	data.parquet	8	2	OK	WIN	0.176696	286.0	100.0	true	false	241.2055	1365.6031	9	
+gzip	data.parquet	8	4	OK	WIN	0.095576	456.2	100.0	true	false	128.4740	1366.2389	9	
+gzip	data.parquet	9	1	OK	WIN	0.175114	100.0	100.0	true	false	398.3310	2274.3978	9	
+gzip	data.parquet	9	2	OK	WIN	0.100037	294.4	100.0	true	false	227.5158	2274.6952	9	
+gzip	data.parquet	9	4	OK	WIN	0.125909	473.5	100.0	true	false	286.5723	2275.5657	9	
+gzip	data.parquet	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	data.parquet	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	1	1	OK	WIN	0.628614	100.1	100.0	true	false	256.5962	408.2906	9	
+pigz	data.parquet	1	2	OK	WIN	0.615743	291.0	200.9	true	false	128.9825	209.3787	9	
+pigz	data.parquet	1	4	OK	WIN	0.709568	428.3	397.1	true	false	75.4842	106.3852	9	
+pigz	data.parquet	2	1	OK	WIN	0.453495	100.1	100.0	true	false	199.5455	440.0708	9	
+pigz	data.parquet	2	2	VOID	VOID	0.790603	280.1	201.0	true	false	178.0659	225.2520	9	paired verdict: VOID-aa_bias=0.0012
+pigz	data.parquet	2	4	VOID	VOID	0.899878	415.0	396.6	true	false	102.8956	114.5302	9	paired verdict: VOID-aa_bias=0.0024
+pigz	data.parquet	3	1	OK	WIN	0.473498	100.1	100.0	true	false	236.8237	500.0802	9	
+pigz	data.parquet	3	2	OK	WIN	0.745589	283.2	201.0	true	false	190.3090	255.1439	9	
+pigz	data.parquet	3	4	OK	WIN	0.851184	420.7	396.7	true	false	109.5593	129.6635	9	
+pigz	data.parquet	4	1	OK	WIN	0.368840	100.1	100.0	true	false	206.5414	560.3665	9	
+pigz	data.parquet	4	2	OK	WIN	0.670927	284.1	200.7	true	false	192.2057	286.4074	9	
+pigz	data.parquet	4	4	OK	WIN	0.769220	418.9	397.4	true	false	111.6807	145.2013	9	
+pigz	data.parquet	5	1	OK	WIN	0.362213	100.1	100.0	true	false	241.7105	667.2662	9	
+pigz	data.parquet	5	2	OK	WIN	0.598402	283.2	200.6	true	false	203.5430	339.9791	9	
+pigz	data.parquet	5	4	OK	WIN	0.686902	418.5	397.7	true	false	118.0994	171.9545	9	
+pigz	data.parquet	6	1	OK	WIN	0.334782	100.1	100.0	true	false	284.1630	848.5088	9	
+pigz	data.parquet	6	2	OK	WIN	0.540133	286.9	200.3	true	false	233.0681	431.4247	9	
+pigz	data.parquet	6	4	OK	WIN	0.597271	450.3	397.2	true	false	127.3156	217.8928	9	
+pigz	data.parquet	7	1	OK	WIN	0.323938	100.1	100.0	true	false	313.8830	969.0020	9	
+pigz	data.parquet	7	2	OK	WIN	0.501972	294.3	200.1	true	false	246.8363	491.8584	9	
+pigz	data.parquet	7	4	OK	WIN	0.603940	429.7	396.1	true	false	150.1877	248.7707	9	
+pigz	data.parquet	8	1	OK	WIN	0.260119	100.0	100.0	true	false	350.7575	1348.3687	9	
+pigz	data.parquet	8	2	OK	WIN	0.354206	285.6	199.9	true	false	241.3656	681.5623	9	
+pigz	data.parquet	8	4	OK	WIN	0.368438	456.5	391.5	true	false	128.6419	348.3645	9	
+pigz	data.parquet	9	1	OK	WIN	0.175404	100.0	100.0	true	false	398.5010	2271.9044	9	
+pigz	data.parquet	9	2	OK	WIN	0.196121	294.1	196.8	true	false	227.6701	1161.3123	9	
+pigz	data.parquet	9	4	OK	WIN	0.436539	472.9	348.7	true	false	286.2016	655.6008	9	
+pigz	data.parquet	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	11	1	OK	WIN	0.014649	100.0	100.0	true	false	1306.4854	89053.2505	9	
+pigz	data.parquet	11	2	OK	WIN	0.005273	294.4	199.7	true	false	228.2049	44615.0082	9	
+pigz	data.parquet	11	4	VOID	VOID	0.017260	470.2	394.6	true	false	362.7320	22601.2277	9	paired verdict: VOID-aa_bias=0.0009
+pigz	data.parquet	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	data.parquet	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	data.parquet	1	1	OK	LOSS	1.835746	96.3	100.4	true	false	257.1907	140.2736	9	
+libdeflate	data.parquet	1	2	OK	WIN	0.923689	265.7	100.1	true	false	129.5335	140.2883	9	
+libdeflate	data.parquet	1	4	OK	WIN	0.546840	427.0	100.1	true	false	76.1193	140.1971	9	
+libdeflate	data.parquet	2	1	OK	TIE	0.999027	100.1	100.1	true	false	200.4846	201.2046	9	
+libdeflate	data.parquet	2	2	OK	TIE	1.038987	280.0	100.1	true	false	209.8333	200.9217	9	
+libdeflate	data.parquet	2	4	OK	WIN	0.795732	299.2	100.2	true	false	159.1420	201.2286	9	
+libdeflate	data.parquet	3	1	OK	LOSS	1.149156	97.0	100.2	true	false	237.6995	206.9134	9	
+libdeflate	data.parquet	3	2	OK	TIE	0.985242	254.3	98.8	true	false	195.9774	206.7203	9	
+libdeflate	data.parquet	3	4	OK	WIN	0.534865	418.0	100.1	true	false	110.3362	206.8678	9	
+libdeflate	data.parquet	4	1	OK	WIN	0.986322	100.1	100.1	true	false	207.3520	210.2281	9	
+libdeflate	data.parquet	4	2	OK	WIN	0.917731	283.5	100.1	true	false	192.8696	210.1531	9	
+libdeflate	data.parquet	4	4	OK	WIN	0.534692	418.1	100.1	true	false	112.4018	210.0363	9	
+libdeflate	data.parquet	5	1	VOID	VOID	1.046428	100.1	100.1	true	false	242.2721	231.5017	9	paired verdict: VOID-aa_bias=0.0013
+libdeflate	data.parquet	5	2	OK	WIN	0.880305	282.9	100.1	true	false	203.8117	231.6059	9	
+libdeflate	data.parquet	5	4	OK	WIN	0.648290	416.7	100.1	true	false	144.1583	232.6650	9	
+libdeflate	data.parquet	6	1	OK	LOSS	1.149532	100.1	99.7	true	false	284.7486	247.7945	9	
+libdeflate	data.parquet	6	2	OK	WIN	0.942522	286.3	100.1	true	false	233.6473	247.8704	9	
+libdeflate	data.parquet	6	4	OK	WIN	0.519673	449.0	100.1	true	false	127.8789	247.5915	9	
+libdeflate	data.parquet	7	1	OK	LOSS	1.124209	100.1	100.1	true	false	314.3037	279.6237	9	
+libdeflate	data.parquet	7	2	OK	WIN	0.885001	294.4	100.1	true	false	247.4077	279.8510	9	
+libdeflate	data.parquet	7	4	OK	WIN	0.540034	429.0	100.1	true	false	150.9718	279.9401	9	
+libdeflate	data.parquet	8	1	VOID	VOID	0.963589	99.9	100.1	true	false	351.2522	362.6187	9	paired verdict: VOID-aa_bias=0.0009
+libdeflate	data.parquet	8	2	VOID	VOID	0.830291	248.3	100.0	true	false	294.5628	362.7722	9	paired verdict: VOID-aa_bias=0.1154
+libdeflate	data.parquet	8	4	OK	WIN	0.356142	283.5	100.0	true	false	129.2688	362.9703	9	
+libdeflate	data.parquet	9	1	OK	WIN	0.951030	100.0	100.0	true	false	399.0922	419.5498	9	
+libdeflate	data.parquet	9	2	OK	WIN	0.543943	293.9	100.0	true	false	228.1642	419.4903	9	
+libdeflate	data.parquet	9	4	OK	WIN	0.684693	472.9	100.0	true	false	287.1356	419.4248	9	
+libdeflate	data.parquet	10	1	OK	LOSS	1.102467	100.0	100.0	true	false	1017.8668	923.3673	9	
+libdeflate	data.parquet	10	2	OK	WIN	0.247238	293.8	100.0	true	false	228.3840	923.6854	9	
+libdeflate	data.parquet	10	4	OK	WIN	0.307773	471.9	100.0	true	false	284.0262	923.3472	9	
+libdeflate	data.parquet	11	1	OK	LOSS	1.030668	100.0	100.0	true	false	1306.6262	1267.5535	9	
+libdeflate	data.parquet	11	2	OK	WIN	0.180530	294.0	100.0	true	false	228.4671	1265.3980	9	
+libdeflate	data.parquet	11	4	OK	WIN	0.286366	470.3	100.0	true	false	362.4271	1266.4260	9	
+libdeflate	data.parquet	12	1	OK	WIN	0.953324	100.0	100.0	true	false	1655.6949	1737.1711	9	
+libdeflate	data.parquet	12	2	OK	WIN	0.137729	293.7	100.0	true	false	228.4438	1736.7786	9	
+libdeflate	data.parquet	12	4	OK	WIN	0.286101	315.2	100.0	true	false	478.1148	1736.9529	9	
+igzip	data.parquet	1	1	OK	LOSS	1.466071	100.1	99.2	true	false	256.8798	175.4442	9	
+igzip	data.parquet	1	2	OK	WIN	0.741151	290.0	100.1	true	false	129.8487	175.0857	9	
+igzip	data.parquet	1	4	VOID		NaN	427.4	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=427.4 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.parquet	2	1	OK	LOSS	1.123357	100.1	100.1	true	false	200.4338	178.6183	9	
+igzip	data.parquet	2	2	OK	TIE	0.999396	279.8	100.1	true	false	178.2831	178.5785	9	
+igzip	data.parquet	2	4	VOID		NaN	415.5	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=415.5 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.parquet	3	1	OK	LOSS	1.444658	100.1	100.1	true	false	237.5889	164.5448	9	
+igzip	data.parquet	3	2	OK	LOSS	1.163812	277.5	100.1	true	false	190.4759	164.1742	9	
+igzip	data.parquet	3	4	VOID		NaN	421.6	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=421.6 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	data.parquet	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	data.parquet	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	1	1	OK	WIN	0.607650	100.7	100.4	true	false	27.7592	45.6664	9	
+gzip	minjs.min.js	1	2	OK	WIN	0.348210	271.5	100.4	true	false	15.8860	45.6129	9	
+gzip	minjs.min.js	1	4	OK	WIN	0.262037	355.5	100.4	true	false	11.6867	45.6931	9	
+gzip	minjs.min.js	2	1	OK	WIN	0.525721	100.6	100.4	true	false	25.4586	48.4546	9	
+gzip	minjs.min.js	2	2	OK	WIN	0.418374	276.6	100.4	true	false	20.2891	48.5122	9	
+gzip	minjs.min.js	2	4	VOID	VOID	0.255508	407.1	100.4	true	false	12.3859	48.4700	9	paired verdict: VOID-aa_bias=0.0094
+gzip	minjs.min.js	3	1	OK	WIN	0.576763	100.5	100.3	true	false	31.5884	55.1141	9	
+gzip	minjs.min.js	3	2	OK	WIN	0.447968	277.5	100.3	true	false	24.7287	55.1994	9	
+gzip	minjs.min.js	3	4	OK	WIN	0.265572	418.8	100.4	true	false	14.4732	55.1922	9	
+gzip	minjs.min.js	4	1	OK	WIN	0.469007	100.5	100.3	true	false	27.8405	59.3737	9	
+gzip	minjs.min.js	4	2	OK	WIN	0.448244	280.1	100.3	true	false	26.6391	59.4611	9	
+gzip	minjs.min.js	4	4	OK	WIN	0.262606	422.0	100.3	true	false	15.6133	59.4264	9	
+gzip	minjs.min.js	5	1	OK	WIN	0.427898	100.4	100.3	true	false	33.5958	78.5346	9	
+gzip	minjs.min.js	5	2	OK	WIN	0.376426	280.4	100.2	true	false	29.5643	78.5284	9	
+gzip	minjs.min.js	5	4	OK	WIN	0.217333	426.5	100.2	true	false	17.0678	78.5713	9	
+gzip	minjs.min.js	6	1	OK	WIN	0.464262	100.3	100.2	true	false	46.3237	99.8022	9	
+gzip	minjs.min.js	6	2	OK	WIN	0.359112	282.6	100.2	true	false	35.8551	99.7836	9	
+gzip	minjs.min.js	6	4	VOID	VOID	0.219434	438.2	100.2	true	false	20.2196	99.8257	9	paired verdict: VOID-aa_bias=0.0018
+gzip	minjs.min.js	7	1	OK	WIN	0.506959	100.3	100.2	true	false	55.7570	109.9189	9	
+gzip	minjs.min.js	7	2	OK	WIN	0.335273	283.3	100.2	true	false	36.8704	109.9608	9	
+gzip	minjs.min.js	7	4	OK	WIN	0.198394	439.4	100.2	true	false	20.6019	109.9761	9	
+gzip	minjs.min.js	8	1	OK	WIN	0.555614	100.3	100.2	true	false	68.3305	123.9930	9	
+gzip	minjs.min.js	8	2	OK	WIN	0.329552	285.9	100.1	true	false	40.4175	123.8792	9	
+gzip	minjs.min.js	8	4	OK	WIN	0.334324	240.7	96.3	true	false	40.2149	124.1731	9	
+gzip	minjs.min.js	9	1	VOID	VOID	0.609847	100.5	100.3	true	false	75.6920	124.1727	9	paired verdict: VOID-aa_bias=0.0018
+gzip	minjs.min.js	9	2	OK	WIN	0.453774	202.2	100.2	true	false	60.0379	125.7869	9	
+gzip	minjs.min.js	9	4	OK	TIE	1.066927	310.3	99.0	true	false	130.8570	124.8332	9	
+gzip	minjs.min.js	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	minjs.min.js	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	1	1	OK	WIN	0.768803	101.6	101.0	true	false	28.1876	36.6380	9	
+pigz	minjs.min.js	1	2	OK	WIN	0.812646	160.1	117.5	true	false	26.2112	34.2297	9	
+pigz	minjs.min.js	1	4	VOID		NaN	200.8	194.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=200.8 (ok=true) rival cpu%=194.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+pigz	minjs.min.js	2	1	OK	WIN	0.646165	72.2	101.4	true	false	25.3868	39.2895	9	
+pigz	minjs.min.js	2	2	VOID	VOID	0.904797	138.2	169.0	true	false	32.6298	36.4970	9	paired verdict: VOID-aa_bias=0.1406
+pigz	minjs.min.js	2	4	VOID		NaN	212.5	154.7	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=212.5 (ok=true) rival cpu%=154.7 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+pigz	minjs.min.js	3	1	OK	WIN	0.685679	76.0	65.8	true	false	31.5310	45.9803	9	
+pigz	minjs.min.js	3	2	OK	TIE	1.068070	178.9	123.6	true	false	38.7291	38.1252	9	
+pigz	minjs.min.js	3	4	VOID		NaN	222.3	186.7	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=222.3 (ok=true) rival cpu%=186.7 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+pigz	minjs.min.js	4	1	OK	WIN	0.514864	72.0	96.6	true	false	28.7885	56.4767	9	
+pigz	minjs.min.js	4	2	OK	LOSS	1.202733	199.9	154.2	true	false	43.5591	37.1786	9	
+pigz	minjs.min.js	4	4	VOID		NaN	271.9	190.8	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=271.9 (ok=true) rival cpu%=190.8 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+pigz	minjs.min.js	5	1	OK	WIN	0.451812	76.3	81.3	true	false	33.6347	74.6173	9	
+pigz	minjs.min.js	5	2	OK	WIN	0.768210	195.0	193.9	true	false	29.7736	39.4979	9	
+pigz	minjs.min.js	5	4	OK	WIN	0.828506	262.6	263.5	true	false	17.6351	21.8331	9	
+pigz	minjs.min.js	6	1	OK	WIN	0.481341	100.4	100.2	true	false	46.3092	96.1977	9	
+pigz	minjs.min.js	6	2	OK	WIN	0.715000	283.1	198.6	true	false	35.8382	50.0882	9	
+pigz	minjs.min.js	6	4	OK	WIN	0.739414	434.2	372.1	true	false	20.0378	27.1132	9	
+pigz	minjs.min.js	7	1	OK	WIN	0.524420	100.3	100.2	true	false	55.7513	106.2652	9	
+pigz	minjs.min.js	7	2	OK	WIN	0.670083	283.6	198.7	true	false	36.9227	55.1153	9	
+pigz	minjs.min.js	7	4	OK	WIN	0.686699	438.4	372.0	true	false	20.5048	29.8402	9	
+pigz	minjs.min.js	8	1	VOID	VOID	0.568365	100.2	100.2	true	false	68.1726	119.9222	9	paired verdict: VOID-aa_bias=0.0011
+pigz	minjs.min.js	8	2	OK	WIN	0.643201	285.2	196.5	true	false	40.4271	62.7709	9	
+pigz	minjs.min.js	8	4	OK	WIN	0.673245	442.0	371.8	true	false	22.5385	33.5043	9	
+pigz	minjs.min.js	9	1	OK	WIN	0.629116	100.2	100.1	true	false	75.7168	120.3887	9	
+pigz	minjs.min.js	9	2	OK	WIN	0.677154	285.8	196.0	true	false	42.6098	62.9458	9	
+pigz	minjs.min.js	9	4	OK	LOSS	2.246413	478.2	372.9	true	false	75.2530	33.4742	9	
+pigz	minjs.min.js	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	11	1	OK	WIN	0.036043	100.1	100.0	true	false	325.2461	9028.3515	9	
+pigz	minjs.min.js	11	2	OK	WIN	0.009450	285.3	199.8	true	false	42.6892	4519.4768	9	
+pigz	minjs.min.js	11	4	VOID	VOID	0.037649	482.0	358.8	true	false	94.9013	2520.3797	9	paired verdict: VOID-aa_bias=0.0045
+pigz	minjs.min.js	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	minjs.min.js	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	minjs.min.js	1	1	OK	LOSS	1.554465	100.7	101.1	true	false	27.6548	17.8093	9	
+libdeflate	minjs.min.js	1	2	OK	WIN	0.890190	272.6	100.9	true	false	15.8374	17.8218	9	
+libdeflate	minjs.min.js	1	4	OK	WIN	0.646281	353.0	101.0	true	false	11.5101	17.8226	9	
+libdeflate	minjs.min.js	2	1	OK	LOSS	1.045290	100.7	100.8	true	false	25.3658	24.2745	9	
+libdeflate	minjs.min.js	2	2	OK	WIN	0.833351	277.5	100.8	true	false	20.2767	24.3188	9	
+libdeflate	minjs.min.js	2	4	OK	WIN	0.500633	409.3	100.7	true	false	12.2275	24.2918	9	
+libdeflate	minjs.min.js	3	1	OK	LOSS	1.180658	100.5	100.7	true	false	31.4978	26.6986	9	
+libdeflate	minjs.min.js	3	2	OK	WIN	0.934056	277.8	100.7	true	false	24.5690	26.6924	9	
+libdeflate	minjs.min.js	3	4	OK	WIN	0.537814	417.0	100.7	true	false	14.3671	26.7876	9	
+libdeflate	minjs.min.js	4	1	OK	WIN	0.980717	100.6	100.6	true	false	27.7888	28.3503	9	
+libdeflate	minjs.min.js	4	2	OK	WIN	0.938991	279.8	100.7	true	false	26.5545	28.2476	9	
+libdeflate	minjs.min.js	4	4	OK	WIN	0.547311	423.0	100.7	true	false	15.5026	28.2942	9	
+libdeflate	minjs.min.js	5	1	OK	LOSS	1.025192	100.5	100.5	true	false	33.5257	32.7599	9	
+libdeflate	minjs.min.js	5	2	OK	WIN	0.901685	281.6	100.6	true	false	29.4659	32.7097	9	
+libdeflate	minjs.min.js	5	4	OK	WIN	0.518470	426.5	100.5	true	false	17.0526	32.7608	9	
+libdeflate	minjs.min.js	6	1	OK	LOSS	1.180807	100.4	100.4	true	false	46.2053	39.1430	9	
+libdeflate	minjs.min.js	6	2	OK	WIN	0.913158	283.4	100.5	true	false	35.7480	39.1307	9	
+libdeflate	minjs.min.js	6	4	OK	WIN	0.512604	438.2	100.4	true	false	20.0267	39.1269	9	
+libdeflate	minjs.min.js	7	1	OK	LOSS	1.114284	100.3	100.3	true	false	55.6502	49.9478	9	
+libdeflate	minjs.min.js	7	2	OK	WIN	0.736840	283.5	100.3	true	false	36.9226	50.0603	9	
+libdeflate	minjs.min.js	7	4	OK	WIN	0.409939	441.5	100.4	true	false	20.5440	50.0741	9	
+libdeflate	minjs.min.js	8	1	OK	WIN	0.931521	100.2	100.2	true	false	68.0771	73.0743	9	
+libdeflate	minjs.min.js	8	2	OK	WIN	0.551654	285.7	100.2	true	false	40.3337	73.0932	9	
+libdeflate	minjs.min.js	8	4	OK	WIN	0.306969	444.0	100.3	true	false	22.4064	73.0511	9	
+libdeflate	minjs.min.js	9	1	OK	WIN	0.926238	100.2	100.2	true	false	75.6920	81.7751	9	
+libdeflate	minjs.min.js	9	2	OK	WIN	0.520274	285.2	100.2	true	false	42.5055	81.7531	9	
+libdeflate	minjs.min.js	9	4	OK	WIN	0.945166	482.1	100.2	true	false	75.3346	81.7773	9	
+libdeflate	minjs.min.js	10	1	OK	WIN	0.937921	100.1	100.1	true	false	249.1709	265.5443	9	
+libdeflate	minjs.min.js	10	2	OK	WIN	0.160730	285.1	100.1	true	false	42.6404	265.4814	9	
+libdeflate	minjs.min.js	10	4	OK	WIN	0.279860	475.6	100.1	true	false	74.3411	265.9488	9	
+libdeflate	minjs.min.js	11	1	OK	WIN	0.864143	100.1	100.1	true	false	325.3120	376.2467	9	
+libdeflate	minjs.min.js	11	2	OK	WIN	0.113360	285.3	100.0	true	false	42.6739	376.4001	9	
+libdeflate	minjs.min.js	11	4	OK	WIN	0.251545	482.4	100.0	true	false	94.6174	376.2480	9	
+libdeflate	minjs.min.js	12	1	OK	WIN	0.819856	100.0	100.0	true	false	379.9792	463.4590	9	
+libdeflate	minjs.min.js	12	2	VOID	VOID	0.091978	285.4	100.0	true	false	42.5933	463.3010	9	paired verdict: VOID-aa_bias=0.0015
+libdeflate	minjs.min.js	12	4	OK	WIN	0.241965	476.2	100.0	true	false	112.1614	463.2715	9	
+igzip	minjs.min.js	1	1	OK	LOSS	1.564788	100.7	101.0	true	false	27.7839	17.7317	9	
+igzip	minjs.min.js	1	2	OK	WIN	0.899546	272.9	101.1	true	false	15.9478	17.7238	9	
+igzip	minjs.min.js	1	4	VOID		NaN	351.5	101.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=351.5 (ok=true) rival cpu%=101.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	minjs.min.js	2	1	OK	LOSS	1.387204	100.7	101.0	true	false	25.4157	18.3238	9	
+igzip	minjs.min.js	2	2	OK	LOSS	1.100730	276.6	101.1	true	false	20.2698	18.4309	9	
+igzip	minjs.min.js	2	4	VOID		NaN	403.5	101.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=403.5 (ok=true) rival cpu%=101.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	minjs.min.js	3	1	OK	WIN	0.844934	100.5	100.5	true	false	31.5369	37.3675	9	
+igzip	minjs.min.js	3	2	OK	WIN	0.660050	278.3	100.5	true	false	24.6206	37.3342	9	
+igzip	minjs.min.js	3	4	VOID		NaN	407.2	100.5	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=407.2 (ok=true) rival cpu%=100.5 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	minjs.min.js	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	minjs.min.js	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	1	1	OK	WIN	0.650094	101.2	100.8	true	false	14.4319	22.2051	9	
+gzip	armexe.elf	1	2	OK	WIN	0.407464	251.0	100.7	true	false	9.0735	22.2466	9	
+gzip	armexe.elf	1	4	OK	WIN	0.284507	335.8	100.8	true	false	6.3113	22.2291	9	
+gzip	armexe.elf	2	1	OK	WIN	0.501231	101.4	100.6	true	false	12.1035	24.1274	9	
+gzip	armexe.elf	2	2	OK	WIN	0.461238	257.7	100.7	true	false	11.0996	24.0905	9	
+gzip	armexe.elf	2	4	OK	WIN	0.297279	362.1	100.7	true	false	7.1616	24.1054	9	
+gzip	armexe.elf	3	1	OK	WIN	0.505068	101.0	100.4	true	false	14.6226	28.8885	9	
+gzip	armexe.elf	3	2	OK	WIN	0.408440	261.9	100.6	true	false	11.7702	28.9077	9	
+gzip	armexe.elf	3	4	OK	WIN	0.263052	366.9	100.7	true	false	7.5716	28.8968	9	
+gzip	armexe.elf	4	1	OK	WIN	0.428749	101.5	100.5	true	false	12.8068	30.0767	9	
+gzip	armexe.elf	4	2	OK	WIN	0.407085	264.0	100.6	true	false	12.2437	30.0577	9	
+gzip	armexe.elf	4	4	VOID	VOID	0.260342	371.2	100.7	true	false	7.8196	30.0876	9	paired verdict: VOID-aa_bias=0.0161
+gzip	armexe.elf	5	1	OK	WIN	0.391545	101.2	100.5	true	false	15.0545	38.4100	9	
+gzip	armexe.elf	5	2	OK	WIN	0.327275	266.8	100.4	true	false	12.5702	38.4403	9	
+gzip	armexe.elf	5	4	OK	WIN	0.207177	377.1	100.5	true	false	7.9677	38.3890	9	
+gzip	armexe.elf	6	1	OK	WIN	0.349282	101.0	100.4	true	false	17.1056	49.0040	9	
+gzip	armexe.elf	6	2	OK	WIN	0.327242	255.4	100.3	true	false	16.0787	49.0798	9	
+gzip	armexe.elf	6	4	OK	WIN	0.196614	372.0	100.4	true	false	9.6466	49.0501	9	
+gzip	armexe.elf	7	1	OK	WIN	0.351869	100.9	100.3	true	false	19.1183	54.3305	9	
+gzip	armexe.elf	7	2	OK	WIN	0.375762	242.5	100.3	true	false	20.4040	54.2649	9	
+gzip	armexe.elf	7	4	OK	WIN	0.223751	353.2	100.4	true	false	12.1634	54.3594	9	
+gzip	armexe.elf	8	1	OK	WIN	0.310047	100.8	100.3	true	false	22.2333	71.7507	9	
+gzip	armexe.elf	8	2	OK	WIN	0.225806	260.8	100.2	true	false	16.2102	71.7877	9	
+gzip	armexe.elf	8	4	VOID	VOID	0.135709	382.9	100.3	true	false	9.7352	71.8490	9	paired verdict: VOID-aa_bias=0.0070
+gzip	armexe.elf	9	1	OK	WIN	0.238150	100.7	100.2	true	false	25.8384	108.5798	9	
+gzip	armexe.elf	9	2	OK	WIN	0.166715	250.7	100.2	true	false	18.1365	108.5890	9	
+gzip	armexe.elf	9	4	OK	WIN	0.261196	377.0	100.2	true	false	28.3372	108.6004	9	
+gzip	armexe.elf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	armexe.elf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	1	1	OK	WIN	0.726665	101.1	100.8	true	false	14.3019	19.7147	9	
+pigz	armexe.elf	1	2	OK	WIN	0.777885	249.7	183.3	true	false	8.9922	11.5790	9	
+pigz	armexe.elf	1	4	OK	WIN	0.868955	340.1	309.4	true	false	6.3243	7.2623	9	
+pigz	armexe.elf	2	1	OK	WIN	0.562405	101.1	100.7	true	false	12.1107	21.5035	9	
+pigz	armexe.elf	2	2	OK	WIN	0.877383	258.2	183.7	true	false	11.0040	12.5981	9	
+pigz	armexe.elf	2	4	OK	WIN	0.936106	363.5	309.7	true	false	7.0780	7.6621	9	
+pigz	armexe.elf	3	1	OK	WIN	0.557905	101.0	100.7	true	false	14.5612	26.0640	9	
+pigz	armexe.elf	3	2	OK	WIN	0.781079	260.9	184.5	true	false	11.7787	15.0633	9	
+pigz	armexe.elf	3	4	VOID	VOID	0.829288	367.2	316.5	true	false	7.4802	8.9949	9	paired verdict: VOID-aa_bias=0.0177
+pigz	armexe.elf	4	1	OK	WIN	0.447471	101.2	100.4	true	false	12.8211	28.6819	9	
+pigz	armexe.elf	4	2	OK	WIN	0.744205	263.4	184.7	true	false	12.2599	16.4739	9	
+pigz	armexe.elf	4	4	OK	WIN	0.785693	372.9	316.3	true	false	7.7666	9.8977	9	
+pigz	armexe.elf	5	1	VOID	VOID	0.405743	101.0	100.4	true	false	15.0642	37.0594	9	paired verdict: VOID-aa_bias=0.0038
+pigz	armexe.elf	5	2	OK	WIN	0.598373	266.9	185.3	true	false	12.5237	20.9600	9	
+pigz	armexe.elf	5	4	OK	WIN	0.647678	378.2	325.6	true	false	7.9689	12.2832	9	
+pigz	armexe.elf	6	1	OK	WIN	0.356014	101.0	100.3	true	false	17.0851	48.0166	9	
+pigz	armexe.elf	6	2	OK	WIN	0.593728	254.9	184.6	true	false	15.9333	26.8292	9	
+pigz	armexe.elf	6	4	OK	WIN	0.602172	373.9	319.6	true	false	9.4615	15.7901	9	
+pigz	armexe.elf	7	1	OK	WIN	0.359442	100.8	100.3	true	false	19.1452	53.1882	9	
+pigz	armexe.elf	7	2	OK	WIN	0.678938	243.9	182.6	true	false	20.4227	30.0829	9	
+pigz	armexe.elf	7	4	OK	WIN	0.666483	354.2	306.4	true	false	12.1743	18.2710	9	
+pigz	armexe.elf	8	1	OK	WIN	0.314539	100.7	100.2	true	false	22.2994	70.8781	9	
+pigz	armexe.elf	8	2	OK	WIN	0.406811	261.7	181.6	true	false	16.2883	40.0133	9	
+pigz	armexe.elf	8	4	OK	WIN	0.349423	383.0	264.1	true	false	9.7532	27.7901	9	
+pigz	armexe.elf	9	1	OK	WIN	0.239851	100.5	100.2	true	false	25.8675	107.8591	9	
+pigz	armexe.elf	9	2	OK	WIN	0.285021	251.7	173.5	true	false	18.0163	63.2135	9	
+pigz	armexe.elf	9	4	OK	WIN	0.591598	379.2	232.0	true	false	28.2247	47.7668	9	
+pigz	armexe.elf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	11	1	OK	WIN	0.019036	100.1	100.0	true	false	90.8638	4781.8208	9	
+pigz	armexe.elf	11	2	VOID	VOID	0.006363	250.4	167.0	true	false	18.2129	2859.1835	9	paired verdict: VOID-aa_bias=0.0031
+pigz	armexe.elf	11	4	OK	WIN	0.022381	373.1	298.1	true	false	35.8927	1605.3625	9	
+pigz	armexe.elf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	armexe.elf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	armexe.elf	1	1	OK	LOSS	1.714153	101.0	102.5	true	false	14.3892	8.4091	9	
+libdeflate	armexe.elf	1	2	OK	LOSS	1.079180	249.6	101.6	true	false	9.0443	8.3953	9	
+libdeflate	armexe.elf	1	4	VOID	VOID	0.752743	339.7	101.8	true	false	6.3289	8.3819	9	paired verdict: VOID-aa_bias=0.0164
+libdeflate	armexe.elf	2	1	OK	LOSS	1.048031	101.2	100.0	true	false	12.0087	11.4378	9	
+libdeflate	armexe.elf	2	2	OK	WIN	0.964896	258.9	101.6	true	false	11.1749	11.5631	9	
+libdeflate	armexe.elf	2	4	VOID	VOID	0.622988	362.2	101.4	true	false	7.1554	11.5440	9	paired verdict: VOID-aa_bias=0.0063
+libdeflate	armexe.elf	3	1	OK	LOSS	1.208161	101.1	101.4	true	false	14.4757	11.9900	9	
+libdeflate	armexe.elf	3	2	OK	WIN	0.971845	262.4	101.5	true	false	11.7450	12.0727	9	
+libdeflate	armexe.elf	3	4	VOID	VOID	0.619283	366.1	101.2	true	false	7.4727	12.0629	9	paired verdict: VOID-aa_bias=0.0133
+libdeflate	armexe.elf	4	1	OK	LOSS	1.029150	101.2	101.3	true	false	12.7447	12.3731	9	
+libdeflate	armexe.elf	4	2	VOID	VOID	0.982827	263.4	101.6	true	false	12.1985	12.3703	9	paired verdict: VOID-aa_bias=0.0045
+libdeflate	armexe.elf	4	4	OK	WIN	0.623588	374.5	101.2	true	false	7.7042	12.3038	9	
+libdeflate	armexe.elf	5	1	OK	LOSS	1.075015	101.1	101.2	true	false	14.9712	13.9405	9	
+libdeflate	armexe.elf	5	2	OK	WIN	0.898616	267.0	101.2	true	false	12.4942	13.9163	9	
+libdeflate	armexe.elf	5	4	OK	WIN	0.566376	375.5	101.2	true	false	7.8541	13.8674	9	
+libdeflate	armexe.elf	6	1	OK	LOSS	1.129070	101.0	101.2	true	false	16.9820	15.0064	9	
+libdeflate	armexe.elf	6	2	OK	LOSS	1.055278	255.3	100.9	true	false	15.8831	15.0692	9	
+libdeflate	armexe.elf	6	4	OK	WIN	0.628092	374.9	101.3	true	false	9.4227	15.0369	9	
+libdeflate	armexe.elf	7	1	OK	LOSS	1.134174	100.7	101.1	true	false	19.0401	16.7789	9	
+libdeflate	armexe.elf	7	2	OK	LOSS	1.210684	243.5	101.0	true	false	20.3454	16.7699	9	
+libdeflate	armexe.elf	7	4	OK	WIN	0.714084	355.5	101.1	true	false	11.9663	16.8471	9	
+libdeflate	armexe.elf	8	1	OK	WIN	0.989759	100.7	100.7	true	false	22.1650	22.3839	9	
+libdeflate	armexe.elf	8	2	OK	WIN	0.720288	262.0	100.7	true	false	16.1243	22.3835	9	
+libdeflate	armexe.elf	8	4	OK	WIN	0.429872	387.3	100.8	true	false	9.6417	22.4308	9	
+libdeflate	armexe.elf	9	1	VOID	VOID	0.964505	100.5	100.7	true	false	25.7964	26.7379	9	paired verdict: VOID-aa_bias=0.0013
+libdeflate	armexe.elf	9	2	OK	WIN	0.669121	251.9	100.5	true	false	17.8633	26.7205	9	
+libdeflate	armexe.elf	9	4	OK	LOSS	1.053257	378.7	100.6	true	false	28.2669	26.8576	9	
+libdeflate	armexe.elf	10	1	OK	LOSS	1.016866	100.2	100.3	true	false	72.7381	71.4954	9	
+libdeflate	armexe.elf	10	2	OK	WIN	0.252808	250.8	100.2	true	false	18.0573	71.4832	9	
+libdeflate	armexe.elf	10	4	OK	WIN	0.385366	384.8	100.3	true	false	27.5574	71.5424	9	
+libdeflate	armexe.elf	11	1	OK	WIN	0.925062	100.2	100.2	true	false	90.7548	98.1748	9	
+libdeflate	armexe.elf	11	2	OK	WIN	0.184128	250.9	100.1	true	false	18.0706	98.0920	9	
+libdeflate	armexe.elf	11	4	OK	WIN	0.365024	374.4	100.2	true	false	35.8426	98.1645	9	
+libdeflate	armexe.elf	12	1	OK	WIN	0.854301	100.1	100.2	true	false	105.3956	123.3145	9	
+libdeflate	armexe.elf	12	2	OK	WIN	0.146571	251.8	100.1	true	false	18.0666	123.3587	9	
+libdeflate	armexe.elf	12	4	OK	WIN	0.358346	358.1	100.1	true	false	44.1758	123.2529	9	
+igzip	armexe.elf	1	1	OK	LOSS	1.544173	101.3	101.8	true	false	14.2764	9.2336	9	
+igzip	armexe.elf	1	2	OK	WIN	0.976735	251.6	101.7	true	false	8.9320	9.2095	9	
+igzip	armexe.elf	1	4	VOID		NaN	339.2	101.2	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=339.2 (ok=true) rival cpu%=101.2 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	armexe.elf	2	1	OK	LOSS	1.271503	100.8	101.4	true	false	12.0249	9.4433	9	
+igzip	armexe.elf	2	2	OK	LOSS	1.158698	258.2	101.8	true	false	10.9827	9.5458	9	
+igzip	armexe.elf	2	4	VOID		NaN	364.7	101.6	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=364.7 (ok=true) rival cpu%=101.6 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	armexe.elf	3	1	OK	LOSS	1.238566	101.1	100.9	true	false	14.4648	11.6966	9	
+igzip	armexe.elf	3	2	OK	WIN	0.995895	263.2	101.2	true	false	11.7867	11.8306	9	
+igzip	armexe.elf	3	4	VOID		NaN	369.2	101.4	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=369.2 (ok=true) rival cpu%=101.4 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	armexe.elf	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	armexe.elf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	1	1	OK	WIN	0.565049	100.0	100.0	true	false	469.9689	832.1950	9	
+gzip	tool.bin	1	2	OK	WIN	0.296482	286.5	100.0	true	false	246.7560	831.7680	9	
+gzip	tool.bin	1	4	OK	WIN	0.163166	449.7	100.0	true	false	135.6799	832.1881	9	
+gzip	tool.bin	2	1	OK	WIN	0.461177	100.0	100.0	true	false	411.5134	892.8987	9	
+gzip	tool.bin	2	2	OK	WIN	0.361631	293.1	100.0	true	false	322.4855	891.5469	9	
+gzip	tool.bin	2	4	OK	WIN	0.195046	467.4	100.0	true	false	173.9379	892.8341	9	
+gzip	tool.bin	3	1	OK	WIN	0.472414	100.0	100.0	true	false	511.6655	1083.2927	9	
+gzip	tool.bin	3	2	OK	WIN	0.353450	291.9	100.0	true	false	383.0218	1083.8021	9	
+gzip	tool.bin	3	4	OK	WIN	0.187566	468.6	100.0	true	false	203.1901	1083.0704	9	
+gzip	tool.bin	4	1	OK	WIN	0.402173	100.0	100.0	true	false	455.2122	1132.0479	9	
+gzip	tool.bin	4	2	OK	WIN	0.375683	292.8	100.0	true	false	425.5244	1132.5055	9	
+gzip	tool.bin	4	4	OK	WIN	0.200907	467.8	100.0	true	false	227.5745	1132.0890	9	
+gzip	tool.bin	5	1	OK	WIN	0.359572	100.0	100.0	true	false	544.9710	1515.6774	9	
+gzip	tool.bin	5	2	OK	WIN	0.326314	291.5	100.0	true	false	494.7358	1515.5939	9	
+gzip	tool.bin	5	4	OK	WIN	0.176752	457.8	100.0	true	false	268.1344	1515.5981	9	
+gzip	tool.bin	6	1	OK	WIN	0.365785	100.0	100.0	true	false	825.0519	2254.3743	9	
+gzip	tool.bin	6	2	VOID	VOID	0.324093	296.6	100.0	true	false	731.1903	2256.2654	9	paired verdict: VOID-aa_bias=0.0005
+gzip	tool.bin	6	4	OK	WIN	0.168361	481.3	100.0	true	false	379.8805	2255.4222	9	
+gzip	tool.bin	7	1	OK	WIN	0.392286	100.0	100.0	true	false	1089.7696	2779.0916	9	
+gzip	tool.bin	7	2	OK	WIN	0.315877	298.3	100.0	true	false	876.4868	2779.0538	9	
+gzip	tool.bin	7	4	OK	WIN	0.165297	487.2	100.0	true	false	459.1410	2778.7130	9	
+gzip	tool.bin	8	1	OK	WIN	0.292859	100.0	100.0	true	false	1369.3631	4676.4147	9	
+gzip	tool.bin	8	2	OK	WIN	0.162816	297.3	100.0	true	false	761.6452	4675.6803	9	
+gzip	tool.bin	8	4	OK	WIN	0.084572	481.7	100.0	true	false	395.3744	4675.7745	9	
+gzip	tool.bin	9	1	OK	WIN	0.260690	100.0	100.0	true	false	1739.4088	6675.6859	9	
+gzip	tool.bin	9	2	OK	WIN	0.133571	297.8	100.0	true	false	891.9168	6678.5051	9	
+gzip	tool.bin	9	4	OK	WIN	0.182591	491.9	100.0	true	false	1218.8056	6674.6644	9	
+gzip	tool.bin	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	tool.bin	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	1	1	OK	WIN	0.682704	100.0	100.0	true	false	471.1956	689.8712	9	
+pigz	tool.bin	1	2	OK	WIN	0.697385	286.6	203.5	true	false	247.0272	354.4912	9	
+pigz	tool.bin	1	4	OK	WIN	0.759076	448.5	403.5	true	false	135.8048	179.2636	9	
+pigz	tool.bin	2	1	OK	WIN	0.549774	100.1	100.0	true	false	412.1687	749.5623	9	
+pigz	tool.bin	2	2	OK	WIN	0.839614	293.0	203.4	true	false	322.7441	384.4122	9	
+pigz	tool.bin	2	4	OK	WIN	0.894991	465.4	403.0	true	false	173.9353	194.2697	9	
+pigz	tool.bin	3	1	OK	WIN	0.554785	100.0	100.0	true	false	511.8602	922.6217	9	
+pigz	tool.bin	3	2	OK	WIN	0.809682	291.8	202.7	true	false	383.4538	473.5578	9	
+pigz	tool.bin	3	4	OK	WIN	0.853082	468.0	402.9	true	false	203.4851	238.6272	9	
+pigz	tool.bin	4	1	OK	WIN	0.436557	100.0	100.0	true	false	455.5161	1042.8886	9	
+pigz	tool.bin	4	2	OK	WIN	0.800420	292.6	202.3	true	false	425.5124	531.6762	9	
+pigz	tool.bin	4	4	OK	WIN	0.851575	467.0	402.8	true	false	227.6281	267.6928	9	
+pigz	tool.bin	5	1	OK	WIN	0.383607	100.0	100.0	true	false	544.4057	1419.7105	9	
+pigz	tool.bin	5	2	OK	WIN	0.688163	291.4	201.8	true	false	494.0034	733.3562	9	
+pigz	tool.bin	5	4	OK	WIN	0.800348	309.2	290.5	true	false	393.6285	461.2459	9	
+pigz	tool.bin	6	1	OK	WIN	0.381382	100.0	100.0	true	false	825.0091	2162.4455	9	
+pigz	tool.bin	6	2	OK	WIN	0.670268	296.8	201.4	true	false	731.5538	1090.9963	9	
+pigz	tool.bin	6	4	OK	WIN	0.689990	481.2	399.9	true	false	380.0642	550.0459	9	
+pigz	tool.bin	7	1	OK	WIN	0.404255	100.0	100.0	true	false	1088.6801	2695.9427	9	
+pigz	tool.bin	7	2	OK	WIN	0.646302	298.4	200.9	true	false	876.7859	1356.7054	9	
+pigz	tool.bin	7	4	OK	WIN	0.669708	487.2	392.8	true	false	460.0150	684.7834	9	
+pigz	tool.bin	8	1	OK	WIN	0.298079	100.0	100.0	true	false	1369.6771	4597.0533	9	
+pigz	tool.bin	8	2	OK	WIN	0.343511	276.1	197.9	true	false	794.8579	2330.1960	9	
+pigz	tool.bin	8	4	OK	WIN	0.358774	479.7	397.2	true	false	395.5564	1167.7334	9	
+pigz	tool.bin	9	1	OK	WIN	0.263306	100.0	99.9	true	false	1738.7312	6605.2709	9	
+pigz	tool.bin	9	2	OK	WIN	0.268803	298.0	200.1	true	false	892.6561	3319.8262	9	
+pigz	tool.bin	9	4	OK	WIN	0.725088	492.3	395.2	true	false	1218.7540	1681.7002	9	
+pigz	tool.bin	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	11	1	OK	WIN	0.022344	100.0	100.0	true	false	6129.2715	274704.6510	9	
+pigz	tool.bin	11	2	OK	WIN	0.006500	298.0	199.9	true	false	891.3073	137109.9167	9	
+pigz	tool.bin	11	4	OK	WIN	0.022881	490.6	392.5	true	false	1581.8920	69163.5306	9	
+pigz	tool.bin	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	tool.bin	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	tool.bin	1	1	OK	LOSS	1.603158	100.0	100.1	true	false	469.7266	293.1705	9	
+libdeflate	tool.bin	1	2	OK	WIN	0.842866	286.7	100.1	true	false	246.6708	293.0141	9	
+libdeflate	tool.bin	1	4	OK	WIN	0.464665	448.8	100.1	true	false	136.5415	292.9566	9	
+libdeflate	tool.bin	2	1	OK	LOSS	1.020331	100.0	100.0	true	false	411.6141	403.4330	9	
+libdeflate	tool.bin	2	2	OK	WIN	0.798960	292.6	100.0	true	false	322.5087	403.7233	9	
+libdeflate	tool.bin	2	4	VOID	VOID	0.431026	466.3	100.0	true	false	173.7845	403.2507	9	paired verdict: VOID-aa_bias=0.0028
+libdeflate	tool.bin	3	1	OK	LOSS	1.172112	100.0	100.0	true	false	511.4405	436.2952	9	
+libdeflate	tool.bin	3	2	OK	WIN	0.877281	291.9	100.1	true	false	383.2064	436.7859	9	
+libdeflate	tool.bin	3	4	OK	WIN	0.464788	468.1	100.0	true	false	202.7769	436.2426	9	
+libdeflate	tool.bin	4	1	OK	WIN	0.977611	100.0	100.0	true	false	455.4649	465.7313	9	
+libdeflate	tool.bin	4	2	OK	WIN	0.914230	292.7	100.0	true	false	425.7539	465.5644	9	
+libdeflate	tool.bin	4	4	OK	WIN	0.488764	466.8	100.0	true	false	227.6282	465.7198	9	
+libdeflate	tool.bin	5	1	OK	LOSS	1.032931	100.0	100.0	true	false	544.5050	527.0051	9	
+libdeflate	tool.bin	5	2	OK	WIN	0.937612	291.3	100.0	true	false	494.4043	527.2555	9	
+libdeflate	tool.bin	5	4	OK	WIN	0.507628	457.4	100.0	true	false	267.9492	527.3845	9	
+libdeflate	tool.bin	6	1	OK	LOSS	1.290806	100.0	100.0	true	false	824.3952	638.6125	9	
+libdeflate	tool.bin	6	2	OK	LOSS	1.145672	296.9	100.0	true	false	731.5597	638.1787	9	
+libdeflate	tool.bin	6	4	OK	WIN	0.594918	481.8	100.0	true	false	379.9116	638.6036	9	
+libdeflate	tool.bin	7	1	OK	LOSS	1.237049	100.0	100.0	true	false	1088.1914	879.2925	9	
+libdeflate	tool.bin	7	2	OK	WIN	0.996655	298.2	100.0	true	false	876.0590	879.2626	9	
+libdeflate	tool.bin	7	4	OK	WIN	0.521663	486.8	100.0	true	false	458.7810	879.6620	9	
+libdeflate	tool.bin	8	1	OK	WIN	0.929119	100.0	100.0	true	false	1369.8130	1473.8239	9	
+libdeflate	tool.bin	8	2	OK	WIN	0.516441	297.0	100.0	true	false	761.0951	1473.8590	9	
+libdeflate	tool.bin	8	4	VOID	VOID	0.267996	481.8	100.0	true	false	395.2256	1474.4713	9	paired verdict: VOID-aa_bias=0.0009
+libdeflate	tool.bin	9	1	OK	WIN	0.914923	100.0	100.0	true	false	1737.2995	1899.4776	9	
+libdeflate	tool.bin	9	2	OK	WIN	0.469360	298.0	100.0	true	false	892.3746	1900.0246	9	
+libdeflate	tool.bin	9	4	OK	WIN	0.641736	492.2	100.0	true	false	1219.7563	1899.4503	9	
+libdeflate	tool.bin	10	1	OK	WIN	0.964176	100.0	100.0	true	false	4509.1998	4676.7174	9	
+libdeflate	tool.bin	10	2	OK	WIN	0.190584	298.0	100.0	true	false	891.1641	4675.9996	9	
+libdeflate	tool.bin	10	4	OK	WIN	0.252598	490.1	100.0	true	false	1181.5479	4676.8607	9	
+libdeflate	tool.bin	11	1	OK	WIN	0.862050	100.0	100.0	true	false	6125.7045	7105.7109	9	
+libdeflate	tool.bin	11	2	OK	WIN	0.125481	298.0	100.0	true	false	892.1788	7107.3803	9	
+libdeflate	tool.bin	11	4	OK	WIN	0.222645	491.8	100.0	true	false	1581.0109	7103.1624	9	
+libdeflate	tool.bin	12	1	OK	WIN	0.790567	100.0	100.0	true	false	7479.6607	9463.2274	9	
+libdeflate	tool.bin	12	2	OK	WIN	0.094203	297.8	100.0	true	false	891.3716	9465.6812	9	
+libdeflate	tool.bin	12	4	OK	WIN	0.205254	490.4	100.0	true	false	1942.2127	9463.3155	9	
+igzip	tool.bin	1	1	OK	LOSS	1.587882	100.0	100.1	true	false	470.2222	296.3066	9	
+igzip	tool.bin	1	2	OK	WIN	0.835456	286.5	100.1	true	false	247.0680	295.8334	9	
+igzip	tool.bin	1	4	VOID		NaN	450.3	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=450.3 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	tool.bin	2	1	OK	LOSS	1.335251	100.0	100.0	true	false	411.9497	308.7682	9	
+igzip	tool.bin	2	2	OK	LOSS	1.046890	292.9	100.1	true	false	322.6350	308.2690	9	
+igzip	tool.bin	2	4	VOID		NaN	466.6	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=466.6 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	tool.bin	3	1	OK	WIN	0.964784	100.0	100.0	true	false	511.0135	529.8124	9	
+igzip	tool.bin	3	2	OK	WIN	0.722454	292.2	100.0	true	false	382.7409	529.7520	9	
+igzip	tool.bin	3	4	VOID		NaN	467.7	100.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=467.7 (ok=true) rival cpu%=100.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	tool.bin	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	tool.bin	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	1	1	OK	WIN	0.648397	101.7	101.1	true	false	10.7538	16.6297	9	
+gzip	engine.wasm	1	2	OK	WIN	0.486591	227.2	100.9	true	false	8.1014	16.6093	9	
+gzip	engine.wasm	1	4	OK	WIN	0.338988	295.8	101.1	true	false	5.6614	16.6376	9	
+gzip	engine.wasm	2	1	OK	WIN	0.527827	101.8	101.0	true	false	9.5663	18.0939	9	
+gzip	engine.wasm	2	2	OK	WIN	0.570012	228.7	100.9	true	false	10.3099	18.1405	9	
+gzip	engine.wasm	2	4	VOID	VOID	0.364617	315.2	101.1	true	false	6.6209	18.1211	9	paired verdict: VOID-aa_bias=0.0121
+gzip	engine.wasm	3	1	OK	WIN	0.535535	101.3	100.8	true	false	12.4862	23.3040	9	
+gzip	engine.wasm	3	2	OK	WIN	0.535036	232.6	100.7	true	false	12.4931	23.3535	9	
+gzip	engine.wasm	3	4	OK	WIN	0.343154	318.5	100.7	true	false	7.9729	23.3521	9	
+gzip	engine.wasm	4	1	OK	WIN	0.468714	101.8	100.9	true	false	10.6682	22.7148	9	
+gzip	engine.wasm	4	2	VOID	VOID	0.583178	235.1	100.6	true	false	13.2786	22.7406	9	paired verdict: VOID-aa_bias=0.0030
+gzip	engine.wasm	4	4	OK	WIN	0.366638	323.1	100.9	true	false	8.3493	22.7950	9	
+gzip	engine.wasm	5	1	VOID	VOID	0.383941	101.4	100.5	true	false	13.0106	33.8784	9	paired verdict: VOID-aa_bias=0.0021
+gzip	engine.wasm	5	2	OK	WIN	0.421085	237.6	100.5	true	false	14.2855	33.9340	9	
+gzip	engine.wasm	5	4	OK	WIN	0.266729	324.2	100.5	true	false	9.0551	33.9166	9	
+gzip	engine.wasm	6	1	OK	WIN	0.328190	101.1	100.3	true	false	17.7649	54.0151	9	
+gzip	engine.wasm	6	2	OK	WIN	0.296001	238.6	100.3	true	false	16.0028	54.0943	9	
+gzip	engine.wasm	6	4	VOID	VOID	0.185038	328.8	100.4	true	false	10.0176	54.0716	9	paired verdict: VOID-aa_bias=0.0067
+gzip	engine.wasm	7	1	OK	WIN	0.292129	100.8	100.2	true	false	19.4066	66.4068	9	
+gzip	engine.wasm	7	2	OK	WIN	0.244039	241.7	100.3	true	false	16.2394	66.4559	9	
+gzip	engine.wasm	7	4	OK	WIN	0.159345	324.7	100.3	true	false	10.5879	66.3972	9	
+gzip	engine.wasm	8	1	OK	WIN	0.293556	100.8	100.2	true	false	23.4104	79.7228	9	
+gzip	engine.wasm	8	2	VOID	VOID	0.228284	241.3	100.2	true	false	18.2215	79.7853	9	paired verdict: VOID-aa_bias=0.0076
+gzip	engine.wasm	8	4	OK	WIN	0.141748	335.8	100.2	true	false	11.3236	79.7202	9	
+gzip	engine.wasm	9	1	OK	WIN	0.308348	100.7	100.2	true	false	25.0090	81.0898	9	
+gzip	engine.wasm	9	2	OK	WIN	0.221256	242.4	100.2	true	false	17.9329	81.0948	9	
+gzip	engine.wasm	9	4	OK	WIN	0.319649	350.1	100.2	true	false	25.9652	81.1536	9	
+gzip	engine.wasm	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	engine.wasm	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	1	1	OK	WIN	0.739760	101.4	101.2	true	false	10.7429	14.5329	9	
+pigz	engine.wasm	1	2	VOID	VOID	0.893415	223.0	175.2	true	false	8.2028	9.1940	9	paired verdict: VOID-aa_bias=0.0076
+pigz	engine.wasm	1	4	OK	WIN	0.932604	291.0	277.9	true	false	5.7125	6.1010	9	
+pigz	engine.wasm	2	1	OK	WIN	0.596406	101.6	101.0	true	false	9.5892	16.0497	9	
+pigz	engine.wasm	2	2	OK	LOSS	1.040934	228.4	176.4	true	false	10.4126	10.0277	9	
+pigz	engine.wasm	2	4	OK	TIE	1.009463	310.1	277.4	true	false	6.6545	6.5953	9	
+pigz	engine.wasm	3	1	OK	WIN	0.584479	101.3	100.9	true	false	12.4563	21.2971	9	
+pigz	engine.wasm	3	2	OK	WIN	0.975176	233.7	179.4	true	false	12.4573	12.7647	9	
+pigz	engine.wasm	3	4	OK	WIN	0.979130	321.7	293.1	true	false	7.9757	8.1433	9	
+pigz	engine.wasm	4	1	OK	WIN	0.491252	101.4	100.8	true	false	10.7169	21.7881	9	
+pigz	engine.wasm	4	2	OK	LOSS	1.014649	234.4	178.6	true	false	13.3205	13.1144	9	
+pigz	engine.wasm	4	4	VOID	VOID	1.017679	320.9	293.3	true	false	8.4542	8.3361	9	paired verdict: VOID-aa_bias=0.0038
+pigz	engine.wasm	5	1	OK	WIN	0.395819	101.2	100.5	true	false	13.0682	33.1350	9	
+pigz	engine.wasm	5	2	OK	WIN	0.758329	236.7	183.7	true	false	14.3986	19.0109	9	
+pigz	engine.wasm	5	4	OK	WIN	0.770311	322.9	303.3	true	false	9.0644	11.7909	9	
+pigz	engine.wasm	6	1	OK	WIN	0.332088	100.9	100.4	true	false	17.7311	53.4435	9	
+pigz	engine.wasm	6	2	OK	WIN	0.545218	238.1	187.2	true	false	16.0130	29.3131	9	
+pigz	engine.wasm	6	4	OK	WIN	0.557069	328.9	309.3	true	false	10.0535	18.0448	9	
+pigz	engine.wasm	7	1	OK	WIN	0.295331	100.8	100.3	true	false	19.4747	65.8858	9	
+pigz	engine.wasm	7	2	OK	WIN	0.456525	241.5	189.8	true	false	16.2494	35.6023	9	
+pigz	engine.wasm	7	4	OK	WIN	0.477628	322.9	307.7	true	false	10.5715	22.1875	9	
+pigz	engine.wasm	8	1	OK	WIN	0.295970	100.8	100.2	true	false	23.4339	79.1666	9	
+pigz	engine.wasm	8	2	OK	WIN	0.430144	240.7	190.7	true	false	18.2578	42.5060	9	
+pigz	engine.wasm	8	4	OK	WIN	0.422267	334.6	306.5	true	false	11.2439	26.6803	9	
+pigz	engine.wasm	9	1	OK	WIN	0.310809	100.7	100.2	true	false	24.9985	80.4171	9	
+pigz	engine.wasm	9	2	OK	WIN	0.418482	243.4	191.7	true	false	17.9223	42.7911	9	
+pigz	engine.wasm	9	4	OK	WIN	0.952865	347.0	305.6	true	false	25.8643	27.1425	9	
+pigz	engine.wasm	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	11	1	OK	WIN	0.026864	100.3	100.0	true	false	75.6542	2815.4618	9	
+pigz	engine.wasm	11	2	OK	WIN	0.011911	242.2	186.6	true	false	18.0467	1515.7783	9	
+pigz	engine.wasm	11	4	OK	WIN	0.037135	352.1	326.3	true	false	32.1851	867.3407	9	
+pigz	engine.wasm	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	engine.wasm	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	engine.wasm	1	1	OK	LOSS	1.635690	101.9	102.9	true	false	10.7017	6.5442	9	
+libdeflate	engine.wasm	1	2	OK	LOSS	1.226627	225.3	102.6	true	false	8.1251	6.6556	9	
+libdeflate	engine.wasm	1	4	OK	WIN	0.860834	294.8	102.5	true	false	5.6187	6.5414	9	
+libdeflate	engine.wasm	2	1	OK	LOSS	1.085707	101.5	101.9	true	false	9.5701	8.8525	9	
+libdeflate	engine.wasm	2	2	OK	LOSS	1.167886	229.4	102.3	true	false	10.3627	8.8645	9	
+libdeflate	engine.wasm	2	4	OK	WIN	0.751196	313.1	102.0	true	false	6.6531	8.8499	9	
+libdeflate	engine.wasm	3	1	OK	LOSS	1.272156	101.5	101.7	true	false	12.3970	9.7408	9	
+libdeflate	engine.wasm	3	2	OK	LOSS	1.265485	233.8	102.0	true	false	12.4437	9.8177	9	
+libdeflate	engine.wasm	3	4	OK	WIN	0.803370	320.8	101.5	true	false	7.8578	9.7993	9	
+libdeflate	engine.wasm	4	1	OK	LOSS	1.039460	101.3	101.9	true	false	10.6436	10.2453	9	
+libdeflate	engine.wasm	4	2	OK	LOSS	1.289384	235.5	101.4	true	false	13.2992	10.2848	9	
+libdeflate	engine.wasm	4	4	OK	WIN	0.812437	324.9	101.4	true	false	8.3300	10.2846	9	
+libdeflate	engine.wasm	5	1	OK	LOSS	1.082012	101.4	101.5	true	false	13.0676	12.0459	9	
+libdeflate	engine.wasm	5	2	OK	LOSS	1.179021	237.0	101.5	true	false	14.2897	12.1131	9	
+libdeflate	engine.wasm	5	4	OK	WIN	0.742921	326.9	101.4	true	false	9.0013	12.1188	9	
+libdeflate	engine.wasm	6	1	OK	LOSS	1.243891	100.8	101.2	true	false	17.6648	14.1657	9	
+libdeflate	engine.wasm	6	2	OK	LOSS	1.120216	238.5	101.1	true	false	15.9401	14.2379	9	
+libdeflate	engine.wasm	6	4	OK	WIN	0.701176	330.0	101.3	true	false	9.9994	14.2806	9	
+libdeflate	engine.wasm	7	1	OK	LOSS	1.115044	100.8	101.1	true	false	19.3319	17.3677	9	
+libdeflate	engine.wasm	7	2	OK	WIN	0.928922	241.8	100.9	true	false	16.1940	17.4041	9	
+libdeflate	engine.wasm	7	4	OK	WIN	0.603699	326.4	101.0	true	false	10.5133	17.3855	9	
+libdeflate	engine.wasm	8	1	VOID	VOID	0.977778	100.7	100.8	true	false	23.4126	23.9646	9	paired verdict: VOID-aa_bias=0.0030
+libdeflate	engine.wasm	8	2	OK	WIN	0.761196	241.6	100.7	true	false	18.2228	23.9487	9	
+libdeflate	engine.wasm	8	4	OK	WIN	0.467279	332.5	100.8	true	false	11.2139	24.0049	9	
+libdeflate	engine.wasm	9	1	OK	WIN	0.965591	100.8	100.7	true	false	24.9669	25.8488	9	
+libdeflate	engine.wasm	9	2	OK	WIN	0.691437	242.2	100.7	true	false	17.9077	25.9151	9	
+libdeflate	engine.wasm	9	4	OK	WIN	0.997076	348.5	100.8	true	false	25.8645	25.9451	9	
+libdeflate	engine.wasm	10	1	VOID	VOID	0.986784	100.3	100.3	true	false	59.6525	60.4507	9	paired verdict: VOID-aa_bias=0.0019
+libdeflate	engine.wasm	10	2	OK	WIN	0.296122	242.2	100.3	true	false	17.9224	60.4494	9	
+libdeflate	engine.wasm	10	4	OK	WIN	0.428144	348.9	100.3	true	false	25.8110	60.3590	9	
+libdeflate	engine.wasm	11	1	OK	WIN	0.910676	100.2	100.2	true	false	75.4935	82.9303	9	
+libdeflate	engine.wasm	11	2	OK	WIN	0.215957	242.2	100.2	true	false	17.8929	82.8807	9	
+libdeflate	engine.wasm	11	4	OK	WIN	0.387420	354.1	100.2	true	false	32.0580	82.7809	9	
+libdeflate	engine.wasm	12	1	OK	WIN	0.873326	100.2	100.2	true	false	83.6191	95.7302	9	
+libdeflate	engine.wasm	12	2	OK	WIN	0.187227	242.9	100.2	true	false	17.9562	95.8407	9	
+libdeflate	engine.wasm	12	4	OK	WIN	0.368448	359.0	100.2	true	false	35.2453	95.6908	9	
+igzip	engine.wasm	1	1	OK	LOSS	1.522127	101.5	102.4	true	false	10.6696	6.9969	9	
+igzip	engine.wasm	1	2	VOID	VOID	1.152052	224.6	102.6	true	false	8.0899	6.9939	9	paired verdict: VOID-aa_bias=0.0116
+igzip	engine.wasm	1	4	VOID		NaN	292.0	102.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=292.0 (ok=true) rival cpu%=102.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	engine.wasm	2	1	OK	LOSS	1.302380	101.4	102.2	true	false	9.5672	7.3327	9	
+igzip	engine.wasm	2	2	OK	LOSS	1.409020	227.5	102.8	true	false	10.3180	7.3272	9	
+igzip	engine.wasm	2	4	VOID		NaN	314.8	102.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=314.8 (ok=true) rival cpu%=102.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	engine.wasm	3	1	OK	LOSS	1.167872	101.2	101.8	true	false	12.4008	10.6184	9	
+igzip	engine.wasm	3	2	OK	LOSS	1.167218	233.9	101.7	true	false	12.4176	10.6161	9	
+igzip	engine.wasm	3	4	VOID		NaN	318.5	101.8	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=318.5 (ok=true) rival cpu%=101.8 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	engine.wasm	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	engine.wasm	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	1	1	OK	WIN	0.652946	102.1	101.0	true	false	10.2020	15.6103	9	
+gzip	symbols.dwarf	1	2	OK	WIN	0.447848	244.0	101.0	true	false	6.9886	15.6573	9	
+gzip	symbols.dwarf	1	4	OK	WIN	0.360441	302.4	101.1	true	false	5.6101	15.6306	9	
+gzip	symbols.dwarf	2	1	OK	WIN	0.547945	102.3	101.0	true	false	9.2054	16.8035	9	
+gzip	symbols.dwarf	2	2	OK	WIN	0.524388	253.4	100.7	true	false	8.8319	16.8252	9	
+gzip	symbols.dwarf	2	4	OK	WIN	0.402596	314.7	101.1	true	false	6.8116	16.8677	9	
+gzip	symbols.dwarf	3	1	OK	WIN	0.534756	101.2	100.8	true	false	11.2327	20.9635	9	
+gzip	symbols.dwarf	3	2	OK	WIN	0.484409	259.9	100.7	true	false	10.1693	20.9940	9	
+gzip	symbols.dwarf	3	4	OK	WIN	0.367724	321.7	100.9	true	false	7.7233	20.9941	9	
+gzip	symbols.dwarf	4	1	OK	WIN	0.492625	101.7	100.8	true	false	10.1110	20.5634	9	
+gzip	symbols.dwarf	4	2	OK	WIN	0.557184	259.2	100.8	true	false	11.4645	20.5877	9	
+gzip	symbols.dwarf	4	4	OK	WIN	0.390710	339.6	100.9	true	false	8.0524	20.5597	9	
+gzip	symbols.dwarf	5	1	OK	WIN	0.420980	101.5	100.6	true	false	11.9226	28.3296	9	
+gzip	symbols.dwarf	5	2	OK	WIN	0.482843	260.0	100.7	true	false	13.6950	28.3451	9	
+gzip	symbols.dwarf	5	4	OK	WIN	0.315746	356.4	100.6	true	false	8.9454	28.3222	9	
+gzip	symbols.dwarf	6	1	OK	WIN	0.404269	100.8	100.4	true	false	18.8443	46.5493	9	
+gzip	symbols.dwarf	6	2	VOID	VOID	0.488911	279.4	100.4	true	false	22.8114	46.6534	9	paired verdict: VOID-aa_bias=0.0031
+gzip	symbols.dwarf	6	4	OK	WIN	0.328921	374.2	100.4	true	false	15.3381	46.6294	9	
+gzip	symbols.dwarf	7	1	OK	WIN	0.453236	100.5	100.3	true	false	27.6078	60.8896	9	
+gzip	symbols.dwarf	7	2	OK	WIN	0.532786	283.3	100.3	true	false	32.4832	60.9599	9	
+gzip	symbols.dwarf	7	4	OK	WIN	0.386581	359.0	100.3	true	false	23.5570	60.9162	9	
+gzip	symbols.dwarf	8	1	OK	WIN	0.256376	100.5	100.1	true	false	36.4765	142.1730	9	
+gzip	symbols.dwarf	8	2	OK	WIN	0.155149	277.0	100.1	true	false	22.0574	142.2520	9	
+gzip	symbols.dwarf	8	4	OK	WIN	0.100859	383.0	100.1	true	false	14.3246	142.1289	9	
+gzip	symbols.dwarf	9	1	OK	WIN	0.177930	100.3	100.1	true	false	54.6467	307.1616	9	
+gzip	symbols.dwarf	9	2	OK	WIN	0.095635	283.7	100.1	true	false	29.4253	307.4491	9	
+gzip	symbols.dwarf	9	4	OK	WIN	0.132046	342.5	100.1	true	false	40.5397	307.1700	9	
+gzip	symbols.dwarf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	symbols.dwarf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	1	1	OK	WIN	0.766376	101.8	101.6	true	false	10.2074	13.2901	9	
+pigz	symbols.dwarf	1	2	OK	WIN	0.854122	243.4	180.7	true	false	7.0599	8.2586	9	
+pigz	symbols.dwarf	1	4	OK	WIN	0.992144	299.8	280.6	true	false	5.5955	5.6456	9	
+pigz	symbols.dwarf	2	1	OK	WIN	0.638756	101.8	101.1	true	false	9.2386	14.5222	9	
+pigz	symbols.dwarf	2	2	OK	WIN	0.986355	253.9	181.6	true	false	8.8047	8.9339	9	
+pigz	symbols.dwarf	2	4	OK	LOSS	1.135689	313.6	283.6	true	false	6.7433	5.9399	9	
+pigz	symbols.dwarf	3	1	OK	WIN	0.605849	101.5	100.8	true	false	11.1698	18.4273	9	
+pigz	symbols.dwarf	3	2	OK	WIN	0.937281	258.0	186.4	true	false	10.1840	10.8865	9	
+pigz	symbols.dwarf	3	4	OK	LOSS	1.117715	322.3	302.5	true	false	7.8159	6.9976	9	
+pigz	symbols.dwarf	4	1	OK	WIN	0.522949	101.8	100.9	true	false	10.1159	19.3659	9	
+pigz	symbols.dwarf	4	2	OK	TIE	1.001858	257.2	184.2	true	false	11.5225	11.5170	9	
+pigz	symbols.dwarf	4	4	OK	LOSS	1.096522	337.1	297.8	true	false	8.1451	7.4360	9	
+pigz	symbols.dwarf	5	1	OK	WIN	0.441936	101.4	100.5	true	false	11.8926	26.9083	9	
+pigz	symbols.dwarf	5	2	OK	WIN	0.886319	259.7	185.8	true	false	13.7101	15.4915	9	
+pigz	symbols.dwarf	5	4	OK	WIN	0.937658	360.7	309.1	true	false	9.0389	9.6740	9	
+pigz	symbols.dwarf	6	1	OK	WIN	0.417102	101.0	100.4	true	false	18.8147	45.1022	9	
+pigz	symbols.dwarf	6	2	OK	WIN	0.949963	279.5	195.6	true	false	22.8334	24.0495	9	
+pigz	symbols.dwarf	6	4	OK	LOSS	1.112531	377.0	350.1	true	false	15.3016	13.7315	9	
+pigz	symbols.dwarf	7	1	OK	WIN	0.464508	100.7	100.3	true	false	27.6400	59.4976	9	
+pigz	symbols.dwarf	7	2	VOID	VOID	1.037014	283.6	196.0	true	false	32.4951	31.3590	9	paired verdict: VOID-aa_bias=0.0020
+pigz	symbols.dwarf	7	4	OK	LOSS	1.364896	359.5	361.3	true	false	23.5775	17.2765	9	
+pigz	symbols.dwarf	8	1	OK	WIN	0.258729	100.4	100.1	true	false	36.4525	140.9837	9	
+pigz	symbols.dwarf	8	2	OK	WIN	0.300226	276.7	194.1	true	false	22.1143	73.6132	9	
+pigz	symbols.dwarf	8	4	OK	WIN	0.354645	379.9	356.0	true	false	14.3407	40.4385	9	
+pigz	symbols.dwarf	9	1	OK	WIN	0.178314	100.3	100.1	true	false	54.6329	306.5085	9	
+pigz	symbols.dwarf	9	2	VOID	VOID	0.184395	283.4	193.1	true	false	29.4635	159.7538	9	paired verdict: VOID-aa_bias=0.0020
+pigz	symbols.dwarf	9	4	OK	WIN	0.490814	341.9	374.4	true	false	40.6246	82.7614	9	
+pigz	symbols.dwarf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	11	1	OK	WIN	0.014472	100.1	100.0	true	false	110.7304	7646.8148	9	
+pigz	symbols.dwarf	11	2	OK	WIN	0.007543	282.6	196.4	true	false	29.4886	3906.3778	9	
+pigz	symbols.dwarf	11	4	OK	WIN	0.019532	352.2	317.6	true	false	47.2515	2420.6707	9	
+pigz	symbols.dwarf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	symbols.dwarf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	symbols.dwarf	1	1	OK	LOSS	1.572995	101.6	102.9	true	false	10.1949	6.4899	9	
+libdeflate	symbols.dwarf	1	2	VOID	VOID	1.091038	241.2	102.7	true	false	7.0749	6.4824	9	paired verdict: VOID-aa_bias=0.0159
+libdeflate	symbols.dwarf	1	4	OK	WIN	0.854132	301.5	102.6	true	false	5.5833	6.5179	9	
+libdeflate	symbols.dwarf	2	1	OK	LOSS	1.092405	102.1	102.1	true	false	9.1853	8.4062	9	
+libdeflate	symbols.dwarf	2	2	OK	LOSS	1.041035	250.2	102.2	true	false	8.8496	8.5176	9	
+libdeflate	symbols.dwarf	2	4	OK	WIN	0.796736	311.3	102.1	true	false	6.7326	8.4218	9	
+libdeflate	symbols.dwarf	3	1	OK	LOSS	1.231941	101.3	102.2	true	false	11.1674	9.0865	9	
+libdeflate	symbols.dwarf	3	2	OK	LOSS	1.119030	256.6	101.9	true	false	10.1842	9.1087	9	
+libdeflate	symbols.dwarf	3	4	OK	WIN	0.852497	319.2	102.1	true	false	7.7551	9.1202	9	
+libdeflate	symbols.dwarf	4	1	OK	LOSS	1.040935	101.7	101.2	true	false	10.1004	9.6979	9	
+libdeflate	symbols.dwarf	4	2	OK	LOSS	1.179118	258.2	101.2	true	false	11.4788	9.7389	9	
+libdeflate	symbols.dwarf	4	4	OK	WIN	0.837351	338.5	101.6	true	false	8.1124	9.7191	9	
+libdeflate	symbols.dwarf	5	1	OK	LOSS	1.082829	101.4	101.7	true	false	11.8314	10.9300	9	
+libdeflate	symbols.dwarf	5	2	OK	LOSS	1.241136	259.6	101.7	true	false	13.5706	10.9690	9	
+libdeflate	symbols.dwarf	5	4	OK	WIN	0.803950	362.3	101.5	true	false	8.7688	10.9058	9	
+libdeflate	symbols.dwarf	6	1	VOID	VOID	1.396347	100.8	101.2	true	false	18.7817	13.4517	9	paired verdict: VOID-aa_bias=0.0024
+libdeflate	symbols.dwarf	6	2	OK	LOSS	1.689475	279.6	101.4	true	false	22.8023	13.4944	9	
+libdeflate	symbols.dwarf	6	4	VOID	VOID	1.130357	374.0	101.4	true	false	15.3083	13.5440	9	paired verdict: VOID-aa_bias=0.0042
+libdeflate	symbols.dwarf	7	1	OK	LOSS	1.396448	100.6	100.9	true	false	27.5754	19.7459	9	
+libdeflate	symbols.dwarf	7	2	OK	LOSS	1.642529	283.9	101.0	true	false	32.4758	19.7801	9	
+libdeflate	symbols.dwarf	7	4	OK	LOSS	1.186867	359.3	100.9	true	false	23.4949	19.8173	9	
+libdeflate	symbols.dwarf	8	1	OK	WIN	0.924869	100.4	100.5	true	false	36.4403	39.3930	9	
+libdeflate	symbols.dwarf	8	2	VOID	VOID	0.560142	277.7	100.5	true	false	22.1231	39.4600	9	paired verdict: VOID-aa_bias=0.0024
+libdeflate	symbols.dwarf	8	4	OK	WIN	0.363182	380.7	100.4	true	false	14.3138	39.4536	9	
+libdeflate	symbols.dwarf	9	1	OK	WIN	0.901811	100.3	100.3	true	false	54.6076	60.5250	9	
+libdeflate	symbols.dwarf	9	2	OK	WIN	0.484645	282.2	100.3	true	false	29.3619	60.5813	9	
+libdeflate	symbols.dwarf	9	4	OK	WIN	0.670140	341.0	100.3	true	false	40.6091	60.5659	9	
+libdeflate	symbols.dwarf	10	1	OK	WIN	0.976688	100.2	100.2	true	false	89.9994	92.1721	9	
+libdeflate	symbols.dwarf	10	2	OK	WIN	0.318643	283.6	100.2	true	false	29.3903	92.2653	9	
+libdeflate	symbols.dwarf	10	4	OK	WIN	0.436129	343.0	100.2	true	false	40.1659	92.2045	9	
+libdeflate	symbols.dwarf	11	1	OK	WIN	0.886956	100.2	100.2	true	false	110.4951	124.5599	9	
+libdeflate	symbols.dwarf	11	2	VOID	VOID	0.236476	282.7	100.1	true	false	29.4659	124.5173	9	paired verdict: VOID-aa_bias=0.0019
+libdeflate	symbols.dwarf	11	4	OK	WIN	0.378576	351.9	100.1	true	false	47.1114	124.4124	9	
+libdeflate	symbols.dwarf	12	1	OK	WIN	0.820358	100.1	100.1	true	false	136.0392	165.7633	9	
+libdeflate	symbols.dwarf	12	2	OK	WIN	0.176815	282.8	100.1	true	false	29.3435	165.9047	9	
+libdeflate	symbols.dwarf	12	4	OK	WIN	0.362289	338.6	100.1	true	false	60.1255	166.0193	9	
+igzip	symbols.dwarf	1	1	OK	LOSS	1.473091	102.0	103.0	true	false	10.2303	6.9542	9	
+igzip	symbols.dwarf	1	2	VOID	VOID	1.022742	242.5	102.8	true	false	7.0299	6.8716	9	paired verdict: VOID-aa_bias=0.0121
+igzip	symbols.dwarf	1	4	VOID		NaN	297.3	101.9	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=297.3 (ok=true) rival cpu%=101.9 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	symbols.dwarf	2	1	OK	LOSS	1.290571	101.8	102.7	true	false	9.1494	7.0983	9	
+igzip	symbols.dwarf	2	2	VOID	VOID	1.217053	250.7	102.5	true	false	8.7179	7.1356	9	paired verdict: VOID-aa_bias=0.0066
+igzip	symbols.dwarf	2	4	VOID		NaN	312.4	102.3	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=312.4 (ok=true) rival cpu%=102.3 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	symbols.dwarf	3	1	OK	LOSS	1.033536	101.5	101.7	true	false	11.1352	10.7669	9	
+igzip	symbols.dwarf	3	2	OK	WIN	0.944506	255.8	101.8	true	false	10.1954	10.8032	9	
+igzip	symbols.dwarf	3	4	VOID		NaN	311.5	102.0	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=311.5 (ok=true) rival cpu%=102.0 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	symbols.dwarf	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	symbols.dwarf	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	1	1	OK	WIN	0.637541	100.1	100.1	true	false	196.1473	307.7992	9	
+gzip	movie.mp4	1	2	OK	WIN	0.329485	278.7	100.1	true	false	101.4605	307.9662	9	
+gzip	movie.mp4	1	4	OK	WIN	0.195527	410.4	100.1	true	false	60.3323	307.7300	9	
+gzip	movie.mp4	2	1	OK	WIN	0.426327	100.1	100.1	true	false	131.9591	309.3323	9	
+gzip	movie.mp4	2	2	OK	WIN	0.329306	279.0	100.1	true	false	101.5783	307.8397	9	
+gzip	movie.mp4	2	4	OK	WIN	0.198190	406.7	100.1	true	false	61.1896	308.3089	9	
+gzip	movie.mp4	3	1	OK	WIN	0.468775	100.1	100.1	true	false	145.7875	310.6280	9	
+gzip	movie.mp4	3	2	OK	WIN	0.339831	279.6	100.1	true	false	105.6539	310.6791	9	
+gzip	movie.mp4	3	4	OK	WIN	0.202900	406.8	100.1	true	false	63.2224	313.5507	9	
+gzip	movie.mp4	4	1	VOID	VOID	0.406420	100.1	100.1	true	false	132.0120	324.8324	9	paired verdict: VOID-aa_bias=0.0011
+gzip	movie.mp4	4	2	OK	WIN	0.323213	279.1	100.1	true	false	104.9193	325.2971	9	
+gzip	movie.mp4	4	4	OK	WIN	0.194774	405.5	100.1	true	false	63.2054	324.3097	9	
+gzip	movie.mp4	5	1	OK	WIN	0.448950	100.1	100.1	true	false	146.1259	324.9435	9	
+gzip	movie.mp4	5	2	OK	WIN	0.322954	279.4	100.1	true	false	105.0061	324.9728	9	
+gzip	movie.mp4	5	4	OK	WIN	0.193631	403.9	100.1	true	false	63.0925	325.3477	9	
+gzip	movie.mp4	6	1	OK	WIN	0.446976	100.1	100.0	true	false	146.2744	326.9712	9	
+gzip	movie.mp4	6	2	OK	WIN	0.321151	279.3	100.1	true	false	104.9967	327.0949	9	
+gzip	movie.mp4	6	4	OK	WIN	0.193302	403.5	100.1	true	false	63.1906	327.0112	9	
+gzip	movie.mp4	7	1	OK	WIN	0.445825	100.1	100.1	true	false	146.2972	327.9701	9	
+gzip	movie.mp4	7	2	OK	WIN	0.319762	279.0	100.0	true	false	104.9801	328.2098	9	
+gzip	movie.mp4	7	4	OK	WIN	0.191960	402.7	100.1	true	false	63.2059	329.1712	9	
+gzip	movie.mp4	8	1	OK	WIN	0.427171	100.1	100.1	true	false	142.0750	332.2321	9	
+gzip	movie.mp4	8	2	OK	WIN	0.318578	279.4	100.1	true	false	106.1285	333.3297	9	
+gzip	movie.mp4	8	4	VOID	VOID	0.191246	403.8	100.1	true	false	63.6675	332.2218	9	paired verdict: VOID-aa_bias=0.0026
+gzip	movie.mp4	9	1	OK	WIN	0.415632	100.1	100.0	true	false	141.7999	341.1051	9	
+gzip	movie.mp4	9	2	OK	WIN	0.302736	279.0	100.1	true	false	103.1456	340.6793	9	
+gzip	movie.mp4	9	4	OK	WIN	0.412092	414.5	100.1	true	false	140.6044	341.3168	9	
+gzip	movie.mp4	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+gzip	movie.mp4	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	1	1	OK	WIN	0.753617	100.1	100.1	true	false	196.1584	260.1183	9	
+pigz	movie.mp4	1	2	OK	WIN	0.759845	279.0	200.4	true	false	101.8178	133.8636	9	
+pigz	movie.mp4	1	4	OK	WIN	0.875148	410.1	393.2	true	false	60.1081	68.6103	9	
+pigz	movie.mp4	2	1	OK	WIN	0.504326	100.1	100.1	true	false	131.9450	261.8003	9	
+pigz	movie.mp4	2	2	OK	WIN	0.753526	279.5	200.1	true	false	101.4153	134.6718	9	
+pigz	movie.mp4	2	4	OK	WIN	0.882140	408.2	392.5	true	false	60.8149	69.0384	9	
+pigz	movie.mp4	3	1	OK	WIN	0.556182	100.1	100.1	true	false	145.9444	262.5032	9	
+pigz	movie.mp4	3	2	OK	WIN	0.781616	279.2	200.2	true	false	105.6990	135.1870	9	
+pigz	movie.mp4	3	4	OK	WIN	0.908968	405.1	391.2	true	false	63.2077	69.5911	9	
+pigz	movie.mp4	4	1	OK	WIN	0.470174	100.1	100.1	true	false	131.9195	280.6288	9	
+pigz	movie.mp4	4	2	OK	WIN	0.718203	280.3	199.9	true	false	104.7910	146.1551	9	
+pigz	movie.mp4	4	4	OK	WIN	0.844222	405.0	392.5	true	false	63.0536	74.7101	9	
+pigz	movie.mp4	5	1	OK	WIN	0.517866	100.1	100.1	true	false	145.8605	281.7367	9	
+pigz	movie.mp4	5	2	OK	WIN	0.713648	279.7	199.5	true	false	104.9296	147.0570	9	
+pigz	movie.mp4	5	4	OK	WIN	0.838093	406.7	390.5	true	false	63.3260	75.4951	9	
+pigz	movie.mp4	6	1	OK	WIN	0.515159	100.1	100.0	true	false	146.1397	283.8369	9	
+pigz	movie.mp4	6	2	OK	WIN	0.705710	279.1	198.2	true	false	104.9646	148.8106	9	
+pigz	movie.mp4	6	4	OK	WIN	0.816500	402.8	383.1	true	false	63.0628	77.2812	9	
+pigz	movie.mp4	7	1	OK	WIN	0.513999	100.1	100.1	true	false	146.3686	284.7451	9	
+pigz	movie.mp4	7	2	OK	WIN	0.700896	279.3	197.6	true	false	105.1317	150.0297	9	
+pigz	movie.mp4	7	4	OK	WIN	0.806840	402.7	379.3	true	false	63.2560	78.3667	9	
+pigz	movie.mp4	8	1	OK	WIN	0.490560	100.1	100.0	true	false	141.9587	289.4467	9	
+pigz	movie.mp4	8	2	OK	WIN	0.687424	279.6	194.8	true	false	106.1341	154.4342	9	
+pigz	movie.mp4	8	4	OK	WIN	0.769944	403.1	364.5	true	false	63.9132	82.9514	9	
+pigz	movie.mp4	9	1	OK	WIN	0.477304	100.1	100.1	true	false	142.0391	297.7149	9	
+pigz	movie.mp4	9	2	OK	WIN	0.635021	279.1	189.9	true	false	103.3772	162.8784	9	
+pigz	movie.mp4	9	4	OK	LOSS	1.538651	414.6	339.8	true	false	140.5424	91.3503	9	
+pigz	movie.mp4	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	11	1	OK	WIN	0.035432	100.0	100.0	true	false	473.5295	13378.6210	9	
+pigz	movie.mp4	11	2	OK	WIN	0.014909	279.3	191.9	true	false	103.4017	6934.3808	9	
+pigz	movie.mp4	11	4	OK	WIN	0.042869	416.4	360.7	true	false	160.5605	3744.6951	9	
+pigz	movie.mp4	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+pigz	movie.mp4	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+libdeflate	movie.mp4	1	1	OK	LOSS	1.993885	100.1	100.2	true	false	195.9205	98.3697	9	
+libdeflate	movie.mp4	1	2	OK	LOSS	1.031530	278.6	100.2	true	false	101.4466	98.4126	9	
+libdeflate	movie.mp4	1	4	VOID	VOID	0.611899	408.6	100.2	true	false	60.1812	98.2403	9	paired verdict: VOID-aa_bias=0.0054
+libdeflate	movie.mp4	2	1	OK	WIN	0.988243	100.1	100.2	true	false	131.9321	133.4989	9	
+libdeflate	movie.mp4	2	2	OK	WIN	0.757964	279.5	100.1	true	false	101.4643	133.8999	9	
+libdeflate	movie.mp4	2	4	VOID	VOID	0.455981	403.1	100.1	true	false	61.0051	133.6713	9	paired verdict: VOID-aa_bias=0.0037
+libdeflate	movie.mp4	3	1	OK	LOSS	1.092277	100.1	100.1	true	false	145.8315	133.5627	9	
+libdeflate	movie.mp4	3	2	OK	WIN	0.790115	280.2	100.1	true	false	105.4894	133.6515	9	
+libdeflate	movie.mp4	3	4	OK	WIN	0.473933	404.7	100.1	true	false	63.4031	133.6876	9	
+libdeflate	movie.mp4	4	1	VOID	VOID	0.988804	100.1	100.1	true	false	132.0480	133.5669	9	paired verdict: VOID-aa_bias=0.0022
+libdeflate	movie.mp4	4	2	OK	WIN	0.783412	279.6	100.1	true	false	104.6728	133.5892	9	
+libdeflate	movie.mp4	4	4	OK	WIN	0.471681	402.3	100.1	true	false	63.0528	133.8666	9	
+libdeflate	movie.mp4	5	1	VOID	VOID	1.047049	100.1	100.1	true	false	145.7761	139.1772	9	paired verdict: VOID-aa_bias=0.0014
+libdeflate	movie.mp4	5	2	OK	WIN	0.751737	279.1	100.1	true	false	104.8860	139.4036	9	
+libdeflate	movie.mp4	5	4	OK	WIN	0.452269	403.4	100.1	true	false	63.1053	139.5550	9	
+libdeflate	movie.mp4	6	1	OK	LOSS	1.048870	100.1	100.1	true	false	146.1375	139.3594	9	
+libdeflate	movie.mp4	6	2	OK	WIN	0.752591	279.0	100.1	true	false	105.0076	139.4515	9	
+libdeflate	movie.mp4	6	4	OK	WIN	0.452998	402.3	100.1	true	false	63.2183	139.6280	9	
+libdeflate	movie.mp4	7	1	OK	LOSS	1.048597	100.1	100.1	true	false	146.2768	139.5057	9	
+libdeflate	movie.mp4	7	2	OK	WIN	0.751362	279.4	100.1	true	false	104.9766	139.8131	9	
+libdeflate	movie.mp4	7	4	OK	WIN	0.453907	402.7	100.1	true	false	63.4379	139.6402	9	
+libdeflate	movie.mp4	8	1	OK	LOSS	1.007944	100.1	100.1	true	false	141.9321	140.6807	9	
+libdeflate	movie.mp4	8	2	OK	WIN	0.753094	279.3	100.1	true	false	106.0051	140.6654	9	
+libdeflate	movie.mp4	8	4	OK	WIN	0.451454	404.5	100.1	true	false	63.5565	140.6693	9	
+libdeflate	movie.mp4	9	1	VOID	VOID	1.008852	100.1	100.1	true	false	141.8966	140.6876	9	paired verdict: VOID-aa_bias=0.0013
+libdeflate	movie.mp4	9	2	VOID	VOID	0.733116	279.2	100.1	true	false	103.2455	140.7099	9	paired verdict: VOID-aa_bias=0.0023
+libdeflate	movie.mp4	9	4	VOID	VOID	0.998168	414.2	100.1	true	false	140.6462	140.7350	9	paired verdict: VOID-aa_bias=0.0014
+libdeflate	movie.mp4	10	1	OK	LOSS	1.404497	100.0	100.1	true	false	424.2326	301.9415	9	
+libdeflate	movie.mp4	10	2	OK	WIN	0.342178	278.8	100.1	true	false	103.3990	302.2221	9	
+libdeflate	movie.mp4	10	4	OK	WIN	0.464846	414.2	100.1	true	false	140.3399	301.7021	9	
+libdeflate	movie.mp4	11	1	OK	LOSS	1.410139	100.0	100.1	true	false	471.7873	334.5779	9	
+libdeflate	movie.mp4	11	2	OK	WIN	0.308326	279.4	100.1	true	false	103.3078	335.1138	9	
+libdeflate	movie.mp4	11	4	OK	WIN	0.477512	418.0	100.1	true	false	160.2235	334.9314	9	
+libdeflate	movie.mp4	12	1	OK	LOSS	1.402323	100.0	100.1	true	false	523.3873	373.2184	9	
+libdeflate	movie.mp4	12	2	OK	WIN	0.276659	279.0	100.1	true	false	103.3971	373.4995	9	
+libdeflate	movie.mp4	12	4	OK	WIN	0.485313	413.9	100.0	true	false	180.7409	372.6285	9	
+igzip	movie.mp4	1	1	OK	LOSS	1.418742	100.1	100.1	true	false	197.0109	138.8787	9	
+igzip	movie.mp4	1	2	OK	WIN	0.733392	278.7	100.1	true	false	101.5918	138.8199	9	
+igzip	movie.mp4	1	4	VOID		NaN	406.7	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=406.7 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	movie.mp4	2	1	OK	WIN	0.915621	100.1	100.1	true	false	131.8454	144.0519	9	
+igzip	movie.mp4	2	2	OK	WIN	0.703787	279.5	100.1	true	false	101.4570	144.2600	9	
+igzip	movie.mp4	2	4	VOID		NaN	406.8	100.1	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=406.8 (ok=true) rival cpu%=100.1 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	movie.mp4	3	1	OK	LOSS	1.723427	100.1	100.2	true	false	145.8990	84.1777	9	
+igzip	movie.mp4	3	2	OK	LOSS	1.250046	279.3	100.2	true	false	105.6212	84.1017	9	
+igzip	movie.mp4	3	4	VOID		NaN	405.9	100.2	false	false	NaN	NaN	0	pin-gate FAIL: ours cpu%=405.9 (ok=true) rival cpu%=100.2 (ok=false) vs intended threads=4 (window [200,640]) — the arm(s) named 'ok=false' did not run at the claimed concurrency; wall number discarded, never trusted
+igzip	movie.mp4	4	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	4	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	4	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	5	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	5	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	5	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	6	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	6	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	6	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	7	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	7	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	7	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	8	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	8	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	8	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	9	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	9	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	9	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	10	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	10	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	10	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	11	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	11	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	11	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	12	1	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	12	2	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	
+igzip	movie.mp4	12	4	ABSENT		NaN	NaN	NaN	false	false	NaN	NaN	0	

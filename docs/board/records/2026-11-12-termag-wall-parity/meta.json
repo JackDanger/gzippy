@@ -1,0 +1,7 @@
+{
+  "ours_tmpl": "/home/jdanger/www/gzippy-bench/campaign/wall-tune-e2c73d44/gzippy-subject -{level} -p {threads} -c {input}",
+  "ours_bin": "/home/jdanger/www/gzippy-bench/campaign/wall-tune-e2c73d44/gzippy-subject",
+  "ours_sha256": "a69c0eabab604b776f1223f4689eca3104bf52bed8f6fb0fb67f8e6b9c1fe189",
+  "created_unix": 1794476763,
+  "attested": false
+}
