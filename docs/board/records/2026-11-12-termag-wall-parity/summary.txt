@@ -1,0 +1,181 @@
+WALLCENSUS gzippy_sha256=a69c0eabab60 commit=e2c73d4456b48b273faefc4cf22f46220d35e1e1 host=Linux aarch64
+  rival gzip         gzip 1.12
+  rival pigz         pigz 2.8
+  rival libdeflate   gzip compression program v1.19
+  rival igzip        igzip command line interface 2.31.1
+  corpus files: 11 (shas stamped in the JSON artifact)
+
+FAILING CELLS (ours strictly SLOWER, beyond the paired significance gate): 161 of 1025 measured cells
+
+vs gzip (1 of 280 measured, worst +33.9% wall):
+  L9  T4  data.json            ratio=1.3388  +33.9%
+
+vs igzip (38 of 63 measured, worst +72.3% wall):
+  L3  T1  movie.mp4            ratio=1.7234  +72.3%
+  L2  T1  dickens              ratio=1.6396  +64.0%
+  L1  T1  data.json            ratio=1.6358  +63.6%
+  L1  T1  tool.bin             ratio=1.5879  +58.8%
+  L2  T1  data.csv             ratio=1.5838  +58.4%
+  L1  T1  minjs.min.js         ratio=1.5648  +56.5%
+  L2  T1  aozora.txt           ratio=1.5474  +54.7%
+  L1  T1  armexe.elf           ratio=1.5442  +54.4%
+  L1  T1  engine.wasm          ratio=1.5221  +52.2%
+  L1  T1  data.csv             ratio=1.5205  +52.0%
+  L2  T1  data.json            ratio=1.5078  +50.8%
+  L1  T1  symbols.dwarf        ratio=1.4731  +47.3%
+  L1  T1  aozora.txt           ratio=1.4677  +46.8%
+  L1  T1  data.parquet         ratio=1.4661  +46.6%
+  L1  T1  dickens              ratio=1.4559  +45.6%
+  L3  T1  data.parquet         ratio=1.4447  +44.5%
+  L1  T1  movie.mp4            ratio=1.4187  +41.9%
+  L2  T2  engine.wasm          ratio=1.4090  +40.9%
+  L2  T1  minjs.min.js         ratio=1.3872  +38.7%
+  L2  T1  tool.bin             ratio=1.3353  +33.5%
+  L2  T1  engine.wasm          ratio=1.3024  +30.2%
+  L2  T1  symbols.dwarf        ratio=1.2906  +29.1%
+  L2  T1  armexe.elf           ratio=1.2715  +27.2%
+  L3  T2  movie.mp4            ratio=1.2500  +25.0%
+  L3  T1  armexe.elf           ratio=1.2386  +23.9%
+  L2  T2  dickens              ratio=1.2070  +20.7%
+  L3  T1  engine.wasm          ratio=1.1679  +16.8%
+  L3  T2  engine.wasm          ratio=1.1672  +16.7%
+  L3  T2  data.parquet         ratio=1.1638  +16.4%
+  L2  T2  armexe.elf           ratio=1.1587  +15.9%
+  L2  T1  data.parquet         ratio=1.1234  +12.3%
+  L2  T2  aozora.txt           ratio=1.1216  +12.2%
+  L2  T2  minjs.min.js         ratio=1.1007  +10.1%
+  L3  T1  dickens              ratio=1.0969  +9.7%
+  L2  T2  data.json            ratio=1.0792  +7.9%
+  L2  T2  data.csv             ratio=1.0677  +6.8%
+  L2  T2  tool.bin             ratio=1.0469  +4.7%
+  L3  T1  symbols.dwarf        ratio=1.0335  +3.4%
+
+vs libdeflate (96 of 369 measured, worst +140.5% wall):
+  L9  T4  data.json            ratio=2.4054  +140.5%
+  L1  T1  movie.mp4            ratio=1.9939  +99.4%
+  L6  T2  data.csv             ratio=1.9225  +92.3%
+  L1  T1  data.parquet         ratio=1.8357  +83.6%
+  L1  T1  armexe.elf           ratio=1.7142  +71.4%
+  L6  T2  symbols.dwarf        ratio=1.6895  +68.9%
+  L7  T2  symbols.dwarf        ratio=1.6425  +64.3%
+  L1  T1  engine.wasm          ratio=1.6357  +63.6%
+  L1  T1  tool.bin             ratio=1.6032  +60.3%
+  L1  T1  symbols.dwarf        ratio=1.5730  +57.3%
+  L1  T1  minjs.min.js         ratio=1.5545  +55.4%
+  L1  T1  dickens              ratio=1.5223  +52.2%
+  L1  T1  aozora.txt           ratio=1.5103  +51.0%
+  L1  T1  data.json            ratio=1.5077  +50.8%
+  L6  T1  aozora.txt           ratio=1.4833  +48.3%
+  L7  T1  data.csv             ratio=1.4686  +46.9%
+  L6  T1  data.csv             ratio=1.4587  +45.9%
+  L1  T1  data.csv             ratio=1.4128  +41.3%
+  L7  T2  data.csv             ratio=1.4115  +41.2%
+  L11 T1  movie.mp4            ratio=1.4101  +41.0%
+  L10 T1  movie.mp4            ratio=1.4045  +40.4%
+  L12 T1  movie.mp4            ratio=1.4023  +40.2%
+  L7  T1  symbols.dwarf        ratio=1.3964  +39.6%
+  L6  T1  tool.bin             ratio=1.2908  +29.1%
+  L6  T1  dickens              ratio=1.2900  +29.0%
+  L4  T2  engine.wasm          ratio=1.2894  +28.9%
+  L7  T1  aozora.txt           ratio=1.2816  +28.2%
+  L3  T1  engine.wasm          ratio=1.2722  +27.2%
+  L3  T2  engine.wasm          ratio=1.2655  +26.5%
+  L6  T1  engine.wasm          ratio=1.2439  +24.4%
+  L5  T2  symbols.dwarf        ratio=1.2411  +24.1%
+  L7  T1  tool.bin             ratio=1.2370  +23.7%
+  L3  T1  symbols.dwarf        ratio=1.2319  +23.2%
+  L1  T2  engine.wasm          ratio=1.2266  +22.7%
+  L3  T1  dickens              ratio=1.2265  +22.7%
+  L7  T2  armexe.elf           ratio=1.2107  +21.1%
+  L3  T1  armexe.elf           ratio=1.2082  +20.8%
+  L3  T1  aozora.txt           ratio=1.2034  +20.3%
+  L7  T4  symbols.dwarf        ratio=1.1869  +18.7%
+  L6  T2  aozora.txt           ratio=1.1848  +18.5%
+  L6  T1  minjs.min.js         ratio=1.1808  +18.1%
+  L3  T1  minjs.min.js         ratio=1.1807  +18.1%
+  L4  T2  symbols.dwarf        ratio=1.1791  +17.9%
+  L5  T2  engine.wasm          ratio=1.1790  +17.9%
+  L3  T1  tool.bin             ratio=1.1721  +17.2%
+  L2  T2  engine.wasm          ratio=1.1679  +16.8%
+  L6  T1  data.json            ratio=1.1612  +16.1%
+  L5  T2  data.csv             ratio=1.1549  +15.5%
+  L6  T1  data.parquet         ratio=1.1495  +15.0%
+  L3  T1  data.parquet         ratio=1.1492  +14.9%
+  L6  T2  tool.bin             ratio=1.1457  +14.6%
+  L7  T1  armexe.elf           ratio=1.1342  +13.4%
+  L3  T1  data.json            ratio=1.1305  +13.0%
+  L6  T1  armexe.elf           ratio=1.1291  +12.9%
+  L7  T1  data.parquet         ratio=1.1242  +12.4%
+  L3  T1  data.csv             ratio=1.1211  +12.1%
+  L6  T2  engine.wasm          ratio=1.1202  +12.0%
+  L3  T2  symbols.dwarf        ratio=1.1190  +11.9%
+  L7  T1  dickens              ratio=1.1179  +11.8%
+  L7  T1  engine.wasm          ratio=1.1150  +11.5%
+  L7  T1  minjs.min.js         ratio=1.1143  +11.4%
+  L10 T1  data.parquet         ratio=1.1025  +10.2%
+  L2  T1  symbols.dwarf        ratio=1.0924  +9.2%
+  L3  T1  movie.mp4            ratio=1.0923  +9.2%
+  L2  T1  engine.wasm          ratio=1.0857  +8.6%
+  L5  T1  symbols.dwarf        ratio=1.0828  +8.3%
+  L5  T1  engine.wasm          ratio=1.0820  +8.2%
+  L1  T2  armexe.elf           ratio=1.0792  +7.9%
+  L5  T1  armexe.elf           ratio=1.0750  +7.5%
+  L2  T1  aozora.txt           ratio=1.0635  +6.4%
+  L6  T2  armexe.elf           ratio=1.0553  +5.5%
+  L9  T4  armexe.elf           ratio=1.0533  +5.3%
+  L2  T1  data.json            ratio=1.0513  +5.1%
+  L6  T1  movie.mp4            ratio=1.0489  +4.9%
+  L7  T1  movie.mp4            ratio=1.0486  +4.9%
+  L2  T1  armexe.elf           ratio=1.0480  +4.8%
+  L5  T1  data.json            ratio=1.0462  +4.6%
+  L2  T1  minjs.min.js         ratio=1.0453  +4.5%
+  L2  T1  data.csv             ratio=1.0416  +4.2%
+  L5  T2  aozora.txt           ratio=1.0415  +4.2%
+  L2  T2  symbols.dwarf        ratio=1.0410  +4.1%
+  L4  T1  symbols.dwarf        ratio=1.0409  +4.1%
+  L4  T1  engine.wasm          ratio=1.0395  +3.9%
+  L5  T1  tool.bin             ratio=1.0329  +3.3%
+  L2  T1  dickens              ratio=1.0327  +3.3%
+  L1  T2  movie.mp4            ratio=1.0315  +3.2%
+  L11 T1  data.parquet         ratio=1.0307  +3.1%
+  L4  T1  armexe.elf           ratio=1.0291  +2.9%
+  L5  T1  minjs.min.js         ratio=1.0252  +2.5%
+  L6  T4  data.csv             ratio=1.0204  +2.0%
+  L2  T1  tool.bin             ratio=1.0203  +2.0%
+  L5  T1  aozora.txt           ratio=1.0169  +1.7%
+  L10 T1  armexe.elf           ratio=1.0169  +1.7%
+  L5  T1  dickens              ratio=1.0132  +1.3%
+  L8  T1  movie.mp4            ratio=1.0079  +0.8%
+  L4  T1  data.json            ratio=1.0079  +0.8%
+
+vs pigz (26 of 313 measured, worst +419.6% wall):
+  L9  T4  data.json            ratio=5.1961  +419.6%
+  L9  T4  minjs.min.js         ratio=2.2464  +124.6%
+  L6  T4  data.csv             ratio=1.7673  +76.7%
+  L6  T2  data.csv             ratio=1.6925  +69.3%
+  L7  T4  data.csv             ratio=1.5608  +56.1%
+  L9  T4  movie.mp4            ratio=1.5387  +53.9%
+  L7  T2  data.csv             ratio=1.5005  +50.1%
+  L7  T4  symbols.dwarf        ratio=1.3649  +36.5%
+  L2  T4  data.json            ratio=1.2579  +25.8%
+  L3  T4  data.json            ratio=1.2499  +25.0%
+  L9  T4  dickens              ratio=1.2439  +24.4%
+  L4  T2  minjs.min.js         ratio=1.2027  +20.3%
+  L4  T4  data.csv             ratio=1.1957  +19.6%
+  L4  T2  data.csv             ratio=1.1866  +18.7%
+  L5  T4  data.csv             ratio=1.1645  +16.5%
+  L9  T4  data.csv             ratio=1.1612  +16.1%
+  L2  T4  symbols.dwarf        ratio=1.1357  +13.6%
+  L5  T2  data.csv             ratio=1.1230  +12.3%
+  L3  T4  symbols.dwarf        ratio=1.1177  +11.8%
+  L1  T4  data.json            ratio=1.1175  +11.7%
+  L6  T4  symbols.dwarf        ratio=1.1125  +11.3%
+  L4  T4  symbols.dwarf        ratio=1.0965  +9.7%
+  L2  T2  engine.wasm          ratio=1.0409  +4.1%
+  L3  T2  data.json            ratio=1.0289  +2.9%
+  L2  T2  data.json            ratio=1.0281  +2.8%
+  L4  T2  engine.wasm          ratio=1.0146  +1.5%
+
+VOID CELLS: 97 (measurement failed — never a result; each names its own reason in the TSV/JSON error field)
+
+WALLCENSUS declared=1584 measured_ok=1025 absent=462 rival_unavailable=0 void=97 slower=161 gzip_slower=1 igzip_slower=38 libdeflate_slower=96 pigz_slower=26
