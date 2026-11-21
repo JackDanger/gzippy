@@ -218,21 +218,26 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let istat = input_file.metadata().map_err(|e| GzippyError::os(&e))?;
 
     if istat.is_dir() {
-        return if args.recursive {
-            compress_directory(filename, args)
-        } else {
-            // Same contract as decompress_file (see comment there):
-            // `gzip somedir` (no -r) prints exactly this shape and
-            // exits 2 (WARNING, not ERROR) — never touches the
-            // directory, never halts a multi-file invocation's remaining
-            // good files. pigz disagrees (exit 1, "skipping: X is a
-            // directory"); gzip is the primary drop-in target so we
-            // match gzip.
-            if !args.quiet {
-                eprintln!("gzippy: {} is a directory -- ignored", filename);
-            }
-            Ok(2)
-        };
+        if args.recursive {
+            let Some(_walk) = crate::utils::enter_dir_walk(&istat) else {
+                if !args.quiet {
+                    eprintln!("gzippy: {}: directory loop -- skipped", filename);
+                }
+                return Ok(1);
+            };
+            return compress_directory(filename, args);
+        }
+        // Same contract as decompress_file (see comment there):
+        // `gzip somedir` (no -r) prints exactly this shape and
+        // exits 2 (WARNING, not ERROR) — never touches the
+        // directory, never halts a multi-file invocation's remaining
+        // good files. pigz disagrees (exit 1, "skipping: X is a
+        // directory"); gzip is the primary drop-in target so we
+        // match gzip.
+        if !args.quiet {
+            eprintln!("gzippy: {} is a directory -- ignored", filename);
+        }
+        return Ok(2);
     }
 
     // gzip.c:737-768 — the whole `if (! to_stdout)` WARN ladder, same skip
@@ -881,20 +886,14 @@ fn compress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     Ok(exit_code)
 }
 
+/// gzip.c make_ofname compress arm: `strcat(ofname, z_suffix)` — the suffix
+/// is appended verbatim. Probed 1.14: `foo.` -> `foo..gz`, `-S _z bar` ->
+/// `bar_z`, `-S x foo` -> `foox`. The old `set_extension` arithmetic gave
+/// `foo.gz` (colliding with `foo`'s output), `bar._z` and `foo.x`.
 fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathBuf {
-    let mut output_path = input_path.to_path_buf();
-    let current_extension = output_path
-        .extension()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or("");
-    let new_extension = if current_extension.is_empty() {
-        args.suffix.trim_start_matches('.').to_string()
-    } else {
-        format!("{}{}", current_extension, args.suffix)
-    };
-    output_path.set_extension(&new_extension);
-    output_path
+    let mut s = input_path.as_os_str().to_os_string();
+    s.push(&args.suffix);
+    std::path::PathBuf::from(s)
 }
 
 fn print_stats(

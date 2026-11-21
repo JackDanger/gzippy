@@ -199,21 +199,70 @@ fn build_zopfli_oracle() {
 }
 
 fn install_git_hooks() {
-    // Resolve the *effective* hooks directory via git itself. This works
-    // from a linked worktree (where `.git` is a file, not a directory)
-    // and honors a custom `core.hooksPath`. The old literal `.git/hooks`
-    // silently installed nothing whenever `cargo build` ran inside a
-    // worktree, leaving the pre-commit / pre-push hooks frozen at
-    // whatever revision was last built from the main checkout.
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-path", "hooks"])
-        .output();
-    let hooks_dir = match output {
-        Ok(o) if o.status.success() => {
-            std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    // Install only into gzippy's OWN checkout. A build script runs for every
+    // consumer — a copied/vendored source tree inside another repository, a
+    // path dependency, a build run from another repo's hook (GIT_DIR
+    // exported) — and `git rev-parse` there resolves to the ENCLOSING repo,
+    // whose pre-commit/pre-push/commit-msg this used to overwrite (external
+    // report against 1.0.0, reproduced). Three conditions, all required:
+    //   * cargo is building gzippy itself (CARGO_PRIMARY_PACKAGE), not as a dep;
+    //   * no GIT_DIR/GIT_WORK_TREE override is in effect;
+    //   * the repo's top level IS this package directory, and the effective
+    //     hooks dir lies inside that repo's git dir — so a global/system
+    //     `core.hooksPath` shared by every repo is never written.
+    // Resolved via git itself, which also works from a linked worktree
+    // (where `.git` is a file) — the old literal `.git/hooks` installed
+    // nothing there.
+    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+        || std::env::var_os("GIT_DIR").is_some()
+        || std::env::var_os("GIT_WORK_TREE").is_some()
+    {
+        return;
+    }
+    let git = |args: &[&str]| -> Option<std::path::PathBuf> {
+        let o = std::process::Command::new("git").args(args).output().ok()?;
+        if !o.status.success() {
+            return None;
         }
-        _ => return, // not a git checkout, or git unavailable
+        let p = std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string());
+        std::fs::canonicalize(p).ok()
     };
+    let Some(manifest_dir) =
+        std::env::var_os("CARGO_MANIFEST_DIR").and_then(|d| std::fs::canonicalize(d).ok())
+    else {
+        return;
+    };
+    let (Some(top), Some(common)) = (
+        git(&["rev-parse", "--show-toplevel"]),
+        git(&["rev-parse", "--git-common-dir"]),
+    ) else {
+        return; // not a git checkout, or git unavailable
+    };
+    if top != manifest_dir {
+        return;
+    }
+    // `--git-path hooks` may name a directory that does not exist yet, so
+    // canonicalize its parent (always present: the git dir, or the
+    // core.hooksPath parent) and re-attach the last component.
+    let Some(hooks_dir) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let p = std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string());
+            Some(
+                std::fs::canonicalize(p.parent()?)
+                    .ok()?
+                    .join(p.file_name()?),
+            )
+        })
+    else {
+        return;
+    };
+    if !hooks_dir.starts_with(&common) {
+        return; // core.hooksPath points outside this repo
+    }
     if std::fs::create_dir_all(&hooks_dir).is_err() {
         return;
     }
@@ -232,15 +281,19 @@ fn install_hook(src: &str, dst: &std::path::Path) {
     // Compare content, not mtime: a worktree checkout gives tracked
     // files arbitrary timestamps, so an mtime heuristic can leave a
     // stale hook installed. Rewrite whenever the bytes differ.
-    let content = std::fs::read(src).unwrap_or_else(|_| panic!("read {}", src.display()));
+    let Ok(content) = std::fs::read(src) else {
+        return;
+    };
     if std::fs::read(dst).map(|d| d == content).unwrap_or(false) {
         return;
     }
-    std::fs::write(dst, &content).unwrap_or_else(|_| panic!("write {}", dst.display()));
+    if std::fs::write(dst, &content).is_err() {
+        println!("cargo:warning=could not install git hook {}", dst.display());
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|_| panic!("chmod +x {}", dst.display()));
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755));
     }
 }

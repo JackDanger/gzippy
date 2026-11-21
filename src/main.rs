@@ -222,6 +222,20 @@ fn run() -> Result<i32, GzippyError> {
         return Ok(0);
     }
 
+    // gzip.c main: the suffix is validated once, up front, in every mode
+    // (probed 1.14: compress, -d, -t and -c all exit 1). An empty or
+    // over-long (> MAX_SUFFIX = 30) suffix is "invalid"; one containing '/'
+    // would name an output in another directory and previously panicked in
+    // `Path::set_extension`.
+    if args.suffix.contains('/') {
+        eprintln!("gzippy: suffix contains '/'");
+        return Ok(1);
+    }
+    if args.suffix.is_empty() || args.suffix.len() > 30 {
+        eprintln!("gzippy: invalid suffix '{}'", args.suffix);
+        return Ok(1);
+    }
+
     // `--tune <spec>` (l1-tune feature only): apply the L1 matchfinder
     // config override for every compress call this process makes. Applied
     // once, up front — matches the "one process, one candidate config" shape

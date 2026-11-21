@@ -888,3 +888,91 @@ fn index_output_link_is_never_written_through() {
         .unwrap()
         .is_file());
 }
+
+// ---------------------------------------------------------------------------
+// -S validation and compress-side naming (gzip.c main / make_ofname).
+// Probed gzip 1.14 for every expectation below.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn suffix_is_validated_up_front_like_gzip() {
+    let d = tempdir();
+    write_file(d.path(), "foo", b"a\n");
+    let long = "a".repeat(31);
+    for (s, msg) in [
+        ("/x", "suffix contains '/'"),
+        ("a/b", "suffix contains '/'"),
+        ("", "invalid suffix ''"),
+        (long.as_str(), "invalid suffix"),
+    ] {
+        for mode in [&[][..], &["-d"][..], &["-c"][..]] {
+            let mut args: Vec<&str> = mode.to_vec();
+            args.extend(["-S", s, "foo"]);
+            let out = run(d.path(), &args);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "-S {s:?} {mode:?}: gzip exits 1"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(msg),
+                "-S {s:?} {mode:?}: stderr {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_dir(d.path()).unwrap().count(),
+        1,
+        "nothing may be written"
+    );
+}
+
+#[test]
+fn compress_appends_the_suffix_verbatim() {
+    // strcat(ofname, z_suffix): no extension arithmetic.
+    let d = tempdir();
+    for (name, extra, want) in [
+        ("foo.", &[][..], "foo..gz"),
+        ("bar", &["-S", "_z"][..], "bar_z"),
+        ("baz", &["-S", "-z"][..], "baz-z"),
+        ("quz", &["-S", "x"][..], "quzx"),
+        ("a.tar", &[][..], "a.tar.gz"),
+    ] {
+        write_file(d.path(), name, b"a\n");
+        let mut args = vec!["-k"];
+        args.extend_from_slice(extra);
+        args.push(name);
+        let out = run(d.path(), &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(d.path().join(want).is_file(), "{args:?} must write {want}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_force_survives_a_symlink_loop() {
+    // -rf follows symlinked directories (no O_NOFOLLOW under -f); a link
+    // back to an ancestor used to recurse until the stack overflowed
+    // (SIGABRT, exit 134) before compressing anything.
+    let d = tempdir();
+    let sub = d.path().join("tree").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(d.path().join("tree").join("o"), b"o\n").unwrap();
+    fs::write(sub.join("s"), b"s\n").unwrap();
+    std::os::unix::fs::symlink("..", sub.join("loop")).unwrap();
+    let out = run(d.path(), &["-rf", "tree"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("directory loop"));
+    assert!(d.path().join("tree/o.gz").is_file());
+    assert!(sub.join("s.gz").is_file());
+}
