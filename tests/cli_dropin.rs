@@ -617,3 +617,99 @@ fn v_flag_prints_route_line_on_stderr() {
         "plain compress must stay silent on stderr (no -v, no GZIPPY_DEBUG)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// -N must never let the header FNAME choose a directory (path traversal).
+//
+// gzip(1) 1.14 `get_method` ORIG_NAME branch: the stored name is reduced to
+// its base name (`gzip_base_name`) before it replaces the on-disk file name,
+// so the output always lands beside the input. Probed: `gzip -dNk a/b/x.gz`
+// with FNAME "../../file" writes `a/b/file`. An archive is untrusted input —
+// before this clause, `gzippy -dN` wrote attacker-chosen bytes to any
+// relative or absolute path the user could write, then deleted the input.
+// ---------------------------------------------------------------------------
+
+/// A gzip member of `data` whose header carries `fname` verbatim.
+fn gz_with_fname(dir: &Path, data: &[u8], fname: &[u8]) -> Vec<u8> {
+    write_file(dir, "payload", data);
+    compress_ok(dir, &["-n"], "payload");
+    let gz = fs::read(dir.join("payload.gz")).expect("payload.gz");
+    fs::remove_file(dir.join("payload.gz")).expect("rm payload.gz");
+    assert_eq!(
+        gz[3] & 0x1e,
+        0,
+        "setup: -n header must carry no optional fields"
+    );
+    let mut out = gz[..10].to_vec();
+    out[3] |= 0x08; // FNAME
+    out.extend_from_slice(fname);
+    out.push(0);
+    out.extend_from_slice(&gz[10..]);
+    out
+}
+
+/// Every regular file under `root`, relative to it.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).expect("read_dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn assert_fname_confined(fname: &[u8], expect_name: &str) {
+    let d = tempdir();
+    let inner = d.path().join("a").join("b");
+    fs::create_dir_all(&inner).expect("mkdir a/b");
+    let data = sample_bytes();
+    let gz = gz_with_fname(&inner, &data, fname);
+    fs::write(inner.join("evil.gz"), gz).expect("write evil.gz");
+    let out = run(&inner, &["-d", "-N", "evil.gz"]);
+    let shown = String::from_utf8_lossy(fname);
+    assert!(
+        out.status.success(),
+        "-dN with FNAME {shown:?} must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expect = PathBuf::from("a").join("b").join(expect_name);
+    assert_eq!(
+        files_under(d.path()),
+        vec![expect.clone()],
+        "-dN with FNAME {shown:?}: output must land beside the input as {expect:?} and nowhere else"
+    );
+    assert_eq!(fs::read(d.path().join(&expect)).unwrap(), data);
+}
+
+#[test]
+fn dash_upper_n_relative_traversal_fname_stays_beside_input() {
+    assert_fname_confined(b"../../escaped", "escaped");
+}
+
+#[test]
+fn dash_upper_n_absolute_fname_stays_beside_input() {
+    let outside = tempdir();
+    let target = outside.path().join("absolute-target");
+    assert_fname_confined(target.to_str().unwrap().as_bytes(), "absolute-target");
+    assert!(
+        !target.exists(),
+        "-dN must never write the absolute FNAME path"
+    );
+}
+
+#[test]
+fn dash_upper_n_dotdot_or_dir_only_fname_falls_back_to_on_disk_name() {
+    // A stored name with no usable base name ("..", ".", "x/") restores
+    // nothing; the output is named from the on-disk file, as with no FNAME.
+    for f in [&b".."[..], b".", b"dir/", b"../"] {
+        assert_fname_confined(f, "evil");
+    }
+}

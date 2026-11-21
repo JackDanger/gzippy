@@ -252,6 +252,20 @@ pub(crate) fn extract_gzip_mtime(data: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
+/// The base name of a header FNAME — the only part that may name an output
+/// file. gzip.c `gzip_base_name`: everything after the last path separator
+/// ('/', plus '\\' and a drive ':' on Windows). Returns `None` when nothing
+/// usable remains (empty, ".", "..", or a name ending in a separator), so the
+/// caller falls back to the on-disk name instead of writing a directory.
+pub(crate) fn fname_base_name(fname: &str) -> Option<&str> {
+    let is_sep = |c: char| c == '/' || (cfg!(windows) && (c == '\\' || c == ':'));
+    let base = fname.rsplit(is_sep).next().unwrap_or("");
+    match base {
+        "" | "." | ".." => None,
+        b => Some(b),
+    }
+}
+
 /// Extract the original filename (FNAME field) from a gzip header.
 pub(crate) fn extract_gzip_fname(data: &[u8]) -> Option<String> {
     if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
