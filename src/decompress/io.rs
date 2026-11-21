@@ -52,7 +52,10 @@ use crate::decompress::format::{
 
 use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
-use crate::utils::{debug_enabled, preserve_metadata, strip_compression_extension};
+use crate::utils::{
+    copy_stat, create_output_file, debug_enabled, is_same_file, output_occupied,
+    strip_compression_extension,
+};
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -243,8 +246,26 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         Some(get_output_filename(input_path, args, &mmap))
     };
 
+    let overwrite = args.force || output_path.as_deref().is_some_and(output_occupied);
     if let Some(ref output_path) = output_path {
-        if output_path.exists() && !args.force {
+        // gzip.c check_ofname `same_file`: an output name that resolves to
+        // the INPUT's inode (e.g. -dN whose stored name is the archive's own
+        // name) must be refused before -f can unlink or truncate the input.
+        if is_same_file(&istat, output_path) {
+            if !args.quiet {
+                if output_path.as_path() == input_path {
+                    eprintln!("gzippy: {}: cannot decompress onto itself", name);
+                } else {
+                    eprintln!(
+                        "gzippy: {} and {} are the same file",
+                        name,
+                        output_path.display()
+                    );
+                }
+            }
+            return Ok(1);
+        }
+        if output_occupied(output_path) && !args.force {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() {
                 eprint!(
@@ -291,6 +312,9 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
 
+    // Dup'd handle on the output we created (copy_stat / sync on the FD);
+    // `Some` also means "we created it", which licenses the error-path unlink.
+    let mut out_meta: Option<File> = None;
     let result = if args.stdout {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
@@ -301,13 +325,15 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         r
     } else {
         let output_path = output_path.clone().unwrap();
-        let output_file = File::create(&output_path)?;
+        let output_file = create_output_file(&output_path, overwrite)?;
+        out_meta = Some(output_file.try_clone()?);
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-        writer.flush()?;
         let out_fd = out_fd_of(writer.get_ref());
-        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
-        writer.flush()?;
-        r
+        // The final flush belongs to the result: a flush error (ENOSPC on
+        // the buffered tail) must reach the cleanup arm below, not return
+        // early and leave a partial output beside the input.
+        decompress_to_writer(&mmap, &mut writer, out_fd, format, args)
+            .and_then(|n| writer.flush().map(|_| n).map_err(Into::into))
     };
 
     crate::set_output_file(None);
@@ -315,22 +341,20 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     match result {
         Ok(output_size) => {
             if !args.stdout {
-                if let Some(ref output_path) = output_path {
-                    preserve_metadata(input_path, output_path);
-                    if args.name {
-                        if let Some(mtime) = extract_gzip_mtime(&mmap) {
-                            if mtime != 0 {
-                                let _ = filetime::set_file_mtime(
-                                    output_path,
-                                    filetime::FileTime::from_unix_time(mtime as i64, 0),
-                                );
-                            }
-                        }
-                    }
+                if let Some(ref f) = out_meta {
+                    // The header MTIME is restored only under an explicit -N
+                    // (gzip(1), same clause as FNAME — issue #268); plain -d
+                    // keeps the .gz file's own mtime. `args.name` defaults to
+                    // true and so cannot make that distinction.
+                    let header_mtime = args
+                        .name_explicit
+                        .then(|| extract_gzip_mtime(&mmap))
+                        .flatten()
+                        .filter(|&m| m != 0)
+                        .map(|m| filetime::FileTime::from_unix_time(m as i64, 0));
+                    copy_stat(&istat, f, header_mtime);
                     if args.synchronous {
-                        if let Ok(f) = File::open(output_path) {
-                            let _ = f.sync_all();
-                        }
+                        let _ = f.sync_all();
                     }
                 }
             }
@@ -349,11 +373,9 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             Ok(0)
         }
         Err(e) => {
-            if !args.stdout {
-                let cleanup_path = get_output_filename(input_path, args, &mmap);
-                if cleanup_path.exists() {
-                    let _ = std::fs::remove_file(&cleanup_path);
-                }
+            // Remove only a file WE created (never one a racing create hit).
+            if let (Some(_), Some(p)) = (&out_meta, &output_path) {
+                let _ = std::fs::remove_file(p);
             }
             Err(e)
         }

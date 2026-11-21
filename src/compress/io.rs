@@ -8,7 +8,7 @@
 //! preservation, stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
+use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Seek, Write};
 use std::path::Path;
 
 struct CountingWriter<W: Write> {
@@ -36,7 +36,15 @@ use crate::compress::optimization::{detect_content_type, ContentType, Optimizati
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
-use crate::utils::preserve_metadata;
+use crate::utils::{copy_stat, create_output_file, output_occupied};
+
+/// Create the output (see [`create_output_file`]) and keep a dup'd handle in
+/// `meta` for the post-encode copy_stat / sync on the same inode.
+fn open_output(path: &Path, overwrite: bool, meta: &mut Option<File>) -> std::io::Result<File> {
+    let f = create_output_file(path, overwrite)?;
+    *meta = Some(f.try_clone()?);
+    Ok(f)
+}
 
 /// Splices a full FNAME/MTIME gzip header over the minimal header the T1
 /// encoders emit (issue #309: gzip's contract stores FNAME and MTIME when
@@ -333,8 +341,12 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         Some(get_output_filename(input_path, args))
     };
 
+    // gzip.c check_ofname lstat()s the name: a dangling symlink occupies
+    // it too. `overwrite` records that replacing it was approved (-f or a
+    // "y"), which is the ONLY case create_output_file may unlink it.
+    let overwrite = args.force || output_path.as_deref().is_some_and(output_occupied);
     if let Some(ref output_path) = output_path {
-        if output_path.exists() && !args.force {
+        if output_occupied(output_path) && !args.force {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() {
                 eprint!(
@@ -375,8 +387,13 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let content_type = if args.processes <= 1 || args.compression_level <= 3 {
         ContentType::Binary
     } else {
-        let mut sample_file = File::open(input_path)?;
-        detect_content_type(&mut sample_file).unwrap_or(ContentType::Binary)
+        // Sample the ALREADY-OPEN input (never re-open by path: the name may
+        // have been swapped for a symlink since the O_NOFOLLOW open), then
+        // rewind the shared offset for the encoder that reads it next.
+        let mut sample_file = &input_file;
+        let ct = detect_content_type(&mut sample_file).unwrap_or(ContentType::Binary);
+        sample_file.seek(std::io::SeekFrom::Start(0))?;
+        ct
     };
 
     // (-i/--independent used to cap levels 7-9 to an L6 OptimizationConfig
@@ -405,7 +422,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         );
     }
 
-    let header_info = build_header_info(input_path, args);
+    let header_info = build_header_info(input_path, &istat, args);
     let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
 
     // Increment 7: the pure-Rust parallel DEFLATE encoder is the SOLE production
@@ -443,11 +460,15 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
 
+    // A second handle on the output we created, for copy_stat/sync on the
+    // FD after the encoder has consumed (and closed) the writer. `Some` also
+    // means "we created it", which is what licenses the error-path unlink.
+    let mut out_meta: Option<File> = None;
     let result = if args.rsyncable && use_mmap {
         if args.verbosity >= 2 {
             eprintln!("gzippy: using rsyncable compression");
         }
-        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
         if args.stdout {
             crate::compress::rsyncable::compress_rsyncable(
                 &mmap,
@@ -458,7 +479,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             )
             .map_err(|e| e.into())
         } else {
-            let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+            let output_file = BufWriter::new(open_output(
+                output_path.as_deref().unwrap(),
+                overwrite,
+                &mut out_meta,
+            )?);
             crate::compress::rsyncable::compress_rsyncable(
                 &mmap,
                 args.compression_level as u32,
@@ -478,7 +503,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // SAFETY: the input file is opened read-only and mapped for the
         // duration of this compression; it is not mutated concurrently by
         // gzippy, matching every other mmap read path in this module.
-        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        let mmap = unsafe { memmap2::Mmap::map(&input_file)? };
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
@@ -505,7 +530,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 .compress_buffer_pure(&mmap, out)
                 .map_err(|e| e.into())
         } else {
-            let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+            let output_file = BufWriter::new(open_output(
+                output_path.as_deref().unwrap(),
+                overwrite,
+                &mut out_meta,
+            )?);
             encoder
                 .compress_buffer_pure(&mmap, output_file)
                 .map_err(|e| e.into())
@@ -555,7 +584,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             // File output: gzip's contract stores FNAME + MTIME (issue #309).
             // The graded `-c` output above is untouched.
             let mut out = HeaderSpliceWriter::new(
-                BufWriter::new(File::create(output_path.as_ref().unwrap())?),
+                BufWriter::new(open_output(
+                    output_path.as_deref().unwrap(),
+                    overwrite,
+                    &mut out_meta,
+                )?),
                 header_info.to_member_header(),
                 crate::compress::deflate::minimal_gzip_header(args.compression_level as u32),
             );
@@ -572,7 +605,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             Some(file_size as usize),
         )
     } else {
-        let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
+        let output_file = BufWriter::new(open_output(
+            output_path.as_deref().unwrap(),
+            overwrite,
+            &mut out_meta,
+        )?);
         if opt_config.thread_count == 1 && !explicit_zopfli && !is_zlib {
             // The T1 branch inside `compress_with_pipeline_sized` writes the
             // fixed minimal header; splice the full FNAME/MTIME header over
@@ -609,10 +646,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     match result {
         Ok(_) => {
             if !args.stdout {
-                let output_path = get_output_filename(input_path, args);
-                preserve_metadata(input_path, &output_path);
-                if args.synchronous {
-                    if let Ok(f) = File::open(&output_path) {
+                if let Some(ref f) = out_meta {
+                    copy_stat(&istat, f, None);
+                    if args.synchronous {
                         let _ = f.sync_all();
                     }
                 }
@@ -629,11 +665,10 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             Ok(0)
         }
         Err(e) => {
-            if !args.stdout {
-                let cleanup_path = get_output_filename(input_path, args);
-                if cleanup_path.exists() {
-                    let _ = std::fs::remove_file(&cleanup_path);
-                }
+            // Remove only a file WE created: a failed create (EEXIST in a
+            // race) must never delete whatever another process put there.
+            if out_meta.is_some() {
+                let _ = std::fs::remove_file(get_output_filename(input_path, args));
             }
             Err(e)
         }
@@ -907,7 +942,11 @@ fn print_stats(
     }
 }
 
-pub(crate) fn build_header_info(path: &Path, args: &GzippyArgs) -> GzipHeaderInfo {
+pub(crate) fn build_header_info(
+    path: &Path,
+    istat: &std::fs::Metadata,
+    args: &GzippyArgs,
+) -> GzipHeaderInfo {
     let filename = if !args.no_name {
         path.file_name()
             .and_then(|n| n.to_str())
@@ -916,9 +955,9 @@ pub(crate) fn build_header_info(path: &Path, args: &GzippyArgs) -> GzipHeaderInf
         None
     };
     let mtime = if !args.no_time {
-        std::fs::metadata(path)
+        istat
+            .modified()
             .ok()
-            .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0)

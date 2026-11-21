@@ -65,7 +65,9 @@ fn run_build_index(args: &GzippyArgs) -> i32 {
         .unwrap_or_else(|| format!("{}.gzidx", input_path));
 
     // Serialize the index
-    match std::fs::File::create(&output_path) {
+    // Never follow a link planted at `<input>.gzidx` (see create_output_file);
+    // the index has always replaced an existing file, so `overwrite` is set.
+    match crate::utils::create_output_file(Path::new(&output_path), true) {
         Ok(mut file) => {
             if let Err(e) = crate::decompress::index::serialize_index(&index, &mut file) {
                 eprintln!("gzippy: failed to serialize index: {}", e);

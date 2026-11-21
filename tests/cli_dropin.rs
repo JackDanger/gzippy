@@ -713,3 +713,178 @@ fn dash_upper_n_dotdot_or_dir_only_fname_falls_back_to_on_disk_name() {
         assert_fname_confined(f, "evil");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Output-file creation (gzip.c create_outfile / check_ofname / copy_stat).
+//
+// The output is opened O_CREAT|O_EXCL, mode 0600, so a symlink or hardlink
+// planted at the output name is never written through; under -f (or a "y")
+// the planted entry is unlinked — the link, never its target. Metadata is
+// copied on the output FD, never by path. Each case was a write-through bug
+// before this clause (probed against gzip 1.14, which leaves the victim
+// intact in every case).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn planted_output_link_is_never_written_through() {
+    use std::os::unix::fs::symlink;
+    let data = sample_bytes();
+    // (args, input name, output name, prepare input)
+    for (force, decompress) in [(false, false), (true, false), (false, true), (true, true)] {
+        for hard in [false, true] {
+            if hard && !force {
+                continue; // an existing regular file is simply "already exists"
+            }
+            let d = tempdir();
+            let victim = d.path().join("victim");
+            fs::write(&victim, b"VICTIM").unwrap();
+            write_file(d.path(), "foo", &data);
+            let (input, output) = if decompress {
+                compress_ok(d.path(), &[], "foo");
+                ("foo.gz", "foo")
+            } else {
+                ("foo", "foo.gz")
+            };
+            let out_path = d.path().join(output);
+            if hard {
+                fs::hard_link(&victim, &out_path).unwrap();
+            } else if force {
+                symlink(&victim, &out_path).unwrap();
+            } else {
+                // dangling: Path::exists() reads it as absent
+                symlink(d.path().join("created-through-link"), &out_path).unwrap();
+            }
+            let mut args = vec![];
+            if decompress {
+                args.push("-d");
+            }
+            if force {
+                args.push("-f");
+            }
+            args.push(input);
+            let out = run(d.path(), &args);
+            let case = format!("args={args:?} hardlink={hard}");
+            assert_eq!(
+                fs::read(&victim).unwrap(),
+                b"VICTIM",
+                "{case}: victim written through"
+            );
+            assert!(
+                !d.path().join("created-through-link").exists(),
+                "{case}: file created through a dangling link"
+            );
+            if force {
+                assert!(
+                    out.status.success(),
+                    "{case}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let meta = fs::symlink_metadata(&out_path).unwrap();
+                assert!(
+                    meta.file_type().is_file(),
+                    "{case}: output must be a fresh regular file"
+                );
+            } else {
+                assert_eq!(
+                    out.status.code(),
+                    Some(2),
+                    "{case}: must refuse, gzip exit 2"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn output_takes_input_group_and_mode_on_the_fd() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let d = tempdir();
+    write_file(d.path(), "f", &sample_bytes());
+    fs::set_permissions(d.path().join("f"), fs::Permissions::from_mode(0o640)).unwrap();
+    let istat = fs::metadata(d.path().join("f")).unwrap();
+    compress_ok(d.path(), &[], "f");
+    let o = fs::metadata(d.path().join("f.gz")).unwrap();
+    assert_eq!(o.mode() & 0o7777, 0o640, "copy_stat: mode");
+    assert_eq!(
+        o.gid(),
+        istat.gid(),
+        "copy_stat: group (fchown before fchmod)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dash_upper_n_onto_own_archive_is_refused_and_keeps_the_input() {
+    let d = tempdir();
+    let gz = gz_with_fname(d.path(), &sample_bytes(), b"arc.gz");
+    fs::write(d.path().join("arc.gz"), &gz).unwrap();
+    let out = run(d.path(), &["-d", "-N", "-f", "arc.gz"]);
+    assert_eq!(out.status.code(), Some(1), "gzip.c same_file: ERROR class");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot decompress onto itself"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(d.path().join("arc.gz")).unwrap(),
+        gz,
+        "input must survive intact"
+    );
+}
+
+#[test]
+fn plain_dash_d_ignores_header_mtime() {
+    // gzip(1): the stored MTIME, like FNAME, is restored only under -N
+    // (issue #268's clause). Plain -d keeps the .gz file's own mtime.
+    let d = tempdir();
+    let mut gz = gz_with_fname(d.path(), &sample_bytes(), b"x");
+    gz[4..8].copy_from_slice(&1u32.to_le_bytes());
+    fs::write(d.path().join("t.gz"), &gz).unwrap();
+    let gz_mtime = fs::metadata(d.path().join("t.gz"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let out = run(d.path(), &["-dk", "t.gz"]);
+    assert!(out.status.success());
+    assert_eq!(
+        fs::metadata(d.path().join("t"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        gz_mtime
+    );
+    fs::remove_file(d.path().join("x")).ok();
+    let out = run(d.path(), &["-dkN", "t.gz"]);
+    assert!(out.status.success());
+    let restored = fs::metadata(d.path().join("x"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        restored,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_output_link_is_never_written_through() {
+    let d = tempdir();
+    write_file(d.path(), "ix", &sample_bytes());
+    compress_ok(d.path(), &[], "ix");
+    let victim = d.path().join("victim");
+    fs::write(&victim, b"VICTIM").unwrap();
+    std::os::unix::fs::symlink(&victim, d.path().join("ix.gz.gzidx")).unwrap();
+    let out = run(d.path(), &["--index", "ix.gz"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"VICTIM");
+    assert!(fs::symlink_metadata(d.path().join("ix.gz.gzidx"))
+        .unwrap()
+        .is_file());
+}
