@@ -358,11 +358,17 @@ pub fn read_parallel_sm_resume_multi<W: std::io::Write>(
 
     while offset < gzip_data.len() {
         let remaining = &gzip_data[offset..];
-        // Stop cleanly at the end (no trailing junk) — fewer than the minimum
-        // header+trailer bytes, or no gzip magic, means we have consumed every
-        // member.
-        if remaining.len() < 18 || remaining[0] != 0x1f || remaining[1] != 0x8b {
+        // gzip(1) 1.14 trailing-data rule: bytes that begin with the gzip magic
+        // `1f 8b` (or are exactly a lone `1f` at EOF) ARE a member and must be
+        // complete — a truncated one is "unexpected end of file", exit 1. Any
+        // other trailing bytes (zero padding, garbage) clean-stop: every member
+        // has been consumed.
+        let claims_member = remaining.starts_with(&[0x1f, 0x8b]) || remaining == [0x1f];
+        if !claims_member {
             break;
+        }
+        if remaining.len() < 18 {
+            return Err(ReadParallelSmError::InvalidFormat);
         }
 
         // Header → start of this member's deflate body.

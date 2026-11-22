@@ -544,15 +544,16 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
     let mut total_crc = CRC32Calculator::new();
     let mut total_size = 0usize;
 
-    // Rolling 32 KiB window. First chunk starts with a zero window (chunk-0
-    // semantics: the first deflate block references no back-history past output
-    // start, so a zero dict is correct for chunk 0). All subsequent chunks get
-    // the TRUE trailing 32 KiB, so they take the window-PRESENT clean path.
-    let mut prev_tail = vec![0u8; MAX_WINDOW_SIZE];
+    // Rolling window of the REAL bytes before `cur` (at most 32 KiB). It starts
+    // EMPTY: the first chunk has no history, so a back-reference reaching before
+    // the stream's first byte must be an error (gzip/libdeflate "distance too
+    // far back"), not a read of a fabricated zero window. Every chunk takes the
+    // window-seeded clean path; once 32 KiB exist it is the full-window route.
+    let mut prev_tail: Vec<u8> = Vec::new();
     let mut cur = 0usize;
     while cur < total_bits {
         let stop_hint = (cur + stride_bits).min(total_bits);
-        let chunk = crate::decompress::parallel::chunk_decode::decode_chunk(
+        let chunk = crate::decompress::parallel::chunk_decode::decode_chunk_with_exact_window(
             input,
             cur,
             stop_hint,
@@ -561,20 +562,13 @@ pub fn drive_thin_t1_oracle<W: std::io::Write>(
         )
         .map_err(FetchError::Decode)?;
 
-        // Advance the rolling window from this chunk's decoded tail.
+        // Advance the rolling window from this chunk's decoded tail. `data` is
+        // `prev_tail` (the dictionary prefix) followed by this chunk's output,
+        // so its last min(len, 32 KiB) bytes are exactly the next window.
         let data_len = chunk.data.len();
-        if data_len >= MAX_WINDOW_SIZE {
-            let mut t = vec![0u8; MAX_WINDOW_SIZE];
-            chunk.data.copy_last_into(&mut t);
-            prev_tail = t;
-        } else {
-            let mut nt = prev_tail.clone();
-            let mut tail_bytes = vec![0u8; data_len];
-            chunk.data.copy_range_into(0, &mut tail_bytes);
-            nt.extend_from_slice(&tail_bytes);
-            let n = nt.len();
-            prev_tail = nt[n.saturating_sub(MAX_WINDOW_SIZE)..].to_vec();
-        }
+        let mut t = vec![0u8; data_len.min(MAX_WINDOW_SIZE)];
+        chunk.data.copy_last_into(&mut t);
+        prev_tail = t;
 
         // In-order write + CRC fold (mirror of the consumer's clean branch).
         chunk
@@ -1905,7 +1899,6 @@ fn run_decode_task(
     // `m_windowMap->get(blockOffset)` only — no predecessor scan, no
     // speculative side-slot merge. Windows are published on the consumer
     // path (`queueChunkForPostProcessing`, GzipChunkFetcher.hpp:557-574).
-    let zero_window: [u8; 32768] = [0u8; 32768];
     let window_at_offset: Option<Window> = if params.start_bit == 0 {
         None
     } else {
@@ -1914,12 +1907,15 @@ fn run_decode_task(
     let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
     let chunk_result = if params.start_bit == 0 {
-        decode_chunk_with_until_exact(
+        // Stream start: NO predecessor bytes. An EMPTY exact window (not 32 KiB
+        // of zeros) makes a back-reference before the first byte a decode error
+        // instead of fabricated zero output (see
+        // `chunk_decode::decode_chunk_with_exact_window`).
+        crate::decompress::parallel::chunk_decode::decode_chunk_with_exact_window(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
-            &zero_window[..],
-            false,
+            &[],
             configuration,
         )
     } else if let Some(w) = window_at_offset.as_ref() {

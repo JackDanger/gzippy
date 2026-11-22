@@ -257,6 +257,46 @@ pub fn decode_chunk_until_exact(
     )
 }
 
+/// Decode a chunk whose predecessor bytes are known EXACTLY: `window` holds
+/// every real byte of the member before `encoded_offset_bits` (at most 32 KiB;
+/// EMPTY at member start). Same seeded `deflate::Block` engine and contiguous
+/// clean tail as the full-window path, but the dictionary prefix is only the
+/// real bytes — so a back-reference reaching before the member's first byte
+/// fails the decoders' existing `distance > pos` range check instead of
+/// reading a fabricated zero window (gzip/zlib/libdeflate: "invalid distance
+/// too far back"). This replaced seeding chunk 0 with 32 KiB of zeros, which
+/// decoded such streams as zero bytes. No per-match cost: the check already
+/// exists; only the prefix length changes.
+#[cfg(parallel_sm)]
+pub fn decode_chunk_with_exact_window(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    window: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+    if window.len() == MAX_WINDOW_SIZE {
+        return decode_chunk(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            window,
+            configuration,
+        );
+    }
+    debug_assert!(window.len() < MAX_WINDOW_SIZE);
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    finish_decode_chunk_seeded_block_native(
+        &mut chunk,
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        window,
+    )?;
+    Ok(chunk)
+}
+
 /// Vendor `finishDecodeChunkWithInexactOffset` shape. Continues a chunk with a
 /// known clean 32 KiB window, stopping at the first deflate boundary at-or-past
 /// `stop_hint_bits` (or exactly at it on the exact path).
@@ -779,7 +819,8 @@ fn try_continue_next_member(
             MULTI_MEMBER_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(MemberContinuation::Continued)
         }
-        Err(_) => {
+        Err(e) => {
+            trailing_bytes_not_a_member(&input[header_byte..], header_byte, &e)?;
             // Trailing bytes after a fully-verified footer are not a parseable
             // gzip header ⇒ clean-stop at this member boundary (§3.2).
             Ok(MemberContinuation::EndOfData {
@@ -787,6 +828,27 @@ fn try_continue_next_member(
             })
         }
     }
+}
+
+/// gzip(1) trailing-data rule at a member boundary (probed on GNU gzip 1.14):
+/// bytes after a complete member that begin with the gzip magic `1f 8b` — or
+/// are exactly a lone `1f` at EOF — ARE a member, so a header that does not
+/// parse (truncated, bad method, ...) is an error ("unexpected end of file",
+/// "unknown method N", exit 1). Anything else is trailing garbage / padding and
+/// clean-stops (zeros silently; other bytes "trailing garbage ignored").
+#[cfg(parallel_sm)]
+fn trailing_bytes_not_a_member(
+    rest: &[u8],
+    header_byte: usize,
+    header_err: &dyn std::fmt::Display,
+) -> Result<(), ChunkDecodeError> {
+    if rest.starts_with(&[0x1f, 0x8b]) || rest == [0x1f] {
+        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("gzip member at byte {header_byte} is incomplete or invalid: {header_err}"),
+        )));
+    }
+    Ok(())
 }
 
 /// STAGE-2b: window-absent (speculative) decode entry that WALKS member
@@ -1048,6 +1110,14 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     let mut stream_bytes_read: u64 = 0;
     // Liveness guard state — see `check_blocks_after_input_end`.
     let mut blocks_after_input_end: u32 = 0;
+    // Member-relative output floor (MULTI_MEMBER only; 0 otherwise). After a
+    // member boundary inside this chunk, the decoders are handed the buffer
+    // starting at the new member's first byte, so their existing
+    // `distance > pos` range check rejects a back-reference into the PREVIOUS
+    // member (gzip/libdeflate: "distance too far back") instead of copying its
+    // bytes. Applied per body call, never per symbol.
+    let mut member_floor: usize = 0;
+    let mut member_floor_pending = false;
 
     // Per-call contig headroom: one max-length back-ref (258) + the 8-byte
     // word-copy overshoot (matches `decode_clean_into_contig`'s `out_room`
@@ -1072,6 +1142,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
 
         loop {
             let slice_byte = marker_ctx.current_bit_offset / 8;
+            check_stream_end_within_input(marker_ctx.current_bit_offset, input.len())?;
             let mut bits = marker_ctx.open_bits(input);
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
@@ -1135,6 +1206,11 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                 // Vec growth is amortized, so the +1 only changes the moment a
                 // doubling fires, never the decoded bytes.
                 let (base, cap, pos_before) = chunk.data.contig_decode_window(HEADROOM + 1);
+                if MULTI_MEMBER && member_floor_pending {
+                    member_floor = pos_before;
+                    member_floor_pending = false;
+                }
+                let floor = if MULTI_MEMBER { member_floor } else { 0 };
                 let mut pos = pos_before;
                 // H1: release-mode guard — never let the decoder write past the
                 // reserved headroom (a contract violation here is a heap OOB,
@@ -1150,21 +1226,31 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                 // `[0, cap)`; the assert above proves `pos <= out_room` (the
                 // headroom contract); `bits.data` is the compressed input, which
                 // never aliases the chunk's decode destination.
+                // Member-relative view `[floor, cap)` (floor <= pos_before).
+                let (mbase, mcap) = (unsafe { base.add(floor) }, cap - floor);
+                let mut mpos = pos - floor;
                 let body_res = match comp_type {
                     CompressionType::Uncompressed => unsafe {
                         block.decode_clean_stored_into_contig(
                             &mut bits,
-                            base,
-                            cap,
-                            &mut pos,
+                            mbase,
+                            mcap,
+                            &mut mpos,
                             usize::MAX,
                         )
                     },
                     CompressionType::FixedHuffman | CompressionType::DynamicHuffman => unsafe {
-                        block.decode_clean_into_contig(&mut bits, base, cap, &mut pos, usize::MAX)
+                        block.decode_clean_into_contig(
+                            &mut bits,
+                            mbase,
+                            mcap,
+                            &mut mpos,
+                            usize::MAX,
+                        )
                     },
                     CompressionType::Reserved => Err(BlockError::InvalidCompression),
                 };
+                pos = mpos + floor;
                 let emitted = match body_res {
                     Ok(n) => n,
                     Err(e) => {
@@ -1219,6 +1305,7 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
             marker_ctx.current_bit_offset = end_bit_offset;
 
             if block.is_last_block() {
+                check_stream_end_within_input(end_bit_offset, input.len())?;
                 if MULTI_MEMBER {
                     // ── rapidgzip cross-member continuation (GzipChunk.hpp:602-653).
                     //    Corrected sequencing [R1-#1]: at BFINAL the footer is
@@ -1302,12 +1389,14 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                                 "empty-window reset must not drain output"
                             );
                             did_read_header = true;
+                            member_floor_pending = true;
                             marker_ctx.current_bit_offset = (header_byte + header_len) * 8;
                             MULTI_MEMBER_CONTINUATIONS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             continue;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            trailing_bytes_not_a_member(&input[header_byte..], header_byte, &e)?;
                             // Trailing bytes after a fully-verified footer are not
                             // a parseable gzip header ⇒ clean-stop at this member
                             // boundary (§3.2 LABELED DEVIATION from vendor's
@@ -1493,10 +1582,11 @@ fn seed_block_for_contig_native(
     initial_window: &[u8],
 ) -> Result<MarkerDecodeCtx, ChunkDecodeError> {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-    debug_assert_eq!(
-        initial_window.len(),
-        MAX_WINDOW_SIZE,
-        "seeded-Block route requires a full 32 KiB window (caller gate)"
+    // A full 32 KiB predecessor window, or (decode_chunk_with_exact_window)
+    // the exact real bytes before a chunk that starts < 32 KiB into a member.
+    debug_assert!(
+        initial_window.len() <= MAX_WINDOW_SIZE,
+        "seeded-Block window exceeds 32 KiB"
     );
 
     // Dictionary prefix: the predecessor window at `data[0..32768)`, excluded
@@ -2006,6 +2096,7 @@ where
     let mut blocks_after_input_end: u32 = 0;
     loop {
         let slice_byte = ctx.current_bit_offset / 8;
+        check_stream_end_within_input(ctx.current_bit_offset, data.len())?;
         let mut bits = ctx.open_bits(data);
         let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
@@ -2085,6 +2176,7 @@ where
         ctx.current_bit_offset = end_bit_offset;
 
         if block.is_last_block() {
+            check_stream_end_within_input(end_bit_offset, data.len())?;
             return Ok((
                 MarkerStep::Finished {
                     end_bit_offset,
@@ -2108,12 +2200,42 @@ fn absolute_bit_pos(
     byte_offset: usize,
     bits: &crate::decompress::inflate::consume_first_decode::Bits,
 ) -> usize {
+    if bits.is_overconsumed() {
+        // Decoded past the end of the slice (truncated / malformed input): the
+        // wrapped `bitsleft` low byte is `256 - overrun`, so report the true
+        // position PAST the end. Saturating `pos*8 - available` here used to
+        // report a position up to 255 bits BEFORE the end, which hid the
+        // truncation (and could step the block loop backward).
+        return byte_offset * 8 + bits.pos * 8 + (256 - bits.available() as usize);
+    }
     let consumed_bytes_from_slice = bits.pos;
     let bits_in_buf = bits.available();
     let bits_consumed_from_slice = consumed_bytes_from_slice
         .saturating_mul(8)
         .saturating_sub(bits_in_buf as usize);
     byte_offset * 8 + bits_consumed_from_slice
+}
+
+/// A deflate block that ends PAST the end of its input slice decoded
+/// nonexistent (zero-padding) bits: the stream is truncated. gzip(1):
+/// "unexpected end of file". Checked at BFINAL and before each block header.
+/// Without it, a member truncated into its 8-byte trailer decoded its last
+/// block from the reader's zero padding and passed.
+#[cfg(parallel_sm)]
+fn check_stream_end_within_input(
+    end_bit_offset: usize,
+    input_len: usize,
+) -> Result<(), ChunkDecodeError> {
+    if end_bit_offset > input_len * 8 {
+        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "deflate stream truncated: final block ends at bit {end_bit_offset}, input has {} bits",
+                input_len * 8
+            ),
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(not(parallel_sm))]

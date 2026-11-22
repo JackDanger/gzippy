@@ -240,6 +240,14 @@ impl<'a> Bits<'a> {
         self.pos.saturating_mul(8).saturating_sub(unread)
     }
 
+    /// True when `consume` has taken more bits than the reader held — the
+    /// wrapped `bitsleft` low byte is `256 - overrun` (> 64). Only possible when
+    /// a decoder read past the end of `data`: truncated / malformed input.
+    #[inline]
+    pub fn is_overconsumed(&self) -> bool {
+        (self.bitsleft as u8) > 64
+    }
+
     /// Branchless refill matching libdeflate
     /// CRITICAL: Handles underflow where bitsleft has wrapped to > 64
     #[inline(always)]

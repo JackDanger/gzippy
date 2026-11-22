@@ -3015,6 +3015,13 @@ impl Block {
                 // absolute bit position so the engine-B tail / next read_header
                 // never sees engine A's internal bit representation.
                 let reread = |bits: &mut Bits| {
+                    // An over-consumed reader (decoded past end of input) keeps
+                    // its wrapped state: `bit_position` clamps it to a position
+                    // BEFORE the end, which would erase the evidence the chunk
+                    // driver uses to reject the truncated stream.
+                    if bits.is_overconsumed() {
+                        return;
+                    }
                     let data = bits.data;
                     let bp = bits.bit_position();
                     *bits = Bits::at_bit_offset(data, bp);

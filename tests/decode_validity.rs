@@ -224,3 +224,64 @@ fn zlib_fixed_huffman_symbol_286_is_rejected() {
     let o = decode_stdin_file(&f);
     assert_rejected("zlib_sym286 < file", &o);
 }
+
+// --- Finding 7: back-references before the start of the member.
+
+#[test]
+fn backref_before_stream_start_is_rejected() {
+    // Fixed block whose first symbol is a 258-byte match at distance 32768:
+    // there are no prior bytes. main printed 258 zero bytes, exit 0.
+    let f = unhex("1f8b08000000000000031bbdff1f009abf69ae02010000");
+    assert_file_rejected_all_threads("window_underflow_small", &f);
+}
+
+#[test]
+fn backref_into_previous_member_is_rejected() {
+    // Member 2 is a back-reference into member 1's bytes (each gzip member is
+    // an independent DEFLATE stream; its CRC was crafted to match). gzip and
+    // libdeflate print member 1 and exit 1.
+    let f = unhex(concat!(
+        "1f8b08000000000002ffcb48cdc9c957c84dcd4d4a2d52c8cf4bd55148cd4bc9cc4b57c8cc5388",
+        "0200adb90bdf1d0000001f8b0800000000000003030200407f805503000000",
+    ));
+    assert_file_rejected_all_threads("xmember_backref", &f);
+}
+
+// --- Findings 11/14: truncation at the end of the file.
+
+/// `printf 'hello\n' | gzip -n` (GNU gzip 1.14).
+const HELLO_GZ: &str = "1f8b0800000000000003cb48cdc9c9e7020020303a3606000000";
+
+#[test]
+fn trailer_truncated_by_one_byte_is_rejected() {
+    // empty.gz (FNAME "null") cut to 24 of 25 bytes: the "trailer" read from
+    // the last 8 bytes overlapped the deflate data. gzip: unexpected end of file.
+    let f = unhex("1f8b08080000000000036e756c6c00030000000000000000");
+    assert_file_rejected_all_threads("empty.gz cut to 24 bytes", &f);
+}
+
+#[test]
+fn trailing_gzip_magic_that_is_not_a_complete_member_is_rejected() {
+    // gzip 1.14: bytes after a member that start with 1f 8b (or are a lone
+    // 1f at EOF) are a member: truncated -> "unexpected end of file", bad
+    // method -> "unknown method", exit 1 either way.
+    for tail in ["1f", "1f8b", "1f8b08", "1f8b0800000000000003", "1f8b78797a"] {
+        let f = unhex(&format!("{HELLO_GZ}{tail}"));
+        assert_file_rejected_all_threads(&format!("hello.gz + {tail}"), &f);
+    }
+}
+
+#[test]
+fn trailing_zeros_or_non_magic_garbage_still_decode() {
+    // Not a member: zero padding (gzip: silent) and other bytes (gzip: "trailing
+    // garbage ignored") keep the decoded member and do not fail.
+    for tail in ["00000000", "1f00", "001f8b08", "67617262616765"] {
+        let f = unhex(&format!("{HELLO_GZ}{tail}"));
+        for t in [1usize, 4] {
+            let o = decode_file(&f, t);
+            assert!(!o.timed_out, "hello.gz + {tail} -p{t} hung");
+            assert_eq!(o.code, Some(0), "hello.gz + {tail} -p{t}: exit");
+            assert_eq!(o.stdout, b"hello\n", "hello.gz + {tail} -p{t}: output");
+        }
+    }
+}
