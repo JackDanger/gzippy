@@ -614,7 +614,8 @@ pub fn decode_lz77(
     }
 
     // LZ77 copy
-    crate::decompress::simd_copy::lz77_copy_fast(output, distance, length);
+    // SAFETY: `distance` was just checked to be in `1..=output.len()`.
+    unsafe { crate::decompress::simd_copy::lz77_copy_fast(output, distance, length) };
 
     Ok(())
 }

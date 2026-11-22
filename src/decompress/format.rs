@@ -182,6 +182,33 @@ pub(crate) enum FirstMemberBoundary {
     UnexpectedEof,
     /// get_method's CM-byte refusal: "unknown method N -- not supported".
     UnknownMethod(u8),
+    /// get_method's other header refusals (gzip.c get_method, 1.14): the
+    /// ENCRYPTED (0x20) and RESERVED (0xC0) FLG bits, and an FHCRC that does
+    /// not match the low 16 bits of the header's CRC32. Carries the text that
+    /// follows the file name, exactly as gzip prints it; ERROR class, exit 1.
+    Refused(String),
+}
+
+impl FirstMemberBoundary {
+    /// Print a refusal the way gzip does and return its exit status; `None`
+    /// for `Header` (proceed). One printer for every CLI call site.
+    pub(crate) fn report(&self, name: &str) -> Option<i32> {
+        match self {
+            FirstMemberBoundary::Header => None,
+            FirstMemberBoundary::UnexpectedEof => {
+                eprintln!("\ngzippy: {}: unexpected end of file", name);
+                Some(1)
+            }
+            FirstMemberBoundary::UnknownMethod(cm) => {
+                eprintln!("gzippy: {}: unknown method {} -- not supported", name, cm);
+                Some(1)
+            }
+            FirstMemberBoundary::Refused(rest) => {
+                eprintln!("gzippy: {}{}", name, rest);
+                Some(1)
+            }
+        }
+    }
 }
 
 /// Classify the FIRST member header of `data` (already known to start with
@@ -198,6 +225,13 @@ pub(crate) fn classify_first_member(data: &[u8]) -> FirstMemberBoundary {
         return FirstMemberBoundary::UnknownMethod(data[2]);
     }
     let flags = data[3];
+    // gzip.c get_method checks these right after reading FLG, before MTIME.
+    if flags & 0x20 != 0 {
+        return FirstMemberBoundary::Refused(" is encrypted -- not supported".to_string());
+    }
+    if flags & 0xC0 != 0 {
+        return FirstMemberBoundary::Refused(format!(" has flags 0x{:x} -- not supported", flags));
+    }
     let mut pos = 10usize;
     if flags & 0x04 != 0 {
         // FEXTRA: 2-byte XLEN, then XLEN bytes (gzip.c:1458+).
@@ -226,9 +260,18 @@ pub(crate) fn classify_first_member(data: &[u8]) -> FirstMemberBoundary {
         }
     }
     if flags & 0x02 != 0 {
-        // FHCRC.
+        // FHCRC: the low 16 bits of the CRC32 of every header byte before it
+        // (RFC 1952 §2.3.1). gzip verifies it; so do we.
         if pos + 2 > data.len() {
             return FirstMemberBoundary::UnexpectedEof;
+        }
+        let stored = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        let computed = (crc32fast::hash(&data[..pos]) & 0xffff) as u16;
+        if stored != computed {
+            return FirstMemberBoundary::Refused(format!(
+                ": header checksum 0x{:04x} != computed checksum 0x{:04x}",
+                stored, computed
+            ));
         }
     }
     FirstMemberBoundary::Header

@@ -888,3 +888,72 @@ fn index_output_link_is_never_written_through() {
         .unwrap()
         .is_file());
 }
+
+// ---------------------------------------------------------------------------
+// Container integrity (2026-11 decoder audit). gzip(1) rejects every one of
+// these with exit 1 ("invalid compressed data--crc error", "--format
+// violated", "header checksum ... != computed checksum", "has flags 0x..",
+// "not in gzip format"); gzippy must never exit 0 on them — at ANY -p, from
+// a file or from stdin — and must never abort (exit 134 = panic).
+// ---------------------------------------------------------------------------
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Audit repros, byte-exact: a plain two-member file whose member 2 carries a
+/// wrong CRC32; a gzippy "GZ"-FEXTRA block with a wrong CRC32; the same block
+/// with ISIZE=0; two "GZ" blocks whose BSIZE ends inside their own header; a
+/// member whose FHCRC is wrong; a member with the 0x40 reserved FLG bit.
+const INTEGRITY_REJECTS: &[(&str, &str, &str)] = &[
+    ("mm_badcrc.gz", "1f8b08000000000000030bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb29848c2a1e553caa7854f1a8e251c5c34b310078563412080700001f8b08000000000000030b484cce56c8ad5448caaf5028cf2cc95048cb2c4b5548c9af4acd53c8c92c2ccd2f52c82a4d2f565454540818553aaa7454e9a8d251a5a34a075a290020f9b4bab8060000", ""),
+    ("bgzf_badcrc.gz", "1f8b08040000000000030800475a040052000000cb48cdc9c95728cf2fca49d15128c9c82c5600a2448592d4e21285fc34a048aa82937b949b424162490657c6a8e251c5a38aa9ad1800efbeadde84030000", ""),
+    ("bgzf_isize0.gz", "1f8b08040000000000030800475a040052000000cb48cdc9c95728cf2fca49d15128c9c82c5600a2448592d4e21285fc34a048aa82937b949b424162490657c6a8e251c5a38aa9ad180019a63e3b00000000", ""),
+    ("bgzf_bsize20x2.gz", "1f8b08040000000000030800475a0400140000001f8b08040000000000030800475a040014000000", ""),
+    ("hdr_fhcrc_bad.gz", "1f8b0802000000000003deadcb484d4c492d5228492d2e512848acccc94f4ce1ca188262008cd927fcc8000000", "header checksum 0xadde != computed checksum 0x77a7"),
+    ("hdr_flag40.gz", "1f8b0840000000000003cb484d4c492d5228492d2e512848acccc94f4ce1ca188262008cd927fcc8000000", "has flags 0x40 -- not supported"),
+];
+
+#[test]
+fn corrupt_containers_exit_one_at_every_thread_count_file_and_stdin() {
+    let d = tempdir();
+    for (name, h, msg) in INTEGRITY_REJECTS {
+        let bytes = hex(h);
+        write_file(d.path(), name, &bytes);
+        for p in ["-p1", "-p4"] {
+            for out in [
+                run(d.path(), &["-dc", p, name]),
+                run_piped(d.path(), &["-dc", p], &bytes),
+                run(d.path(), &["-t", p, name]),
+            ] {
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(1), "{name} {p}: stderr={err}");
+                assert!(err.contains(msg), "{name} {p}: want {msg:?} in {err:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn text_starting_with_x_is_not_sniffed_as_zlib() {
+    // gzip -dcf passes non-gzip bytes through; "x" (0x78) is only zlib's
+    // first byte when the whole CMF/FLG check passes, which "xh" does not.
+    let d = tempdir();
+    let text = b"xhello world";
+    write_file(d.path(), "x.txt", text);
+    write_file(d.path(), "x.gz", text);
+    let piped = run_piped(d.path(), &["-dcf"], text);
+    assert_eq!(piped.status.code(), Some(0));
+    assert_eq!(piped.stdout, text);
+    let file = run(d.path(), &["-dcf", "x.txt"]);
+    assert_eq!(file.status.code(), Some(0));
+    assert_eq!(file.stdout, text);
+    for args in [&["-t", "x.gz"][..], &["-dc", "x.gz"][..]] {
+        let out = run(d.path(), args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not in gzip format"));
+    }
+}

@@ -220,8 +220,18 @@ mod portable {
 ///
 /// This is the main entry point for LZ77 back-reference copies.
 /// It handles all distance/length combinations optimally.
+///
+/// # Safety
+///
+/// The caller must guarantee `1 <= distance <= output.len()`. The copy reads
+/// from `output.len() - distance` with raw pointers and does not check it: a
+/// zero distance reads uninitialised memory and a distance past the start of
+/// the buffer reads before the allocation. Every DEFLATE caller already has
+/// this check (it is RFC 1951's "distance too far back" error), so it is a
+/// precondition rather than a branch on the hot path.
 #[inline(always)]
-pub fn lz77_copy_fast(output: &mut Vec<u8>, distance: usize, length: usize) {
+pub unsafe fn lz77_copy_fast(output: &mut Vec<u8>, distance: usize, length: usize) {
+    debug_assert!(distance != 0 && distance <= output.len());
     // Reserve space
     output.reserve(length);
     let out_pos = output.len();
@@ -467,14 +477,16 @@ mod tests {
     #[test]
     fn test_lz77_copy_rle() {
         let mut output = vec![b'A'];
-        lz77_copy_fast(&mut output, 1, 10);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut output, 1, 10) };
         assert_eq!(output, b"AAAAAAAAAAA");
     }
 
     #[test]
     fn test_lz77_copy_pattern() {
         let mut output = b"AB".to_vec();
-        lz77_copy_fast(&mut output, 2, 8);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut output, 2, 8) };
         assert_eq!(output, b"ABABABABAB");
     }
 
@@ -482,14 +494,16 @@ mod tests {
     fn test_lz77_copy_large() {
         let mut output: Vec<u8> = (0..100).collect();
         let expected: Vec<u8> = (0..100).chain(0..100).collect();
-        lz77_copy_fast(&mut output, 100, 100);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut output, 100, 100) };
         assert_eq!(output, expected);
     }
 
     #[test]
     fn test_lz77_copy_overlapping() {
         let mut output = b"Hello".to_vec();
-        lz77_copy_fast(&mut output, 5, 15);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut output, 5, 15) };
         assert_eq!(output, b"HelloHelloHelloHello");
     }
 
@@ -501,7 +515,8 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..10000 {
             output.truncate(1000);
-            lz77_copy_fast(&mut output, 100, 900);
+            // SAFETY: 1 <= distance <= buf.len() by construction.
+            unsafe { lz77_copy_fast(&mut output, 100, 900) };
         }
         let elapsed = start.elapsed();
 
@@ -519,7 +534,8 @@ mod simd_tests {
     fn test_rle_copy() {
         // RLE: distance 1, repeat single byte
         let mut buf = vec![b'A'];
-        lz77_copy_fast(&mut buf, 1, 32);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut buf, 1, 32) };
         assert_eq!(buf.len(), 33);
         assert!(buf.iter().all(|&b| b == b'A'), "All bytes should be 'A'");
     }
@@ -528,7 +544,8 @@ mod simd_tests {
     fn test_pattern_copy_dist_2() {
         // Distance 2: repeat 2-byte pattern
         let mut buf = vec![b'A', b'B'];
-        lz77_copy_fast(&mut buf, 2, 32);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut buf, 2, 32) };
         assert_eq!(buf.len(), 34);
         for (i, &byte) in buf.iter().enumerate() {
             let expected = if i % 2 == 0 { b'A' } else { b'B' };
@@ -541,7 +558,8 @@ mod simd_tests {
         // Large distance, large length
         let mut buf: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let original = buf.clone();
-        lz77_copy_fast(&mut buf, 500, 500);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut buf, 500, 500) };
         assert_eq!(buf.len(), 1500);
         // First 1000 bytes unchanged
         assert_eq!(&buf[..1000], &original[..]);
@@ -553,7 +571,8 @@ mod simd_tests {
     fn test_overlapping_copy() {
         // Overlapping: distance < length
         let mut buf = vec![1u8, 2, 3, 4];
-        lz77_copy_fast(&mut buf, 4, 12);
+        // SAFETY: 1 <= distance <= buf.len() by construction.
+        unsafe { lz77_copy_fast(&mut buf, 4, 12) };
         assert_eq!(buf.len(), 16);
         // Should repeat: 1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4
         for (i, &byte) in buf.iter().enumerate() {

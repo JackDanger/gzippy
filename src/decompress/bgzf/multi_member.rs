@@ -262,9 +262,14 @@ pub(crate) fn gz_coverage_is_pure(data: &[u8]) -> bool {
         if data[offset + 3] & 0x04 == 0 {
             return false;
         }
-        let member_len = match gz_member_len(data, offset) {
-            Some(l) if l >= 18 => l,
-            _ => return false,
+        // Geometry, not just the size field: the member must hold its own
+        // header (FEXTRA + FNAME/FCOMMENT/FHCRC) AND an 8-byte trailer. A size
+        // that ends inside the header (e.g. BSIZE=20 on a 20-byte header) is
+        // not our format — route it to the generic gzip path, which sees an
+        // ordinary member with an unknown extra field (what gzip(1) sees).
+        let member_len = match gz_member_geometry(data, offset) {
+            Some((l, _)) => l,
+            None => return false,
         };
         offset = match offset.checked_add(member_len) {
             Some(o) if o <= data.len() => o,
@@ -273,6 +278,39 @@ pub(crate) fn gz_coverage_is_pure(data: &[u8]) -> bool {
         members += 1;
     }
     members >= 1 && offset == data.len()
+}
+
+/// Whole-member geometry of a "GZ"-FEXTRA member at `start`: `(length,
+/// deflate_start)` where `deflate_start` is the absolute offset of the raw
+/// deflate body past every optional header field. `None` unless the member
+/// lies inside `data` and `deflate_start + 8 <= start + length` (room for the
+/// CRC32 + ISIZE trailer) — the invariant every decode site slices by. Shared
+/// by the router ([`gz_coverage_is_pure`]) and the block scan
+/// (`parse_bgzf_blocks`) so a member the router accepts can never panic the
+/// decoder.
+pub(super) fn gz_member_geometry(data: &[u8], start: usize) -> Option<(usize, usize)> {
+    let length = gz_member_len(data, start)?;
+    let end = start.checked_add(length)?;
+    if length < 18 || end > data.len() {
+        return None;
+    }
+    let flags = data[start + 3];
+    let xlen = u16::from_le_bytes([data[start + 10], data[start + 11]]) as usize;
+    let mut ds = start + 12 + xlen;
+    for flag in [0x08u8, 0x10] {
+        // FNAME / FCOMMENT: NUL-terminated, and the NUL must lie inside the member.
+        if flags & flag != 0 {
+            let nul = data.get(ds..end)?.iter().position(|&b| b == 0)?;
+            ds += nul + 1;
+        }
+    }
+    if flags & 0x02 != 0 {
+        ds += 2; // FHCRC
+    }
+    if ds.checked_add(8)? > end {
+        return None;
+    }
+    Some((length, ds))
 }
 
 /// Parse the "GZ" FEXTRA subfield's whole-member compressed length at `start`.
@@ -409,8 +447,25 @@ pub fn decompress_multi_member_parallel_to_vec(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
+                    // Integrity (RFC 1952 §2.3.1): a member is valid only if BOTH its
+                    // ISIZE and its CRC32 match the decoded bytes. ISIZE alone let a
+                    // corrupted stored block (or a bad CRC field) exit 0 with wrong
+                    // bytes at T>1 while -p1 (sequential, CRC-checked) and gzip
+                    // rejected it. A mismatch flags the error; the caller then
+                    // re-runs the sequential path, which reports the precise cause.
                     match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_out) if actual_out == out_size => {}
+                        Ok(actual_out) if actual_out == out_size => {
+                            let t = deflate_end;
+                            let expected_crc = u32::from_le_bytes([
+                                data[t],
+                                data[t + 1],
+                                data[t + 2],
+                                data[t + 3],
+                            ]);
+                            if super::crc32_of(out_slice) != expected_crc {
+                                error_ref.store(true, Ordering::Relaxed);
+                            }
+                        }
                         _ => error_ref.store(true, Ordering::Relaxed),
                     }
                 }
