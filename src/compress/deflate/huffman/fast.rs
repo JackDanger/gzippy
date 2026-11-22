@@ -475,6 +475,16 @@ pub fn make_huffman_code_into(out: &mut HuffmanCode, num_syms: usize, max_len: u
         return;
     }
 
+    // `compute_length_counts`/`gen_codewords` index the fixed 17-entry
+    // `len_counts` by length and assume a feasible limit: `max_len` > 15 wrote
+    // past it, and a limit too small for the used alphabet underflowed the
+    // depth walk — both stack-buffer-overflows under ASan through this SAFE
+    // `pub fn` (encoder audit). Every DEFLATE caller passes 7 or 15, so this
+    // is one well-predicted compare per block.
+    assert!(
+        max_len <= MAX_CODEWORD_LEN && num_used_syms <= 1usize << max_len,
+        "make_huffman_code_into: max_len {max_len} infeasible for {num_used_syms} used symbols"
+    );
     build_tree(a, num_used_syms);
 
     let mut len_counts = [0u32; MAX_CODEWORD_LEN + 2];
@@ -516,6 +526,11 @@ pub fn make_huffman_code_exact_into(
         lens[nonzero_idx] = 1;
         return;
     }
+    // Same feasibility contract as `make_huffman_code_into` (see there).
+    assert!(
+        max_len <= MAX_CODEWORD_LEN && num_used_syms <= 1usize << max_len,
+        "make_huffman_code_exact_into: max_len {max_len} infeasible for {num_used_syms} used symbols"
+    );
     // No per-block allocation (CLAUDE.md STEP 1). Same thread_local pattern as
     // SORT_COUNTERS above: clear()+resize() reuses capacity after the first block, and each
     // worker thread gets its own buffers so chunk-independence is untouched.
@@ -684,5 +699,30 @@ mod tests {
         // 0b1011 (4 bits) reversed => 0b1101 = 13.
         assert_eq!(reverse_codeword(0b1011, 4), 0b1101);
         assert_eq!(reverse_codeword(0, 5), 0);
+    }
+}
+
+#[cfg(test)]
+mod infeasible_limit_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "infeasible")]
+    fn max_len_above_15_is_refused_not_overflowed() {
+        let freqs: Vec<u32> = (1..=286).collect();
+        let _ = make_huffman_code(286, 40, &freqs);
+    }
+
+    #[test]
+    #[should_panic(expected = "infeasible")]
+    fn max_len_too_small_for_alphabet_is_refused() {
+        let _ = make_huffman_code(3, 1, &[5, 6, 7]);
+    }
+
+    #[test]
+    fn deflate_limits_still_build() {
+        let freqs: Vec<u32> = (1..=286).collect();
+        assert_eq!(make_huffman_code(286, 15, &freqs).lens.len(), 286);
+        assert_eq!(make_huffman_code(19, 7, &[1; 19]).lens.len(), 19);
     }
 }
