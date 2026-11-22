@@ -883,8 +883,16 @@ fn create_litlen_entry(symbol: usize, codeword_bits: u8) -> LitLenEntry {
         let (base, extra) = LENGTH_TABLE[idx];
         LitLenEntry::length(base, extra, codeword_bits)
     } else {
-        // Invalid symbol, create a dummy entry
-        LitLenEntry(0)
+        // Reserved symbols 286/287 (RFC 1951 §3.2.5). They get codewords only
+        // in the FIXED code (dynamic headers with HLIT > 286 are rejected at
+        // parse time). This used to be `LitLenEntry(0)` — a 0-BIT, length-0
+        // match that consumed nothing, so a dynamic code assigning 286 spun the
+        // body loop forever. Mirror libdeflate's `litlen_decode_results`
+        // (deflate_decompress.c:587, `ENTRY(258, 0)` for 285/286/287): consume
+        // the real codeword and decode as a length-258 match, so the stream
+        // always makes progress and an invalid stream fails on its distance or
+        // its CRC — with no extra branch in the per-symbol fastloops.
+        LitLenEntry::length(258, 0, codeword_bits)
     }
 }
 
