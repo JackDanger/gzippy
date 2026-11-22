@@ -1,17 +1,17 @@
 Package: gzippy
-Version: 0.8.0-1
+Version: 1.0.1-1
 Architecture: amd64
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 1175
-Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
+Installed-Size: 2152
+Depends: libc6 (>= 2.38), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.8.0-1_amd64.deb
-Size: 513580
-SHA256: 05e898c12d2e409ae9f6a5e998d6915fa974d4686fcf8b363a518efbe96a28ca
-SHA1: bca12bd94f74fbbc6fbc1822faf35c36c1e44b34
-MD5sum: 86b69550752e58d876779fd806673e5d
+Filename: pool/main/g/gzippy/gzippy_1.0.1-1_amd64.deb
+Size: 827524
+SHA256: 40b6afa0b8f20b4d72b1c9dd668e6acee62be437975f24f6c66b7cd63d3d3633
+SHA1: ff408cf6f6cbe4d3fcd89d72372d2f7780bdcb51
+MD5sum: ac0289d14c0974a2b7a3deb0deed9876
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.8.0-1
+Version: 1.0.1-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.8.0-1)
+Depends: gzippy (>= 1.0.1-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.8.0-1_all.deb
-Size: 2132
-SHA256: c74472f1ef166fa466cc71c480360f0e608ff75d4b0c53cde37fef6429faa115
-SHA1: 2b585b948ad5c787d3f13044f14b11b96423b89e
-MD5sum: 70d783917683debf22f52232ccabae72
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_1.0.1-1_all.deb
+Size: 2660
+SHA256: 5d5cb137bdec6d2207a5a3269c8a2f27bf87dde9ae611a11709bb865c885881c
+SHA1: c22cb6c579ec49c070b58d4e21aac8cfb02013ec
+MD5sum: e625f083b7222565a5616e571c359b51
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
