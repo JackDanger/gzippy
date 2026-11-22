@@ -45,3 +45,16 @@ cargo +nightly fuzz run parallel_sm_roundtrip -- -max_total_time=180
   can drive a multi-GB allocation (DoS). This is the multi-member sequential decoder,
   not the parallel-SM path; needs its own bounded-growth fix + tests. ARM 2 now skips
   multi-member-classified inputs so it does not mask parallel-SM findings.
+
+## Targets: `decode_untrusted`, `decode_gzip_focus`
+
+Untrusted-input targets from the 2026-11-21 decoder audit (which found two
+hangs, the header-driven OOM class and the skipped-CRC paths with them).
+
+- `decode_untrusted`: the first byte selects an entry point — gzip at T1/T2/T4,
+  `decompress_raw`, `decompress_deflate64`, or raw deflate under a fixed gzip
+  header. Whenever gzippy returns `Ok` on a gzip input that flate2's
+  `MultiGzDecoder` also accepts, the bytes must match.
+- `decode_gzip_focus`: gzip at T1/T2/T4 only, skipping GZ-FEXTRA inputs.
+
+    cargo +nightly fuzz run decode_untrusted -- -max_total_time=600 -rss_limit_mb=2048
