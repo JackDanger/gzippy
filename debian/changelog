@@ -1,3 +1,13 @@
+gzippy (1.0.1-1) unstable; urgency=high
+
+  * SECURITY: `gzippy -dN` used the gzip header's stored file name (FNAME)
+    verbatim as the output path, so a crafted archive could write outside
+    the input's directory ("../../x") or to any absolute path, then delete
+    the input. The stored name is now reduced to its base name, as gzip
+    does. Plain `gzippy -d` / `gunzip` (no -N) were not affected.
+
+ -- Jack Danger <github@jackdanger.com>  Sat, 21 Nov 2026 16:03:11 -0800
+
 gzippy (1.0.0-1) unstable; urgency=medium
 
   * First major release of the one-encoder trunk: gzippy 0-9 routes through
