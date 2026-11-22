@@ -228,15 +228,88 @@ pub fn report_open_failure(failure: OpenFailure, quiet: bool) -> i32 {
     1
 }
 
-/// Copy permissions and mtime from `src` to `dst`.
-/// Errors are silently ignored — best-effort, matching gzip behavior.
-pub fn preserve_metadata(src: &Path, dst: &Path) {
-    if let Ok(metadata) = fs::metadata(src) {
-        let _ = fs::set_permissions(dst, metadata.permissions());
-        if let Ok(mtime) = metadata.modified() {
-            let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
+/// Whether anything occupies `path` — a regular file, a directory, or a
+/// symlink INCLUDING a dangling one. gzip's check_ofname lstat()s the output
+/// name; `Path::exists()` follows links, so a planted dangling symlink read
+/// as "absent" and the create then wrote through it.
+pub fn output_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// Create an output file the way gzip.c `create_outfile` does:
+/// `O_WRONLY | O_CREAT | O_EXCL`, mode 0600 (the real mode is copied from the
+/// input on success, on the fd — see [`copy_stat`]). O_EXCL never follows a
+/// symlink and never writes through an existing hardlink, and 0600 keeps the
+/// half-written output unreadable to other users.
+///
+/// `overwrite`: the caller already approved replacing whatever occupies the
+/// name (`-f`, or a "y" at the prompt). Then — and only then — an existing
+/// entry is unlinked (the link itself, never its target) and the create is
+/// retried once, exactly gzip's `unlink`-then-reopen under `-f`.
+pub fn create_output_file(path: &Path, overwrite: bool) -> std::io::Result<fs::File> {
+    let open = || {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
         }
+        opts.open(path)
+    };
+    match open() {
+        Err(e) if overwrite && e.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(path)?;
+            open()
+        }
+        r => r,
     }
+}
+
+/// True when `path` names the same inode as `istat` (gzip.c `same_file`).
+pub fn is_same_file(istat: &fs::Metadata, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path)
+            .map(|o| o.dev() == istat.dev() && o.ino() == istat.ino())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (istat, path);
+        false
+    }
+}
+
+/// Copy ownership, permissions and times from the input's stat to the
+/// OUTPUT FD — gzip.c `copy_stat`. Everything goes through the open handle,
+/// never a path, so a name swapped after the write cannot redirect a chmod
+/// or utime onto another file. Order is gzip's: group first, then mode
+/// (masked to 07777), then owner — so the input's group-permission bits are
+/// never granted to the directory's group. `mtime` overrides the input's
+/// mtime (the header MTIME under `-dN`). Errors are ignored, as in gzip:
+/// an unprivileged user cannot chown to another owner.
+pub fn copy_stat(istat: &fs::Metadata, out: &fs::File, mtime: Option<filetime::FileTime>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+        let fd = out.as_raw_fd();
+        // SAFETY: fchown on a valid, owned fd; -1 leaves that id unchanged.
+        unsafe { libc::fchown(fd, libc::uid_t::MAX, istat.gid()) };
+        let _ = out.set_permissions(fs::Permissions::from_mode(istat.mode() & 0o7777));
+        // SAFETY: as above.
+        unsafe { libc::fchown(fd, istat.uid(), libc::gid_t::MAX) };
+    }
+    #[cfg(not(unix))]
+    let _ = out.set_permissions(istat.permissions());
+    let _ = filetime::set_file_handle_times(
+        out,
+        Some(filetime::FileTime::from_last_access_time(istat)),
+        Some(mtime.unwrap_or_else(|| filetime::FileTime::from_last_modification_time(istat))),
+    );
 }
 
 pub fn detect_format_from_file(path: &Path) -> Option<crate::format::CompressionFormat> {
