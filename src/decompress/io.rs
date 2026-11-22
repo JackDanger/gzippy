@@ -46,7 +46,8 @@ use memmap2::Mmap;
 
 use crate::cli::GzippyArgs;
 use crate::decompress::format::{
-    extract_gzip_fname, extract_gzip_mtime, has_bgzf_markers, is_likely_multi_member,
+    extract_gzip_fname, extract_gzip_mtime, fname_base_name, has_bgzf_markers,
+    is_likely_multi_member,
 };
 
 use crate::error::{GzippyError, GzippyResult};
@@ -651,12 +652,19 @@ fn get_output_filename(input_path: &Path, args: &GzippyArgs, data: &[u8]) -> std
     // file minus the suffix below and ignores the header, and the gunzip
     // alias is plain -d and keeps that default.
     if args.name_explicit {
-        if let Some(fname) = extract_gzip_fname(data) {
-            if !fname.is_empty() {
-                let mut output = input_path.to_path_buf();
-                output.set_file_name(&fname);
-                return output;
-            }
+        // The header is untrusted input: only its BASE NAME may replace the
+        // on-disk file name (gzip.c get_method ORIG_NAME branch,
+        // `gzip_base_name`), so a stored "../../x" or "/etc/x" can never
+        // pick the output directory. A name with no usable base ("..",
+        // ".", "dir/") restores nothing and falls through to the on-disk
+        // name below.
+        if let Some(base) = extract_gzip_fname(data)
+            .as_deref()
+            .and_then(fname_base_name)
+        {
+            let mut output = input_path.to_path_buf();
+            output.set_file_name(base);
+            return output;
         }
     }
     if args.suffix != ".gz" {
