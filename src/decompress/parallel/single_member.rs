@@ -960,8 +960,14 @@ fn trailing_member_after_first(gzip_data: &[u8]) -> bool {
             Ok(n) => n,
             Err(_) => return false,
         };
+    // ANY bytes past member 1's trailer: a second member (the misroute case
+    // this was written for) OR trailing zero padding / garbage (tape and tar
+    // padding). The resume walk clean-stops on non-member bytes exactly as
+    // gzip(1) does ("decompression OK, trailing garbage ignored"; zeros are
+    // ignored silently). Gating on a second `1f 8b` only made a 512-byte
+    // zero pad after a valid member a hard error with EMPTY output.
     let next = header_size + deflate_len + 8;
-    next + 2 <= gzip_data.len() && gzip_data[next] == 0x1f && gzip_data[next + 1] == 0x8b
+    next < gzip_data.len()
 }
 
 pub fn decompress_parallel<W: Write>(
