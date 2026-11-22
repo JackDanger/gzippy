@@ -713,3 +713,61 @@ fn dash_upper_n_dotdot_or_dir_only_fname_falls_back_to_on_disk_name() {
         assert_fname_confined(f, "evil");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Trailing bytes after the last member (gzip(1) get_method: zero padding is
+// ignored silently; other garbage is "decompression OK, trailing garbage
+// ignored"). Tape/tar-padded .gz files are the common case. The single-member
+// decoder used to resume past member 1 ONLY when a second `1f 8b` followed,
+// so 512 zero bytes made a valid archive a hard error with EMPTY output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trailing_padding_or_garbage_after_member_decodes() {
+    let d = tempdir();
+    let mut big = Vec::new();
+    while big.len() < 3 << 20 {
+        big.extend_from_slice(&sample_bytes());
+    }
+    for (name, data) in [("small", sample_bytes()), ("big", big)] {
+        write_file(d.path(), name, &data);
+        compress_ok(d.path(), &["-k", "-f"], name);
+        let gz = fs::read(d.path().join(format!("{name}.gz"))).unwrap();
+        for (tag, tail) in [
+            ("zeros", vec![0u8; 512]),
+            ("garbage", b"garbage\n".to_vec()),
+        ] {
+            let f = format!("{name}-{tag}.gz");
+            let mut padded = gz.clone();
+            padded.extend_from_slice(&tail);
+            fs::write(d.path().join(&f), &padded).unwrap();
+            for p in ["-p1", "-p4"] {
+                let out = run(d.path(), &["-dc", p, &f]);
+                assert!(
+                    out.status.success(),
+                    "{f} {p}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    out.stdout == data,
+                    "{f} {p}: output must equal the member's bytes"
+                );
+            }
+        }
+        // A corrupt member stays an error even with padding after it.
+        let mut bad = gz.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0x55;
+        bad.extend_from_slice(&[0u8; 512]);
+        let f = format!("{name}-corrupt.gz");
+        fs::write(d.path().join(&f), &bad).unwrap();
+        for p in ["-p1", "-p4"] {
+            let out = run(d.path(), &["-dc", p, &f]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{f} {p}: corruption must stay terminal"
+            );
+        }
+    }
+}
