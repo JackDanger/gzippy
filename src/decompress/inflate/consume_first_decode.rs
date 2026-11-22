@@ -1741,7 +1741,20 @@ pub(crate) fn decode_huffman_fastloop_bounded_pipelined(
         let mut dist_entry = dist.lookup(bitbuf);
         let length = (entry >> 16)
             + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
-        if (bitsleft as u8) < 32 {
+        // Refill threshold = LITLEN_TABLEBITS + OFFSET_MAXFASTBITS
+        // (DistTable::TABLE_BITS + 13 extra bits), so that after the worst-case
+        // main-table offset consume bitsleft >= LITLEN_TABLEBITS at the
+        // load-before-refill preload below. aarch64: 11 + 8 + 13 = 32, the
+        // historical constant (identical code). x86_64 (12-bit litlen / 9-bit
+        // dist tables): 34. With the old `< 32` on x86, bitsleft could reach
+        // 32 - 22 = 10; if the last refill had left bitsleft == 63 the buffer
+        // then held only 11 valid bits, and the 12-bit preload index read a
+        // shifted-in zero for bit 11 — a wrong litlen entry on a VALID stream.
+        // (The debug_assert below fired at bitsleft=11 on x86 audit streams;
+        // 11 is still exact because >= 1 valid bit always sits above bitsleft
+        // after a branchless refill, 10 is the corrupting case.)
+        const PRELOAD_REFILL_THRESHOLD: u8 = LitLenTable::TABLE_BITS + DistTable::TABLE_BITS + 13;
+        if (bitsleft as u8) < PRELOAD_REFILL_THRESHOLD {
             refill_branchless_fast!();
         }
         if dist_entry.is_subtable_ptr() {
