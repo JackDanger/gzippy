@@ -47,6 +47,36 @@ pub struct SeekIndex {
     pub deflate_offset: usize,
 }
 
+impl SeekIndex {
+    /// Check every archive-addressing field against the archive it is about
+    /// to be applied to: `deflate_offset` must lie inside the archive, and each
+    /// checkpoint's byte cursor inside the deflate stream with a bit-buffer
+    /// fill the 64-bit reader can hold. `load_index` cannot do this (it never
+    /// sees the archive), and the fields come from a separate file anyone can
+    /// edit or pair with the wrong archive.
+    pub fn validate_against(&self, gzip_data: &[u8]) -> GzippyResult<()> {
+        if self.deflate_offset >= gzip_data.len() {
+            return Err(GzippyError::parse(format!(
+                "Index does not match archive: deflate offset {} is past the {}-byte archive",
+                self.deflate_offset,
+                gzip_data.len()
+            )));
+        }
+        let deflate_len = gzip_data.len() - self.deflate_offset;
+        for (i, p) in self.points.iter().enumerate() {
+            // Only the low 8 bits of `bitsleft` are meaningful (see build_index).
+            if p.input_byte_pos as usize > deflate_len || (p.bitsleft as u8) > 64 {
+                return Err(GzippyError::parse(format!(
+                    "Index does not match archive: checkpoint {i} (byte {}, {} buffered bits) \
+                     is outside the {deflate_len}-byte deflate stream",
+                    p.input_byte_pos, p.bitsleft as u8
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Build a seek index for a gzip file.
 ///
 /// Scans the deflate stream and records checkpoints at regular intervals.
@@ -352,6 +382,11 @@ pub fn seek_decompress<W: Write>(
     if gzip_data.len() < 2 || gzip_data[0] != 0x1f || gzip_data[1] != 0x8b {
         return Err(GzippyError::invalid_argument("Not a gzip file"));
     }
+
+    // The index is a separate, untrusted file: every field that addresses the
+    // archive is checked against it before use, so a tampered or mismatched
+    // index is a clean error rather than an out-of-bounds slice.
+    index.validate_against(gzip_data)?;
 
     // Handle special case: seeking to offset 0 (decompress from beginning)
     if uncompressed_offset == 0 {

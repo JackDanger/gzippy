@@ -883,30 +883,70 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
 }
 
 /// Decompress zlib data (2-byte header + deflate + 4-byte Adler32).
+///
+/// RFC 1950 integrity, both ends: the CMF/FLG header must pass the CM=8 /
+/// CINFO<=7 / FCHECK test with no preset dictionary (FDICT, which this
+/// decoder cannot supply), and the big-endian Adler-32 that follows the
+/// DEFLATE stream must match the decoded bytes. Output growth is bounded by
+/// what the compressed body could expand to ([`bgzf::max_inflated_len`]), so a
+/// malformed body that makes the bit reader fabricate phantom blocks from
+/// zero padding errors instead of doubling toward gigabytes.
 pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    use crate::decompress::inflate::consume_first_decode::{inflate_consume_first_bits, Bits};
     if data.len() < 6 {
         return Err(GzippyError::invalid_argument(
             "Zlib data too short".to_string(),
         ));
     }
-    let deflate_data = &data[2..data.len() - 4];
+    let (cmf, flg) = (data[0], data[1]);
+    if cmf & 0x0f != 8 || cmf >> 4 > 7 || !((cmf as u16) << 8 | flg as u16).is_multiple_of(31) {
+        return Err(GzippyError::decompression("zlib: incorrect header check"));
+    }
+    if flg & 0x20 != 0 {
+        return Err(GzippyError::decompression(
+            "zlib: stream needs a preset dictionary (FDICT), which is not supported",
+        ));
+    }
+    // The DEFLATE stream ends where the decoder stops; the Adler-32 trailer
+    // is the 4 bytes after it (`body` includes them, so a valid stream's
+    // output is unchanged — the decoder stops at BFINAL before reaching them).
+    let body = &data[2..];
+    let ceiling = crate::decompress::bgzf::max_inflated_len(body.len());
     // zlib (RFC 1950) has no ISIZE trailer, so the output size is unknown up
     // front. Start at the 4x heuristic and CUMULATIVELY RE-grow on the
-    // inflate engine's `WriteZero` (output exhausted) signal, exactly like
-    // `decompress_raw_bytes` below — high-ratio pipes such as a file of
-    // zeros would otherwise fail outright at the fixed-size first guess.
-    let mut output_len = data.len().saturating_mul(4).max(64 * 1024);
-    const OUTPUT_CAP: usize = 1 << 31; // 2 GiB ceiling, as in decompress_raw_bytes
+    // inflate engine's `WriteZero` (output exhausted) signal, up to `ceiling`.
+    let mut output_len = data.len().saturating_mul(4).max(64 * 1024).min(ceiling);
     loop {
         let mut output_buf = vec![0u8; output_len];
-        match crate::decompress::bgzf::inflate_into_pub(deflate_data, &mut output_buf) {
+        let mut bits = Bits::new(body);
+        match inflate_consume_first_bits(&mut bits, &mut output_buf) {
             Ok(size) => {
+                let trailer = 2 + bits.bit_position().div_ceil(8);
+                let Some(adler) = data.get(trailer..trailer + 4) else {
+                    return Err(GzippyError::decompression(
+                        "zlib: unexpected end of stream (missing Adler-32 trailer)",
+                    ));
+                };
+                let expected = u32::from_be_bytes([adler[0], adler[1], adler[2], adler[3]]);
+                let actual = crate::compress::zlib_container::adler32(&output_buf[..size]);
+                if actual != expected {
+                    return Err(GzippyError::decompression(format!(
+                        "zlib: Adler-32 mismatch (stored {expected:#010x}, computed {actual:#010x})"
+                    )));
+                }
                 writer.write_all(&output_buf[..size])?;
                 writer.flush()?;
                 return Ok(size as u64);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && output_len < OUTPUT_CAP => {
-                output_len = output_len.saturating_mul(2).min(OUTPUT_CAP);
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && output_len < ceiling => {
+                output_len = output_len.saturating_mul(2).min(ceiling);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
+                return Err(GzippyError::decompression(format!(
+                    "zlib: decoded output exceeds the {ceiling}-byte ceiling a {}-byte \
+                     stream can expand to — malformed stream",
+                    body.len()
+                )));
             }
             Err(e) => {
                 return Err(GzippyError::invalid_argument(format!(
@@ -921,11 +961,13 @@ pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gz
 /// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer.
 ///
 /// Pure-Rust (`inflate_consume_first`) with a growing output buffer — NO C-FFI.
+/// Growth is bounded by what `data` could expand to
+/// ([`bgzf::max_inflated_len`]); a stream claiming more is malformed.
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn decompress_raw_bytes(data: &[u8]) -> GzippyResult<Vec<u8>> {
     use crate::decompress::inflate::consume_first_decode::inflate_consume_first;
-    const CAP: usize = 1 << 31; // 2 GiB output ceiling
-    let mut estimate = data.len().saturating_mul(4).clamp(4096, CAP);
+    let ceiling = crate::decompress::bgzf::max_inflated_len(data.len());
+    let mut estimate = data.len().saturating_mul(4).clamp(4096, ceiling);
 
     loop {
         let mut out = vec![0u8; estimate];
@@ -934,8 +976,8 @@ pub fn decompress_raw_bytes(data: &[u8]) -> GzippyResult<Vec<u8>> {
                 out.truncate(n);
                 return Ok(out);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && estimate < CAP => {
-                estimate = (estimate * 2).min(CAP);
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero && estimate < ceiling => {
+                estimate = estimate.saturating_mul(2).min(ceiling);
             }
             Err(_) => return Err(GzippyError::decompression("invalid raw DEFLATE data")),
         }

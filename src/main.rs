@@ -548,7 +548,8 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     // WITHOUT this gate the parallel decode path reports OK for garbage (exit
     // 0, nothing printed), inverting `gzip -t`'s integrity verdict.
     let is_gzip = mmap.len() >= 2 && mmap[0] == 0x1f && mmap[1] == 0x8b;
-    let cont = mmap.len() >= 2 && mmap[0] == 0x78;
+    // Full RFC 1950 header check, not a leading 'x' byte ("xhello" is text).
+    let cont = crate::compress::zlib_container::is_zlib_stream(&mmap);
     if !is_gzip && !cont {
         // gzip get_method (gzip.c:1461-1462): force + to_stdout copies the
         // input through unchanged instead of failing — `-tf <junk>` exits 0
@@ -572,17 +573,8 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
     // must not come back OK from the parallel decoder for either. ERROR
     // class: unconditional.
     if is_gzip {
-        use crate::decompress::format::FirstMemberBoundary;
-        match crate::decompress::format::classify_first_member(&mmap) {
-            FirstMemberBoundary::UnexpectedEof => {
-                eprintln!("\ngzippy: {}: unexpected end of file", name);
-                return Ok(1);
-            }
-            FirstMemberBoundary::UnknownMethod(cm) => {
-                eprintln!("gzippy: {}: unknown method {} -- not supported", name, cm);
-                return Ok(1);
-            }
-            FirstMemberBoundary::Header => {}
+        if let Some(code) = crate::decompress::format::classify_first_member(&mmap).report(&name) {
+            return Ok(code);
         }
     }
     // get_method's header walk applies to -t exactly like -d (the
@@ -605,6 +597,8 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
                 }
                 return Ok(1);
             }
+            // Already reported (unconditionally) by the block above.
+            FirstMemberBoundary::Refused(_) => return Ok(1),
             FirstMemberBoundary::Header => {}
         }
     }
@@ -658,7 +652,8 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
     // unchanged" — `gzip -tf <junk>` exits 0 silently). gzip names the peer
     // "stdin" itself (treat_stdin: strcpy(ifname, "stdin"), gzip.c:623).
     let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
-    let cont = input_data.len() >= 2 && input_data[0] == 0x78;
+    // Full RFC 1950 header check, not a leading 'x' byte ("xhello" is text).
+    let cont = crate::compress::zlib_container::is_zlib_stream(&input_data);
     if !is_gzip && !cont {
         if args.force {
             return Ok(0);
@@ -676,17 +671,10 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
     // foreign CM byte — same texts, peer named "stdin". ERROR class:
     // unconditional.
     if is_gzip {
-        use crate::decompress::format::FirstMemberBoundary;
-        match crate::decompress::format::classify_first_member(&input_data) {
-            FirstMemberBoundary::UnexpectedEof => {
-                eprintln!("\ngzippy: stdin: unexpected end of file");
-                return Ok(1);
-            }
-            FirstMemberBoundary::UnknownMethod(cm) => {
-                eprintln!("gzippy: stdin: unknown method {} -- not supported", cm);
-                return Ok(1);
-            }
-            FirstMemberBoundary::Header => {}
+        if let Some(code) =
+            crate::decompress::format::classify_first_member(&input_data).report("stdin")
+        {
+            return Ok(code);
         }
     }
     // get_method's header walk on stdin too (decompress_file's block holds
@@ -707,6 +695,8 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
                 }
                 return Ok(1);
             }
+            // Already reported (unconditionally) by the block above.
+            FirstMemberBoundary::Refused(_) => return Ok(1),
             FirstMemberBoundary::Header => {}
         }
     }

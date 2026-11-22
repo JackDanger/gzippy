@@ -38,11 +38,29 @@ pub(crate) struct BgzfBlock {
     deflate_start: usize,
 }
 
+/// Upper bound on what `deflate_len` bytes of DEFLATE can decode to: the
+/// format's ~1032:1 ceiling plus one window of slack for tiny inputs (the same
+/// bound `ChunkData::set_output_ceiling_for_input` arms on the parallel path).
+#[inline]
+pub(crate) fn max_inflated_len(deflate_len: usize) -> usize {
+    const SLACK: usize = 64 * 1024;
+    deflate_len
+        .saturating_mul(crate::decompress::parallel::chunk_data::MAX_DEFLATE_EXPANSION)
+        .saturating_add(SLACK)
+}
+
+/// The gzip CRC32 of `bytes` (the crate's HW-folded kernel).
+#[inline]
+pub(super) fn crc32_of(bytes: &[u8]) -> u32 {
+    crate::decompress::parallel::crc32::crc32_fold(0, bytes)
+}
+
 /// Parse all BGZF blocks from compressed data
 fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
+    let malformed = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
     let mut blocks = Vec::new();
     let mut offset = 0;
-    let mut output_offset = 0;
+    let mut output_offset = 0usize;
 
     while offset + 18 < data.len() {
         // Check gzip magic
@@ -55,89 +73,31 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
             break;
         }
 
-        // Get XLEN
-        if offset + 12 > data.len() {
-            break;
-        }
-        let xlen = u16::from_le_bytes([data[offset + 10], data[offset + 11]]) as usize;
-        if offset + 12 + xlen > data.len() {
-            break;
-        }
+        // Size field + full header geometry (FNAME/FCOMMENT/FHCRC) + 8-byte
+        // trailer, validated once here so no decode site can slice
+        // `data[deflate_start..start+length-8]` out of order (the
+        // BSIZE-shorter-than-header panic). The router (`gz_coverage_is_pure`)
+        // applies the same check, so a malformed member never reaches here
+        // from the CLI; a direct library caller gets a clean error.
+        let (length, deflate_start) = multi_member::gz_member_geometry(data, offset)
+            .ok_or_else(|| malformed("malformed BGZF block header"))?;
 
-        // Find GZ subfield with block size
-        let extra_start = offset + 12;
-        let extra_field = &data[extra_start..extra_start + xlen];
-        let mut block_size = None;
-        let mut pos = 0;
-
-        while pos + 4 <= extra_field.len() {
-            let subfield_id = &extra_field[pos..pos + 2];
-            let subfield_len =
-                u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
-
-            if subfield_id == b"GZ" {
-                if subfield_len == 4 && pos + 8 <= extra_field.len() {
-                    // New 4-byte format (supports blocks > 64KB)
-                    let size = u32::from_le_bytes([
-                        extra_field[pos + 4],
-                        extra_field[pos + 5],
-                        extra_field[pos + 6],
-                        extra_field[pos + 7],
-                    ]) as usize;
-                    if size > 0 {
-                        block_size = Some(size);
-                    }
-                    break;
-                } else if subfield_len == 2 && pos + 6 <= extra_field.len() {
-                    // Legacy 2-byte format (BSIZE-1)
-                    let size_minus_1 =
-                        u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]) as usize;
-                    block_size = Some(size_minus_1 + 1);
-                    break;
-                }
-            }
-
-            pos += 4 + subfield_len;
-        }
-
-        let length = match block_size {
-            Some(l) if l > 0 && offset + l <= data.len() => l,
-            _ => break,
-        };
-
-        // Read ISIZE from trailer (last 4 bytes of block)
-        let isize = if length >= 8 {
-            let trailer_start = offset + length - 4;
-            u32::from_le_bytes([
-                data[trailer_start],
-                data[trailer_start + 1],
-                data[trailer_start + 2],
-                data[trailer_start + 3],
-            ])
-        } else {
-            0
-        };
-
-        // Deflate data starts after the full gzip header (including optional fields)
-        let mut deflate_start = offset + 12 + xlen;
-        let flags = data[offset + 3];
-        // FNAME: null-terminated filename
-        if flags & 0x08 != 0 {
-            while deflate_start < offset + length && data[deflate_start] != 0 {
-                deflate_start += 1;
-            }
-            deflate_start += 1; // skip null terminator
-        }
-        // FCOMMENT: null-terminated comment
-        if flags & 0x10 != 0 {
-            while deflate_start < offset + length && data[deflate_start] != 0 {
-                deflate_start += 1;
-            }
-            deflate_start += 1;
-        }
-        // FHCRC: 2-byte header CRC
-        if flags & 0x02 != 0 {
-            deflate_start += 2;
+        // ISIZE from the trailer (last 4 bytes of block). It is untrusted: the
+        // decoder sizes buffers from it, so a value the block's deflate payload
+        // could not possibly expand to is corruption, rejected before any
+        // allocation (a 248-byte file once drove a 1.2 GB RSS this way).
+        let trailer_start = offset + length - 4;
+        let isize = u32::from_le_bytes([
+            data[trailer_start],
+            data[trailer_start + 1],
+            data[trailer_start + 2],
+            data[trailer_start + 3],
+        ]);
+        let deflate_len = offset + length - 8 - deflate_start;
+        if isize as usize > max_inflated_len(deflate_len) {
+            return Err(malformed(
+                "BGZF block ISIZE exceeds what its compressed data can expand to",
+            ));
         }
 
         blocks.push(BgzfBlock {
@@ -162,6 +122,31 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
     Ok(blocks)
 }
 
+impl BgzfBlock {
+    /// Raw deflate body: past the header, before the 8-byte trailer.
+    /// `parse_bgzf_blocks` / `gz_member_geometry` guarantee the order.
+    #[inline]
+    fn deflate_body<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        &data[self.deflate_start..self.start + self.length - 8]
+    }
+
+    /// RFC 1952 integrity: the decoded bytes must match BOTH the trailer's
+    /// ISIZE and its CRC32.
+    #[inline]
+    fn trailer_matches(&self, data: &[u8], decoded: &[u8]) -> bool {
+        let t = self.start + self.length - 8;
+        let crc = u32::from_le_bytes([data[t], data[t + 1], data[t + 2], data[t + 3]]);
+        decoded.len() == self.isize as usize && crc32_of(decoded) == crc
+    }
+}
+
+fn bgzf_integrity_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "CRC32 or size mismatch in BGZF block",
+    )
+}
+
 /// Inflate directly into a pre-allocated output slice
 ///
 /// Decompress raw deflate data using the pure-Rust inflate engine.
@@ -177,6 +162,7 @@ fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
 /// Public version of inflate_into for use by other modules.
 ///
 /// Pure-Rust inflate — no C-FFI in the decode graph.
+#[allow(dead_code)] // test/library helper; the binary no longer calls it
 pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     inflate_into(deflate_data, output)
 }
@@ -222,13 +208,10 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
 
                     let block = &blocks_ref[idx];
                     let out_size = block.isize as usize;
-                    if out_size == 0 {
-                        continue;
-                    }
-
-                    // Raw deflate: skip gzip header, stop before 8-byte trailer
-                    let deflate_end = block.start + block.length - 8;
-                    let deflate_data = &data[block.deflate_start..deflate_end];
+                    // An ISIZE=0 block is still decoded and CRC-checked: its
+                    // body must decode to zero bytes (a non-empty body fails
+                    // with WriteZero against the empty slice).
+                    let deflate_data = block.deflate_body(data);
 
                     // SAFETY: Each block writes to a disjoint region
                     let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
@@ -238,7 +221,8 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
                     };
 
                     match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_out) if actual_out == out_size => {}
+                        Ok(actual_out) if block.trailer_matches(data, &out_slice[..actual_out]) => {
+                        }
                         _ => error_ref.store(true, Ordering::Relaxed),
                     }
                 }
@@ -247,10 +231,7 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
     });
 
     if had_error.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CRC32 or size mismatch in BGZF block",
-        ));
+        return Err(bgzf_integrity_error());
     }
 
     Ok(output_cell.0.into_inner())
@@ -326,25 +307,18 @@ fn decompress_bgzf_pipelined<W: Write>(
 
                     let block = &blocks_ref[idx];
                     let out_size = block.isize as usize;
-                    if out_size == 0 {
-                        let _ = done_tx.send((idx, Vec::new()));
-                        continue;
-                    }
 
                     if buf.len() < out_size {
                         buf.resize(out_size, 0);
                     }
 
-                    let deflate_end = block.start + block.length - 8;
-                    let deflate_data = &data[block.deflate_start..deflate_end];
-
+                    // Every block is decoded and verified, ISIZE=0 included. A
+                    // block that fails ISIZE/CRC32 is never handed to the
+                    // writer: it sends an empty buffer and flags the error.
+                    let deflate_data = block.deflate_body(data);
                     let actual_out = match inflate_into(deflate_data, &mut buf[..out_size]) {
-                        Ok(n) if n == out_size => n,
-                        Ok(n) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                            n
-                        }
-                        Err(_) => {
+                        Ok(n) if block.trailer_matches(data, &buf[..n]) => n,
+                        _ => {
                             error_ref.store(true, Ordering::Relaxed);
                             0
                         }
@@ -385,10 +359,7 @@ fn decompress_bgzf_pipelined<W: Write>(
     });
 
     if had_error.load(Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CRC32 or size mismatch in BGZF block",
-        ));
+        return Err(bgzf_integrity_error());
     }
 
     Ok(total)
@@ -411,17 +382,14 @@ fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Resul
 
     for block in &blocks {
         let out_size = block.isize as usize;
-        if out_size == 0 {
-            continue;
-        }
 
         if out_size > buf.len() {
             buf.resize(out_size, 0);
         }
 
-        // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE)
-        let deflate_end = block.start + block.length - 8;
-        let deflate_data = &data[block.deflate_start..deflate_end];
+        // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE).
+        // Every block is decoded and verified, ISIZE=0 included.
+        let deflate_data = block.deflate_body(data);
 
         let actual_out = inflate_into(deflate_data, &mut buf[..out_size]).map_err(|_| {
             io::Error::new(
@@ -429,6 +397,9 @@ fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Resul
                 "deflate decompression failed in BGZF block",
             )
         })?;
+        if !block.trailer_matches(data, &buf[..actual_out]) {
+            return Err(bgzf_integrity_error());
+        }
 
         writer.write_all(&buf[..actual_out])?;
         total += actual_out as u64;
