@@ -2231,6 +2231,17 @@ pub fn parse_dynamic_header(bits: &mut Bits) -> Result<(Vec<u8>, Vec<u8>)> {
     bits.consume(5);
     let hclen = (bits.peek() & 0xF) as usize + 4;
     bits.consume(4);
+    // RFC 1951 §3.2.7 / zlib `inflate.c` "too many length or distance
+    // symbols" / gzip(1) `inflate.c` `if (nl > 286 || nd > 30)`. Litlen 286-287
+    // and distance 30-31 are reserved; accepting HLIT up to 288 let a code
+    // assign symbol 286, whose table entry is a 0-bit length-0 match, and the
+    // body loop spun forever on it.
+    if hlit > 286 || hdist > 30 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: too many length or distance symbols",
+        ));
+    }
 
     // Read code length code lengths
     const CODE_LENGTH_ORDER: [usize; 19] = [
@@ -2312,6 +2323,15 @@ pub fn parse_dynamic_header(bits: &mut Bits) -> Result<(Vec<u8>, Vec<u8>)> {
                 ))
             }
         }
+    }
+
+    // zlib "invalid code -- missing end-of-block": without an EOB codeword
+    // the block can never terminate.
+    if all_lengths[256] == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: missing end-of-block code",
+        ));
     }
 
     let litlen_lengths = all_lengths[..hlit].to_vec();
