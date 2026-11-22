@@ -1046,6 +1046,8 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
     // fold away on the single-member (`false`) instantiation.
     let mut did_read_header = false;
     let mut stream_bytes_read: u64 = 0;
+    // Liveness guard state — see `check_blocks_after_input_end`.
+    let mut blocks_after_input_end: u32 = 0;
 
     // Per-call contig headroom: one max-length back-ref (258) + the 8-byte
     // word-copy overshoot (matches `decode_clean_into_contig`'s `out_room`
@@ -1351,8 +1353,48 @@ fn finish_decode_chunk_contig_native<const MULTI_MEMBER: bool>(
                     chunk.data_with_markers.len() + chunk.data.len() - chunk.data_prefix_len;
                 chunk.append_block_boundary_at(end_bit_offset, decoded_offset, Some(input));
             }
+            check_blocks_after_input_end(
+                slice_byte,
+                &bits,
+                input.len(),
+                &mut blocks_after_input_end,
+            )?;
         }
     })
+}
+
+/// Liveness guard for the per-block loops (block boundary only — never the
+/// per-symbol loop). Port of `consume_first_decode`'s `blocks_after_input_end`
+/// guard (`inflate_consume_first_bits`): once every input byte has been pulled
+/// into the bit reader, at most ~64 buffered bits remain, so a well-formed
+/// stream reaches BFINAL within a handful of further blocks (the smallest
+/// non-final block is 10 bits). Malformed / truncated input instead decodes the
+/// reader's zero padding past end-of-input as an endless run of EMPTY non-final
+/// blocks — each hits EOB with zero output, so the "no progress" body guard
+/// never fires, and once the reader over-consumes, `absolute_bit_pos` can even
+/// step BACKWARD and re-decode real bytes in a cycle. Every such cycle passes
+/// through a block whose reader is exhausted, so capping those blocks
+/// terminates it. Byte-transparent: no valid stream decodes anywhere near 64
+/// blocks after its input is exhausted.
+#[cfg(parallel_sm)]
+#[inline]
+fn check_blocks_after_input_end(
+    slice_byte: usize,
+    bits: &crate::decompress::inflate::consume_first_decode::Bits,
+    input_len: usize,
+    blocks_after_input_end: &mut u32,
+) -> Result<(), ChunkDecodeError> {
+    if slice_byte + bits.pos >= input_len {
+        *blocks_after_input_end += 1;
+        if *blocks_after_input_end > 64 {
+            return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "deflate stream did not terminate: no BFINAL block before end of input \
+                 (malformed/truncated)",
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Window-seeded INEXACT clean-decode engine — vendor `GzipChunk.hpp:454-458` (non-ISAL build):
@@ -1961,6 +2003,7 @@ where
 {
     use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
+    let mut blocks_after_input_end: u32 = 0;
     loop {
         let slice_byte = ctx.current_bit_offset / 8;
         let mut bits = ctx.open_bits(data);
@@ -2051,6 +2094,7 @@ where
             ));
         }
         output.note_block_boundary(end_bit_offset, output.sink_len());
+        check_blocks_after_input_end(slice_byte, &bits, data.len(), &mut blocks_after_input_end)?;
     }
 }
 

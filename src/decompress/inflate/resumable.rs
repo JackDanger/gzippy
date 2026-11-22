@@ -1438,6 +1438,15 @@ pub fn parse_dynamic_header_with_lens(
     bits.consume(5);
     let hclen = (bits.peek() & 0xF) as usize + 4;
     bits.consume(4);
+    // RFC 1951 reserves litlen 286-287 / distance 30-31; zlib and gzip(1)
+    // reject HLIT > 286 / HDIST > 30 (same rule as
+    // `consume_first_decode::parse_dynamic_header`).
+    if hlit > 286 || hdist > 30 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: too many length or distance symbols",
+        ));
+    }
 
     // Code-length code lengths in the canonical permutation order.
     const CODE_LENGTH_ORDER: [usize; 19] = [
@@ -1531,6 +1540,15 @@ pub fn parse_dynamic_header_with_lens(
                 ));
             }
         }
+    }
+
+    // zlib "invalid code -- missing end-of-block": no EOB codeword means the
+    // block can never terminate.
+    if all_lengths[256] == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: missing end-of-block code",
+        ));
     }
 
     let litlen_lengths = &all_lengths[..hlit];
