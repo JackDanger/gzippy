@@ -560,6 +560,11 @@ jobs:
           fi
 
       - name: Push AUR packages
+        # An AUR-side refusal (v1.0.1: `gzippy-replace-gzip was deleted;
+        # pushing does not restore it`) must not strand the apt repo, whose
+        # steps follow. The step still shows as failed in the run UI.
+        id: aur
+        continue-on-error: true
         run: |
           X86=${{ steps.shas.outputs.x86_64_unknown_linux_gnu }}
           ARM=${{ steps.shas.outputs.aarch64_unknown_linux_gnu }}
