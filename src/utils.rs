@@ -382,3 +382,53 @@ pub fn bump_exit_code(exit_code: &mut i32, new_code: i32) {
         *exit_code = new_code;
     }
 }
+
+thread_local! {
+    /// (dev, ino) of every directory a `-r` walk is currently inside.
+    static WALKING_DIRS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Held while a `-r` walk is inside one directory; leaving drops it.
+pub struct DirWalkGuard(Option<(u64, u64)>);
+
+impl Drop for DirWalkGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            WALKING_DIRS.with(|w| {
+                let mut w = w.borrow_mut();
+                if let Some(i) = w.iter().rposition(|k| *k == key) {
+                    w.remove(i);
+                }
+            });
+        }
+    }
+}
+
+/// Enter the directory `istat` describes for a `-r` walk, or `None` if the
+/// walk is already inside it. Under `-f` a symlinked directory is followed
+/// (gzip's open does not pass O_NOFOLLOW then), and a link back to an
+/// ancestor made the compress_file -> *_directory recursion unbounded: a
+/// stack overflow abort (exit 134) before anything was compressed. A
+/// directory is walked at most once per ancestry chain; real loops are
+/// reported once and skipped.
+pub fn enter_dir_walk(istat: &fs::Metadata) -> Option<DirWalkGuard> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let key = (istat.dev(), istat.ino());
+        WALKING_DIRS.with(|w| {
+            let mut w = w.borrow_mut();
+            if w.contains(&key) {
+                None
+            } else {
+                w.push(key);
+                Some(DirWalkGuard(Some(key)))
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = istat;
+        Some(DirWalkGuard(None))
+    }
+}

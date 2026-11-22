@@ -99,6 +99,12 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         // on a real directory), not by reading the source. Multi-file runs keep
         // processing the rest.
         if args.recursive {
+            let Some(_walk) = crate::utils::enter_dir_walk(&istat) else {
+                if !args.quiet {
+                    eprintln!("gzippy: {}: directory loop -- skipped", filename);
+                }
+                return Ok(1);
+            };
             return decompress_directory(filename, args);
         }
         if !args.quiet {
