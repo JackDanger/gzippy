@@ -495,7 +495,11 @@ jobs:
           set -euo pipefail
 
           is_published() {
-            curl -fsSL "https://crates.io/api/v1/crates/gzippy/versions" \
+            # crates.io's data-access policy 403s requests with no User-Agent,
+            # which made this check always report "not published" and turned
+            # a re-run of an already-published release into a failure.
+            curl -fsSL -A "gzippy-release-workflow (https://github.com/JackDanger/gzippy)" \
+              "https://crates.io/api/v1/crates/gzippy/versions" \
               | python3 -c "import json,sys; print('\n'.join(v['num'] for v in json.load(sys.stdin)['versions']))" \
               | grep -qx "$VERSION"
           }
@@ -524,8 +528,12 @@ jobs:
           # may have accepted the upload even though the client saw an error,
           # which would otherwise make every retry fail with "already exists".
           for attempt in 1 2 3; do
-            if cargo publish --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN"; then
+            if cargo publish --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee publish.log; then
               echo "Published gzippy v${VERSION} to crates.io (attempt $attempt)"
+              exit 0
+            fi
+            if grep -q "already exists on crates.io index" publish.log; then
+              echo "gzippy v${VERSION} already on crates.io — OK"
               exit 0
             fi
             echo "cargo publish attempt $attempt failed."
