@@ -432,3 +432,37 @@ pub fn enter_dir_walk(istat: &fs::Metadata) -> Option<DirWalkGuard> {
         Some(DirWalkGuard(None))
     }
 }
+
+/// Map stdin when it is a regular file redirected AT ITS START (`< file`).
+///
+/// A redirected fd carries an offset: `{ head -c 1000 >/dev/null; gzippy -c; } < f`
+/// must compress f from byte 1000, as gzip does by reading. Mapping from 0
+/// ignored it and silently compressed bytes that were already consumed
+/// (encoder audit: `-p4` emitted a VALID gzip of the WRONG content). A
+/// non-zero offset returns `None`, so the caller's read-from-fd path runs
+/// from the current position. After mapping, the fd is moved to EOF —
+/// where a reading gzip leaves it — so a later reader of the same open file
+/// description does not see the input a second time.
+#[cfg(unix)]
+pub fn mmap_stdin_regular_from_start() -> Option<memmap2::Mmap> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: fd 0 is borrowed, never closed (forgotten below).
+    let f = std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(0) });
+    let result = (|| {
+        if !f.metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        // SAFETY: lseek on a valid fd.
+        if unsafe { libc::lseek(0, 0, libc::SEEK_CUR) } != 0 {
+            return None;
+        }
+        // SAFETY: read-only map of a regular file; gzippy never mutates it.
+        let m = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+        let _ = m.advise(memmap2::Advice::Sequential);
+        // SAFETY: lseek on a valid fd.
+        unsafe { libc::lseek(0, 0, libc::SEEK_END) };
+        Some(m)
+    })();
+    std::mem::forget(f);
+    result
+}

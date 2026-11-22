@@ -390,27 +390,7 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
 pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     #[cfg(unix)]
-    let mmap_data: Option<Mmap> = {
-        use std::os::unix::io::FromRawFd;
-        let meta = std::fs::File::from(unsafe {
-            std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */)
-        });
-        let is_regular = meta
-            .metadata()
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-        let result = if is_regular {
-            let m = unsafe { Mmap::map(&meta) }.ok();
-            if let Some(ref mmap) = m {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-            }
-            m
-        } else {
-            None
-        };
-        std::mem::forget(meta);
-        result
-    };
+    let mmap_data: Option<Mmap> = crate::utils::mmap_stdin_regular_from_start();
     #[cfg(not(unix))]
     let mmap_data: Option<Mmap> = None;
 

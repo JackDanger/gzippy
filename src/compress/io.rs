@@ -695,25 +695,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     // whole-buffer route below (which honours `-p N`).
     #[cfg(unix)]
     let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
-        use std::os::unix::io::FromRawFd;
-        let meta = std::fs::File::from(unsafe {
-            std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */)
-        });
-        let is_regular = meta
-            .metadata()
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-        let result = if is_regular {
-            let m = unsafe { memmap2::Mmap::map(&meta) }.ok();
-            if let Some(ref mmap) = m {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-            }
-            m
-        } else {
-            None
-        };
-        std::mem::forget(meta);
-        result
+        crate::utils::mmap_stdin_regular_from_start()
     } else {
         None
     };
