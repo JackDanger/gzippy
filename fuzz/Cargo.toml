@@ -36,3 +36,17 @@ path = "fuzz_targets/parallel_sm_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_untrusted"
+path = "fuzz_targets/decode_untrusted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_gzip_focus"
+path = "fuzz_targets/decode_gzip_focus.rs"
+test = false
+doc = false
+bench = false
