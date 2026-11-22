@@ -976,3 +976,41 @@ fn recursive_force_survives_a_symlink_loop() {
     assert!(d.path().join("tree/o.gz").is_file());
     assert!(sub.join("s.gz").is_file());
 }
+
+// ---------------------------------------------------------------------------
+// Redirected stdin honours the fd's current offset (POSIX read semantics;
+// gzip reads from wherever the shell left the file). The T>1 route mmapped
+// stdin from byte 0 and so compressed bytes another reader had already
+// consumed — a VALID gzip of the WRONG content.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn redirected_stdin_starts_at_the_fd_offset() {
+    use std::io::{Seek, SeekFrom};
+    let d = tempdir();
+    let mut data = Vec::new();
+    while data.len() < 300_000 {
+        data.extend_from_slice(&sample_bytes());
+    }
+    let path = write_file(d.path(), "in", &data);
+    for p in ["-p1", "-p4"] {
+        let mut f = fs::File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(1000)).unwrap();
+        let out = Command::new(gzippy())
+            .args(["-c", "-6", p])
+            .stdin(Stdio::from(f))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let gz = write_file(d.path(), "o.gz", &out.stdout);
+        let back = run(
+            d.path(),
+            &["-dc", gz.file_name().unwrap().to_str().unwrap()],
+        );
+        assert!(
+            back.stdout == data[1000..],
+            "{p}: must compress from the fd offset"
+        );
+    }
+}
